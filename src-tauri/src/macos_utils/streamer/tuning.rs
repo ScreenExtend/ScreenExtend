@@ -5,8 +5,19 @@ use objc2::runtime::{NSObjectProtocol, ProtocolObject};
 use objc2_foundation::{NSActivityOptions, NSProcessInfo, NSString};
 
 pub fn apply_process_tuning() {
-    static TOKEN: OnceLock<ProcessTuning> = OnceLock::new();
-    let _ = TOKEN.set(ProcessTuning::begin());
+    static TOKEN: OnceLock<Option<ProcessTuning>> = OnceLock::new();
+    TOKEN.get_or_init(|| {
+        let t = if super::tune::enabled("process_activity") {
+            super::tune::record("process_activity", true, serde_json::Value::Null);
+            Some(ProcessTuning::begin())
+        } else {
+            super::tune::record_skipped("process_activity");
+            tprintln!("[tuning] process-wide activity skipped (SE_TUNE_OFF=process_activity)");
+            None
+        };
+        super::tune::apply_process_candidates();
+        t
+    });
 }
 
 struct ProcessTuning {

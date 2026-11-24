@@ -76,8 +76,30 @@ epochs, meaningless on their own but valid as a *difference*, which is all A/V s
 | `packetize_done_ns` | After H.264 payloading, before the first RTP write. |
 | `socket_write_done_ns` | After the last RTP packet of the frame is written. |
 
-Derived histograms: `capture_delivery`, `scale`, `encode_queue`, `encode`, `packetize`,
-`socket_write`, `pace_wait`, `capture_to_encode`, `capture_to_socket`.
+Derived histograms: `capture_delivery`, `scale`, `encode_queue`, `encode`, `encode_repeat`,
+`packetize`, `socket_write`, `pace_wait`, `capture_to_encode`, `capture_to_socket`.
+
+`encode` and `encode_queue` hold **captured frames only**. A re-submitted picture (keepalive
+repeat, forced-keyframe repeat, macOS hold push) records its submit→emit in `encode_repeat`
+instead: on a one-frame-hold encoder that time is waiting for the next submit, not work (a still
+screen on `h264.gva` showed `encode` p50 201 ms over 177 keepalives before the split). The
+capture-relative stages never included repeats. Empty stages are omitted from the JSON.
+
+**The video RTP timestamp is the host clock** (`host_ns_to_rtp90k` of `EncodedFrame.capture`,
+90 kHz), which the client inverts to recover each frame's host-capture time. For a captured frame
+that is its capture instant. A re-submitted picture — a keepalive repeat, a forced-keyframe repeat
+of the last frame, a macOS hold push — is stamped **when it comes out of the encoder**:
+`max(own submit, emit − E)`, `E` the session's recent real-frame encode time (the minimum of the
+last 8 captured frames' submit→emit; before any, the picture's own submit). Stamped with the
+original capture, a still screen's repeats read on the client as frames captured seconds ago
+(measured 4.6–10 s in a headless-Chrome session) and drove the client's audio target toward its
+400 ms cap through `reportAvSync` / `maybeUpdateTarget`; stamped at the submit, a keepalive that
+a holding encoder emits ~200 ms later would still read ~200 ms. A frame and its hold push no
+longer share a timestamp. The RTP writer also keeps the timestamp **strictly increasing** per session (wrapping
+comparison; a value not ahead of the last one is written as last + 1 tick), because a real frame
+captured just before a repeat's submit but taken just after it would go backwards and a receiver
+drops a frame older than the last one it decoded. Each clamp is counted in `rtp_ts_clamped`
+(session JSON, absent while zero).
 
 `pace_wait` is the odd one out: it is not derived from a `FrameTiming` pair but recorded
 directly by the RTP writer, and it holds **only the time the send pacer slept** — not the
@@ -126,9 +148,20 @@ silently delivering 45, which is the failure this exists to make visible; the ra
 from the frame counter and the host clock at each summary, so it costs one atomic load per
 reporting interval and nothing per frame.
 
+**Session JSON additions (macOS host, r6).** `qp_governor` (present only on a `BaseFrameQp`
+session with the governor on): `qp_effective` (the per-frame QP in force), `qp_user`,
+`ceiling_mbps`, `ms_above_user_qp`, `steps`. `clock`: `host_now_ns` and `unix_ns` read back to
+back (also logged once per session as `[clock] host_now_ns=… unix_ns=…`), so a harness on the same
+machine can check a client's clock-offset estimate against the truth.
+
 ## Degradation counters
 
-`capture_fallback`, `capture_no_first_frame`, `frames_repeated`, `frames_dropped_ring`,
+`capture_fallback`, `capture_no_first_frame`, `frames_repeated` (of which `frames_hold_pushed`: macOS
+repeats that push a held frame out of a one-frame-hold encoder; the mode is the session JSON's
+`hold_push_mode` — `probing`, `immediate` or `suspended` — absent off macOS), `hold_push_suspensions`
+(times pushing was suspended because it made real frames slower; the session JSON's
+`hold_push_guard` says why, with the statistic: real frames' median submit→emit with pushes against
+`L0`, the current median frame interval plus the encoder's measured no-push work), `frames_dropped_ring`,
 `frames_dropped_broadcast`, `encoder_output_drops`,
 `nacks_received`, `keyframe_requests`, `client_keyframe_requests`,
 `keyframe_requests_suppressed`, `delay_overuse_events`, `pacer_deadline_misses`, `idrs_sent`,

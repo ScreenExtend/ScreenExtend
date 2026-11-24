@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "name": "anchors",
+  "workloads": [
+    { "id": "rec", "kind": "recording", "fps": 60 },
+    { "id": "stress", "kind": "synthetic", "pattern": "window_drag_stress", "width": 1920, "height": 1080, "fps": 60, "seconds": 10, "seed": 1 }
+  ],
+  "recipes": [
+    { "name": "prod-qp15", "production": { "qp": 15 } },
+    {
+      "name": "ll-qp15",
+      "codec": "h264",
+      "spec": [["RequireHardwareAcceleratedVideoEncoder", true], ["EnableLowLatencyRateControl", true]],
+      "props": [
+        ["RealTime", true],
+        ["AllowFrameReordering", false],
+        ["ProfileLevel", { "sym": ["kVTProfileLevel_H264_ConstrainedHigh_AutoLevel", "kVTProfileLevel_H264_High_AutoLevel"] }],
+        ["ColorPrimaries", "ITU_R_709_2"],
+        ["TransferFunction", "ITU_R_709_2"],
+        ["YCbCrMatrix", "ITU_R_709_2"],
+        ["ExpectedFrameRate", 60],
+        ["MaxKeyFrameInterval", 36000],
+        ["MaxKeyFrameIntervalDuration", 600.0],
+        ["MaximizePowerEfficiency", false],
+        ["PrioritizeEncodingSpeedOverQuality", true],
+        ["Quality", 0.72],
+        ["MaxAllowedFrameQP", 15],
+        ["MinAllowedFrameQP", 15]
+      ]
+    },
+    { "name": "ll-qp15-abr12.4M", "base": "ll-qp15", "props": [["AverageBitRate", 12441600]] },
+    { "name": "ll-qp15-abr300M", "base": "ll-qp15", "props": [["AverageBitRate", 300000000]] },
+    { "name": "ll-qp15-abr150M", "base": "ll-qp15", "props": [["AverageBitRate", 150000000]] },
+    { "name": "ll-qp15-abr1G", "base": "ll-qp15", "props": [["AverageBitRate", 1000000000]] },
+    { "name": "hw-qp15", "base": "ll-qp15", "spec": [], "remove": ["EnableLowLatencyRateControl"] }
+  ],
+  "groups": [
+    { "name": "anchors", "recipes": ["ll-qp15", "ll-qp15-abr12.4M", "ll-qp15-abr150M", "ll-qp15-abr1G", "hw-qp15", "prod-qp15"], "workloads": ["rec"], "per_frame": true },
+    { "name": "anchor-psnr", "recipes": ["ll-qp15-abr300M"], "workloads": ["rec"], "psnr": true, "per_frame": true },
+    { "name": "stress-acceptance", "recipes": ["ll-qp15", "ll-qp15-abr300M"], "workloads": ["stress"] }
+  ],
+  "order": { "shuffle_seed": 7, "interleave_repeats": true, "cooldown_ms": 2000 }
+}

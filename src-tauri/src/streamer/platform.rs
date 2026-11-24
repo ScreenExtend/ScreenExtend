@@ -84,7 +84,19 @@ pub fn tune_transport_thread() {
     #[cfg(target_os = "windows")]
     crate::windows_utils::streamer::tuning::tune_transport_thread();
     #[cfg(target_os = "macos")]
-    crate::macos_utils::streamer::qos::pin_current_thread_user_initiated();
+    {
+        use crate::macos_utils::streamer::{qos, tune};
+        if tune::enabled("transport_user_interactive") {
+            tune::record_rc(
+                "transport_user_interactive",
+                qos::pin_current_thread_user_interactive(),
+            );
+        } else if tune::enabled("transport_qos") {
+            tune::record_rc("transport_qos", qos::pin_current_thread_user_initiated());
+        } else {
+            tune::record_skipped("transport_qos");
+        }
+    }
 }
 
 pub fn probe_capture(monitor: u32, path: &str) -> Result<()> {

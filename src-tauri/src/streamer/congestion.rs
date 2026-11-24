@@ -605,9 +605,7 @@ impl SharedFeedback {
         if let Some(ns) = s.acked_capture_ns {
             // Monotonic: a later report can only ever move this forward, and reports can be
             // reordered on the wire.
-            let _ = self
-                .acked_capture_ns
-                .fetch_update(Relaxed, Relaxed, |cur| (ns > cur).then_some(ns));
+            self.acked_capture_ns.fetch_max(ns, Relaxed);
         }
         self.twcc_reports.fetch_add(1, Relaxed);
     }

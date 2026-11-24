@@ -66,10 +66,66 @@ const KEY_WAIT_GIVE_UP_MS = 8000;
 //
 // So the count is now the cheap half of the test and `BACKLOG_STALL_MS` is the load-bearing
 // half: a decoder that is producing outputs is keeping up however many pictures it is holding.
+//
+// And "no output for BACKLOG_STALL_MS" is only evidence of a stalled decoder if the decoder had
+// work for that long. The clock used to run from the last output whether or not anything had
+// arrived since, so it counted time with no input. A 1-2 MB IDR from the Intel Mac host at
+// 1920x1080 spends ~150 ms crossing the network with nothing reaching the decoder; when it and
+// the clump of deltas queued behind it land, `now - lastOutput > 66 ms` is already true before
+// the decoder has been given anything, and the 7th delta of the clump tripped the test: deltas
+// dropped, another IDR just as large requested and answered at once. Measured: 20-49 IDRs in
+// 20 s with no packet lost, 41.5 Mbps on the wire for a 27 Mbps stream, host-capture->paint p90
+// 181 ms; starting the clock no earlier than the keyframe submit took that to 7 IDRs, 0 dropped,
+// p90 35 ms. Nothing about it is specific to keyframes: any arrival gap over ~66 ms (idle ping
+// between the two dev Macs reaches 75 ms, an AWDL retune is tens of ms) followed by a clump of
+// seven deltas does the same to a healthy decoder. So the stall clock has a floor that moves
+// whenever input resumes — after an arrival gap (`ARRIVAL_GAP_MS`), when a submit finds the
+// decoder idle (its last output drained the count to zero), and at a keyframe submit.
+//
+// A gap only counts as a resume while the decoder is answering: at most MAX_UNANSWERED submits
+// since its last output. Judging the gap against an estimated frame rate instead left a hole,
+// because the estimate learned from rendered frames and froze with them: once arrivals were
+// further apart than it expected (a 5 fps keepalive desktop, 24-29 fps after 60), every arrival
+// moved the floor and a decoder that had died was never caught here. A decoder that answered its
+// last input may be given any gap; one that has not is given none.
+//
+// Counting is too slow for a sparse stream (seven frames at 5 fps is 1.4 s, and by then the
+// stale reset has zeroed the count), so silence is a second test of its own: SILENT_MIN submits
+// and SILENT_MS of arrivals with no output at all. Each gap is worth at most SILENT_GAP_CAP_MS,
+// so a suspended machine waking up with work outstanding is not a dead decoder.
+//
+// Separately, a keyframe that genuinely takes longer than the window to decode while frames keep
+// flowing: nothing can come out until it does (client decode ran p90 47 ms, p99 58-88 ms on those
+// IDRs). While a keyframe decode is pending, for at most `KEY_DECODE_GRACE_MS`, the backlog test
+// neither drops nor requests and the stale-count resets leave the count alone. Past the grace the
+// old test applies again, so a decoder that really died on a keyframe is still caught.
 const MAX_IN_FLIGHT = 6;
 // No output at all for this long, with the queue over the cap, is a decoder that has stopped
 // rather than one that is pipelined. Two frame periods at 30 fps, so it cannot fire on jitter.
 const BACKLOG_STALL_MS = 66;
+const KEY_DECODE_GRACE_MS = 1000;
+let keyDecodeTs = null;        // RTP stamp of the keyframe handed to the decoder, until its output
+let keyDecodeSinceMs = 0;      // when it was handed over
+let lastKeySubmitMs = 0;       // the stall clock never starts before the latest keyframe submit
+let keyDecodeGraceHits = 0;    // frames the backlog test would have dropped during a key decode
+// Half the stall window: a shorter gap cannot by itself fill it.
+const ARRIVAL_GAP_MS = 33;
+const MAX_UNANSWERED = 2;
+const SILENT_MS = 700;
+const SILENT_MIN = 3;
+const SILENT_GAP_CAP_MS = 400;
+let submitsSinceOutput = 0;
+let silentMs = 0;              // arrival time accumulated while a submit was unanswered
+let silentTrips = 0;
+let lastArrivalMs = 0;
+let floorGapMs = 0;            // arrival of the first frame after an arrival gap
+let floorIdleMs = 0;           // submit that found the decoder drained by its own outputs, or a count resync
+let idleSinceOutput = false;   // the count reached zero through outputs, not through a reset
+// Backlog trips the old clock would have made and the floor prevented, by the latest floor.
+let stallFloorSaves = 0;
+let stallFloorSavesKey = 0;
+let stallFloorSavesGap = 0;
+let stallFloorSavesIdle = 0;
 let inFlight = 0;
 let backlogStreak = 0;
 // The counter is only repaid by an output, and a decoder may accept a chunk and silently
@@ -483,6 +539,12 @@ function collectStats() {
     framesRendered: framesRendered,
     framesUnpainted: framesUnpainted,
     framesDropped: framesDroppedBacklog,
+    keyDecodeGraceHits: keyDecodeGraceHits,
+    silentTrips: silentTrips,
+    stallFloorSaves: stallFloorSaves,
+    stallFloorSavesKey: stallFloorSavesKey,
+    stallFloorSavesGap: stallFloorSavesGap,
+    stallFloorSavesIdle: stallFloorSavesIdle,
     keyframesIn: keyframesIn,
     keyframesForwarded: keyframesForwarded,
     decodeErrors: decodeErrors,
@@ -515,14 +577,30 @@ function postStats() {
   });
 }
 
+// A keyframe decode is pending from its submit until the decoder outputs that stamp or a later
+// one (wrap-aware, like `beforeRenderStart`), and is forgotten on any reset. Bounded by
+// KEY_DECODE_GRACE_MS so a decoder that dies on a keyframe is still caught.
+function keyDecodeInGrace(nowMs) {
+  if (keyDecodeTs === null) return false;
+  if (nowMs - keyDecodeSinceMs > KEY_DECODE_GRACE_MS) return false;
+  return true;
+}
+function clearKeyDecode() { keyDecodeTs = null; keyDecodeSinceMs = 0; }
+function stallFloor() { return Math.max(lastOutputAtMs, lastKeySubmitMs, floorGapMs, floorIdleMs); }
+function resetStallFloor() { lastArrivalMs = 0; floorGapMs = 0; floorIdleMs = 0; idleSinceOutput = false; submitsSinceOutput = 0; silentMs = 0; }
+
 function onDecodedFrame(frame) {
   framesDecoded++;
   if (inFlight > 0) inFlight--;
+  if (inFlight === 0) idleSinceOutput = true;
   lastOutputAtMs = performance.now();
+  submitsSinceOutput = 0;
+  silentMs = 0;
   let handedOff = false;
   // Read the timestamp before presenting: a track generator's writable takes ownership of
   // the frame, after which touching it is a detached-object error.
   const ts = frame.timestamp;
+  if (keyDecodeTs !== null && (((ts >>> 0) - keyDecodeTs) | 0) >= 0) clearKeyDecode();
   try {
     if (!beforeRenderStart(ts)) {
       const outcome = presentFrame(frame);
@@ -570,6 +648,7 @@ function makeDecoder() {
   const d = new VideoDecoder({
     output: onDecodedFrame,
     error: (err) => {
+      clearKeyDecode();
       decodeErrors++;
       self.postMessage({ type: 'decodeerror', message: String(err) });
       resetAndRequestKey();
@@ -582,6 +661,9 @@ function makeDecoder() {
     hasDequeueEvent = true;
     d.ondequeue = function () {
       if (d.decodeQueueSize !== 0) return;
+      // Behind a keyframe that is still decoding, an empty accept queue is the decoder busy on
+      // the keyframe, not decodes it dropped.
+      if (keyDecodeInGrace(performance.now())) return;
       // An empty accept queue with the counter still over the cap can only mean decodes the
       // browser took and never returned an output for.
       if (inFlight > MAX_IN_FLIGHT) inFlight = 0;
@@ -698,6 +780,8 @@ async function doConfigure() {
   setWaitingForKey(true);
   inFlight = 0;
   lastOutputAtMs = 0;
+  clearKeyDecode();
+  resetStallFloor();
   return true;
 }
 
@@ -716,6 +800,8 @@ function resetAndRequestKey() {
   setWaitingForKey(true);
   inFlight = 0;
   lastOutputAtMs = 0;
+  clearKeyDecode();
+  resetStallFloor();
   const old = decoder;
   decoder = null;
   if (old) {
@@ -824,6 +910,12 @@ function startPump(readable) {
 
       framesIn++;
       const arrivalMs = nowAbsMs();
+      const arrivedAtMs = performance.now();
+      const gapMs = lastArrivalMs ? arrivedAtMs - lastArrivalMs : 0;
+      if (gapMs > ARRIVAL_GAP_MS && submitsSinceOutput <= MAX_UNANSWERED) floorGapMs = arrivedAtMs;
+      if (keyDecodeInGrace(arrivedAtMs)) silentMs = 0;
+      else if (submitsSinceOutput > 0) silentMs += Math.min(gapMs, SILENT_GAP_CAP_MS);
+      lastArrivalMs = arrivedAtMs;
       const type = encodedFrame.type === 'key' ? 'key' : 'delta';
       if (type === 'key') keyframesIn++;
 
@@ -844,16 +936,47 @@ function startPump(readable) {
       // Second resync, for engines with no `ondequeue` and for one that stops firing it:
       // frames are still arriving and nothing has come back out, so the decodes the counter
       // is holding are gone.
-      if (inFlight > MAX_IN_FLIGHT && lastOutputAtMs &&
-          performance.now() - lastOutputAtMs > IN_FLIGHT_STALE_MS) {
+      const pumpNowMs = performance.now();
+      const keyBusy = keyDecodeInGrace(pumpNowMs);
+      if (inFlight > MAX_IN_FLIGHT && lastOutputAtMs && !keyBusy &&
+          pumpNowMs - stallFloor() > IN_FLIGHT_STALE_MS) {
         inFlight = 0;
         backlogStreak = 0;
+        // The count was resynchronised, so the work it counts from here started now: without
+        // this a decoder that died long ago would be reset every seven frames and never tripped.
+        floorIdleMs = pumpNowMs;
+      }
+
+      if (renderedOnce && !waitingForKey && decoder && type !== 'key' && !keyBusy &&
+          submitsSinceOutput >= SILENT_MIN && silentMs >= SILENT_MS) {
+        silentTrips++;
+        framesDroppedBacklog++;
+        self.postMessage({ type: 'backlog', inFlight: inFlight, queue: decoder.decodeQueueSize });
+        setWaitingForKey(true);
+        backlogStreak = 0;
+        submitsSinceOutput = 0;
+        silentMs = 0;
+        requestKey(false);
+        continue;
       }
 
       if (renderedOnce && !waitingForKey && decoder && type !== 'key') {
         var outputStalled = lastOutputAtMs !== 0 &&
-          (performance.now() - lastOutputAtMs) > BACKLOG_STALL_MS;
-        if (inFlight > MAX_IN_FLIGHT && outputStalled) {
+          (pumpNowMs - stallFloor()) > BACKLOG_STALL_MS;
+        if (inFlight > MAX_IN_FLIGHT && !outputStalled && lastOutputAtMs !== 0 &&
+            pumpNowMs - lastOutputAtMs > BACKLOG_STALL_MS) {
+          // The old clock would have called this a stall; say which floor said otherwise.
+          stallFloorSaves++;
+          const f = Math.max(lastKeySubmitMs, floorGapMs, floorIdleMs);
+          if (f === lastKeySubmitMs) stallFloorSavesKey++;
+          else if (f === floorGapMs) stallFloorSavesGap++;
+          else stallFloorSavesIdle++;
+        }
+        if (inFlight > MAX_IN_FLIGHT && outputStalled && keyBusy) {
+          // The decoder is on a keyframe: submit the delta, it is needed.
+          keyDecodeGraceHits++;
+          backlogStreak = 0;
+        } else if (inFlight > MAX_IN_FLIGHT && outputStalled) {
           backlogStreak++;
           framesDroppedBacklog++;
           if (backlogStreak >= 2) {
@@ -880,7 +1003,16 @@ function startPump(readable) {
         notePending(encodedFrame.timestamp, arrivalMs);
         const rec = pending.get(encodedFrame.timestamp);
         if (rec) rec.submit = nowAbsMs();
+        if (inFlight === 0 && idleSinceOutput) floorIdleMs = performance.now();
+        idleSinceOutput = false;
+        submitsSinceOutput++;
         inFlight++;
+        // Marked before the decode call: a decoder may output synchronously.
+        if (type === 'key') {
+          keyDecodeTs = encodedFrame.timestamp >>> 0;
+          keyDecodeSinceMs = performance.now();
+          lastKeySubmitMs = keyDecodeSinceMs;
+        }
         decoder.decode(
           new EncodedVideoChunk({
             type,
@@ -891,6 +1023,7 @@ function startPump(readable) {
         if (type === 'key') forwardKeyframe(encodedFrame);
       } catch (err) {
         if (inFlight > 0) inFlight--;
+        clearKeyDecode();
         decodeErrors++;
         self.postMessage({ type: 'decodeerror', message: String(err) });
         resetAndRequestKey();

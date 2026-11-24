@@ -171,8 +171,25 @@ pub const PLI_BACKOFF_CAP_MS: u64 = 2000;
 /// That client decodes outside libwebrtc, so a PLI from it is libwebrtc's idle decoder and not
 /// the page: a page that writes keyframes back to the receiver (G05) leaves one about every 3 s,
 /// which the 2 s cap would still answer with an IDR every time. The page's own requests arrive
-/// as evidence (its keyframe counter moves) and open the window at once.
-pub const PLI_BACKOFF_CAP_HEALTHY_MS: u64 = 10_000;
+/// as evidence (its keyframe counter moves) and open the window at once, as do a NACK and
+/// transport-wide loss. So the keyframes this cap still lets through answer nothing: at 10 s
+/// a real browser was sent one every 10 s for the life of the session (31 in 5 minutes on the
+/// M1, 39 on the Intel Mac), and on worst-case content on the Intel Mac every one was a ~2 MB
+/// frame and a ~250 ms pause in painting. 60 s. `SE_PLI_HEALTHY_CAP_MS` overrides it for a
+/// measurement ([`pli_backoff_cap_healthy_ms`]). Platform-neutral.
+pub const PLI_BACKOFF_CAP_HEALTHY_MS: u64 = 60_000;
+
+/// [`PLI_BACKOFF_CAP_HEALTHY_MS`], or `SE_PLI_HEALTHY_CAP_MS` when set to a number of
+/// milliseconds (read once; values below the 200 ms floor are raised to it by the back-off).
+pub fn pli_backoff_cap_healthy_ms() -> u64 {
+    static CAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| healthy_cap_from(std::env::var("SE_PLI_HEALTHY_CAP_MS").ok().as_deref()))
+}
+
+fn healthy_cap_from(v: Option<&str>) -> u64 {
+    v.and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(PLI_BACKOFF_CAP_HEALTHY_MS)
+}
 
 /// A PLI-free stretch this long means whatever was asking has been satisfied.
 const PLI_QUIET_RESET_MS: u64 = 2 * PLI_BACKOFF_CAP_MS;
@@ -239,7 +256,10 @@ impl PliBackoff {
             self.window_ns = 0;
         }
         if let Some(t) = self.last_admit_ns {
-            if now_ns.saturating_sub(t) < self.window_ns {
+            // The cap in force now, not the one the window grew under: a client that stops being
+            // healthy waits at most the ordinary cap.
+            let cap_ns = cap_ms.max(PLI_BACKOFF_FLOOR_MS) * 1_000_000;
+            if now_ns.saturating_sub(t) < self.window_ns.min(cap_ns) {
                 self.suppressed += 1;
                 return false;
             }
@@ -296,7 +316,7 @@ mod tests {
     fn a_painting_webcodecs_client_is_not_sent_an_idr_for_every_residual_pli() {
         // The page that hands keyframes back to the receiver leaves libwebrtc one PLI about every
         // 3 s. Under the 2 s cap every one of them was an IDR; under the healthy cap they settle
-        // at one per 10 s.
+        // at one per 60 s.
         let mut b = PliBackoff::new();
         let mut n = 0;
         for i in 0..40u64 {
@@ -319,6 +339,59 @@ mod tests {
             n2, 40,
             "the default cap answers every one — the reason for the healthy cap"
         );
+    }
+
+    #[test]
+    fn a_window_grown_under_the_healthy_cap_narrows_when_the_cap_does() {
+        let mut b = PliBackoff::new();
+        let mut t = 1_000 * MS;
+        for _ in 0..600 {
+            b.allow_with_cap(t, PLI_BACKOFF_CAP_HEALTHY_MS);
+            t += 200 * MS;
+        }
+        assert!(b.window_ms() > 30_000);
+        // The client stops painting: the next answers come at most 2 s apart, not 60.
+        let mut waited = 0;
+        while !b.allow_with_cap(t, PLI_BACKOFF_CAP_MS) {
+            t += 200 * MS;
+            waited += 200;
+            assert!(waited <= PLI_BACKOFF_CAP_MS, "{waited} ms");
+        }
+    }
+
+    #[test]
+    fn the_healthy_cap_is_a_minute_and_overridable() {
+        assert_eq!(PLI_BACKOFF_CAP_HEALTHY_MS, 60_000);
+        assert_eq!(healthy_cap_from(None), 60_000);
+        assert_eq!(healthy_cap_from(Some("10000")), 10_000);
+        assert_eq!(healthy_cap_from(Some(" 30000 ")), 30_000);
+        assert_eq!(healthy_cap_from(Some("lots")), 60_000);
+        // Five minutes of residual PLIs every 3 s: the window opens to the cap and stays there,
+        // so after the first ~100 s of doubling only one IDR a minute goes out (was one per 10 s:
+        // 31 in 5 minutes measured in a real browser).
+        let mut b = PliBackoff::new();
+        let mut admitted = Vec::new();
+        for i in 0..100u64 {
+            let t = 1_000 * MS + i * 3_000 * MS;
+            if b.allow_with_cap(t, PLI_BACKOFF_CAP_HEALTHY_MS) {
+                admitted.push(t / MS);
+            }
+        }
+        assert_eq!(b.window_ms(), PLI_BACKOFF_CAP_HEALTHY_MS);
+        assert!(admitted.len() <= 12, "{admitted:?}");
+        let late = admitted.iter().filter(|&&t| t >= 120_000).count();
+        assert!(
+            late <= 4,
+            "after two minutes at most one a minute: {admitted:?}"
+        );
+        // The non-healthy cap and evidence are untouched.
+        let mut c = PliBackoff::new();
+        for i in 0..20u64 {
+            c.allow(1_000 * MS + i * 200 * MS);
+        }
+        assert_eq!(c.window_ms(), PLI_BACKOFF_CAP_MS);
+        c.note_evidence();
+        assert!(c.allow(5_200 * MS));
     }
 
     #[test]

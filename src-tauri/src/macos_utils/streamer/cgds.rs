@@ -209,28 +209,95 @@ impl CgDisplayStreamBackend {
 /// an encoder joins the holding pattern.
 const QUEUE_DEPTH: isize = 5;
 
+/// Capture A/B switches, read once from the environment (the bench `live` stage sets them; a
+/// shipped host never does). Unset means today's properties, unchanged:
+///
+/// - `SE_CGDS_QUEUE_DEPTH=<n>` — `kCGDisplayStreamQueueDepth` (default [`QUEUE_DEPTH`]).
+/// - `SE_CGDS_MIN_FRAME_TIME=<seconds>` — adds `kCGDisplayStreamMinimumFrameTime` (default: absent,
+///   see below; `0` sets it explicitly to zero).
+#[derive(Clone, Debug, Default)]
+struct CgdsKnobs {
+    queue_depth: Option<isize>,
+    min_frame_time_s: Option<f64>,
+    rejected: Vec<String>,
+}
+
+fn cgds_knobs() -> &'static CgdsKnobs {
+    static KNOBS: OnceLock<CgdsKnobs> = OnceLock::new();
+    KNOBS.get_or_init(|| {
+        let mut k = CgdsKnobs::default();
+        let var = |n: &str| std::env::var(n).ok().filter(|v| !v.trim().is_empty());
+        if let Some(v) = var("SE_CGDS_QUEUE_DEPTH") {
+            match v.trim().parse::<isize>() {
+                Ok(n) if (1..=32).contains(&n) => k.queue_depth = Some(n),
+                _ => k.rejected.push(format!("SE_CGDS_QUEUE_DEPTH={v}")),
+            }
+        }
+        if let Some(v) = var("SE_CGDS_MIN_FRAME_TIME") {
+            match v.trim().parse::<f64>() {
+                Ok(f) if (0.0..=1.0).contains(&f) => k.min_frame_time_s = Some(f),
+                _ => k.rejected.push(format!("SE_CGDS_MIN_FRAME_TIME={v}")),
+            }
+        }
+        for r in &k.rejected {
+            teprintln!("[cgds] ignoring {r} (out of range or unrecognised)");
+        }
+        k
+    })
+}
+
+/// What the last stream was created with, for a measurement to record.
+static APPLIED: std::sync::Mutex<Option<serde_json::Value>> = std::sync::Mutex::new(None);
+
+/// The properties the most recent CGDisplayStream was created with, and which came from an
+/// `SE_CGDS_*` switch. `None` until a stream has been created in this process.
+pub fn applied_knobs() -> Option<serde_json::Value> {
+    APPLIED.lock().ok().and_then(|g| g.clone())
+}
+
 fn make_cg_properties(api: &CgDisplayStreamApi) -> Option<CFRetained<CFDictionary>> {
-    let queue_depth = CFNumber::new_isize(QUEUE_DEPTH);
+    let knobs = cgds_knobs();
+    let depth = knobs.queue_depth.unwrap_or(QUEUE_DEPTH);
+    let queue_depth = CFNumber::new_isize(depth);
     let show_cursor = CFBoolean::new(true);
     let preserve_ar = CFBoolean::new(false);
+    let min_frame_time = knobs.min_frame_time_s.map(CFNumber::new_f64);
+    // Resolved only when asked for; absent from the dictionary otherwise.
+    let key_min_frame_time = min_frame_time
+        .as_ref()
+        .and_then(|_| cf_constant(b"kCGDisplayStreamMinimumFrameTime\0"));
 
     // `kCGDisplayStreamMinimumFrameTime` is deliberately absent. Its documented default is
     // zero, so setting it added a throttle rather than relaxing one: after a delivery the
     // stream refuses to deliver again for that long, which delays every update that lands
     // mid-interval by up to a frame period (mean ~8 ms at 60 fps). OBS does not set it either.
+    // (`SE_CGDS_MIN_FRAME_TIME` puts it back, for an A/B measurement only.)
+    let mut keys: Vec<*const c_void> = vec![
+        (api.key_queue_depth as *const CFString).cast(),
+        (api.key_show_cursor as *const CFString).cast(),
+        (api.key_preserve_aspect_ratio as *const CFString).cast(),
+        (api.key_ycbcr_matrix as *const CFString).cast(),
+    ];
+    let mut values: Vec<*const c_void> = vec![
+        (&*queue_depth as *const CFNumber).cast(),
+        (show_cursor as *const CFBoolean).cast(),
+        (preserve_ar as *const CFBoolean).cast(),
+        (api.ycbcr_709 as *const CFString).cast(),
+    ];
+    if let (Some(k), Some(v)) = (key_min_frame_time, min_frame_time.as_ref()) {
+        keys.push((k as *const CFString).cast());
+        values.push((&**v as *const CFNumber).cast());
+    }
+    if let Ok(mut g) = APPLIED.lock() {
+        *g = Some(serde_json::json!({
+            "queue_depth": depth,
+            "queue_depth_from_env": knobs.queue_depth.is_some(),
+            "minimum_frame_time_s": knobs.min_frame_time_s,
+            "minimum_frame_time_applied": key_min_frame_time.is_some(),
+            "rejected": knobs.rejected,
+        }));
+    }
     unsafe {
-        let keys: [*const c_void; 4] = [
-            (api.key_queue_depth as *const CFString).cast(),
-            (api.key_show_cursor as *const CFString).cast(),
-            (api.key_preserve_aspect_ratio as *const CFString).cast(),
-            (api.key_ycbcr_matrix as *const CFString).cast(),
-        ];
-        let values: [*const c_void; 4] = [
-            (&*queue_depth as *const CFNumber).cast(),
-            (show_cursor as *const CFBoolean).cast(),
-            (preserve_ar as *const CFBoolean).cast(),
-            (api.ycbcr_709 as *const CFString).cast(),
-        ];
         CFDictionary::new(
             None,
             keys.as_ptr() as *mut *const c_void,
@@ -405,11 +472,13 @@ impl CaptureBackend for CgDisplayStreamBackend {
         }
 
         tprintln!(
-            "[cgds] capture started: display={} {}x{} @ {}fps (queueDepth={QUEUE_DEPTH}, no minimumFrameTime)",
+            "[cgds] capture started: display={} {}x{} @ {}fps (queueDepth={}, minimumFrameTime={:?})",
             self.display_id,
             self.cfg.width,
             self.cfg.height,
-            self.cfg.fps
+            self.cfg.fps,
+            cgds_knobs().queue_depth.unwrap_or(QUEUE_DEPTH),
+            cgds_knobs().min_frame_time_s,
         );
         self.stream = Some(stream);
         self._queue = Some(queue);

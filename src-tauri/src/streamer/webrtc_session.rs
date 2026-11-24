@@ -37,12 +37,12 @@ use super::bitrate::{
 use super::config::H264Profile;
 use super::congestion::{self, DelayBasedEstimate, NetworkState, SendHistory, SharedFeedback};
 use super::input;
-use super::keyframe::{KeyframeGate, PliBackoff, PLI_BACKOFF_CAP_HEALTHY_MS, PLI_BACKOFF_CAP_MS};
+use super::keyframe::{pli_backoff_cap_healthy_ms, KeyframeGate, PliBackoff, PLI_BACKOFF_CAP_MS};
 use super::lock::LockExt;
 use super::negotiate;
 use super::pacer::{Pacer, PacingMode};
 use super::packetizer::{access_unit_has_sps, payloads_carry_parameter_sets, H264Packetizer};
-use super::pipeline::Pipeline;
+use super::pipeline::{EncodedFrame, Pipeline};
 use super::session::{self, SharedDeviceOverrides};
 use super::sockets;
 
@@ -88,7 +88,7 @@ fn backpressure_limit_bytes(msg_len: usize) -> usize {
 }
 
 /// RTP payload MTU on a same-subnet path: 1200 bytes of datagram minus the 12-byte RTP header.
-const RTP_PAYLOAD_MTU_LAN: usize = 1200 - 12;
+pub(crate) const RTP_PAYLOAD_MTU_LAN: usize = 1200 - 12;
 
 /// RTP payload MTU once the path goes through a relay. The datagram then carries TURN
 /// ChannelData or Send-indication encapsulation on top of RTP, SRTP auth and the outer IP/UDP
@@ -117,6 +117,82 @@ pub fn live_sessions() -> i64 {
     LIVE_SESSIONS.load(Ordering::Relaxed)
 }
 
+/// The encoder controls a session reaches for.
+pub(crate) trait EncoderControl: Send + Sync {
+    fn request_idr(&self);
+    fn request_repair(&self) -> bool;
+    fn set_target_bitrate(&self, bps: u32);
+}
+
+impl EncoderControl for Pipeline {
+    fn request_idr(&self) {
+        Pipeline::request_idr(self)
+    }
+
+    fn request_repair(&self) -> bool {
+        Pipeline::request_repair(self)
+    }
+
+    fn set_target_bitrate(&self, bps: u32) {
+        Pipeline::set_target_bitrate(self, bps)
+    }
+}
+
+/// What a session's tasks and handlers keep of the pipeline: its controls and shared state, never
+/// the frame channel's sender.
+///
+/// They used to keep whole `Pipeline` clones, and a `Pipeline` carries `tx`. The RTP writer held
+/// one through its `KeyframeRequester`, so the channel it was reading from could not close while
+/// the writer was alive and the writer could not leave until the channel closed. It stayed parked
+/// in `recv()` for the life of the host with an `Arc` of the peer connection: one ICE socket,
+/// and everything hanging off the connection, per join.
+#[derive(Clone)]
+pub(crate) struct SessionPipeline {
+    control: Arc<dyn EncoderControl>,
+    telemetry: crate::streamer::telemetry::SharedTelemetry,
+    repair: Arc<crate::streamer::repair::RepairState>,
+    max_bitrate_bps: u32,
+    frame_duration: Duration,
+}
+
+impl SessionPipeline {
+    fn of(pipeline: &Pipeline) -> Self {
+        let mut control = pipeline.clone();
+        control.tx = tokio::sync::broadcast::channel(1).0;
+        Self {
+            telemetry: Arc::clone(&pipeline.telemetry),
+            repair: Arc::clone(&pipeline.repair),
+            max_bitrate_bps: pipeline.max_bitrate_bps,
+            frame_duration: pipeline.frame_duration,
+            control: Arc::new(control),
+        }
+    }
+
+    /// A session with no encoder behind it, for the transport tests.
+    #[cfg(test)]
+    pub(crate) fn without_encoder(control: Arc<dyn EncoderControl>) -> Self {
+        Self {
+            control,
+            telemetry: crate::streamer::telemetry::SessionTelemetry::new_shared(),
+            repair: Arc::new(crate::streamer::repair::RepairState::new()),
+            max_bitrate_bps: 8_000_000,
+            frame_duration: Duration::from_millis(16),
+        }
+    }
+
+    fn request_idr(&self) {
+        self.control.request_idr()
+    }
+
+    fn request_repair(&self) -> bool {
+        self.control.request_repair()
+    }
+
+    fn set_target_bitrate(&self, bps: u32) {
+        self.control.set_target_bitrate(bps)
+    }
+}
+
 /// The one path every keyframe request in a session takes.
 ///
 /// There are five callers — an RTCP PLI, an RTCP FIR, this client opcode, a payloader failure
@@ -125,7 +201,7 @@ pub fn live_sessions() -> i64 {
 /// a decoder's backlog from being answered five times over.
 #[derive(Clone)]
 pub struct KeyframeRequester {
-    pipeline: Pipeline,
+    pipeline: SessionPipeline,
     gate: Arc<KeyframeGate>,
 }
 
@@ -323,16 +399,18 @@ fn h264_codecs(profile: H264Profile) -> Vec<(PayloadType, PayloadType, &'static 
     out
 }
 
+#[cfg(windows)]
+type RawSocket = usize;
+#[cfg(not(windows))]
+type RawSocket = i32;
+
 /// The media socket a session muxes ICE over, when it is on the LAN tier.
 ///
 /// Kept whole so the session can close it: `UDPMuxDefault` spawns a read worker that lives until
 /// `close()`, and the raw handle is what qWAVE needs once the candidate pair is nominated.
 struct MediaSocket {
     mux: Arc<webrtc::ice::udp_mux::UDPMuxDefault>,
-    #[cfg(windows)]
-    raw: usize,
-    #[cfg(not(windows))]
-    raw: i32,
+    raw: RawSocket,
     tuning: sockets::SocketTuning,
     local: std::net::SocketAddr,
 }
@@ -411,7 +489,8 @@ fn lan_media_socket(bind: std::net::IpAddr) -> Option<MediaSocket> {
 
 fn build_api(
     profile: H264Profile,
-    mux: Option<(Arc<webrtc::ice::udp_mux::UDPMuxDefault>, std::net::IpAddr)>,
+    mux: Option<Arc<webrtc::ice::udp_mux::UDPMuxDefault>>,
+    bind_ip: std::net::IpAddr,
 ) -> Result<webrtc::api::API> {
     let mut media_engine = MediaEngine::default();
 
@@ -511,12 +590,13 @@ fn build_api(
     Ok(APIBuilder::new()
         .with_media_engine(media_engine)
         .with_interceptor_registry(registry)
-        .with_setting_engine(udp_only_setting_engine(mux))
+        .with_setting_engine(udp_only_setting_engine(mux, bind_ip))
         .build())
 }
 
 fn udp_only_setting_engine(
-    mux: Option<(Arc<webrtc::ice::udp_mux::UDPMuxDefault>, std::net::IpAddr)>,
+    mux: Option<Arc<webrtc::ice::udp_mux::UDPMuxDefault>>,
+    bind_ip: std::net::IpAddr,
 ) -> webrtc::api::setting_engine::SettingEngine {
     use webrtc::ice::network_type::NetworkType;
     use webrtc::ice::udp_mux::UDPMux;
@@ -535,12 +615,19 @@ fn udp_only_setting_engine(
     // *primary* SSRC's writer. Enabling it would add an `a=ssrc-group:FID` telling Chrome to
     // expect retransmissions on a stream that would always be silent. Repairs already reach the
     // client on the primary SSRC. See `docs/OPTIMIZATIONS.md` row 62.
-    if let Some((mux, bound)) = mux {
+    // The transport tests run on loopback, which ICE leaves out of its gathering. Tests only: a
+    // streamer bound to loopback (the bench) keeps the candidates it always offered, because
+    // loopback ones would measure a different path and could not pair with a browser's LAN ones.
+    if cfg!(test) && bind_ip.is_loopback() {
+        se.set_include_loopback_candidate(true);
+        se.set_ip_filter(Box::new(move |ip: std::net::IpAddr| ip == bind_ip));
+    }
+    if let Some(mux) = mux {
         // One socket means one address that can actually send, so offer exactly that one. Without
         // this the muxed gather advertises a host candidate per local address on the machine —
         // every Hyper-V, VirtualBox and VPN adapter included — and every one of those pairs points
         // at a socket that will not send from it.
-        se.set_ip_filter(Box::new(move |ip: std::net::IpAddr| ip == bound));
+        se.set_ip_filter(Box::new(move |ip: std::net::IpAddr| ip == bind_ip));
         // Only ever on the LAN tier: muxed mode skips server-reflexive gathering outright
         // (`agent_gather.rs`, `UDPNetwork::Muxed(_) => continue`), and a same-subnet peer is
         // already offered no STUN server. Relay gathering builds its own sockets and is
@@ -748,6 +835,100 @@ async fn log_ice_diagnostics(pc: &webrtc::peer_connection::RTCPeerConnection) {
     teprintln!("ICE diagnostics: {pair_count} candidate pair(s) above");
 }
 
+/// How long a close waits for ICE gathering to finish first. A STUN request gives up after 5 s.
+const GATHER_SETTLE: Duration = Duration::from_secs(10);
+
+fn still_gathering(pc: &webrtc::peer_connection::RTCPeerConnection) -> bool {
+    use webrtc::ice_transport::ice_gathering_state::RTCIceGatheringState;
+    pc.ice_gathering_state() == RTCIceGatheringState::Gathering
+}
+
+/// Close `pc`, once it has stopped gathering candidates.
+///
+/// webrtc-ice 0.17.1 does not cancel a gathering round when its agent closes. A candidate that
+/// turns up afterwards (a STUN server that took its time) is added to the closed agent and given a
+/// receive loop nothing will ever stop, and that loop holds the agent: the new socket, and through
+/// the agent's check list every socket it had before.
+async fn close_connection(pc: &webrtc::peer_connection::RTCPeerConnection) {
+    let deadline = Instant::now() + GATHER_SETTLE;
+    while still_gathering(pc) && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    if let Err(e) = pc.close().await {
+        teprintln!("closing peer connection: {e}");
+    }
+}
+
+/// A session's peer connection and the media socket under it, closed exactly once whichever way
+/// the session ends.
+///
+/// Dropping an `RTCPeerConnection` closes nothing: its own tasks hold the ICE agent, and the agent
+/// holds its sockets. So a connection that is merely dropped — a `/whep` request the client
+/// aborted takes the whole `start_session` future with it, between any two `.await`s — stayed up
+/// for the life of the host. Closing runs in a task of its own for the same reason: a `close` the
+/// caller stopped polling halfway would leave a connection that says it is closed and is not.
+struct Transport {
+    pc: Arc<webrtc::peer_connection::RTCPeerConnection>,
+    /// `UDPMuxDefault` runs a read worker that only stops on `close()`.
+    mux: Option<Arc<webrtc::ice::udp_mux::UDPMuxDefault>>,
+    /// The WHEP resource id, once the trickle registry knows this connection by it.
+    resource_id: String,
+    runtime: tokio::runtime::Handle,
+    closing: bool,
+}
+
+impl Transport {
+    fn new(
+        pc: Arc<webrtc::peer_connection::RTCPeerConnection>,
+        mux: Option<Arc<webrtc::ice::udp_mux::UDPMuxDefault>>,
+    ) -> Self {
+        LIVE_SESSIONS.fetch_add(1, Ordering::Relaxed);
+        Self {
+            pc,
+            mux,
+            resource_id: String::new(),
+            runtime: tokio::runtime::Handle::current(),
+            closing: false,
+        }
+    }
+
+    fn begin_close(&mut self) -> Option<tokio::task::JoinHandle<()>> {
+        if std::mem::replace(&mut self.closing, true) {
+            return None;
+        }
+        unregister_trickle(&self.resource_id, &self.pc);
+        let pc = Arc::clone(&self.pc);
+        let mux = self.mux.take();
+        Some(self.runtime.spawn(async move {
+            close_connection(&pc).await;
+            if let Some(mux) = mux {
+                use webrtc::ice::udp_mux::UDPMux;
+                if let Err(e) = mux.close().await {
+                    teprintln!("closing media socket: {e}");
+                }
+            }
+            LIVE_SESSIONS.fetch_sub(1, Ordering::Relaxed);
+        }))
+    }
+
+    /// Close, and wait for it, unless gathering is what it would be waiting for: the caller has a
+    /// display to give back, and nothing left to do here depends on it.
+    async fn close(mut self) {
+        let gathering = still_gathering(&self.pc);
+        if let Some(closing) = self.begin_close() {
+            if !gathering {
+                let _ = closing.await;
+            }
+        }
+    }
+}
+
+impl Drop for Transport {
+    fn drop(&mut self) {
+        let _ = self.begin_close();
+    }
+}
+
 /// What the caller must hold to end a session.
 ///
 /// Nothing used to close the host's peer connection — `grep close() ` over the transport found
@@ -757,18 +938,14 @@ async fn log_ice_diagnostics(pc: &webrtc::peer_connection::RTCPeerConnection) {
 /// of its channel senders being dropped. Not once per device: once per *join*, and the client
 /// rebuilds the whole session on any settings change.
 pub struct SessionHandle {
-    pc: Arc<webrtc::peer_connection::RTCPeerConnection>,
+    transport: Option<Transport>,
+    /// Dropped to send the RTP writer home. It is the one task with no other way to learn the
+    /// session is over: a write to a track whose sender has stopped is `Ok(0)`, not an error.
+    writer_stop: Option<tokio::sync::oneshot::Sender<()>>,
     input_tx: Option<input::InjectorTx>,
     input_join: Option<std::thread::JoinHandle<()>>,
-    /// The LAN-tier media socket, when this session got one. `UDPMuxDefault` runs a read worker
-    /// that only stops on `close()`, so a session that forgot this would leak a thread and a
-    /// socket per join — the exact shape of the leak the peer connection itself used to have.
-    mux: Option<Arc<webrtc::ice::udp_mux::UDPMuxDefault>>,
     /// The qWAVE flow, released with the session.
     _qos: Arc<Mutex<Option<sockets::QosFlow>>>,
-    /// The WHEP resource id, so the trickle registry entry goes away with the session rather than
-    /// waiting for the `Weak` to be swept on the next join.
-    resource_id: String,
 }
 
 /// How long `close` will wait for the injector thread to notice it has no work left.
@@ -789,16 +966,7 @@ fn join_injector(join: std::thread::JoinHandle<()>) -> bool {
 impl SessionHandle {
     /// Close the peer connection and wait for the injector thread to release its input state.
     pub async fn close(mut self) {
-        unregister_trickle(&self.resource_id, &self.pc);
-        if let Err(e) = self.pc.close().await {
-            teprintln!("closing peer connection: {e}");
-        }
-        if let Some(mux) = self.mux.take() {
-            use webrtc::ice::udp_mux::UDPMux;
-            if let Err(e) = mux.close().await {
-                teprintln!("closing media socket: {e}");
-            }
-        }
+        drop(self.writer_stop.take());
         // The connection's own handlers each hold a clone of the injector's sender — the input
         // data channel's `on_message`, and the state-change handler that releases held keys —
         // so the channel cannot disconnect while the connection is alive, whatever this handle
@@ -808,11 +976,10 @@ impl SessionHandle {
         // inside the task that removes the display: every clean leave left its virtual display
         // standing and its transport counted as live. It went unseen because the only other
         // caller was a session being superseded, which kept its display on purpose.
-        drop(self.pc);
-        if let Some(tx) = self.input_tx.as_ref() {
-            tx.shutdown();
+        if let Some(transport) = self.transport.take() {
+            transport.close().await;
         }
-        drop(self.input_tx.take());
+        self.stop_injector();
         if let Some(join) = self.input_join.take() {
             // The proof that the thread went away rather than the hope that it did — but
             // bounded, because a session that cannot produce that proof must still give its
@@ -827,7 +994,29 @@ impl SessionHandle {
                 );
             }
         }
-        LIVE_SESSIONS.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// The connection underneath, to ask afterwards whether anything still holds it.
+    #[cfg(test)]
+    pub(crate) fn peer_connection(
+        &self,
+    ) -> std::sync::Weak<webrtc::peer_connection::RTCPeerConnection> {
+        self.transport
+            .as_ref()
+            .map(|t| Arc::downgrade(&t.pc))
+            .unwrap_or_default()
+    }
+
+    fn stop_injector(&mut self) {
+        if let Some(tx) = self.input_tx.take() {
+            tx.shutdown();
+        }
+    }
+}
+
+impl Drop for SessionHandle {
+    fn drop(&mut self) {
+        self.stop_injector();
     }
 }
 
@@ -848,10 +1037,8 @@ type NegotiatedMedia = (
 /// here is what lets `start_session` run the handshake and the display/pipeline work as two
 /// concurrent futures instead of one serial chain.
 pub struct PendingWhep {
-    pc: Arc<webrtc::peer_connection::RTCPeerConnection>,
-    /// The WHEP resource id this session is addressable by, for trickled ICE.
-    resource_id: String,
-    media_socket: Option<MediaSocket>,
+    transport: Transport,
+    media_raw: Option<RawSocket>,
     track: Arc<TrackLocalStaticRTP>,
     rtp_sender: Arc<webrtc::rtp_transceiver::rtp_sender::RTCRtpSender>,
     audio_track: Option<Arc<TrackLocalStaticSample>>,
@@ -870,7 +1057,7 @@ pub struct PendingWhep {
 impl PendingWhep {
     /// The WHEP resource id, which the `Location` header points at.
     pub fn resource_id(&self) -> &str {
-        &self.resource_id
+        &self.transport.resource_id
     }
 
     /// Give everything back when the other half of the join failed.
@@ -878,16 +1065,15 @@ impl PendingWhep {
     /// Without this a display or pipeline failure would leak exactly what the peer connection used
     /// to leak on every join: the connection, its ICE agent, that agent's sockets, and the mux
     /// read worker.
-    pub async fn abandon(mut self) {
-        unregister_trickle(&self.resource_id, &self.pc);
-        if let Err(e) = self.pc.close().await {
-            teprintln!("closing peer connection after a failed join: {e}");
-        }
-        if let Some(ms) = self.media_socket.take() {
-            use webrtc::ice::udp_mux::UDPMux;
-            let _ = ms.mux.close().await;
-        }
-        LIVE_SESSIONS.fetch_sub(1, Ordering::Relaxed);
+    pub async fn abandon(self) {
+        self.transport.close().await;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn peer_connection(
+        &self,
+    ) -> std::sync::Weak<webrtc::peer_connection::RTCPeerConnection> {
+        Arc::downgrade(&self.transport.pc)
     }
 }
 
@@ -924,10 +1110,9 @@ pub async fn prepare_whep(
             ms.tuning.describe()
         );
     }
-    let api = build_api(
-        profile,
-        media_socket.as_ref().map(|m| (Arc::clone(&m.mux), bind_ip)),
-    )?;
+    let media_raw = media_socket.as_ref().map(|m| m.raw);
+    let mux = media_socket.map(|m| m.mux);
+    let api = build_api(profile, mux.clone(), bind_ip)?;
 
     let rtc_config = RTCConfiguration {
         ice_servers,
@@ -939,7 +1124,8 @@ pub async fn prepare_whep(
             .await
             .context("new_peer_connection")?,
     );
-    LIVE_SESSIONS.fetch_add(1, Ordering::Relaxed);
+    // From here on every way out closes the connection, the caller ceasing to poll included.
+    let mut transport = Transport::new(Arc::clone(&pc), mux);
 
     // Every transport constant that should differ between a 1 ms same-subnet hop and a relayed
     // path, decided once, up front. The post-hoc detector still runs and complains if this
@@ -1056,27 +1242,19 @@ pub async fn prepare_whep(
     let (track, rtp_sender, audio_track, audio_dc, answer_sdp) = match prepared {
         Ok(v) => v,
         Err(e) => {
-            if let Err(ce) = pc.close().await {
-                teprintln!("closing peer connection after a failed negotiation: {ce}");
-            }
-            if let Some(ms) = media_socket {
-                use webrtc::ice::udp_mux::UDPMux;
-                let _ = ms.mux.close().await;
-            }
-            LIVE_SESSIONS.fetch_sub(1, Ordering::Relaxed);
+            transport.close().await;
             return Err(e);
         }
     };
 
     // Registered only once the answer exists: the client cannot PATCH a resource whose id it has
     // not been given, and a failed negotiation must not leave an entry behind.
-    let resource_id = join_id.to_string();
-    let superseded = register_trickle(&resource_id, join_id, device_token, &pc);
+    transport.resource_id = join_id.to_string();
+    let superseded = register_trickle(join_id, join_id, device_token, &pc);
 
     Ok(PendingWhep {
-        pc,
-        resource_id,
-        media_socket,
+        transport,
+        media_raw,
         track,
         rtp_sender,
         audio_track,
@@ -1102,10 +1280,30 @@ pub async fn activate_whep(
     input: InputParams,
     audio: Option<AudioParams>,
 ) -> Result<(String, SessionHandle)> {
+    activate_session(
+        pending,
+        pipeline.tx.subscribe(),
+        SessionPipeline::of(pipeline),
+        closed_tx,
+        input,
+        audio,
+    )
+    .await
+}
+
+/// [`activate_whep`] on the parts of a pipeline a session uses, so the transport can be driven
+/// without an encoder behind it.
+pub(crate) async fn activate_session(
+    pending: PendingWhep,
+    frames: tokio::sync::broadcast::Receiver<EncodedFrame>,
+    pipeline: SessionPipeline,
+    closed_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    input: InputParams,
+    audio: Option<AudioParams>,
+) -> Result<(String, SessionHandle)> {
     let PendingWhep {
-        pc,
-        resource_id,
-        media_socket,
+        transport,
+        media_raw,
         track,
         rtp_sender,
         audio_track,
@@ -1118,6 +1316,7 @@ pub async fn activate_whep(
         locality,
         superseded,
     } = pending;
+    let pc = Arc::clone(&transport.pc);
     let keyframe_gate = Arc::new(KeyframeGate::for_locality(locality));
     let keyframes = KeyframeRequester {
         pipeline: pipeline.clone(),
@@ -1166,18 +1365,22 @@ pub async fn activate_whep(
                     .then(|| control_rx.lock_recover().take())
                     .flatten();
                 if let Some(mut rx) = waiting {
-                    let dc_ctl = Arc::clone(&dc);
+                    let dc_ctl = Arc::downgrade(&dc);
                     tokio::spawn(async move {
                         while let Some(msg) = rx.recv().await {
                             let frame = input::protocol::build_bye(msg.reason.code());
-                            let _ = dc_ctl.send(&Bytes::copy_from_slice(&frame)).await;
+                            if let Some(dc) = dc_ctl.upgrade() {
+                                let _ = dc.send(&Bytes::copy_from_slice(&frame)).await;
+                            }
                             if let Some(sent) = msg.sent {
                                 let _ = sent.send(());
                             }
                         }
                     });
                 }
-                let dc_for_pong = is_reliable.then(|| Arc::clone(&dc));
+                // `Weak`: the channel owns `on_message`, which owns the sender this task reads, so
+                // an `Arc` here is a cycle neither the task nor the channel could ever leave.
+                let dc_for_pong = is_reliable.then(|| Arc::downgrade(&dc));
                 let idr_keyframes = keyframes_dc.clone();
                 // The client rate-limits itself to one request per 200 ms, but that limit is
                 // advisory: a hostile or looping client must not be able to pin the encoder at
@@ -1202,7 +1405,8 @@ pub async fn activate_whep(
                                 t_ns,
                                 crate::streamer::audio::host_now_ns(),
                             );
-                            if dc_pong.send(&Bytes::copy_from_slice(&pong)).await.is_err() {
+                            let Some(dc) = dc_pong.upgrade() else { break };
+                            if dc.send(&Bytes::copy_from_slice(&pong)).await.is_err() {
                                 break;
                             }
                         }
@@ -1334,7 +1538,7 @@ pub async fn activate_whep(
                                 client_frames_painted = stats.frames_painted;
                             }
                             if fresh && client_painting && stats.transport_tier != 0 {
-                                cap_ms = PLI_BACKOFF_CAP_HEALTHY_MS;
+                                cap_ms = pli_backoff_cap_healthy_ms();
                             }
                         }
                         if pli_backoff.allow_with_cap(now_ns, cap_ms) {
@@ -1422,16 +1626,15 @@ pub async fn activate_whep(
         );
     }
 
+    let (writer_stop, mut writer_stopped) = tokio::sync::oneshot::channel::<()>();
     {
-        let mut rx = pipeline.tx.subscribe();
+        let mut rx = frames;
         let track = Arc::clone(&track);
-        let pc_keepalive = Arc::clone(&pc);
         let pipeline = pipeline.clone();
         let keyframes = keyframes.clone();
         let feedback = Arc::clone(&feedback);
         let pacing_target = Arc::clone(&pacing_target_bps);
         tokio::spawn(async move {
-            let _pc = pc_keepalive;
             let telemetry = Arc::clone(&pipeline.telemetry);
             let mut packetizer = H264Packetizer::new();
             // A per-session access-unit ordinal, so transport-wide feedback can say which *frame*
@@ -1449,6 +1652,7 @@ pub async fn activate_whep(
                 pipeline.frame_duration,
             );
             let mut warned_unbound = false;
+            let mut last_rtp_ts: Option<u32> = None;
             let mut first_frame_written = false;
             let mut warned_dropped_params = false;
             // Two extensions when the client offered transport-wide-cc, one when it did not.
@@ -1470,11 +1674,15 @@ pub async fn activate_whep(
                 *feedback.history.lock_recover() = None;
             }
             loop {
-                match rx.recv().await {
+                let received = tokio::select! {
+                    biased;
+                    _ = &mut writer_stopped => break,
+                    received = rx.recv() => received,
+                };
+                match received {
                     Ok(frame) => {
                         let mut timing = frame.timing;
                         let capture_ns = audio::host_instant_to_ns(frame.capture);
-                        let rtp_ts = audio::host_ns_to_rtp90k(capture_ns);
                         frame_ordinal = frame_ordinal.wrapping_add(1);
                         packetizer.packetize(mtu, &frame.data, &mut payloads);
                         if payloads.is_empty() {
@@ -1483,6 +1691,16 @@ pub async fn activate_whep(
                             // is the only recovery, and the gate is what stops that spinning.
                             keyframes.request_quietly();
                             continue;
+                        }
+                        // Strictly increasing per session: a frame captured just before a repeat
+                        // was submitted, but taken by the encode loop just after it, would
+                        // otherwise go backwards, and a receiver drops a frame older than the
+                        // last one it decoded.
+                        let (rtp_ts, clamped) =
+                            next_video_rtp_ts(last_rtp_ts, audio::host_ns_to_rtp90k(capture_ns));
+                        last_rtp_ts = Some(rtp_ts);
+                        if clamped {
+                            telemetry.rtp_ts_clamped.fetch_add(1, Ordering::Relaxed);
                         }
                         // The local packetizer sends parameter sets separately, and fragments
                         // either one, rather than dropping an oversized STAP-A the way the stock
@@ -1503,6 +1721,13 @@ pub async fn activate_whep(
                         pacer.set_target_bps(pacing_target.load(Ordering::Relaxed));
                         pacer.begin_frame();
                         let frame_bytes = frame.data.len() as u64;
+                        if super::telemetry::frame_trace_enabled() {
+                            timing.trace_bytes = frame_bytes as u32;
+                            timing.trace_idr = frame
+                                .data
+                                .windows(4)
+                                .any(|w| w[0] == 0 && w[1] == 0 && w[2] == 1 && (w[3] & 0x1F) == 5);
+                        }
                         let last = payloads.len().saturating_sub(1);
                         let mut stop = false;
                         let mut written = 0usize;
@@ -1644,7 +1869,6 @@ pub async fn activate_whep(
     let pc_state = Arc::downgrade(&pc);
     let qos_flow: Arc<Mutex<Option<sockets::QosFlow>>> = Arc::new(Mutex::new(None));
     let qos_flow_state = Arc::clone(&qos_flow);
-    let media_raw_handle = media_socket.as_ref().map(|m| m.raw);
     let locality_logged = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let closed_tx = Arc::new(Mutex::new(closed_tx));
     let input_tx_state = input_tx.clone();
@@ -1665,9 +1889,7 @@ pub async fn activate_whep(
             if let Some(old) = superseded.lock_recover().take().and_then(|w| w.upgrade()) {
                 tokio::spawn(async move {
                     tprintln!("closing the transport this renegotiation replaced");
-                    if let Err(e) = old.close().await {
-                        teprintln!("closing the superseded peer connection: {e}");
-                    }
+                    close_connection(&old).await;
                 });
             }
         }
@@ -1691,7 +1913,6 @@ pub async fn activate_whep(
             if !locality_logged.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 let pc = pc_state.clone();
                 let qos_slot = Arc::clone(&qos_flow_state);
-                let media_raw = media_raw_handle;
                 tokio::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     let Some(pc) = pc.upgrade() else { return };
@@ -1770,12 +1991,11 @@ pub async fn activate_whep(
     Ok((
         answer_sdp,
         SessionHandle {
-            pc,
+            transport: Some(transport),
+            writer_stop: Some(writer_stop),
             input_tx: Some(input_tx),
             input_join: Some(input_join),
-            mux: media_socket.map(|m| m.mux),
             _qos: qos_flow,
-            resource_id,
         },
     ))
 }
@@ -1896,17 +2116,21 @@ fn start_audio_forwarders(
     }
 
     if let Some(dc) = dc {
-        let dc_for_open = Arc::clone(&dc);
         // Weak for the same reason as the connection-state handler: the data channel this
-        // closure is attached to is owned by the peer connection, so an `Arc` here is a cycle.
+        // closure is attached to is owned by the peer connection, so an `Arc` of either here is a
+        // cycle — and one a session that never connects never breaks, because the closure is only
+        // consumed by the channel opening.
+        let dc_for_open = Arc::downgrade(&dc);
         let pc_for_open = Arc::downgrade(pc);
         dc.on_open(Box::new(move || {
-            let dc = Arc::clone(&dc_for_open);
+            let dc = dc_for_open.clone();
             let pc = pc_for_open.clone();
             let audio = audio.clone();
             let telemetry = Arc::clone(&telemetry);
             Box::pin(async move {
-                let Some(pc) = pc.upgrade() else { return };
+                let (Some(pc), Some(dc)) = (pc.upgrade(), dc.upgrade()) else {
+                    return;
+                };
                 tokio::spawn(forward_datachannel(pc, dc, audio, telemetry));
             })
         }));
@@ -2176,7 +2400,7 @@ async fn forward_track(
 
 fn spawn_bitrate_driver(
     pc: Arc<webrtc::peer_connection::RTCPeerConnection>,
-    pipeline: Pipeline,
+    pipeline: SessionPipeline,
     feedback: Arc<SharedFeedback>,
     keyframe_gate: Arc<KeyframeGate>,
     pacing_target_bps: Arc<std::sync::atomic::AtomicU32>,
@@ -2409,8 +2633,35 @@ fn spawn_bitrate_driver(
     });
 }
 
+/// The video RTP timestamp actually written: `candidate` (the host clock at 90 kHz), unless it is
+/// not strictly ahead of the previous one (wrapping comparison), in which case one tick after the
+/// previous one. Returns whether it had to clamp.
+fn next_video_rtp_ts(last: Option<u32>, candidate: u32) -> (u32, bool) {
+    match last {
+        Some(l) if (candidate.wrapping_sub(l) as i32) <= 0 => (l.wrapping_add(1), true),
+        _ => (candidate, false),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_video_rtp_timestamp_never_goes_backwards() {
+        use super::next_video_rtp_ts as next;
+        // The first frame and a normal increase are untouched.
+        assert_eq!(next(None, 12_345), (12_345, false));
+        assert_eq!(next(Some(1_000), 2_500), (2_500, false));
+        // Equal: one tick on.
+        assert_eq!(next(Some(1_000), 1_000), (1_001, true));
+        // Slightly behind (a real frame captured just before a repeat's submit).
+        assert_eq!(next(Some(1_000), 990), (1_001, true));
+        // Across the 32-bit wrap: ahead stays ahead, behind is clamped, the +1 wraps too.
+        assert_eq!(next(Some(u32::MAX - 10), 5), (5, false));
+        assert_eq!(next(Some(5), u32::MAX - 10), (6, true));
+        assert_eq!(next(Some(u32::MAX), u32::MAX), (0, true));
+        assert_eq!(next(Some(u32::MAX), 0), (0, false));
+    }
+
     use super::*;
 
     #[test]
@@ -2722,7 +2973,8 @@ mod tests {
         use webrtc::rtp_transceiver::rtp_transceiver_direction::RTCRtpTransceiverDirection;
         use webrtc::rtp_transceiver::RTCRtpTransceiverInit;
 
-        let api = build_api(profile, None).expect("build_api");
+        let api =
+            build_api(profile, None, std::net::Ipv4Addr::UNSPECIFIED.into()).expect("build_api");
         // A peer connection binds UDP sockets for its ICE agent, which a locked-down box may
         // refuse; that is a skip, not a failure of the SDP under test.
         let client = match api.new_peer_connection(RTCConfiguration::default()).await {
@@ -3024,6 +3276,14 @@ fn unregister_trickle(id: &str, pc: &Arc<webrtc::peer_connection::RTCPeerConnect
             map.remove(id);
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn trickle_entries() -> usize {
+    TRICKLE_SESSIONS
+        .lock_recover()
+        .as_ref()
+        .map_or(0, |m| m.len())
 }
 
 /// The join a live resource names, when it belongs to `device_token`.

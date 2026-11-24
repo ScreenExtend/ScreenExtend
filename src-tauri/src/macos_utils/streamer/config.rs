@@ -1,6 +1,6 @@
 use crate::streamer::config::{Config, H264Profile, ScalePercent};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct EncoderConfig {
     pub width: u32,
     pub height: u32,
@@ -20,6 +20,9 @@ pub struct EncoderConfig {
     /// all - `streamer/platform.rs` consumes it under `cfg(windows)` only - so the Settings
     /// toggle and `serve --software-encode` were both inert on this platform.
     pub software_encode: bool,
+    /// Build the session from this recipe instead of the production ladder and properties
+    /// (`vt_recipe.rs`). `None` is the shipped behaviour; `SE_VT_RECIPE` can still supply one.
+    pub recipe: Option<std::sync::Arc<super::vt_recipe::Recipe>>,
 }
 
 pub fn scaled_dims(native_w: u32, native_h: u32, scale: ScalePercent) -> (u32, u32) {
@@ -74,6 +77,7 @@ pub fn live_encoder_config(
         // here, at encoder-selection time, so the Settings toggle changes the *next* session's
         // encoder without every streamer having to be drained and rebuilt.
         software_encode: cfg.software_encode_now(),
+        recipe: None,
     }
 }
 

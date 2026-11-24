@@ -1,0 +1,208 @@
+{
+ "version": 1,
+ "name": "full",
+ "_comment": "Skeleton for the live stage. The lead owns the contents: workloads, recipes and groups below are placeholders showing every live option. Run lengths are the live default (12 s) unless a group says otherwise.",
+ "workloads": [
+  {
+   "id": "stress",
+   "kind": "synthetic",
+   "pattern": "window_drag_stress",
+   "fps": 60,
+   "seed": 1
+  },
+  {
+   "id": "scroll",
+   "kind": "synthetic",
+   "pattern": "scroll",
+   "fps": 60
+  },
+  {
+   "id": "motion",
+   "kind": "synthetic",
+   "pattern": "motion",
+   "fps": 60
+  },
+  {
+   "id": "static",
+   "kind": "synthetic",
+   "pattern": "static",
+   "fps": 60
+  },
+  {
+   "id": "rec",
+   "kind": "recording",
+   "fps": 60
+  }
+ ],
+ "recipes": [
+  {
+   "name": "prod-qp15",
+   "production": {
+    "qp": 15
+   }
+  },
+  {
+   "name": "ll-qp15",
+   "codec": "h264",
+   "spec": [
+    [
+     "RequireHardwareAcceleratedVideoEncoder",
+     true
+    ],
+    [
+     "EnableLowLatencyRateControl",
+     true
+    ]
+   ],
+   "props": [
+    [
+     "RealTime",
+     true
+    ],
+    [
+     "AllowFrameReordering",
+     false
+    ],
+    [
+     "ProfileLevel",
+     {
+      "sym": [
+       "kVTProfileLevel_H264_ConstrainedHigh_AutoLevel",
+       "kVTProfileLevel_H264_High_AutoLevel"
+      ]
+     }
+    ],
+    [
+     "ColorPrimaries",
+     "ITU_R_709_2"
+    ],
+    [
+     "TransferFunction",
+     "ITU_R_709_2"
+    ],
+    [
+     "YCbCrMatrix",
+     "ITU_R_709_2"
+    ],
+    [
+     "ExpectedFrameRate",
+     60
+    ],
+    [
+     "MaxKeyFrameInterval",
+     36000
+    ],
+    [
+     "MaxKeyFrameIntervalDuration",
+     600.0
+    ],
+    [
+     "MaximizePowerEfficiency",
+     false
+    ],
+    [
+     "PrioritizeEncodingSpeedOverQuality",
+     true
+    ],
+    [
+     "Quality",
+     0.72
+    ],
+    [
+     "MaxAllowedFrameQP",
+     15
+    ],
+    [
+     "MinAllowedFrameQP",
+     15
+    ]
+   ]
+  },
+  {
+   "name": "ll-bfqp15",
+   "base": "ll-qp15",
+   "remove": [
+    "Quality",
+    "MaxAllowedFrameQP",
+    "MinAllowedFrameQP",
+    "PrioritizeEncodingSpeedOverQuality"
+   ],
+   "frame_opts": [
+    [
+     "BaseFrameQP",
+     15
+    ]
+   ]
+  }
+ ],
+ "groups": [
+  {
+   "name": "live-core",
+   "stage": "live",
+   "recipes": [
+    "prod-qp15",
+    "ll-bfqp15"
+   ],
+   "workloads": [
+    "stress",
+    "scroll",
+    "static"
+   ],
+   "repeats": 1
+  },
+  {
+   "name": "live-recording",
+   "stage": "live",
+   "recipes": [
+    "prod-qp15"
+   ],
+   "workloads": [
+    "rec"
+   ],
+   "repeats": 1
+  },
+  {
+   "name": "live-capture-ab",
+   "stage": "live",
+   "recipes": [
+    "prod-qp15"
+   ],
+   "workloads": [
+    "stress"
+   ],
+   "repeats": 1,
+   "live": {
+    "seconds": 12,
+    "capture": {
+     "sck_min_interval": 0,
+     "sck_queue_depth": 3
+    }
+   }
+  },
+  {
+   "name": "live-display-ab",
+   "stage": "live",
+   "recipes": [
+    "prod-qp15"
+   ],
+   "workloads": [
+    "stress"
+   ],
+   "repeats": 1,
+   "live": {
+    "width": 2560,
+    "height": 1440,
+    "refresh": 60,
+    "dpr": 1.0,
+    "video_scale": 100,
+    "warmup_s": 1.5
+   }
+  }
+ ],
+ "order": {
+  "shuffle_seed": 1,
+  "interleave_repeats": true,
+  "cooldown_ms": 3000,
+  "watchdog_slack_s": 60
+ }
+}

@@ -170,6 +170,12 @@ pub fn fast_path() {
         print_version();
         exit(0);
     }
+    // The encoder benchmark runs before Tauri on purpose: none of its stages needs a runtime,
+    // a window or AppKit, and every unit of work is a child process of this same binary.
+    #[cfg(feature = "bench")]
+    if first == "bench" && !crate::bench::wants_tauri(&raw[1..]) {
+        crate::bench::main(&raw[1..]);
+    }
     #[cfg(target_os = "macos")]
     if first == "audio-recover" {
         crate::macos_utils::audio::legacy::routing::watchdog_recover();
@@ -198,6 +204,12 @@ pub fn dispatch(app: &tauri::AppHandle) -> Outcome {
     // developer tool, not a shipped command.
     if args[0] == "probe" {
         return probe::run(app);
+    }
+    // The bench's `live` child: the one bench unit that needs the Tauri runtime (a virtual display
+    // needs `platform::setup`). `fast_path` let it through; everything else `bench` exited there.
+    #[cfg(all(feature = "bench", target_os = "macos"))]
+    if args[0] == "bench" {
+        crate::bench::live_child(app);
     }
     route(app)
 }
@@ -346,7 +358,9 @@ The self-test prints its per-stage telemetry summary on exit; `--whep-selftest` 
             local_ips: Some(state.local_ips.clone()),
             virtual_display: Some(state.virtual_display.clone()),
             session_auth: Some(state.session_auth.clone()),
-            device_overrides: Some(state.device_overrides.clone()),
+            // No override map: the probe runs exactly what its flags say (`apply_join_quality`
+            // gives a device with no row the join defaults, QP 15 and scale 100).
+            device_overrides: None,
             sessions: Some(state.sessions.clone()),
             disconnect_grace: Some(state.disconnect_grace.clone()),
             user_turn: Some(state.user_turn.clone()),
@@ -1757,6 +1771,20 @@ mod desktop {
         let state = app.state::<platform::AppState>();
         crate::streamer::input::prime();
         platform::permissions::prime();
+        // The one first Screen Recording request. Nothing else in a headless host asks, so
+        // without it the app never appears in the Screen Recording list at all. `prompt_gate`
+        // enforces "once": a request already on record makes this a silent read. Off the
+        // main thread because the macOS dialog blocks the caller.
+        #[cfg(target_os = "macos")]
+        {
+            platform::permissions::remember_marker_dir(app);
+            std::thread::spawn(|| {
+                platform::permissions::prompt_gate(
+                    platform::permissions::KEY_SCREEN_RECORDING,
+                    false,
+                )
+            });
+        }
 
         let store = app.store(crate::data_dir::config_store()).ok();
         let http = arg_u16(m, "http-port")
@@ -1886,6 +1914,16 @@ mod desktop {
         let _ = ctrlc::set_handler(move || {
             let _ = tx.send(());
         });
+        // Opt-in and unproven; see `main_pump_enabled`.
+        #[cfg(target_os = "macos")]
+        if platform::virtual_display::main_pump_enabled() {
+            while matches!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)) {
+                platform::virtual_display::pump_main_run_loop(0.25);
+            }
+        } else {
+            let _ = rx.recv();
+        }
+        #[cfg(not(target_os = "macos"))]
         let _ = rx.recv();
 
         crate::logbus::echo_stdout("\nStopping…");

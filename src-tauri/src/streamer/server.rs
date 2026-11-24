@@ -1692,33 +1692,13 @@ async fn start_session(
         }
         _ => None,
     };
-    if let Some(o) = device_settings {
-        cfg.scale = ScalePercent::new(o.video_scale);
-        // The quality slider is constant QP, as it shipped. e9c521b turned it into a QP floor under
-        // CBR so congestion control could act, and at the computed ~12 Mbps for 1080p60 that CBR
-        // is what the user sees: soft text and a chroma fringe on white glyphs. Constant QP has no
-        // bitrate to adapt, and never had; `set_bitrate` reports `IgnoredConstantQp` once and the
-        // loss controller stands down, which is how every session before the overhaul ran.
-        if o.adaptive_quality {
-            cfg.qp = None;
-            cfg.quality_qp = Some(o.video_quality);
-        } else {
-            cfg.qp = Some(o.video_quality);
-            cfg.quality_qp = None;
-        }
-        // A rate the join path recorded is what the device reported then, not a choice anyone
-        // made; the device's report now wins over it (see `session::mark_join_seeded`).
-        cfg.max_fps = if session::is_join_seeded(device_token) {
-            detected_refresh
-        } else {
-            o.refresh_rate.clamp(MIN_REFRESH_RATE, MAX_REFRESH_RATE)
-        };
-        // Whether `max_fps` is a ceiling or a promise. Off — the default — makes it a promise:
-        // the pipeline holds the cadence and repeats an unchanged frame rather than letting the
-        // rate sag. Copied here, once, so nothing downstream has to reach back into the
-        // override map on a frame path.
-        cfg.auto_frame_rate = o.auto_frame_rate;
-    }
+    apply_join_quality(
+        &mut cfg,
+        device_settings.as_ref(),
+        state.config.device_overrides.is_some(),
+        detected_refresh,
+        session::is_join_seeded(device_token),
+    );
 
     // What the client's offer says it can decode, read before the encoder is built because the
     // profile is an encoder-session parameter and cannot be changed afterwards. Baseline was the
@@ -1814,11 +1794,14 @@ async fn start_session(
     }
     let swap_axes = portrait != client_portrait;
 
-    // Record what this join is actually running at, for a device the host holds no settings for
-    // yet. Without it the override map has no row until the first save, so that save had nothing
-    // to compare against and was classified as a change to everything — which is how renaming a
-    // freshly joined device rebuilt its session. The values are exactly `Device::defaults`, which
-    // is what the sheet is showing the user, so an untouched save now compares equal.
+    // Seed the row for a device the host holds no settings for yet. Without it the override map
+    // has no row until the first save, so that save had nothing to compare against and was
+    // classified as a change to everything — which is how renaming a freshly joined device
+    // rebuilt its session. The values are exactly `Device::defaults`, which is what the sheet is
+    // showing the user, so an untouched save compares equal — and this join really runs them:
+    // `apply_join_quality` applied the same `join_defaults()` to `cfg` above. (It used not to: a
+    // first join ran the adaptive tier while this row said constant QP 15, and a save of q15 /
+    // adaptive off compared equal and never corrected it.)
     if let Some(overrides) = state.config.device_overrides.as_ref() {
         let mut map = overrides.lock_recover();
         match map.entry(device_token.to_string()) {
@@ -2995,9 +2978,112 @@ fn log_urls(lan_ip: Option<&str>, http_port: u16, https_port: u16, self_signed: 
     }
 }
 
+/// Apply a device row's stream-quality fields to the join's `cfg`: video scale, the quality slider
+/// (`video_quality` as constant QP, or as a QP ceiling under adaptive bitrate), the frame-rate cap
+/// and whether it is a ceiling or a promise.
+fn apply_override_quality(cfg: &mut Config, o: &session::DeviceOverride, max_fps: u32) {
+    cfg.scale = ScalePercent::new(o.video_scale);
+    // The quality slider is constant QP, as it shipped. e9c521b turned it into a QP floor under
+    // CBR so congestion control could act, and at the computed ~12 Mbps for 1080p60 that CBR is
+    // what the user sees: soft text and a chroma fringe on white glyphs. Constant QP has no
+    // bitrate to adapt, and never had; `set_bitrate` reports `IgnoredConstantQp` once and the loss
+    // controller stands down, which is how every session before the overhaul ran.
+    if o.adaptive_quality {
+        cfg.qp = None;
+        cfg.quality_qp = Some(o.video_quality);
+    } else {
+        cfg.qp = Some(o.video_quality);
+        cfg.quality_qp = None;
+    }
+    cfg.max_fps = max_fps;
+    // Whether `max_fps` is a ceiling or a promise. Off — the default — makes it a promise: the
+    // pipeline holds the cadence and repeats an unchanged frame rather than letting the rate sag.
+    // Copied here, once, so nothing downstream has to reach back into the override map on a frame
+    // path.
+    cfg.auto_frame_rate = o.auto_frame_rate;
+}
+
+/// The join's quality configuration. A saved row applies as it always did. A device the host
+/// holds no row for — every device's first join — runs `DeviceOverride::join_defaults()`, the row
+/// the join seeds and the settings sheet shows, so a first and a second join of an untouched
+/// device run the same thing. Unchanged when there is no override map at all (the probe harness,
+/// whose `live_config` passes none) or the base config carries an explicit `qp`.
+fn apply_join_quality(
+    cfg: &mut Config,
+    device_settings: Option<&session::DeviceOverride>,
+    has_overrides: bool,
+    detected_refresh: u32,
+    join_seeded: bool,
+) {
+    match device_settings {
+        Some(o) => {
+            // A rate the join path recorded is what the device reported then, not a choice anyone
+            // made; the device's report now wins over it (see `session::mark_join_seeded`).
+            let max_fps = if join_seeded {
+                detected_refresh
+            } else {
+                o.refresh_rate.clamp(MIN_REFRESH_RATE, MAX_REFRESH_RATE)
+            };
+            apply_override_quality(cfg, o, max_fps);
+        }
+        None if has_overrides && cfg.qp.is_none() => {
+            apply_override_quality(
+                cfg,
+                &session::DeviceOverride::join_defaults(),
+                detected_refresh,
+            );
+        }
+        None => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_first_join_runs_what_the_row_it_seeds_says() {
+        let quality = |c: &Config| (c.qp, c.quality_qp, c.scale, c.max_fps, c.auto_frame_rate);
+        // First join: no row yet.
+        let mut first = Config::default();
+        apply_join_quality(&mut first, None, true, 120, false);
+        // Second join of the untouched device: the row the first join seeded (join_defaults with
+        // the detected rate), marked seeded.
+        let seeded = session::DeviceOverride {
+            refresh_rate: 120,
+            ..session::DeviceOverride::join_defaults()
+        };
+        let mut second = Config::default();
+        apply_join_quality(&mut second, Some(&seeded), true, 120, true);
+        assert_eq!(quality(&first), quality(&second));
+        assert_eq!(first.qp, Some(15), "constant QP 15, not the adaptive tier");
+        assert_eq!(first.quality_qp, None);
+        assert_eq!(first.max_fps, 120);
+        // No override map (the probe harness): untouched, its --scale included.
+        let mut probe = Config {
+            scale: crate::streamer::config::ScalePercent::new(50),
+            ..Config::default()
+        };
+        apply_join_quality(&mut probe, None, false, 120, false);
+        assert_eq!(probe.qp, None);
+        assert_eq!(probe.scale, crate::streamer::config::ScalePercent::new(50));
+        // An explicit base qp (probe --qp): untouched.
+        let mut probe_qp = Config {
+            qp: Some(22),
+            ..Config::default()
+        };
+        apply_join_quality(&mut probe_qp, None, true, 120, false);
+        assert_eq!(probe_qp.qp, Some(22));
+        // A saved adaptive row still runs adaptive with the slider as the QP ceiling.
+        let adaptive = session::DeviceOverride {
+            adaptive_quality: true,
+            video_quality: 20,
+            ..session::DeviceOverride::join_defaults()
+        };
+        let mut a = Config::default();
+        apply_join_quality(&mut a, Some(&adaptive), true, 60, false);
+        assert_eq!((a.qp, a.quality_qp), (None, Some(20)));
+    }
 
     fn state_with_local_ips(ips: &[&str]) -> AppState {
         let local_ips = session::new_shared_local_ips();

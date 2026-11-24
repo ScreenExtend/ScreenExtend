@@ -220,9 +220,18 @@ const TCC_REPROBE_INTERVAL: Duration = Duration::from_secs(30);
 /// dismisses the dialog the capture APIs go on delivering frames: they just contain
 /// wallpaper. So the host reports a healthy stream while the client shows a blank desktop.
 /// `ensure_screen_recording_access` catches this at pipeline start, which is every join
-/// and every refresh, and nowhere in between -- this is the in-between. Only a definite
-/// `Some(true) -> Some(false)` transition acts; `None` means "could not read" and must
-/// never be treated as a refusal.
+/// and every refresh, and nowhere in between -- this is the in-between. It acts only on
+/// `Some(false)` from `screen_recording_live`, which is `Silent::DefinitelyDenied`: live
+/// positive evidence (other apps' windows on screen, titles stripped) in a process that has
+/// never confirmed a grant. `None` is `Unknown` -- including the cached preflight negative
+/// of a host granted while running with nothing else on screen -- and never kicks.
+///
+/// What that leaves it able to catch is a session that started on `Unknown` and turns out
+/// to be streaming wallpaper. It can no longer see a grant *withdrawn* from a process that
+/// had confirmed one, and in practice it never could for the common case: a process that
+/// started authorized gets `CGPreflightScreenCaptureAccess == true` cached for its whole
+/// life, which reads as granted whatever happens later. (It used to require a prior
+/// `Some(true)`, which now latches `CONFIRMED` and would make the edge unreachable.)
 ///
 /// **AirPlay geometry.** On that display tier macOS owns the display and moves it under
 /// us; the sender re-sends codec data when it does, which `MirrorStats` latches. Bumping
@@ -234,7 +243,6 @@ fn start_session_watchdog(app_handle: tauri::AppHandle) {
         .spawn(move || {
             let airplay_tier = virtual_display::probe_display_backend()
                 == virtual_display::DisplayBackend::AirPlayFallback;
-            let mut authorized: Option<bool> = None;
             let mut last_probe = Instant::now();
             loop {
                 std::thread::sleep(WATCHDOG_TICK);
@@ -263,21 +271,20 @@ fn start_session_watchdog(app_handle: tauri::AppHandle) {
                 };
                 if !streaming {
                     // Nothing to protect, and the next join re-reads authorization anyway.
-                    authorized = None;
                     continue;
                 }
                 if last_probe.elapsed() < TCC_REPROBE_INTERVAL {
                     continue;
                 }
                 last_probe = Instant::now();
-                let now = permissions::screen_recording_live();
-                if authorized == Some(true) && now == Some(false) {
+                // `Some(false)` is a definite denial and nothing weaker (see above).
+                if permissions::screen_recording_live() == Some(false) {
                     teprintln!(
-                        "[tcc] Screen Recording authorization was revoked while streaming. \
-                         macOS 15 and later re-ask about every 30 days; capture would keep \
-                         delivering frames of the wallpaper, so the sessions are being ended \
-                         instead. Re-approve ScreenExtend under System Settings -> Privacy & \
-                         Security -> Screen Recording, then reconnect."
+                        "[tcc] Screen Recording is definitely not authorized while streaming \
+                         (other apps' windows are on screen with their titles stripped); \
+                         capture would keep delivering frames of the wallpaper, so the sessions \
+                         are being ended instead. Approve ScreenExtend under System Settings -> \
+                         Privacy & Security -> Screen Recording, then reconnect."
                     );
                     crate::streamer::session::broadcast_bye(
                         &state.sessions,
@@ -304,9 +311,6 @@ fn start_session_watchdog(app_handle: tauri::AppHandle) {
                     {
                         teprintln!("[tcc] could not emit ScreenRecordingRevoked: {e}");
                     }
-                }
-                if now.is_some() {
-                    authorized = now;
                 }
             }
         })

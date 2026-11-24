@@ -1,0 +1,481 @@
+{
+ "version": 1,
+ "name": "quick",
+ "workloads": [
+  {
+   "id": "rec",
+   "kind": "recording",
+   "fps": 60
+  },
+  {
+   "id": "stress",
+   "kind": "synthetic",
+   "pattern": "window_drag_stress",
+   "width": 1920,
+   "height": 1080,
+   "fps": 60,
+   "seconds": 10,
+   "seed": 1
+  }
+ ],
+ "recipes": [
+  {
+   "name": "prod-qp15",
+   "production": {
+    "qp": 15
+   }
+  },
+  {
+   "name": "ll-qp15",
+   "codec": "h264",
+   "spec": [
+    [
+     "RequireHardwareAcceleratedVideoEncoder",
+     true
+    ],
+    [
+     "EnableLowLatencyRateControl",
+     true
+    ]
+   ],
+   "props": [
+    [
+     "RealTime",
+     true
+    ],
+    [
+     "AllowFrameReordering",
+     false
+    ],
+    [
+     "ProfileLevel",
+     {
+      "sym": [
+       "kVTProfileLevel_H264_ConstrainedHigh_AutoLevel",
+       "kVTProfileLevel_H264_High_AutoLevel"
+      ]
+     }
+    ],
+    [
+     "ColorPrimaries",
+     "ITU_R_709_2"
+    ],
+    [
+     "TransferFunction",
+     "ITU_R_709_2"
+    ],
+    [
+     "YCbCrMatrix",
+     "ITU_R_709_2"
+    ],
+    [
+     "ExpectedFrameRate",
+     60
+    ],
+    [
+     "MaxKeyFrameInterval",
+     36000
+    ],
+    [
+     "MaxKeyFrameIntervalDuration",
+     600.0
+    ],
+    [
+     "MaximizePowerEfficiency",
+     false
+    ],
+    [
+     "PrioritizeEncodingSpeedOverQuality",
+     true
+    ],
+    [
+     "Quality",
+     0.72
+    ],
+    [
+     "MaxAllowedFrameQP",
+     15
+    ],
+    [
+     "MinAllowedFrameQP",
+     15
+    ]
+   ]
+  },
+  {
+   "name": "ll-qp15-abr12.4M",
+   "base": "ll-qp15",
+   "props": [
+    [
+     "AverageBitRate",
+     12441600
+    ]
+   ]
+  },
+  {
+   "name": "ll-qp15-abr300M",
+   "base": "ll-qp15",
+   "props": [
+    [
+     "AverageBitRate",
+     300000000
+    ]
+   ]
+  },
+  {
+   "name": "ll-qp15-abr150M",
+   "base": "ll-qp15",
+   "props": [
+    [
+     "AverageBitRate",
+     150000000
+    ]
+   ]
+  },
+  {
+   "name": "ll-qp15-abr1G",
+   "base": "ll-qp15",
+   "props": [
+    [
+     "AverageBitRate",
+     1000000000
+    ]
+   ]
+  },
+  {
+   "name": "hw-qp15",
+   "base": "ll-qp15",
+   "spec": [],
+   "remove": [
+    "EnableLowLatencyRateControl"
+   ]
+  },
+  {
+   "name": "ll-qp15-abr300M-rtoff",
+   "base": "ll-qp15-abr300M",
+   "props": [
+    [
+     "RealTime",
+     false
+    ]
+   ]
+  },
+  {
+   "name": "ll-qp15-abr300M-quality",
+   "base": "ll-qp15-abr300M",
+   "props": [
+    [
+     "PrioritizeEncodingSpeedOverQuality",
+     false
+    ]
+   ]
+  },
+  {
+   "name": "ll-qp15-abr300M-flush",
+   "base": "ll-qp15-abr300M",
+   "flush_each_frame": true
+  },
+  {
+   "name": "ll-qp20-abr300M",
+   "base": "ll-qp15-abr300M",
+   "props": [
+    [
+     "Quality",
+     0.62
+    ],
+    [
+     "MaxAllowedFrameQP",
+     20
+    ],
+    [
+     "MinAllowedFrameQP",
+     20
+    ]
+   ]
+  },
+  {
+   "name": "ll-qp10-abr300M",
+   "base": "ll-qp15-abr300M",
+   "props": [
+    [
+     "Quality",
+     0.82
+    ],
+    [
+     "MaxAllowedFrameQP",
+     10
+    ],
+    [
+     "MinAllowedFrameQP",
+     10
+    ]
+   ]
+  },
+  {
+   "name": "ll-qp25-abr300M",
+   "base": "ll-qp15-abr300M",
+   "props": [
+    [
+     "Quality",
+     0.52
+    ],
+    [
+     "MaxAllowedFrameQP",
+     25
+    ],
+    [
+     "MinAllowedFrameQP",
+     25
+    ]
+   ]
+  },
+  {
+   "name": "ll-qp15-abr250M",
+   "base": "ll-qp15",
+   "props": [
+    [
+     "AverageBitRate",
+     250000000
+    ]
+   ]
+  },
+  {
+   "name": "ll-qp15-abr100M",
+   "base": "ll-qp15",
+   "props": [
+    [
+     "AverageBitRate",
+     100000000
+    ]
+   ]
+  },
+  {
+   "name": "ll-qp15-abr300M-mfd0",
+   "base": "ll-qp15-abr300M",
+   "props": [
+    [
+     "MaxFrameDelayCount",
+     0
+    ]
+   ]
+  },
+  {
+   "name": "ll-qp15-abr300M-mfd1",
+   "base": "ll-qp15-abr300M",
+   "props": [
+    [
+     "MaxFrameDelayCount",
+     1
+    ]
+   ]
+  },
+  {
+   "name": "ll-abr12M",
+   "base": "ll-qp15",
+   "remove": [
+    "Quality",
+    "MinAllowedFrameQP"
+   ],
+   "props": [
+    [
+     "MaxAllowedFrameQP",
+     45
+    ],
+    [
+     "AverageBitRate",
+     12441600
+    ]
+   ]
+  },
+  {
+   "name": "ll-abr30M",
+   "base": "ll-abr12M",
+   "props": [
+    [
+     "AverageBitRate",
+     30000000
+    ]
+   ]
+  },
+  {
+   "name": "ll-cbr12M",
+   "base": "ll-qp15",
+   "remove": [
+    "Quality",
+    "MinAllowedFrameQP",
+    "MaxAllowedFrameQP"
+   ],
+   "props": [
+    [
+     "ConstantBitRate",
+     12000000
+    ]
+   ]
+  },
+  {
+   "name": "hw-qp15-abr300M",
+   "base": "hw-qp15",
+   "props": [
+    [
+     "AverageBitRate",
+     300000000
+    ]
+   ]
+  },
+  {
+   "name": "hw-qp15-rtoff",
+   "base": "hw-qp15",
+   "props": [
+    [
+     "RealTime",
+     false
+    ]
+   ]
+  },
+  {
+   "name": "hw-abr12M",
+   "base": "hw-qp15",
+   "remove": [
+    "Quality",
+    "MinAllowedFrameQP"
+   ],
+   "props": [
+    [
+     "MaxAllowedFrameQP",
+     45
+    ],
+    [
+     "AverageBitRate",
+     12441600
+    ]
+   ]
+  },
+  {
+   "name": "sw-qp15",
+   "base": "hw-qp15",
+   "spec": [
+    [
+     "EnableHardwareAcceleratedVideoEncoder",
+     false
+    ]
+   ],
+   "remove": [
+    "RequireHardwareAcceleratedVideoEncoder"
+   ]
+  },
+  {
+   "name": "hevc-ll-qp15-abr300M",
+   "base": "ll-qp15-abr300M",
+   "codec": "hevc",
+   "props": [
+    [
+     "ProfileLevel",
+     {
+      "sym": "kVTProfileLevel_HEVC_Main_AutoLevel"
+     }
+    ]
+   ]
+  },
+  {
+   "name": "hevc-hw-qp15",
+   "base": "hw-qp15",
+   "codec": "hevc",
+   "props": [
+    [
+     "ProfileLevel",
+     {
+      "sym": "kVTProfileLevel_HEVC_Main_AutoLevel"
+     }
+    ]
+   ]
+  },
+  {
+   "name": "prod-abr",
+   "production": {}
+  },
+  {
+   "name": "ll-bfqp15",
+   "base": "ll-qp15",
+   "remove": [
+    "Quality",
+    "MaxAllowedFrameQP",
+    "MinAllowedFrameQP",
+    "PrioritizeEncodingSpeedOverQuality"
+   ],
+   "frame_opts": [
+    [
+     "BaseFrameQP",
+     15
+    ]
+   ]
+  }
+ ],
+ "groups": [
+  {
+   "name": "core-stress",
+   "recipes": [
+    "prod-qp15",
+    "ll-qp15",
+    "ll-qp15-abr12.4M",
+    "ll-qp15-abr300M",
+    "ll-qp15-abr150M",
+    "ll-qp15-abr1G",
+    "hw-qp15",
+    "hw-qp15-abr300M",
+    "ll-abr12M",
+    "hevc-ll-qp15-abr300M",
+    "ll-qp15-abr300M-rtoff"
+   ],
+   "workloads": [
+    "stress"
+   ],
+   "repeats": 2
+  },
+  {
+   "name": "psnr-stress",
+   "recipes": [
+    "ll-qp15",
+    "ll-qp15-abr300M",
+    "hw-qp15"
+   ],
+   "workloads": [
+    "stress"
+   ],
+   "psnr": true
+  },
+  {
+   "name": "anchors-recording",
+   "recipes": [
+    "prod-qp15",
+    "ll-qp15",
+    "ll-qp15-abr12.4M",
+    "ll-qp15-abr300M",
+    "ll-qp15-abr150M",
+    "ll-qp15-abr1G",
+    "hw-qp15"
+   ],
+   "workloads": [
+    "rec"
+   ]
+  },
+  {
+   "name": "live-stress",
+   "stage": "live",
+   "recipes": [
+    "prod-qp15",
+    "ll-bfqp15"
+   ],
+   "workloads": [
+    "stress"
+   ],
+   "live": {
+    "seconds": 8
+   }
+  }
+ ],
+ "order": {
+  "shuffle_seed": 11,
+  "interleave_repeats": true,
+  "cooldown_ms": 1500
+ }
+}

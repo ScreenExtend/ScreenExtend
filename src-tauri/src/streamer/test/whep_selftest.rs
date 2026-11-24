@@ -83,77 +83,8 @@ pub async fn run(mut config: Config) -> Result<()> {
     wait_for_health(port).await?;
     tprintln!("[selftest] server healthy");
 
-    let api = {
-        use webrtc::api::media_engine::MIME_TYPE_H264;
-        use webrtc::rtp_transceiver::rtp_codec::{RTCRtpCodecCapability, RTCRtpCodecParameters};
-        use webrtc::rtp_transceiver::RTCPFeedback;
-
-        let mut m = MediaEngine::default();
-        let fb = vec![
-            RTCPFeedback {
-                typ: "goog-remb".to_owned(),
-                parameter: "".to_owned(),
-            },
-            RTCPFeedback {
-                typ: "ccm".to_owned(),
-                parameter: "fir".to_owned(),
-            },
-            RTCPFeedback {
-                typ: "nack".to_owned(),
-                parameter: "".to_owned(),
-            },
-            RTCPFeedback {
-                typ: "nack".to_owned(),
-                parameter: "pli".to_owned(),
-            },
-            RTCPFeedback {
-                typ: "transport-cc".to_owned(),
-                parameter: "".to_owned(),
-            },
-        ];
-        m.register_codec(
-            RTCRtpCodecParameters {
-                capability: RTCRtpCodecCapability {
-                    mime_type: MIME_TYPE_H264.to_owned(),
-                    clock_rate: 90000,
-                    channels: 0,
-                    sdp_fmtp_line:
-                        "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
-                            .to_owned(),
-                    rtcp_feedback: fb,
-                },
-                payload_type: 102,
-                ..Default::default()
-            },
-            RTPCodecType::Video,
-        )?;
-        m.register_codec(
-            RTCRtpCodecParameters {
-                capability: RTCRtpCodecCapability {
-                    mime_type: "video/rtx".to_owned(),
-                    clock_rate: 90000,
-                    channels: 0,
-                    sdp_fmtp_line: "apt=102".to_owned(),
-                    rtcp_feedback: vec![],
-                },
-                payload_type: 103,
-                ..Default::default()
-            },
-            RTPCodecType::Video,
-        )?;
-        let mut registry = Registry::new();
-        registry = register_default_interceptors(registry, &mut m)?;
-        let mut se = webrtc::api::setting_engine::SettingEngine::default();
-        se.set_network_types(vec![
-            webrtc::ice::network_type::NetworkType::Udp4,
-            webrtc::ice::network_type::NetworkType::Udp6,
-        ]);
-        APIBuilder::new()
-            .with_media_engine(m)
-            .with_interceptor_registry(registry)
-            .with_setting_engine(se)
-            .build()
-    };
+    let api =
+        build_api(&["level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"])?;
 
     // Two peers, both from 127.0.0.1, both presenting their own device token — the owner's
     // two-tabs-on-one-machine case, which used to collapse into one session with the first
@@ -282,6 +213,85 @@ pub async fn run(mut config: Config) -> Result<()> {
 
     tprintln!("=== M3 WHEP self-test PASSED ({final_count} RTP packets) ===");
     Ok(())
+}
+
+/// The client API the self-test and the bench `live` stage join with: one H.264 payload type per
+/// `fmtp` line given (102, 104, …, each with its RTX twin), the browser's feedback set, the default
+/// interceptors (NACK generator, receiver reports, TWCC), UDP only.
+pub(crate) fn build_api(h264_fmtps: &[&str]) -> Result<webrtc::api::API> {
+    build_api_with(h264_fmtps, 0)
+}
+
+/// `srtp_window`: the SRTP replay window in packets, 0 = webrtc-rs's default of 64. A packet older
+/// than the window is dropped as a replay, so with 64 no NACK repair further back than 64 packets
+/// can ever arrive — not one of the first 570 packets of a 636-packet keyframe.
+pub(crate) fn build_api_with(h264_fmtps: &[&str], srtp_window: usize) -> Result<webrtc::api::API> {
+    use webrtc::api::media_engine::MIME_TYPE_H264;
+    use webrtc::rtp_transceiver::rtp_codec::{RTCRtpCodecCapability, RTCRtpCodecParameters};
+    use webrtc::rtp_transceiver::RTCPFeedback;
+
+    let mut m = MediaEngine::default();
+    let fb = || {
+        [
+            ("goog-remb", ""),
+            ("ccm", "fir"),
+            ("nack", ""),
+            ("nack", "pli"),
+            ("transport-cc", ""),
+        ]
+        .iter()
+        .map(|(t, p)| RTCPFeedback {
+            typ: (*t).to_owned(),
+            parameter: (*p).to_owned(),
+        })
+        .collect::<Vec<_>>()
+    };
+    for (i, fmtp) in h264_fmtps.iter().enumerate() {
+        let pt = 102 + 2 * i as u8;
+        m.register_codec(
+            RTCRtpCodecParameters {
+                capability: RTCRtpCodecCapability {
+                    mime_type: MIME_TYPE_H264.to_owned(),
+                    clock_rate: 90000,
+                    channels: 0,
+                    sdp_fmtp_line: (*fmtp).to_owned(),
+                    rtcp_feedback: fb(),
+                },
+                payload_type: pt,
+                ..Default::default()
+            },
+            RTPCodecType::Video,
+        )?;
+        m.register_codec(
+            RTCRtpCodecParameters {
+                capability: RTCRtpCodecCapability {
+                    mime_type: "video/rtx".to_owned(),
+                    clock_rate: 90000,
+                    channels: 0,
+                    sdp_fmtp_line: format!("apt={pt}"),
+                    rtcp_feedback: vec![],
+                },
+                payload_type: pt + 1,
+                ..Default::default()
+            },
+            RTPCodecType::Video,
+        )?;
+    }
+    let mut registry = Registry::new();
+    registry = register_default_interceptors(registry, &mut m)?;
+    let mut se = webrtc::api::setting_engine::SettingEngine::default();
+    se.set_network_types(vec![
+        webrtc::ice::network_type::NetworkType::Udp4,
+        webrtc::ice::network_type::NetworkType::Udp6,
+    ]);
+    if srtp_window > 0 {
+        se.set_srtp_replay_protection_window(srtp_window);
+    }
+    Ok(APIBuilder::new()
+        .with_media_engine(m)
+        .with_interceptor_registry(registry)
+        .with_setting_engine(se)
+        .build())
 }
 
 /// One joined peer: its connection, its counters and the join id the host gave it.
@@ -418,7 +428,7 @@ async fn join_peer(
     })
 }
 
-async fn wait_for_health(port: u16) -> Result<()> {
+pub(crate) async fn wait_for_health(port: u16) -> Result<()> {
     let req =
         format!("GET /health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
     for _ in 0..100 {
@@ -451,8 +461,13 @@ async fn http_post_join(
         "height": 720,
         "dpr": 1.0,
         "sdp": sdp,
-    })
-    .to_string();
+    });
+    post_join(port, &body).await
+}
+
+/// POST a `/whep` join request body and return (answer SDP, join id).
+pub(crate) async fn post_join(port: u16, body: &serde_json::Value) -> Result<(String, String)> {
+    let body = body.to_string();
     let req = format!(
         "POST /whep HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),
@@ -486,7 +501,7 @@ async fn http_post_join(
     Ok((body.to_string(), join_id))
 }
 
-async fn tls_send_recv(port: u16, request: &[u8]) -> Result<Vec<u8>> {
+pub(crate) async fn tls_send_recv(port: u16, request: &[u8]) -> Result<Vec<u8>> {
     use std::sync::Arc;
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

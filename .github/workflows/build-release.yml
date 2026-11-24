@@ -114,11 +114,51 @@ jobs:
             exit 1
           fi
 
+      # 0.7.0 shipped with no bundle signature: only the arm64 slice carried the linker's
+      # ad-hoc signature (identifier `ScreenExtend-<hash>`, Info.plist not bound, nothing
+      # sealed), the x86_64 slice was unsigned, and the bundle had no designated requirement.
+      # TCC then stored every grant against a csreq the running app could never satisfy, so
+      # the permission gate could not be passed on Apple silicon. `bundle.macOS.signingIdentity`
+      # is now "-" in tauri.macos.conf.json, so the bundler signs the universal executable
+      # (both slices) and then the bundle, before the DMG and the updater .app.tar.gz are made
+      # from it. This step fails the release unless that signature is whole: verifies with
+      # --deep --strict, identifier == bundle id, Info.plist bound, resources sealed, and each
+      # slice's CDHash in the designated requirement (or, with a Developer ID, the requirement
+      # satisfied by every slice).
+      - name: macOS bundle signature is whole (every slice, Info.plist, resources)
+        if: matrix.platform == 'macos-latest'
+        run: |
+          app=$(find src-tauri/target/universal-apple-darwin/release/bundle/macos \
+                     -maxdepth 1 -name 'ScreenExtend.app' | head -1)
+          if [ -z "$app" ]; then echo "::error::no ScreenExtend.app was produced"; exit 1; fi
+          lipo -archs "$app/Contents/MacOS/ScreenExtend"
+          if ! bash scripts/check-macos-signature.sh "$app"; then
+            echo "::error::the macOS bundle signature is incomplete; TCC grants could never match this build"
+            exit 1
+          fi
+          # The updater archive is what an existing install receives; check the copy inside it
+          # too, so a signature lost between bundling and archiving cannot ship.
+          tarball=$(find src-tauri/target/universal-apple-darwin/release/bundle/macos \
+                         -maxdepth 1 -name '*.app.tar.gz' | head -1)
+          if [ -n "$tarball" ]; then
+            tmp=$(mktemp -d)
+            tar -xzf "$tarball" -C "$tmp"
+            inner=$(find "$tmp" -maxdepth 2 -name '*.app' -type d | head -1)
+            if [ -z "$inner" ]; then echo "::error::no .app inside $tarball"; exit 1; fi
+            bash scripts/check-macos-signature.sh "$inner" || {
+              echo "::error::the app inside $tarball is not whole-signed"; exit 1; }
+          else
+            echo "::warning::no .app.tar.gz updater archive was found to check"
+          fi
+
       # TCC keys a grant on (service, bundle id) plus a `csreq` blob captured at grant time, so
       # an identity that drifts between releases shows the user a ticked Screen Recording box
-      # over a grant that no longer applies -- and on macOS 15 an ad-hoc identity reads as
-      # denied however the user answered. The expected requirement is checked in beside the
-      # resource provenance; see docs/manual-tests/macos-app-signing.md for how to re-seed it.
+      # over a grant that no longer applies. An ad-hoc identity's designated requirement is its
+      # cdhashes, which change with every build: a grant made to an ad-hoc build works for that
+      # build and is lost on every update. Whether macOS 15 specifically treats an ad-hoc
+      # identity any worse than that is unverified on this project. The expected requirement is
+      # checked in beside the resource provenance; see docs/manual-tests/macos-app-signing.md
+      # for how to re-seed it.
       #
       # Nothing in this workflow signs with a Developer ID until an APPLE_CERTIFICATE secret
       # exists, so without one the build is ad-hoc by construction: say so loudly and let the

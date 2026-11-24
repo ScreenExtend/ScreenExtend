@@ -204,8 +204,16 @@ pub fn check_system_requirements() -> CompatibilityReport {
         capture_backend: capture_backend().to_string(),
         // Which VideoToolbox encoder, not just "VideoToolbox": `VTCopyVideoEncoderList` says
         // whether this Mac has a hardware H.264 encoder at all, and the report is the one place
-        // a user can see that answer without reading the log.
-        encoder_backend: super::streamer::encoder::probe_encoder_backend().to_string(),
+        // a user can see that answer without reading the log. It stays the bare backend name
+        // (CLAUDE.md, `doctor --json`); the rate-control detail goes to the log and, per session,
+        // to the telemetry (`encoder_id`, `rate_tier`).
+        encoder_backend: {
+            tprintln!(
+                "[vt] encoder backend: {}",
+                super::streamer::encoder::encoder_backend_detail()
+            );
+            super::streamer::encoder::probe_encoder_backend().to_string()
+        },
         hosted_network_backend: hostap_backend.as_str().to_string(),
         input_backend: input_backend.as_str().to_string(),
         // Both are Windows' display-driver story: macOS has no driver to install, and so no

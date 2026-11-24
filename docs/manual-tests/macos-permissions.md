@@ -222,3 +222,95 @@ display underneath us. To exercise that (pre-10.14.4 tier only): resize the AirP
 from Displays preferences during a live session and confirm the client re-negotiates on its
 next `/reconfig` poll without a restart, with `[airplay] macOS changed the display
 geometry` in the log.
+
+---
+
+## One prompt, then silence: the prompt policy (needs a human, ~10 min)
+
+What it checks: the rule "poll with silent checks only after the first request; no more than
+one prompt unless the user explicitly presses Retry". The policy itself
+(`permissions::prompt_policy`) and the call-site pins are unit-tested; what no test can do is
+watch the screen while a person grants the permission. Run on macOS 15 or 26 (the releases
+where `SCShareableContent` raises the alert on every unauthorized call — the defect this
+fixes re-raised it every 2 s while the gate polled).
+
+Setup, on a freshly built, whole-signed app (`bash scripts/check-macos-signature.sh` passes):
+
+```sh
+tccutil reset ScreenCapture app.screenextend.desktop
+tccutil reset Accessibility app.screenextend.desktop
+rm -f ~/Library/Application\ Support/app.screenextend.desktop/permission-requests.json
+```
+
+1. Launch the app from `/Applications` in Finder. Expect **exactly one** macOS
+   screen-recording prompt. Count every system dialog that appears from here to step 4.
+2. Do not answer it for 30 s, then press "Open System Settings" in the prompt (or dismiss it
+   and use the gate's **Open Settings** button). Leave System Settings in front for at least
+   60 s. Expect: no further prompt covers System Settings. `permission-requests.json` now
+   holds a `screen_recording` row with `count: 1`.
+3. Turn ScreenExtend on. Expect: the gate either closes on its own or switches to the
+   "Restart needed" wording. Press **Restart**. Expect: the relaunched app shows no prompt
+   at all (the automatic request after a relaunch is a silent read) and passes the gate.
+4. Total system dialogs counted: **1**. Anything more is a failure; note which step.
+
+Retry, and the stale-row repair:
+
+5. Turn ScreenExtend **off** in System Settings, quit, relaunch. Expect: the gate, no prompt,
+   and the row's text "macOS has already asked once… press Retry".
+6. Put **at least two other apps' windows** on screen (say Finder and TextEdit: a definite
+   denial needs ≥ 2 untitled foreign windows from ≥ 2 apps), then press **Retry** on the Screen
+   Recording row. Expect one log line `[permissions] screen_recording reads as definitely
+   denied (on-screen-windows-untitled) on an explicit Retry; … running tccutil reset
+   ScreenCapture app.screenextend.desktop before asking again`, then exactly one prompt, and the
+   row's text changes to "ScreenExtend cleared its Screen Recording entry and asked macOS
+   again — the entry was either switched off or no longer matched this copy…".
+6b. Repeat step 6 with **no** other window on screen (Show Desktop, or a fresh empty Space).
+   Expect the log line `Retry without a TCC reset — the silent read is Unknown
+   (no-foreign-window-to-read)` and **no** reset: an unconfirmable state is never reset.
+7. **Open Settings** must only open the pane: pressing it repeatedly raises no prompt.
+
+## Granted while running, then Show Desktop (the stale-cache case, needs a human, ~5 min)
+
+What it checks: `CGPreflightScreenCaptureAccess` stays `false` for the life of a process that
+started unauthorized, so a host granted *while running* must not treat that cached negative as
+a denial when there is nothing else on screen to read. Unit-tested as
+`granted_while_running_then_nothing_on_screen_is_unknown_and_harmless`; this is the screen half.
+
+1. Reset as in the setup above, launch from `/Applications`, answer the one prompt with
+   "Open System Settings", turn ScreenExtend on. **Do not restart.** The gate should close (the
+   System Settings window's title is readable now) — if it shows "Restart needed" instead,
+   that is acceptable, press nothing and carry on from the dashboard if it lets you.
+2. Join from a client device and confirm the picture is your desktop, not wallpaper.
+3. Press Show Desktop (F11 / fn-F11 or the hot corner) so no other app's window is on screen,
+   and minimise everything. Leave it 60 s (two watchdog re-probes at 30 s).
+   Expect: **the session stays up**, no "Screen Recording Is Off" dialog, no
+   `[tcc] Screen Recording is definitely not authorized while streaming` log line.
+4. With the desktop still shown, disconnect and rejoin from the client. Expect: the join
+   succeeds (the log may say `state could not be confirmed (…); starting capture anyway`, or
+   nothing if the grant was already confirmed). It must **not** say the permission is denied.
+5. If system audio is on for that device on macOS 13.0–14.1 (the ScreenCaptureKit audio tier),
+   expect audio to start; the log must not say `ScreenCaptureKit audio is not started`.
+6. Press Retry in the gate or the lapse dialog if either is up. Expect **no** `tccutil reset`
+   line: the read is `Unknown` or `Granted`, never a definite denial, after a confirmed grant.
+
+## `serve` only, first run (needs a human, ~5 min)
+
+What it checks: a headless host makes the one first request itself. Before this, nothing in
+`serve` ever requested Screen Recording, so the app never appeared in the Screen Recording list.
+
+1. Reset as in the setup above. Do **not** open the GUI at any point.
+2. Start the host the way it will run in production — through LaunchServices, so the request is
+   attributed to the app and not to Terminal:
+   `open -n -a /Applications/ScreenExtend.app --args serve --no-cloud`.
+   Expect exactly one macOS screen-recording prompt naming ScreenExtend, and a
+   `screen_recording` row in `permission-requests.json`.
+3. Grant it, `ScreenExtend stop`, start it again the same way. Expect no prompt at all.
+4. Started instead from a shell (`/Applications/ScreenExtend.app/Contents/MacOS/ScreenExtend
+   serve`), the request is attributed to Terminal: expect a prompt naming Terminal at most once
+   per run (unless Terminal is already allowed), the log line `requested from a process that does
+   not own the app's TCC identity … remembered for this process only`, and
+   `permission-requests.json` **unchanged**. The same holds for `pnpm tauri dev` / `cargo run`:
+   a dev session must never write the marker and suppress the `.app`'s one automatic prompt.
+
+Record the macOS build, the number of dialogs at each step, and the contents of
+`permission-requests.json` after steps 2 and 6.
