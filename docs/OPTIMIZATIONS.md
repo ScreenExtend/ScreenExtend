@@ -6186,3 +6186,23 @@ checkpoint (the same as before the first join). Bench churn, 160 joins each: 0 l
 
 **Not verified / open.** Windows (type-checked only). Memory on the Intel host still grows about 0.8 MB per
 join (r7: 2.8; M1: 0.14), unexplained. An aborted `POST /whep` can still leave the *display* up (by reading).
+
+## QSV-SCENARIO — Quick Sync `ScenarioInfo` DISPLAY_REMOTING to REMOTE_GAMING — `VERIFIED` (Intel UHD Graphics Gen12 only)
+
+`init_encode` and `query_fps_supported` now send `MFX_SCENARIO_REMOTE_GAMING`. Measured on Windows 11
+26200, i7-12650H, driver 31.0.101.3413, 1080p60, WGC capture of a virtual display to bitstream, five
+interleaved runs of about 1,445 frames each, median of runs, p50/p95/p99 ms:
+
+| | p50 | p95 | p99 |
+|---|---|---|---|
+| DISPLAY_REMOTING | 6.81 | 11.03 | 12.19 |
+| REMOTE_GAMING | 3.95 | 5.82 | 6.41 |
+
+Same bitrate, PSNR +0.007 dB, no decode errors, live `Reset` still works with no extra IDR. The gain is
+absent back-to-back, which fits a clock/power hint (inferred, not measured). Measured on a build with LTO
+off, the scenario selected by a temporary env switch, with bench instrumentation. Not tested: any other
+Intel generation or driver.
+
+Rejected in the same pass: `AsyncDepth` 2 (one whole frame of latency: 18.9 ms p50 at 60 fps), zero-copy
+VPP input (no reliable gain), CBR with one slice (0.5-1.6 ms, but CBR refused a live bitrate `Reset`
+with -14 in the harness), and moving to a different API (the backend already is direct oneVPL).
