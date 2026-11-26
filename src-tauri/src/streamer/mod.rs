@@ -30,24 +30,13 @@ use tokio::runtime::Runtime;
 
 /// Ceiling on the shared runtime's worker count.
 ///
-/// The problem this number was introduced to solve was 48 threads: tokio's default is
-/// `available_parallelism()` and a runtime was built **per network adapter**, so three adapters on
-/// a 16-thread host meant 48 priority-boosted, mostly idle workers competing with the encoder. One
-/// shared runtime fixes that by itself — 16 total is a third of what two adapters used to cost and
-/// fewer than one adapter's worth. Capping it at 4 on top of that was a second, separate change,
-/// and it is the one that had no measurement behind it.
+/// Do not narrow it: tokio has no dedicated I/O thread (a worker services the reactor only when
+/// it parks, or every `event_interval` = 61 task polls), so with few workers an arriving pointer
+/// datagram waits behind busy tasks. Measured with a 1 kHz pointer burst: 779 of 1000 frames
+/// reached `SendInput` at 4 workers, 1000 of 1000 at 16 (forward leg p99 3 ms).
 ///
-/// It costs input latency because **tokio has no dedicated I/O thread**: a worker services the
-/// reactor only when it parks, or every `event_interval` (61) task polls. A session steadily
-/// occupies the RTP writer, the RTCP/TWCC reader, the bitrate driver's `getStats`, the audio
-/// forwarder at 200 packets/s and the `/reconfig` poll, so with four workers all four can be
-/// runnable at once and the arriving SCTP datagram that carries a pointer move waits behind up to
-/// 61 task polls. Measured on this box with a 1 kHz pointer burst: at 4 workers 779 of 1000 frames
-/// reached `SendInput`; at 16, 1000 of 1000, with the forward leg's p99 at 3 ms.
-///
-/// The blind spot is worth naming: `route()` stamps `host_recv_ns` *after* that wait, so a stall
-/// here leaves every host-side stage histogram clean and shows up only as dropped motion the client
-/// can see. `SE_TRANSPORT_WORKERS` overrides the width for a measurement.
+/// `route()` stamps `host_recv_ns` after that wait, so a stall here shows in no host-side stage
+/// histogram, only as dropped motion on the client.
 const MAX_TRANSPORT_WORKERS: usize = 16;
 
 static RUNTIME: OnceLock<std::result::Result<Runtime, String>> = OnceLock::new();
@@ -56,17 +45,24 @@ fn build_transport_runtime() -> std::io::Result<Runtime> {
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(2);
-    // `SE_TRANSPORT_WORKERS` overrides the width for a measurement. The worker count is the one
-    // transport constant whose cost cannot be reasoned about from the code — tokio has no
-    // dedicated I/O thread, so how soon an arriving datagram is noticed depends on whether any
-    // worker is parked, which depends on how many there are — and re-measuring it used to mean a
-    // rebuild between every pair of numbers.
-    let workers = std::env::var("SE_TRANSPORT_WORKERS")
+    // SE_TRANSPORT_WORKERS overrides the width for a measurement
+    let workers = crate::envcfg::var("SE_TRANSPORT_WORKERS")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|n| *n > 0)
         .unwrap_or_else(|| cores.clamp(1, MAX_TRANSPORT_WORKERS));
     tprintln!("transport runtime: {workers} worker(s) on {cores} logical processors");
+    // candidate: tune a worker on its first park, not at start. Only workers park, so
+    // blocking-pool threads never register with MMCSS
+    #[cfg(windows)]
+    if crate::windows_utils::streamer::tune::candidate("transport_mmcss_lazy") {
+        return tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(workers)
+            .thread_name("se-transport")
+            .enable_all()
+            .on_thread_park(crate::windows_utils::streamer::tuning::tune_transport_thread_once)
+            .build();
+    }
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers)
         .thread_name("se-transport")
@@ -75,10 +71,8 @@ fn build_transport_runtime() -> std::io::Result<Runtime> {
         .build()
 }
 
-/// The one tokio runtime the host uses for every network adapter.
-///
-/// Built on first use and kept for the process lifetime — adapter churn (a Wi-Fi roam that
-/// changes the IP) used to tear down and rebuild a whole runtime.
+/// The one tokio runtime the host uses for every network adapter, built on first use and kept
+/// for the process lifetime so adapter churn (a Wi-Fi roam) never rebuilds it.
 pub fn transport_runtime() -> Result<&'static Runtime> {
     match RUNTIME.get_or_init(|| build_transport_runtime().map_err(|e| e.to_string())) {
         Ok(runtime) => Ok(runtime),
@@ -111,9 +105,8 @@ impl Streamer {
 
     /// Run this adapter's server to completion on the shared runtime.
     ///
-    /// The caller keeps its own thread — `block_on` drives `server::run` there and the tasks it
-    /// spawns go to the shared worker pool — so one adapter's accept loop still cannot starve
-    /// another's, but the workers are no longer duplicated per adapter.
+    /// The caller keeps its own thread: `block_on` drives `server::run` there and the tasks it
+    /// spawns go to the shared worker pool, so one adapter's accept loop cannot starve another's.
     pub fn run_with_handle(self, handle: axum_server::Handle) -> Result<()> {
         Self::prepare();
         transport_runtime()?.block_on(server::run(self.config, Some(handle)))

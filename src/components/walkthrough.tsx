@@ -10,10 +10,9 @@ import { useZoom } from "@/components/global-provider";
 import { HIGHLIGHT_PROXY_ID, WALKTHROUGH_TOUR } from "@/components/walkthrough-context";
 import { cn } from "@/lib/utils";
 
-// This module pulls in `nextstepjs` (and `motion` behind it), so it must stay off the
-// eager import graph -- `App.tsx` reaches it through a dynamic import. The two constants
-// live in `walkthrough-context.ts` for the same reason and are re-exported here for the
-// files that already had them from this path.
+// This module pulls in `nextstepjs` (and `motion`), so keep it off the eager import graph:
+// `App.tsx` reaches it through a dynamic import, and the two constants live in
+// `walkthrough-context.ts` for that reason.
 export { HIGHLIGHT_PROXY_ID, WALKTHROUGH_TOUR };
 export type SidePadding = { top?: number; right?: number; bottom?: number; left?: number };
 
@@ -147,13 +146,9 @@ export function HighlightProxy() {
       }
     };
 
-    // This used to be an unconditional `requestAnimationFrame` loop: a `querySelector`
-    // plus a `getBoundingClientRect` -- a synchronous layout flush -- at the display's
-    // refresh rate for as long as a step was on screen, on a host that is simultaneously
-    // capturing, encoding and streaming a display. It runs at full rate only while
-    // something is actually moving the target: a scroll, a window resize, or a CSS
-    // transition anywhere in the document (which is what the 300 ms sidebar collapse is).
-    // `IDLE_MS` is the safety net for a move nothing announced.
+    // getBoundingClientRect is a synchronous layout flush, so measure at frame rate only
+    // while something may be moving the target (scroll, resize, a CSS transition such as the
+    // 300 ms sidebar collapse). IDLE_MS catches a move nothing announced.
     const BURST_MS = 700;
     const IDLE_MS = 250;
 

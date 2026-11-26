@@ -1,25 +1,18 @@
 #!/usr/bin/env node
 // The Settings config.json editor: `pnpm test:config`.
 //
-// No runner and no devDependency, the same rule the client-page harnesses follow. Node
-// strips the types out of the three modules under test on import -- `config-defaults.ts`,
-// `config-schema.ts` and `json-structure.ts` are erasable-syntax-only and import nothing
-// outside that set -- so what is checked is what the app ships, not a copy of it.
+// No runner and no devDependency. Node strips the types out of the modules under test on
+// import (they are erasable-syntax-only and import nothing outside that set), so what is
+// checked is what the app ships, not a copy of it.
 //
-// It exists because of two defects that both reached the owner's machine at once, and it
-// pins the three properties that would have caught them:
-//
-//   1. `stunUrls` was added to the config type and not to the schema, so the editor
-//      reported the user's own config as invalid and refused to save it. Nothing failed:
-//      not tsc, not eslint, not a build. => the schema and the type are cross-checked.
-//   2. index.html gained an inline <style>, so Tauri added a nonce to `style-src`, which
-//      per CSP voids the `'unsafe-inline'` monaco's runtime-injected theme stylesheet
-//      needs. The editor lost every syntax colour, its gutter and its scrollbars, and
-//      logged nothing. => index.html is asserted to carry no <style>, and the policy is
-//      asserted to still say 'unsafe-inline'.
-//   3. The masking that hides tokens is a column range over the scanned document; one
-//      column too many and the key name goes under the mask too. => the spans are checked
-//      against the exact characters of each secret.
+// It pins three things that fail silently:
+//   1. A key added to the config type and not to the schema makes the editor report the user's
+//      own config as invalid and refuse to save it, with tsc, eslint and the build all clean.
+//   2. An inline <style> in index.html makes Tauri add a nonce to `style-src`, which per CSP
+//      voids the `'unsafe-inline'` monaco's runtime-injected theme stylesheet needs: the
+//      editor loses its syntax colours, gutter and scrollbars and logs nothing.
+//   3. The secret mask is a column range over the scanned document: one column too many and
+//      the key name goes under the mask too.
 import assert from 'node:assert/strict';
 import { readFileSync, existsSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -49,9 +42,8 @@ function test(what, run) {
   }
 }
 
-// The owner's own config.json, merged with the defaults exactly as `readStore` does, with
-// every secret replaced by a dummy of the same shape. It is the document that could not be
-// saved.
+// A real config.json, merged with the defaults exactly as `readStore` does, with every secret
+// replaced by a dummy of the same shape.
 const fixture = read('scripts/fixtures/config-owner.json');
 const fixtureConfig = JSON.parse(fixture);
 
@@ -75,9 +67,9 @@ test('every persisted key is required, so a missing one is reported', () => {
   assert.deepEqual(optional, []);
 });
 
-// The nested shapes have no runtime value to enumerate -- `devices` defaults to [] -- so
-// their members are read out of the type declarations themselves. A member line is
-// `  name: type;` or `  name?: type;` at one level of indentation inside the block.
+// The nested shapes have no runtime value to enumerate (`devices` defaults to []), so their
+// members are read out of the type declarations. A member line is `  name: type;` or
+// `  name?: type;` at one level of indentation inside the block.
 const membersOf = typeName => {
   const source = read('src/lib/config-defaults.ts');
   const start = source.indexOf('export type ' + typeName + ' = {');
@@ -112,8 +104,8 @@ test("the owner's config validates with nothing reported", () => {
 });
 
 test('stunUrls specifically is accepted', () => {
-  // The exact regression: a config carrying the default STUN list was rejected as
-  // "Property stunUrls is not allowed".
+  // a config carrying the default STUN list must not be rejected as
+  // "Property stunUrls is not allowed"
   assert.equal('stunUrls' in fixtureConfig, true, 'fixture lost its stunUrls key');
   const errors = validateConfig({ ...fixtureConfig, stunUrls: 'stun:stun.l.google.com:19302' });
   assert.deepEqual(errors, []);
@@ -208,8 +200,7 @@ test('a mask covers the value exactly -- no quote, no comma, no key name', () =>
     assert.ok(text.length > 0, span.path + ': masked nothing');
     assert.ok(!/["',]/.test(text), span.path + ': mask reaches past the value -> ' + text);
     assert.ok(line.includes('"' + text + '"'), span.path + ': ' + text + ' not in ' + line);
-    // The key name must stay legible: a mask that swallowed it is the blank line the
-    // owner saw.
+    // the key name must stay legible: a mask that swallowed it leaves a blank line
     const key = /^\s*"([^"]+)":/.exec(line)[1];
     assert.ok(
       span.startColumn > line.indexOf('"' + key + '"') + key.length + 2,
@@ -255,13 +246,12 @@ test('a value carrying every base64url and URL character is scanned whole', () =
 
 console.log('=== the editor\'s stylesheets survive the page CSP ===');
 
-// The comment in index.html says the word, at length, so that the next person does not
-// re-add the element; strip comments before looking for the element itself.
+// index.html's own comment mentions <style>, so strip comments before looking for the element
 const hasStyleElement = html => /<style[\s>]/i.test(html.replace(/<!--[\s\S]*?-->/g, ''));
 
 test('index.html carries no <style> element', () => {
   // Tauri nonces `style-src` as soon as it finds one, and a nonce makes CSP ignore
-  // 'unsafe-inline' -- which silently drops monaco's runtime-injected theme sheet.
+  // 'unsafe-inline', which silently drops monaco's runtime-injected theme sheet.
   assert.equal(hasStyleElement(read('index.html')), false);
 });
 
@@ -284,8 +274,8 @@ test("the policy still says style-src 'unsafe-inline'", () => {
 test("monaco's stylesheet ships as its own asset, not as injected CSS", () => {
   // Monaco's ~60 KB of layout CSS reaches the page as a <link> emitted beside the lazy
   // editor chunk. A `cssCodeSplit: false` or a raised `assetsInlineLimit` would turn it
-  // into an injected <style> instead, which walks into the same CSP trap from the other
-  // side -- and, unlike the theme sheet, that one takes the editor's whole layout with it.
+  // into an injected <style>, which hits the same CSP trap and takes the editor's whole
+  // layout with it.
   const assets = resolve(root, 'dist/assets');
   if (!existsSync(assets)) {
     console.log('       (no dist/assets -- run pnpm build for this check)');
@@ -300,21 +290,14 @@ test("monaco's stylesheet ships as its own asset, not as injected CSS", () => {
 
 console.log('=== a malformed config.json is survivable ===');
 
-// The defect, exactly as it reached the owner. `config.json` held
-//
-//     "devices": {"0": {"refreshRate": 30}}
-//
-// -- an object where the type says array, which is what a dotted CLI write produced when the
-// intermediate array did not exist. The bootstrap's saved-settings replay does
-// `for (const d of config.devices ?? [])`, which throws `TypeError: object is not iterable`;
-// the throw was caught as a setup failure and the user was told his drivers were missing.
-//
-// Two properties are pinned here: the raw value is genuinely un-iterable (so this is the real
-// defect and not a paraphrase of it), and the normalised value is iterable and says so in the
-// log.
+// `"devices": {"0": {"refreshRate": 30}}` is an object where the type says array. The
+// bootstrap's saved-settings replay does `for (const d of config.devices ?? [])`, which throws
+// `TypeError: object is not iterable`, and that throw surfaces as a setup failure blamed on
+// missing drivers. Pinned here: the raw value really is un-iterable, and the normalised value
+// is iterable and says so in the log.
 const BROKEN_DEVICES = { '0': { refreshRate: 30 } };
 
-// What `bootstrap.tsx` does with the value, reduced to the one line that threw.
+// what `bootstrap.tsx` does with the value, reduced to the one line that throws
 const replayDevices = config => {
   const seen = [];
   for (const device of config.devices ?? []) seen.push(device);
@@ -345,8 +328,7 @@ test('every top-level key malformed at once still yields the declared shape', ()
   // The bootstrap has to reach the dashboard with a store in which nothing is the right type.
   const wrecked = {};
   for (const key of Object.keys(defaultConfig)) {
-    // Deliberately the wrong container for each: an object where an array belongs, an array
-    // where an object belongs, a string where a number belongs, and so on.
+    // deliberately the wrong container for each
     const declared = properties[key].type;
     wrecked[key] =
       declared === 'array' ? { '0': {} }
@@ -359,8 +341,7 @@ test('every top-level key malformed at once still yields the declared shape', ()
   assert.equal(notes.length, Object.keys(defaultConfig).length, notes.join('\n'));
   assert.equal(repaired.length, Object.keys(defaultConfig).length);
   assert.deepEqual(config, defaultConfig);
-  // And the document that comes out is one the editor accepts, which is the definition of "the
-  // declared shape" that matters to the user.
+  // and the document that comes out is one the editor accepts
   assert.deepEqual(validateConfig(config), []);
 });
 
@@ -415,7 +396,7 @@ test('a value outside its enum is replaced rather than passed on', () => {
 
 test('a device row missing fields comes out complete, so the replay can hand it to the host', () => {
   // `bootstrap.tsx` passes `device.scale` and friends straight to `setDeviceOverride`, where an
-  // `undefined` is rejected at the IPC boundary -- a saved row written by an older version is
+  // `undefined` is rejected at the IPC boundary: a saved row written by an older version is
   // the same class of startup failure as the wrong container type.
   const { config, notes, repaired } = normalizeConfig({
     ...fixtureConfig,
@@ -446,9 +427,9 @@ test('keys the schema does not name are kept, not deleted', () => {
 
 test("the owner's own config survives normalisation unchanged", () => {
   // The normaliser runs on every read, so a well-formed document may not be edited by it. The
-  // one thing it adds is a value for a declared field the document does not carry at all --
-  // `pointerScope` and `autoFrameRate` post-date the rows in this fixture -- and that is what
-  // makes the replay able to hand every row to the host without an `undefined` in it.
+  // one thing it adds is a value for a declared field the document does not carry at all (the
+  // fixture's rows have no `pointerScope` or `autoFrameRate`), which is what lets the replay
+  // hand every row to the host without an `undefined` in it.
   const { config, notes, repaired } = normalizeConfig(fixtureConfig);
   assert.deepEqual(notes, []);
   assert.deepEqual(repaired, [], 'a valid document must never be rewritten');
@@ -470,11 +451,10 @@ test("the owner's own config survives normalisation unchanged", () => {
 
 console.log('=== the Rust writer agrees about what is an array ===');
 
-// `cli.rs` carries the container half of this schema, because that is the half a *writer* has to
-// enforce: `config set devices.0.refreshRate 30` used to create an object for every missing
-// segment, numeric or not, which is where `{"0": {...}}` came from. Two tables mean two things
-// to drift, so the Rust one is parsed out of the source here and checked against this schema --
-// the same trick `membersOf` above plays on `config-defaults.ts`.
+// `cli.rs` carries the container half of this schema, because that is the half a writer has
+// to enforce: `config set devices.0.refreshRate 30` must index an array, not create
+// `{"0": {...}}`. Two tables can drift, so the Rust one is parsed out of the source here and
+// checked against this schema.
 const rustSource = read('src-tauri/src/cli.rs');
 
 const rustShapes = (() => {

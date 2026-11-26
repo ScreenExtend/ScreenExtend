@@ -1,46 +1,36 @@
-//! The UDP socket the media actually rides, and the options webrtc-rs never sets on it.
+//! The UDP socket the media rides, and the options webrtc-rs never sets on it.
 //!
-//! `grep -rn "CONNRESET\|SO_SNDBUF\|set_tos\|IP_TOS\|socket2"` over `webrtc-ice-0.17.1` and
-//! `webrtc-util-0.17.1` returns nothing: ICE sockets are created by `listen_udp_in_port_range`
-//! with OS defaults and never touched again. On a Wi-Fi second monitor that costs three things —
-//! video queued in the AP's best-effort access category alongside every background download, a
-//! send buffer that a keyframe burst can overrun inside our own process, and, on Windows, the
-//! `SIO_UDP_CONNRESET` footgun where one ICMP port-unreachable makes the *next* `recv_from` fail.
+//! `webrtc-ice-0.17.1` creates ICE sockets with OS defaults and never touches them again: video
+//! queues in the AP's best-effort access category, a keyframe burst can overrun the send buffer,
+//! and on Windows `SIO_UDP_CONNRESET` lets one ICMP port-unreachable fail the next `recv_from`.
 //!
-//! The only hook webrtc-rs offers is `SettingEngine::set_udp_network(UDPNetwork::Muxed(..))`,
-//! which accepts any `Conn` — and `impl Conn for tokio::net::UdpSocket` exists, so a socket
-//! configured here can become the ICE transport. It has a hard cost:
-//! `webrtc-ice`'s `agent_gather.rs:117-120` skips server-reflexive gathering entirely in muxed mode
-//! (`UDPNetwork::Muxed(_) => continue`). Relay gathering is unaffected, and a same-subnet peer is
-//! already offered no STUN server at all, so this is used **only** on a session classified
-//! `SameNetwork` — where srflx candidates were never going to be gathered anyway.
+//! The only hook is `SettingEngine::set_udp_network(UDPNetwork::Muxed(..))`, and in muxed mode
+//! `webrtc-ice` skips server-reflexive gathering entirely (`agent_gather.rs`). So a socket from
+//! here is used only on a session classified `SameNetwork`, which gathers no srflx candidates
+//! anyway.
 //!
 //! Everything here is a probed tier: a failure is logged once and the session carries on with the
 //! stock ephemeral sockets.
 
 use std::net::{SocketAddr, UdpSocket};
 
-/// Send and receive buffer size for the media socket.
+/// Send and receive buffer size for the media socket, the same 1 MiB Sunshine sets.
 ///
-/// Sunshine sets exactly this (`send_buffer_size(1024*1024)`) for the same reason: a 200 KB IDR
-/// written as ~170 back-to-back datagrams can exhaust a default send buffer and be dropped inside
-/// the sending process, before the NIC ever sees it. The pacer makes that far less likely; the
-/// buffer is what covers the burst the pacer is explicitly told not to smooth on a LAN.
+/// A 200 KB IDR is ~170 back-to-back datagrams, which can exhaust a default send buffer and be
+/// dropped inside the sending process. This covers the burst the pacer does not smooth on a LAN.
 pub const UDP_BUFFER_BYTES: usize = 1024 * 1024;
 
 /// DSCP AF41 (0x22 << 2 = 0x88) is the class the Wi-Fi Alliance maps to WMM AC_VI.
 ///
-/// macOS accepts `IP_TOS` on an unconnected socket with no entitlement, and pairs it with
-/// `SO_NET_SERVICE_TYPE`, which is the API that actually drives the layer-2 WMM access category
-/// (`xnu bsd/sys/socket.h` documents the service types as "different categories of delay, jitter
-/// and loss parameters" and cites RFC 4594).
+/// macOS accepts `IP_TOS` on an unconnected socket with no entitlement. `SO_NET_SERVICE_TYPE` is
+/// what drives the layer-2 WMM access category (`xnu bsd/sys/socket.h`, which cites RFC 4594).
 #[cfg(target_os = "macos")]
 const IP_TOS_AF41: libc::c_int = 0x88;
 
-/// `NET_SERVICE_TYPE_VI` — interactive video, from `xnu bsd/sys/socket.h`
-/// (`BE 0, BK 1, SIG 2, VI 3, VO 4, RV 5, AV 6, OAM 7, RD 8`). `VI` rather than `VO`, because
-/// input, audio and video share one socket under BUNDLE and marking a 20 Mbps video stream as
-/// Voice is antisocial and may be policed by the AP.
+/// `NET_SERVICE_TYPE_VI`, interactive video, from `xnu bsd/sys/socket.h`
+/// (`BE 0, BK 1, SIG 2, VI 3, VO 4, RV 5, AV 6, OAM 7, RD 8`). `VI` rather than `VO`: input,
+/// audio and video share one socket under BUNDLE, and an AP may police a 20 Mbps stream marked
+/// as Voice.
 #[cfg(target_os = "macos")]
 const NET_SERVICE_TYPE_VI: libc::c_int = 3;
 
@@ -147,10 +137,8 @@ fn set_buffer(_sock: &UdpSocket, _send: bool) -> bool {
 
 /// Turn off `SIO_UDP_CONNRESET`.
 ///
-/// On Windows an *unconnected* UDP socket that receives an ICMP port-unreachable makes the next
-/// `recv_from` fail with `WSAECONNRESET`. Whether webrtc-rs's read loop survives that is
-/// unverified — which is the reason to remove the question rather than answer it. It is the
-/// classic Windows UDP-server footgun and nothing in the stack disables it.
+/// On Windows an unconnected UDP socket that receives an ICMP port-unreachable fails its next
+/// `recv_from` with `WSAECONNRESET`, and nothing in the stack disables that.
 #[cfg(windows)]
 fn disable_connreset(sock: &UdpSocket) -> bool {
     use windows::Win32::Networking::WinSock::{WSAIoctl, SIO_UDP_CONNRESET, SOCKET};
@@ -178,11 +166,10 @@ fn disable_connreset(_sock: &UdpSocket) -> bool {
 
 /// Mark the socket as interactive video where the OS supports it on an unconnected socket.
 ///
-/// **Windows deliberately does nothing here.** `setsockopt(IP_TOS)` is silently ignored unless
+/// Windows deliberately does nothing here: `setsockopt(IP_TOS)` is silently ignored unless
 /// `HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\DisableUserTOSSetting` is cleared,
-/// and writing that key is not something a screen-sharing app should do to a user's machine. The
-/// supported route is qWAVE, which needs the destination address and therefore cannot run until
-/// the ICE pair is nominated — see [`mark_video_flow`].
+/// and an app has no business writing that key. The supported route is qWAVE, which needs the
+/// destination address and so waits for the nominated ICE pair: see [`mark_video_flow`].
 #[cfg(target_os = "macos")]
 fn mark_interactive_video(sock: &UdpSocket) -> bool {
     let svc = NET_SERVICE_TYPE_VI;
@@ -217,14 +204,13 @@ fn mark_interactive_video(_sock: &UdpSocket) -> bool {
 ///
 /// Windows marks DSCP through qWAVE and nowhere else.
 /// [`QOSAddSocketToFlow`](https://learn.microsoft.com/en-us/windows/win32/api/qos2/nf-qos2-qosaddsockettoflow)
-/// with `QOSTrafficTypeAudioVideo` yields DSCP 0x28 (CS5) plus 802.1p 5, and — unlike
-/// `QOSSetFlow(QOSSetOutgoingDSCPValue, …)`, which needs Administrators or Network Configuration
-/// Operators — the traffic-type route needs no privilege at all. The 802.1p tag is only added for
-/// an *adaptive* flow whose destination is on the local link, which is exactly the same-subnet
-/// second-monitor case, so `QOS_NON_ADAPTIVE_FLOW` is deliberately not passed.
+/// with `QOSTrafficTypeAudioVideo` yields DSCP 0x28 (CS5) plus 802.1p 5 and needs no privilege
+/// (`QOSSetFlow(QOSSetOutgoingDSCPValue, ..)` needs Administrators or Network Configuration
+/// Operators). The 802.1p tag is only added for an adaptive flow whose destination is on the
+/// local link, so `QOS_NON_ADAPTIVE_FLOW` is deliberately not passed.
 ///
-/// `DestAddr` is required because ICE sockets are unconnected, which is why this cannot be part
-/// of [`tune`] and runs once the nominated pair is known.
+/// `DestAddr` is required because ICE sockets are unconnected, so this cannot be part of
+/// [`tune`] and runs once the nominated pair is known.
 #[cfg(windows)]
 pub struct QosFlow {
     handle: windows::Win32::Foundation::HANDLE,
@@ -263,6 +249,12 @@ pub fn mark_video_flow(raw: usize, dest: SocketAddr) -> Option<QosFlow> {
         AF_INET, AF_INET6, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKET,
     };
 
+    // candidate: a non-adaptive flow is marked at once, at the cost of the 802.1p tag, and a
+    // refusal is logged
+    let non_adaptive = crate::windows_utils::streamer::tune::candidate("qos_non_adaptive_flow");
+    let flags =
+        non_adaptive.then_some(windows::Win32::NetworkManagement::QoS::QOS_NON_ADAPTIVE_FLOW);
+
     let version = QOS_VERSION {
         MajorVersion: 1,
         MinorVersion: 0,
@@ -270,7 +262,13 @@ pub fn mark_video_flow(raw: usize, dest: SocketAddr) -> Option<QosFlow> {
     let mut handle = HANDLE::default();
     let created = unsafe { QOSCreateHandle(&version, &mut handle) };
     if !created.as_bool() {
-        // qWAVE service disabled, or the platform does not have it. Carry on unmarked.
+        if non_adaptive {
+            teprintln!(
+                "media socket: QOSCreateHandle failed ({})",
+                windows::core::Error::from_thread()
+            );
+        }
+        // qWAVE service disabled or absent: carry on unmarked
         return None;
     }
 
@@ -289,7 +287,7 @@ pub fn mark_video_flow(raw: usize, dest: SocketAddr) -> Option<QosFlow> {
                     SOCKET(raw),
                     Some((&sa as *const SOCKADDR_IN).cast::<SOCKADDR>()),
                     QOSTrafficTypeAudioVideo,
-                    None,
+                    flags,
                     &mut flow_id,
                 )
             }
@@ -307,13 +305,19 @@ pub fn mark_video_flow(raw: usize, dest: SocketAddr) -> Option<QosFlow> {
                     SOCKET(raw),
                     Some((&sa as *const SOCKADDR_IN6).cast::<SOCKADDR>()),
                     QOSTrafficTypeAudioVideo,
-                    None,
+                    flags,
                     &mut flow_id,
                 )
             }
         }
     };
     if !ok.as_bool() {
+        if non_adaptive {
+            teprintln!(
+                "media socket: QOSAddSocketToFlow({dest}) failed ({})",
+                windows::core::Error::from_thread()
+            );
+        }
         unsafe {
             let _ = windows::Win32::NetworkManagement::QoS::QOSCloseHandle(handle);
         }
@@ -327,7 +331,7 @@ pub struct QosFlow;
 
 #[cfg(not(windows))]
 pub fn mark_video_flow(_raw: i32, _dest: SocketAddr) -> Option<QosFlow> {
-    // macOS marks per-socket in `tune`, with no destination needed.
+    // macOS marks per-socket in `tune`, no destination needed
     None
 }
 
@@ -356,6 +360,37 @@ mod tests {
             !tuning.dscp_marked,
             "Windows marks through qWAVE after nomination, never with setsockopt"
         );
+    }
+
+    /// The premise of turning `SIO_UDP_CONNRESET` off: on an unconnected socket, one ICMP
+    /// port-unreachable fails the next receive, and webrtc-rs ends a candidate's receive loop on
+    /// any error. A tuned socket keeps receiving.
+    #[cfg(windows)]
+    #[test]
+    fn a_port_unreachable_report_never_fails_a_tuned_socket() {
+        let closed = {
+            let gone = UdpSocket::bind("127.0.0.1:0").expect("bind");
+            gone.local_addr().expect("addr")
+        };
+        let receive_after_reset = |sock: &UdpSocket| {
+            sock.set_read_timeout(Some(std::time::Duration::from_millis(300)))
+                .expect("timeout");
+            sock.send_to(b"x", closed).expect("send");
+            let mut buf = [0u8; 16];
+            sock.recv_from(&mut buf).map_err(|e| e.kind())
+        };
+        let stock = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        if receive_after_reset(&stock) != Err(std::io::ErrorKind::ConnectionReset) {
+            crate::test_support::skip_because(
+                "a_port_unreachable_report_never_fails_a_tuned_socket",
+                "this machine reported no port-unreachable on loopback",
+            );
+            return;
+        }
+        let (tuned, tuning) = bind_tuned("127.0.0.1:0".parse().unwrap()).expect("bind");
+        assert!(tuning.connreset_disabled);
+        let err = receive_after_reset(&tuned).expect_err("nothing is sent back");
+        assert_ne!(err, std::io::ErrorKind::ConnectionReset);
     }
 
     #[test]

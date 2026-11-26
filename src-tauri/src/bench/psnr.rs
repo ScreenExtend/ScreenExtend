@@ -2,9 +2,8 @@
 //! compare luma against the source.
 //!
 //! - `sharp`: each emitted picture against its own source frame.
-//! - `shown`: at every source frame, the picture the viewer would be looking at (the latest
-//!   decoded one at or before it) against that source, so a dropped frame is charged for being
-//!   stale.
+//! - `shown`: at every source frame, the latest picture decoded at or before it against that
+//!   source, so a dropped frame is charged for being stale.
 
 use std::collections::BTreeMap;
 use std::ffi::c_void;

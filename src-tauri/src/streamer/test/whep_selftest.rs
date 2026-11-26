@@ -19,16 +19,13 @@ use crate::streamer::config::{Config, H264Profile};
 const MIN_RTP_PACKETS: u64 = 30;
 const TIMEOUT_SECS: u64 = 10;
 
-/// Credentials the self-test hands itself. `/whep` requires a session id and OTP like any other
-/// join; the caller installs the same pair into the config's `SessionAuth`.
+/// Credentials the self-test joins with: the caller installs the same pair into the config's
+/// `SessionAuth`.
 pub const SELFTEST_SESSION_ID: &str = "SELFTESTSESSN";
 pub const SELFTEST_OTP: &str = "000000";
 
-/// The attributes an answer must carry for a browser to decode this stream at all.
-///
-/// Split out from the live run so the SDP half is testable without a display, an encoder, or a
-/// network: the live run feeds it a real answer, and `answer_sdp_checks_catch_a_stripped_answer`
-/// feeds it a captured one.
+/// The attributes an answer must carry for a browser to decode this stream at all. Separate from
+/// the live run so the SDP half is testable without a display, an encoder or a network.
 pub fn answer_sdp_checks(answer_sdp: &str) -> Vec<(&'static str, bool)> {
     vec![
         ("H264", answer_sdp.contains("H264")),
@@ -37,10 +34,9 @@ pub fn answer_sdp_checks(answer_sdp: &str) -> Vec<(&'static str, bool)> {
             answer_sdp.contains("packetization-mode=1"),
         ),
         (
-            // The profile bytes must be symmetric — RFC 6184 requires it and webrtc-rs's own
-            // fmtp matcher compares exactly these two — but the *level* is now derived from the
-            // negotiated geometry, so asserting a literal `42e01f` would fail the moment the
-            // answer became honest about what it is sending.
+            // The profile bytes must be symmetric: RFC 6184 requires it and webrtc-rs's own
+            // fmtp matcher compares exactly these two. The level is derived from the negotiated
+            // geometry, so a literal `42e01f` must not be asserted.
             "profile-level-id=42e0..",
             answer_sdp.contains("profile-level-id=42e0"),
         ),
@@ -86,10 +82,8 @@ pub async fn run(mut config: Config) -> Result<()> {
     let api =
         build_api(&["level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"])?;
 
-    // Two peers, both from 127.0.0.1, both presenting their own device token — the owner's
-    // two-tabs-on-one-machine case, which used to collapse into one session with the first
-    // frozen and replaced by the second. Nothing about the address distinguishes them; the join
-    // id the host mints does.
+    // two tabs on one machine: same address, different device tokens. Only the join id the host
+    // mints tells them apart, and the second must not replace the first
     let mut peers: Vec<Peer> = Vec::new();
     for (label, token) in [
         ("tab-1", "aaaaaaaabbbbbbbbccccccccdddddddd"),
@@ -155,9 +149,8 @@ pub async fn run(mut config: Config) -> Result<()> {
         ),
     }
 
-    // Proving RTP flows takes about a second, which is a liveness check and not a measurement:
-    // the stage histograms would describe a session that had barely started, mostly startup
-    // transients. `--duration` holds the session open so the numbers mean something.
+    // RTP flowing is a liveness check, about a second: `--duration` holds the session open so
+    // the stage histograms are not mostly startup transients
     if hold_secs > 0 && rtp_count.load(Ordering::Relaxed) >= MIN_RTP_PACKETS {
         tprintln!("[selftest] holding the session open for {hold_secs}s to collect telemetry");
         let started = rtp_count.load(Ordering::Relaxed);
@@ -183,8 +176,7 @@ pub async fn run(mut config: Config) -> Result<()> {
     let tracks = track_seen.load(Ordering::Relaxed);
     tprintln!("[selftest] on_track fired: {tracks}; RTP packets received: {final_count}");
 
-    // Both peers are asserted to have received media: a second display that never paints is
-    // exactly the symptom being fixed.
+    // every peer must have received media: a second display that never paints is the failure
     let mut starved: Vec<&str> = Vec::new();
     for peer in &peers {
         let n = peer.rtp_count.load(Ordering::Relaxed);
@@ -200,12 +192,12 @@ pub async fn run(mut config: Config) -> Result<()> {
 
     if !starved.is_empty() {
         bail!(
-            "these peers received no media at all: {} — a second join must not stop the first",
+            "these peers received no media at all: {}. A second join must not stop the first",
             starved.join(", ")
         );
     }
     if tracks == 0 {
-        bail!("on_track never fired — no media track negotiated");
+        bail!("on_track never fired: no media track negotiated");
     }
     if final_count < MIN_RTP_PACKETS {
         bail!("only {final_count} RTP packets in {TIMEOUT_SECS}s (need >= {MIN_RTP_PACKETS})");
@@ -216,15 +208,15 @@ pub async fn run(mut config: Config) -> Result<()> {
 }
 
 /// The client API the self-test and the bench `live` stage join with: one H.264 payload type per
-/// `fmtp` line given (102, 104, …, each with its RTX twin), the browser's feedback set, the default
+/// `fmtp` line (102, 104 and up, each with its RTX twin), the browser's feedback set, the default
 /// interceptors (NACK generator, receiver reports, TWCC), UDP only.
 pub(crate) fn build_api(h264_fmtps: &[&str]) -> Result<webrtc::api::API> {
     build_api_with(h264_fmtps, 0)
 }
 
 /// `srtp_window`: the SRTP replay window in packets, 0 = webrtc-rs's default of 64. A packet older
-/// than the window is dropped as a replay, so with 64 no NACK repair further back than 64 packets
-/// can ever arrive — not one of the first 570 packets of a 636-packet keyframe.
+/// than the window is dropped as a replay, so at 64 a NACK repair for the first 570 packets of a
+/// 636-packet keyframe can never arrive.
 pub(crate) fn build_api_with(h264_fmtps: &[&str], srtp_window: usize) -> Result<webrtc::api::API> {
     use webrtc::api::media_engine::MIME_TYPE_H264;
     use webrtc::rtp_transceiver::rtp_codec::{RTCRtpCodecCapability, RTCRtpCodecParameters};
@@ -325,8 +317,7 @@ async fn join_peer(
 
     let rtp_count = Arc::new(AtomicU64::new(0));
     let track_seen = Arc::new(AtomicU64::new(0));
-    // Host-clock stamp of the first RTP packet off the wire. Time-to-first-frame is the number
-    // the join chain is judged on, and it is not derivable from the packet count alone.
+    // host-clock stamp of the first RTP packet, for time-to-first-frame
     let first_rtp_ns = Arc::new(AtomicU64::new(0));
 
     {
@@ -442,8 +433,7 @@ pub(crate) async fn wait_for_health(port: u16) -> Result<()> {
     bail!("server did not become healthy in time")
 }
 
-/// `/whep` takes a JSON join request, not a bare SDP body. Posting `application/sdp` — which
-/// this did — could only ever come back 400, which is why the self-test had never passed.
+/// `/whep` takes a JSON join request, not a bare SDP body: `application/sdp` comes back 400.
 async fn http_post_join(
     port: u16,
     sdp: &str,
@@ -480,13 +470,11 @@ pub(crate) async fn post_join(port: u16, body: &serde_json::Value) -> Result<(St
         .split_once("\r\n\r\n")
         .ok_or_else(|| anyhow!("malformed HTTP response (no header/body split)"))?;
     let status_line = head.lines().next().unwrap_or("");
-    // `201 Created` on the direct listener, which is the one this self-test drives; `200` is
-    // what the cloud tunnel answers, since it hands out no resource to point a `Location` at.
+    // 201 on the direct listener; the cloud tunnel answers 200, with no resource for a `Location`
     if !(status_line.contains("201") || status_line.contains("200")) {
         bail!("POST /whep returned: {status_line}\nbody: {body}");
     }
-    // The session's name, as the host hands it out. `X-Join-Id` is the direct form; `Location`
-    // carries the same id as the WHEP resource.
+    // `X-Join-Id` is the direct form; `Location` carries the same id as the WHEP resource
     let join_id = head
         .lines()
         .find_map(|l| {
@@ -526,11 +514,9 @@ pub(crate) async fn tls_send_recv(port: u16, request: &[u8]) -> Result<Vec<u8>> 
     Ok(raw)
 }
 
-/// A verifier that accepts any certificate.
-///
-/// The server presents a runtime-generated self-signed certificate, so a real chain check is
-/// impossible; this whole module is compiled only under `cfg(test)` or the `probe` feature so
-/// nothing that skips certificate validation is ever linked into a shipping binary.
+/// A verifier that accepts any certificate, because the server's is self-signed at runtime. The
+/// module is compiled only under `cfg(test)` or the `probe` feature: it must never be linked into
+/// a shipping binary.
 mod danger {
     use tokio_rustls::rustls::client::danger::{
         HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
@@ -625,8 +611,8 @@ mod tests {
 
     #[test]
     fn answer_sdp_checks_catch_a_stripped_answer() {
-        // Drop the feedback lines and the rtx codec: the stream would still negotiate and would
-        // still be H.264, but loss recovery would be gone and nothing today would notice.
+        // without the feedback lines and the rtx codec the stream still negotiates H.264, but
+        // loss recovery is gone and nothing else would notice
         let stripped: String = SAMPLE_ANSWER
             .lines()
             .filter(|l| !l.starts_with("a=rtcp-fb") && !l.contains("rtx"))
@@ -641,7 +627,7 @@ mod tests {
         assert!(failed.contains(&"rtcp-fb ccm fir"), "got {failed:?}");
         assert!(failed.contains(&"transport-cc"), "got {failed:?}");
         assert!(failed.contains(&"rtx"), "got {failed:?}");
-        // The codec itself is untouched, so those checks must still pass.
+        // the codec itself is untouched, so those checks must still pass
         assert!(!failed.contains(&"H264"), "got {failed:?}");
         assert!(!failed.contains(&"packetization-mode=1"), "got {failed:?}");
     }

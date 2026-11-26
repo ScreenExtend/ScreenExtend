@@ -101,14 +101,12 @@ fn toggle_mute(dev: AudioObjectID) {
     }
 }
 
-/// Drains the actions the tap callback classified and performs the HAL round trips they need.
+/// Drains the actions the tap callback classified and does the HAL round trips they need.
 ///
-/// This exists so the callback does not. It is an *active* session-level event tap with
-/// `kCGEventTapOptionDefault`, so every keyboard and mouse event for the whole login session waits
-/// behind whatever it does — and what it used to do was two synchronous `AudioObject*` round trips
-/// to `coreaudiod`. When `coreaudiod` is busy (a hot-plug, a format change, another app
-/// enumerating devices) that overruns `kCGEventTapDisabledByTimeout` and macOS disables the tap,
-/// which is why the re-enable branch in `tap_callback` exists at all.
+/// The callback must not: it is an active session-level event tap, so every keyboard and mouse
+/// event in the login session waits behind it, and a synchronous `AudioObject*` call into a busy
+/// `coreaudiod` overruns `kCGEventTapDisabledByTimeout` and macOS disables the tap (hence the
+/// re-enable branch in `tap_callback`).
 fn action_worker(dev: AudioObjectID, rx: crossbeam_channel::Receiver<VolumeAction>) {
     while let Ok(action) = rx.recv() {
         match action {
@@ -173,9 +171,8 @@ extern "C-unwind" fn tap_callback(
             NX_KEYTYPE_MUTE => Some(VolumeAction::ToggleMute),
             _ => None,
         };
-        // try_send, never send: the whole point is that this callback cannot block. A full queue
-        // means the worker is behind on a burst of key repeats, and dropping one of those is
-        // invisible where stalling every input event in the session is not.
+        // try_send, never send: this callback cannot block. A full queue means the worker is
+        // behind on key repeats, and dropping one is invisible.
         if let Some(a) = action {
             let _ = ctx.tx.try_send(a);
         }
@@ -193,11 +190,9 @@ pub struct VolumeKeyTap {
 
 unsafe impl Send for VolumeKeyTap {}
 
-/// Queue depth for classified key presses.
-///
-/// A key repeat runs at roughly 30 Hz and each action is one pair of HAL round trips, so a handful
-/// of slots absorbs a burst; past that the presses are stale anyway and dropping them beats making
-/// the session's input path wait.
+/// Queue depth for classified key presses. A key repeat runs at roughly 30 Hz, so a handful of
+/// slots absorbs a burst; past that the presses are stale and dropping them beats stalling the
+/// session's input path.
 const ACTION_QUEUE_DEPTH: usize = 16;
 
 impl VolumeKeyTap {
@@ -314,28 +309,23 @@ struct Manager {
 }
 
 fn env_forced() -> bool {
-    std::env::var_os("SCREENEXTEND_LEGACY_VOLUME_TAP").is_some()
+    crate::envcfg::var_os("SCREENEXTEND_LEGACY_VOLUME_TAP").is_some()
 }
 
 fn desired() -> bool {
     ENABLED.load(Ordering::Relaxed) || env_forced()
 }
 
-/// A poisoned `STATE` must not take the volume keys down with it.
-///
-/// The guard is held across `VolumeKeyTap`'s `Drop`, which stops a run loop and joins two threads;
-/// a panic anywhere under it would otherwise turn every later `set_enabled`/`is_active` call into
-/// a panic of its own.
+/// A poisoned `STATE` must not take the volume keys down with it: the guard is held across
+/// `VolumeKeyTap`'s `Drop`, which stops a run loop and joins two threads.
 fn state() -> std::sync::MutexGuard<'static, Manager> {
     STATE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Bring the tap into line with `desired()`, starting or stopping it as needed.
 ///
-/// `VolumeKeyTap::start` blocks on a handshake with the tap thread, so it runs with no lock held;
-/// the guard is taken only to read the intent and again to install the result. Two concurrent
-/// callers can therefore both build a tap, and the loser's is dropped — cheaper than serialising
-/// every caller behind a thread handshake.
+/// `VolumeKeyTap::start` blocks on a handshake with the tap thread, so it runs with no lock
+/// held. Two concurrent callers can both build a tap, and the loser's is dropped.
 fn reconcile() {
     let (want, device) = {
         let m = state();

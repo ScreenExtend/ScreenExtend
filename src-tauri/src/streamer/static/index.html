@@ -105,7 +105,7 @@
         <div id="modal" role="dialog" aria-modal="true" style="z-index: 9999">
             <div class="card">
                 <h2>Switch to HTTPS: faster and more secure</h2>
-                <p>This page is on an insecure (HTTP) connection. Your browser only unlocks the low-latency video and audio paths on a secure one, so switching makes the screen faster as well as private. You will see a one-time warning about the self-signed certificate; that is expected — choose Advanced (or More Info), then continue to the site.</p>
+                <p>This page is on an insecure (HTTP) connection. Your browser only unlocks the low-latency video and audio paths on a secure one, so switching makes the screen faster as well as private. You will see a one-time warning about the self-signed certificate; that is expected. Choose Advanced (or More Info), then continue to the site.</p>
                 <div class="row">
                     <button id="goHttps">Switch to HTTPS</button>
                     <button id="dismiss">Stay on HTTP</button>
@@ -169,13 +169,9 @@
             const hasScriptTransform = ('RTCRtpReceiver' in window) && ('transform' in RTCRtpReceiver.prototype) && (typeof RTCRtpScriptTransform !== 'undefined');
             const hasLegacyEncodedStreams = ('RTCRtpReceiver' in window) && (typeof RTCRtpReceiver.prototype.createEncodedStreams === 'function');
             const canWebCodecs = (hasScriptTransform || hasLegacyEncodedStreams) && ('VideoDecoder' in window) && (typeof canvas.transferControlToOffscreen === 'function');
-            // RTCRtpScriptTransform is preferred wherever it exists, and Chrome 141+ has both
-            // it and the legacy createEncodedStreams. Only the standard one carries
-            // sendKeyFrameRequest(), and the transform runs *instead of* libwebrtc's
-            // reference finder, so a receiver without it can never ask for an IDR: a single
-            // lost keyframe froze the picture until a watchdog demoted the whole session to
-            // <video>. `forceLegacyTransform` is the escape hatch if the standard path turns
-            // out not to start on some build.
+            // Prefer RTCRtpScriptTransform (Chrome 141+ also has the legacy createEncodedStreams):
+            // a transform replaces libwebrtc's reference finder, and only this one can ask for an
+            // IDR over RTCP, by sendKeyFrameRequest(). `forceLegacyTransform` is the escape hatch.
             let forceLegacyTransform = false;
             function useScriptTransformNow() {
                 return hasScriptTransform && !forceLegacyTransform;
@@ -184,15 +180,12 @@
             let audioFast = audioCaps.webcodecsOpus && audioCaps.worklet;
 
             const DEBUG = /(?:[?&#])debug\b/.test(location.search + location.hash);
-            // Presentation tier override for the manual A/B in docs/manual-tests/client-page.md.
-            // `canvas` is the default and the floor; `track` routes decoded frames through a
-            // VideoTrackGenerator into the <video> element, which may or may not win a
-            // hardware overlay depending on the platform.
+            // Presentation tier override for a manual A/B. `canvas` is the default and the floor;
+            // `track` routes decoded frames through a VideoTrackGenerator into the <video> element,
+            // which may or may not win a hardware overlay.
             const PRESENT_PREF = (/(?:[?&#])present=(\w+)/.exec(location.search + location.hash) || [])[1] || 'canvas';
 
-            // Everything the page used to swallow in a bare `catch (_) { noteSuppressed(); }` — 63 of them —
-            // now lands here and rides the once-a-second stats frame to the host. A silent
-            // degradation is one nobody ever fixes.
+            // silent degradations are bits here, sent to the host in the once-a-second stats frame
             const DEG = {
                 FULLSCREEN_DENIED: 1 << 0,
                 POINTER_LOCK_DENIED: 1 << 1,
@@ -217,16 +210,11 @@
                 RVFC_UNAVAILABLE: 1 << 20,
                 KEYBOARD_LOCK_UNAVAILABLE: 1 << 21,
                 TRICKLE_ICE_UNAVAILABLE: 1 << 22,
-                // Set the first time a dialog on this page took the locks and the input
-                // forwarding away from the host so the user could reach it. Without it the
-                // host sees a device that stopped sending input and cannot tell a modal from
-                // a wedge.
+                // a dialog on this page took the locks and input forwarding; lets the host tell a
+                // modal from a wedged device
                 INPUT_SUSPENDED_FOR_MODAL: 1 << 23,
-                // The answer carried no join id and no cookie set one, so every later request
-                // this tab makes names no session: `/reconfig` reads zeros forever, `/leave`
-                // reaches nothing, and the host holds the display until the grace runs out.
-                // Only a proxy that strips both can produce it, which is exactly the kind of
-                // failure that is invisible without a bit.
+                // the answer carried no join id and no cookie set one (a proxy stripped both):
+                // later requests name no session, `/reconfig` reads zeros, `/leave` reaches nothing
                 JOIN_ID_MISSING: 1 << 24,
             };
             let degradeFlags = 0;
@@ -245,19 +233,141 @@
 
             let pc = null;
             let worker = null;
-            // The host clock offset is measured on the input channel and has to reach both
-            // workers; neither can measure it itself, and a worker's `performance` origin is
-            // its own creation, so only the absolute form crosses the boundary meaningfully.
+            // Measured on the input channel and relayed to both workers. A worker's `performance`
+            // origin is its own creation, so only the absolute form crosses the boundary.
             let hostClockOffsetMs = null;
             let watchdog = null;
-            // Latched by the worker's one 'rendered' message and cleared only by a teardown. The
-            // frame watchdog is armed from two connection-state handlers, and either can fire
-            // again after the first frame has been painted (ICE 'connected' then 'completed',
-            // the peer connection's own 'connected' landing after the worker's message, a
-            // transient disconnect that recovers). The worker says 'rendered' once per session,
-            // so nothing would ever clear a watchdog armed after it, and five seconds later a
-            // session that was painting was demoted to <video> on a second offer.
+            // Latched by the worker's one 'rendered' message, cleared only by a teardown. The
+            // connection-state handlers can fire again after the first paint, and a frame watchdog
+            // armed then would never be cleared and would demote a painting session to <video>.
             let webcodecsPainted = false;
+            // whether this session's transform has seen a frame
+            let framesArrived = false;
+            // the frame watchdog came due while the page was hidden; it restarts when shown
+            let frameWatchdogHeld = false;
+            let pageVisibilityHook = null;
+            // whether the frame watchdog has spent its one decoder restart
+            let decoderRestarted = false;
+            // A host that answered before its capture opened says so in every PONG until its first
+            // frame leaves; the no-picture timers (both watchdogs, <video> go-live) are held and
+            // restart in full after. Bounded here, past the host's budget. Inert without the bit.
+            const PICTURE_PENDING_LIMIT_MS = 45000;
+            let picturePending = false;
+            let pictureHeld = false;
+            let liveHeldForPicture = false;
+            let reconfigHeld = false;
+            let pictureTimer = null;
+            let rearmPictureWatchdogs = null;
+            // Whether the offer let the host answer before the picture is ready, and whether a PONG
+            // has spoken yet. The <video> path goes live at ICE connect, before the first PONG; if
+            // the host may have answered early it waits for that PONG (or LIVE_HOLD_MS).
+            let pendingAsked = false;
+            let hostStateSeen = false;
+            let liveHoldTimer = null;
+            const LIVE_HOLD_MS = 1500;
+            const PENDING_TEXT = 'Preparing the display\u2026';
+            const CONNECTING_TEXT = 'Connecting';
+            function setLoadingText(text) {
+                try {
+                    const p = loadingEl.querySelector('p');
+                    if (p) p.textContent = text;
+                } catch (_) { noteSuppressed(); }
+            }
+            function setPicturePending(on) {
+                // a painted frame settles it: a PONG sent before that frame left the host must not
+                // put a painting session back on the clock
+                if (on && webcodecsPainted) return;
+                if (on === picturePending) return;
+                picturePending = on;
+                if (on) {
+                    // a rebuild's deadline is a no-picture timer too
+                    if (reconfigWatchdog) { clearReconfigWatchdog(); reconfigHeld = true; }
+                    if (watchdog) { clearTimeout(watchdog); watchdog = null; pictureHeld = true; }
+                    if (transformWatchdog) { clearTimeout(transformWatchdog); transformWatchdog = null; pictureHeld = true; }
+                    if (!pictureTimer) {
+                        pictureTimer = setTimeout(function () {
+                            pictureTimer = null;
+                            if (!picturePending) return;
+                            // the <video> path's evidence of a picture: a decoded frame
+                            if (videoShowsFrames()) { setPicturePending(false); return; }
+                            linkLost("The host's screen did not become ready.");
+                        }, PICTURE_PENDING_LIMIT_MS);
+                    }
+                    setLoadingText(PENDING_TEXT);
+                    try {
+                        acquireWakeLock().then(function (ok) {
+                            // a request that resolves after the wait is over, with the page not
+                            // live, gives the lock straight back
+                            if (ok && !picturePending && !locked) releaseWakeLock();
+                        }, noteSuppressed);
+                    } catch (_) { noteSuppressed(); }
+                    // Only seeds the /reconfig poll (one fetch for the epoch): its probe runs once
+                    // the session is live, so an epoch seen before there is a picture cannot
+                    // rebuild a session that has none (a kick ends the link anyway).
+                    try { startReconfigPoll(); } catch (_) { noteSuppressed(); }
+                    return;
+                }
+                setLoadingText(CONNECTING_TEXT);
+                if (pictureTimer) { clearTimeout(pictureTimer); pictureTimer = null; }
+                if (reconfigHeld) {
+                    reconfigHeld = false;
+                    if (reconfiguring) armReconfigWatchdog();
+                }
+                if (pictureHeld) {
+                    pictureHeld = false;
+                    if (rearmPictureWatchdogs) rearmPictureWatchdogs();
+                }
+                if (liveHeldForPicture) {
+                    liveHeldForPicture = false;
+                    onStreamLive();
+                }
+            }
+            function videoShowsFrames() {
+                try {
+                    return !!(video && video.srcObject && video.videoWidth > 0);
+                } catch (_) { noteSuppressed(); return false; }
+            }
+            function clearPicturePending() {
+                // a rebuild whose deadline was held gets it back
+                if (reconfigHeld && reconfiguring) armReconfigWatchdog();
+                // a wait that ends before the stage went live gives the wake lock back
+                if (picturePending && !locked) { try { releaseWakeLock(); } catch (_) { noteSuppressed(); } }
+                picturePending = false;
+                pictureHeld = false;
+                liveHeldForPicture = false;
+                reconfigHeld = false;
+                hostStateSeen = false;
+                if (pictureTimer) { clearTimeout(pictureTimer); pictureTimer = null; }
+                if (liveHoldTimer) { clearTimeout(liveHoldTimer); liveHoldTimer = null; }
+                setLoadingText(CONNECTING_TEXT);
+            }
+            // a PONG has spoken (pending or not): releases a <video>-path go-live held for it
+            function noteHostStateSeen(pending) {
+                hostStateSeen = true;
+                setPicturePending(pending);
+                if (!picturePending && liveHeldForPicture) {
+                    liveHeldForPicture = false;
+                    if (liveHoldTimer) { clearTimeout(liveHoldTimer); liveHoldTimer = null; }
+                    onStreamLive();
+                }
+            }
+            // the <video> path's go-live at ICE connect
+            function liveOnConnect() {
+                if (picturePending || (pendingAsked && !hostStateSeen)) {
+                    liveHeldForPicture = true;
+                    if (!picturePending && !liveHoldTimer) {
+                        liveHoldTimer = setTimeout(function () {
+                            liveHoldTimer = null;
+                            if (liveHeldForPicture && !picturePending) {
+                                liveHeldForPicture = false;
+                                onStreamLive();
+                            }
+                        }, LIVE_HOLD_MS);
+                    }
+                    return;
+                }
+                onStreamLive();
+            }
             let statsPoll = null;
             let liveWatch = null;
             let lastRendered = -1;
@@ -265,21 +375,15 @@
             let renderStalls = 0;
             let usingFallback = false;
             let joinData = null;
-            // The host names each session at `POST /whep` and hands the name back in
-            // `X-Join-Id`. It belongs to this tab and to no other, so it lives in
-            // `sessionStorage`: `localStorage` is shared by every tab of an origin, which is
-            // precisely why two tabs used to be one session on the host. The device token
-            // stays in `localStorage` on purpose — that one *is* shared, because both tabs are
-            // the same device and share its settings.
+            // The host names each session at `POST /whep` and returns the name in `X-Join-Id`. It
+            // is this tab's alone, hence `sessionStorage` (`localStorage` is shared by every tab of
+            // an origin). The device token stays in `localStorage`: both tabs are the same device.
             var JOIN_ID_KEY = 'se.joinId';
             var currentJoinId = '';
 
-            // A per-page-load name for this tab's offers, sent with every `POST /whep`. The join id
-            // only exists once an answer has arrived, so a first join whose answer is lost has
-            // nothing to present when it offers again, and the host builds a second session and a
-            // second display beside the one it already answered. With this id the host can
-            // recognise the retry as the attempt already in flight (a session opened under the
-            // same id that has never connected). A host that does not read the field ignores it.
+            // Per-page-load name for this tab's offers, sent with every `POST /whep`. A first join
+            // whose answer is lost has no join id for its retry; by this id the host recognises the
+            // retry as the attempt in flight instead of building a second session and display.
             var attemptId = (function () {
                 var b = new Uint8Array(16);
                 try { window.crypto.getRandomValues(b); } catch (_) {
@@ -302,18 +406,15 @@
                 try { return sessionStorage.getItem(JOIN_ID_KEY) || ''; } catch (_) { noteSuppressed(); return ''; }
             }
 
-            // Every session-scoped request carries the id. A request without one names nothing
-            // and the host answers with nothing, which is the correct answer: it will not guess
-            // from the address, because addresses move under a live session and are handed on
-            // to the next device that asks for one.
+            // Every session-scoped request carries the id. Without one the host answers nothing: it
+            // will not guess from the address, which moves under a live session and is recycled.
             function withJoin(path) {
                 if (!currentJoinId) return path;
                 return path + (path.indexOf('?') < 0 ? '?' : '&') + 'join=' + encodeURIComponent(currentJoinId);
             }
 
-            // Release the session this tab holds, so the host takes its display down now rather
-            // than after the disconnect grace. `sendBeacon` because this also runs from
-            // `pagehide`, where a `fetch` is not guaranteed to leave.
+            // Releases this tab's session so the host takes its display down now, not after the
+            // disconnect grace. A beacon, because a `fetch` from `pagehide` may never leave.
             function releaseJoin(id) {
                 var join = id || currentJoinId;
                 if (!join) return;
@@ -321,9 +422,8 @@
                 if (join === currentJoinId) setJoinId('');
             }
 
-            // A tab that reloaded still has the previous session's id, and the host is holding
-            // that display against a rejoin that is never coming under that name. Letting it go
-            // here costs one beacon and saves the whole disconnect grace.
+            // A reloaded tab still has the previous session's id, and the host is holding that
+            // display for a rejoin that will never come: one beacon saves the whole grace.
             (function releaseStaleJoin() {
                 var stale = readStoredJoinId();
                 if (!stale) return;
@@ -372,7 +472,7 @@
             function enterDegraded() {
                 if (!isLive || kicked || reconfiguring) return;
                 degraded = true;
-                showLinkStatus(navigator.onLine === false ? 'Offline — waiting for your network' : 'Reconnecting…');
+                showLinkStatus(navigator.onLine === false ? 'Offline, waiting for your network' : 'Reconnecting…');
             }
 
             function evaluateLink() {
@@ -388,14 +488,9 @@
                 }
             }
 
-            // The link went away and the page is offering to reconnect. That is not a departure,
-            // so the join is kept: the host holds the display behind its disconnect grace, the
-            // dashboard row stays where it is, and pressing Connect continues the same session on
-            // the same display with the windows still on it. Beaconing `/leave` here is what made
-            // a settings change that took too long read as "device left, device joined" — a row
-            // that vanished and came back, two notifications, a second display and every window
-            // shuffled onto the primary monitor. Only a page that is actually going away
-            // (`pagehide`) or a session the host has ended (`kickDevice`) releases the join.
+            // A lost link is not a departure, so the join is kept: the host holds the display
+            // behind its disconnect grace and Connect continues the same session. Never beacon
+            // `/leave` here: only `pagehide` and a kick (`kickDevice`) release the join.
             function linkLost(msg) {
                 if (kicked) return;
                 restorePreJoinPage(msg, true);
@@ -403,6 +498,7 @@
 
             document.addEventListener('visibilitychange', () => {
                 if (document.visibilityState === 'visible') markAlive();
+                if (pageVisibilityHook) pageVisibilityHook();
             });
 
             window.SEHealth = {
@@ -414,9 +510,9 @@
                 },
             };
 
-            // A DOMException with an empty message — an AbortError from a cancelled
-            // setRemoteDescription, some InvalidStateErrors — used to reach showError as ''
-            // and leave the spinner up over a disabled Connect button with no text, forever.
+            // A DOMException can have an empty message (an AbortError from a cancelled
+            // setRemoteDescription, some InvalidStateErrors), and '' to showError would leave the
+            // spinner up over a disabled Connect button.
             function errorText(err) {
                 if (!err) return 'Connection failed.';
                 return (err.message && String(err.message)) || String(err) || 'Connection failed.';
@@ -426,18 +522,16 @@
                 errEl.classList.toggle('show', !!msg);
                 if (msg) restorePageChrome();
             }
-            // The page-level half of `restorePreJoinPage` (below): what the user sees and what
-            // the browser is holding for the stage. Safe to run twice and safe before anything
-            // was armed.
+            // The page-level half of `restorePreJoinPage`: what the user sees and what the browser
+            // holds for the stage. Safe to run twice, and before anything was armed.
             function restorePageChrome() {
-                // The session is over, so the frozen frame the rebuild was holding on to is
-                // no longer standing in for anything.
+                // the session is over: the frozen frame a rebuild was holding stands in for nothing
                 dropStaleCanvas();
                 lastOfferedSinkId = null;
                 stopLock();
                 isLive = false;
-                // `onStreamLive` hides the form 450 ms after it fades it out; a session that
-                // ended inside that window would otherwise have its error form hidden for it.
+                // `onStreamLive` hides the form 450 ms after fading it; a session that ends inside
+                // that window must not have its error form hidden
                 if (joinHideTimer) { clearTimeout(joinHideTimer); joinHideTimer = 0; }
                 loadingEl.classList.remove('show');
                 joinEl.style.display = '';
@@ -449,13 +543,12 @@
             function showVideo() {
                 video.style.display = 'block';
                 canvas.style.display = 'none';
-                // The picture now comes from the element, so a held-over canvas would sit on
-                // top of it showing the frame the session had before it demoted.
+                // a held-over canvas would sit on top of the element showing the pre-demotion frame
                 dropStaleCanvas();
             }
 
-            // The letterboxed picture rect that input coordinates are normalised against
-            // needs the intrinsic size, and on the <video> paths this is where it arrives.
+            // Input coordinates are normalised against the letterboxed picture rect, which needs
+            // the intrinsic size; on the <video> paths this is where it arrives.
             function relayVideoSize() {
                 if (!(video.videoWidth > 0)) return;
                 try { if (window.RemoteInput) RemoteInput.setPictureSize(video.videoWidth, video.videoHeight); } catch (_) { noteSuppressed(); }
@@ -463,13 +556,9 @@
             video.addEventListener('loadedmetadata', relayVideoSize);
             video.addEventListener('resize', relayVideoSize);
 
-            // A rebuild cannot reuse a canvas whose control has been transferred to a worker, so
-            // every WebCodecs (re)start has to replace the element — and replacing it outright
-            // blanked the stage for the whole rebuild. That is the black stage behind every
-            // host-initiated reconfigure (a scale or refresh change from the dashboard), every
-            // orientation flip and every demotion. So the old canvas is kept on screen, the
-            // replacement is inserted behind it, and the first frame the new session paints is
-            // what removes the old one.
+            // A canvas whose control went to a worker cannot be reused, so every WebCodecs
+            // (re)start replaces the element. The old one stays on screen with the replacement
+            // behind it until the new session paints, so a rebuild does not blank the stage.
             let staleCanvas = null;
             function dropStaleCanvas() {
                 const old = staleCanvas;
@@ -497,14 +586,9 @@
             let isLive = false;
             let joinHideTimer = 0;
 
-            // Input forwarding is armed late. input.js's data channels have to exist before the
-            // offer (they are part of it), and `RemoteInput.setup` switches its listeners on in
-            // the same call — including a capture-phase `keydown` on the window that calls
-            // `preventDefault()`. Armed at Connect, that swallowed every key on the join form for
-            // as long as the join took, and because a failed join never called
-            // `RemoteInput.teardown()`, for good: no Ctrl+C on the error, no typing a new OTP.
-            // So the listeners are held suspended (input.js's own modal gate) from `setup` until
-            // the stage is actually live, and a modal can only add to that, never lift it early.
+            // `RemoteInput.setup` must run before the offer (its data channels are in it), and its
+            // capture-phase `keydown` calls `preventDefault()`, swallowing every key on the join
+            // form. So input stays suspended until the stage is live; a modal can only add to that.
             let streamInputArmed = false;
             function syncInputGate() {
                 try {
@@ -512,37 +596,16 @@
                 } catch (_) { noteSuppressed(); }
             }
 
-            // Trickle ICE is kept for the speed, but its *outcome* is resolved before the
-            // streaming stage appears. The three ways it can fail — the answer named no
-            // resource, the verb was refused, nothing was ever acknowledged — all end in a
-            // rejoin with a gathered offer, and a rejoin behind a picture the user is already
-            // using is the one thing that must never happen. So the first rendered frame arms
-            // the transition and the sender's own "nothing more to send" performs it, which is
-            // `a=end-of-candidates` acknowledged on the happy path.
-            //
-            // The deadline is a net for a browser that emits neither a null candidate nor
-            // `iceGatheringState === 'complete'`, not a budget: it is well past any real
-            // gathering, including a TURN allocation, and it reports itself as bit 15.
-            //
-            // It is armed when the answer names the trickle resource, not when the offer is
-            // posted. Nothing the sender does can happen before that — it has no URL to PATCH —
-            // and neither can a frame, because the peer connection does not exist until the
-            // answer is set. So the window before the answer is one where the hold is holding
-            // nothing back and gathering is not what is being waited on. Armed at the offer, the
-            // deadline covered the WHEP round trip as well, and that round trip creates a virtual
-            // display: `DISPLAY_ATTACH_TIMEOUT` alone is 5 s and `DISPLAY_CORRELATION_LOCK`
-            // serialises it across joins, so a host that was merely slow reported a *gathering*
-            // failure for a join that then succeeded — and held the picture for 8 s to do it.
-            // `WHEP_TIMEOUT_MS` (10 s) is what bounds a host that never answers.
+            // Trickle ICE is settled before the stage appears: a failure means a rejoin with a
+            // gathered offer, which must never happen behind a live picture. The first frame arms
+            // the transition and the sender's "nothing more to send" performs it. The deadline is a
+            // net (bit 15) for a browser that never signals end of gathering, well past a real one.
             const ICE_SETTLE_DEADLINE_MS = 8000;
             let icePending = false;
             let liveHeld = false;
             let iceSettleTimer = 0;
-            // Latched for the life of one peer connection: once ICE has come up, a trickle
-            // failure must not rejoin, however the connection is doing afterwards. Without the
-            // latch a session that connected and later degraded could answer a refused PATCH
-            // with a rejoin behind the picture the user is watching, which is the one thing the
-            // hold exists to prevent.
+            // Latched for the life of one peer connection: once ICE has come up, a trickle failure
+            // must not rejoin, even if the connection later degrades.
             let iceEverConnected = false;
             function holdStageForIce() {
                 icePending = true;
@@ -571,8 +634,7 @@
             }
 
             function onStreamLive() {
-                // Frames are arriving, so nothing below is still waiting for one: both
-                // watchdogs stand down here even when the stage transition is held.
+                // frames are arriving: both watchdogs stand down even if the transition is held
                 if (watchdog) { clearTimeout(watchdog); watchdog = null; }
                 if (statsPoll) { clearInterval(statsPoll); statsPoll = null; }
                 clearReconfigWatchdog();
@@ -580,7 +642,7 @@
                 reconfiguring = false;
                 loadingEl.classList.remove('show');
                 dropStaleCanvas();
-                // The stream is live: from here the stage owns the keyboard and pointer.
+                // from here the stage owns the keyboard and pointer
                 streamInputArmed = true;
                 syncInputGate();
                 if (isLive) { startReconfigPoll(); return; }
@@ -589,24 +651,14 @@
                 joinEl.classList.add('hide');
                 if (joinHideTimer) clearTimeout(joinHideTimer);
                 joinHideTimer = setTimeout(() => { joinHideTimer = 0; joinEl.style.display = 'none'; }, 450);
-                // Everything that only matters to a live stage is armed here, at the first
-                // painted frame (or ICE `connected` on the <video> path), never at Connect: the
-                // wake lock, the `beforeunload` prompt, fullscreen, pointer and keyboard lock and
-                // their re-entry handlers. Fullscreen and pointer lock want a user gesture; they
-                // ride the Connect click's activation where it is still alive (Chrome keeps it
-                // ~5 s) and otherwise the next tap enters them (the gesture handler). Arming them
-                // at the click instead would hold the wake lock and the leave prompt over a join
-                // that may never produce a picture. `restorePreJoinPage` undoes all of it.
+                // Wake lock, `beforeunload` prompt, fullscreen and input locks are armed at the
+                // first painted frame (ICE `connected` on <video>), never at Connect: a join may
+                // never paint. Locks ride the click's activation (Chrome: ~5 s) or the next tap.
                 startLock();
                 startReconfigPoll();
-                // Keep refining in the background; it is applied by the next reconfigure
-                // rather than by forcing one.
-                // A *second* measurement, not the promise the join already consumed — that
-                // one has resolved and re-reading it can only ever hand back the number
-                // already in joinData, which made the refinement structurally inert.
-                // Sixty samples this time, and only now that the page is foregrounded and
-                // painting, so it is a better measurement than the one the join could
-                // wait for rather than the same one again.
+                // Refine the refresh rate in the background; the next reconfigure applies it. This
+                // must be a second measurement (the join's promise already resolved to the number
+                // in joinData): more samples, taken now that the page is foregrounded and painting.
                 getRefreshRate(REFRESH_REFINE_SAMPLES).then(
                     (r) => noteRefinedRefreshRate(clampRefresh(r)), noteSuppressed);
             }
@@ -653,40 +705,22 @@
                 armProbe();
             }
 
-            // The host's answer is a small set of fields and each one belongs to a class: the
-            // sink is audio-only, the kick epoch ends the session, and the reconfig epoch is the
-            // only thing that costs a renegotiation. Act on what moved — the poll runs about
-            // once a second and re-applying an unchanged value is work the class does not call
-            // for, which for the sink meant commanding the audio graph a speaker it was already
-            // playing on sixty times a minute.
+            // Each field belongs to a class: the sink is audio-only, the kick epoch ends the
+            // session, and only the reconfig epoch costs a renegotiation. Act only on what moved:
+            // the poll runs about once a second.
             function applyReconfig(j) {
                 if (typeof j.audioSink === 'string' && j.audioSink !== appliedSinkId) {
                     appliedSinkId = j.audioSink;
-                    // Applied silently, on whatever ids this device has. Where the labels were
-                    // never revealed the host's picker shows positional names and the routing
-                    // still works; that is what `degraded` bit 9 is for. Nothing here raises
-                    // anything over the live stage: the host operator choosing `CHOOSE_OUTPUT` is
-                    // remembered on this device and answered at its next join, before the stream.
-                    //
-                    // `false` is the engine refusing, not "not yet": a sink commanded before the
-                    // graph exists answers `null` and is applied when it does. A refusal is
-                    // *reported*, not offered: the audio stays where it is, the host learns the
-                    // sink actually in use from `/audio-outputs` (`current`) and `sinkTier`, and
-                    // the log says why. It used to arm the browser's chooser on the next tap,
-                    // which over a live stage dropped pointer lock, keyboard lock and fullscreen
-                    // for a request the person at this device never made.
-                    //
-                    // `audioSink` is in *every* `/reconfig` body, so this runs about once a
-                    // second; the report is latched on the id, once per sink the host asks for.
+                    // Applied silently: a chooser over the live stage would drop pointer lock,
+                    // keyboard lock and fullscreen. A refusal (`false`) is only reported: the host
+                    // reads the sink in use from `/audio-outputs` and `sinkTier`.
                     try {
-                        // "Choose a speaker on this device…" is queued for the next join; any
-                        // other value re-arms it for a later request.
                         if (window.SEAudio && SEAudio.noteOutputChoiceRequest) SEAudio.noteOutputChoiceRequest(j.audioSink);
                         if (window.SEAudio) {
                             Promise.resolve(SEAudio.setSpeaker(j.audioSink)).then(function (ok) {
+                                // `null` is no refusal: no graph yet, applied when one exists
                                 if (ok !== false) return;
-                                // The engine refused, so the value is not applied and must be
-                                // retried on the next poll rather than latched as done.
+                                // refused, so not applied: clear the latch so the next poll retries
                                 appliedSinkId = null;
                                 if (j.audioSink === lastOfferedSinkId) return;
                                 lastOfferedSinkId = j.audioSink;
@@ -695,9 +729,7 @@
                                 try { SEAudio.postOutputs(true); } catch (_) { noteSuppressed(); }
                             }, noteSuppressed);
                         } else {
-                            // There is no audio graph to command yet, so nothing was applied and
-                            // the latch must not claim otherwise — the host may never send this
-                            // value again.
+                            // nothing was applied, so the latch must not claim otherwise
                             appliedSinkId = null;
                         }
                     } catch (_) { appliedSinkId = null; noteSuppressed(); }
@@ -722,19 +754,15 @@
                 restorePreJoinPage(msg || 'You have been removed from this session.', false);
             }
 
-            // While `reconfiguring` is set, every recovery path on the page returns early —
-            // the probe tick, the link evaluation, the connection-state handler and the leave
-            // beacon. A rebuild that never completes therefore leaves the last decoded frame
-            // frozen with no spinner, no status and no reconnect, so it gets its own deadline.
+            // While `reconfiguring` is set every recovery path returns early (the probe tick, the
+            // link evaluation, the connection-state handler, the leave beacon), so a rebuild that
+            // never completes would freeze the last frame forever: it gets its own deadline.
             const RECONFIG_DEADLINE_MS = 15000;
             let reconfigWatchdog = null;
             function clearReconfigWatchdog() {
                 if (reconfigWatchdog) { clearTimeout(reconfigWatchdog); reconfigWatchdog = null; }
             }
-            function reconfigure() {
-                if (reconfiguring) return;
-                reconfiguring = true;
-                usingFallback = false;
+            function armReconfigWatchdog() {
                 clearReconfigWatchdog();
                 reconfigWatchdog = setTimeout(() => {
                     reconfigWatchdog = null;
@@ -742,8 +770,14 @@
                     reconfiguring = false;
                     linkLost('Disconnected, reconnect to continue.');
                 }, RECONFIG_DEADLINE_MS);
-                // The same session offering again: the host changes the display's mode under it
-                // and the last decoded frame stays on screen until the new one paints.
+            }
+            function reconfigure() {
+                if (reconfiguring) return;
+                reconfiguring = true;
+                usingFallback = false;
+                armReconfigWatchdog();
+                // the same session offering again: the host changes the display's mode under it,
+                // and the last decoded frame stays up until the new one paints
                 start(true, true);
             }
 
@@ -855,11 +889,9 @@
 
             const GESTURE_EVENTS = ['pointerdown', 'pointerup', 'mousedown', 'mouseup', 'click', 'touchstart', 'touchend', 'keydown', 'wheel'];
 
-            // Screen Wake Lock (Chrome 84, Firefox 126, Safari 16.4 partial / 18.4 full) is
-            // the real API; nosleep.js — which keeps the screen alive by looping a tiny
-            // video — is the floor beneath it. NoSleep is constructed lazily so a failed
-            // /nosleep.js fetch cannot take the rest of this script down with it, which a
-            // top-level `new NoSleep()` did.
+            // Screen Wake Lock (Chrome 84, Firefox 126, Safari 16.4 partial / 18.4 full) is the
+            // real API; nosleep.js, which loops a tiny video, is the floor beneath it. NoSleep is
+            // built lazily so a failed /nosleep.js fetch cannot take the rest of this script down.
             let noSleepImpl = null;
             let noSleepTried = false;
             function getNoSleep() {
@@ -868,8 +900,8 @@
                 try {
                     if (typeof NoSleep === 'function') {
                         noSleepImpl = new NoSleep();
-                        // The bundled build plays an *unmuted* looping clip; muting it also
-                        // relaxes the autoplay rules that would otherwise refuse it.
+                        // the bundled build plays an unmuted looping clip; muting it also relaxes
+                        // the autoplay rules that would otherwise refuse it
                         if (noSleepImpl.noSleepVideo) noSleepImpl.noSleepVideo.muted = true;
                     }
                 } catch (_) { noteSuppressed(); noSleepImpl = null; }
@@ -888,11 +920,9 @@
             let pageshowHandler = null;
             let locked = false;
 
-            // Only the unprefixed form is specified to return a Promise. Safari below 16.4
-            // returns undefined from webkitRequestFullscreen, so the `.catch()` at every
-            // call site threw a TypeError — and because startLock() is called un-awaited
-            // from onStreamLive(), that rejection silently skipped pointer lock, keyboard
-            // lock and the wake lock for the whole session.
+            // Only the unprefixed form is specified to return a Promise (Safari below 16.4 returns
+            // undefined from webkitRequestFullscreen), so normalise: a `.catch()` on undefined
+            // would throw and make startLock() skip pointer lock, keyboard lock and the wake lock.
             function enterFullscreen(el) {
                 let r;
                 try {
@@ -936,15 +966,13 @@
                     try { await navigator.keyboard.lock(); } catch (_) { noteSuppressed(); }
                 }
             }
-            // Raw, un-accelerated deltas where the platform has them (Chrome 88+ on
-            // Windows/macOS/ChromeOS, Safari 18.4, Firefox 152 — not Linux). Without it the
-            // client's OS applies its own pointer curve and the host applies another, so
-            // the two compound. The option form rejects where unsupported, and the whole
-            // call returns undefined instead of a Promise below Chrome 92 / Safari 18.4.
+            // Raw, un-accelerated deltas where the platform has them (Chrome 88+ on Windows, macOS
+            // and ChromeOS, Safari 18.4, Firefox 152; not Linux); otherwise the client's pointer
+            // curve and the host's compound. The option form rejects where unsupported, and the
+            // call returns undefined, not a Promise, below Chrome 92 / Safari 18.4.
             let pointerLockUnadjusted = false;
-            // input.js puts this on the wire as the MOUSE_DELTA flags byte, so the host
-            // knows whether the deltas have already been through an OS pointer curve.
-            // Every assignment goes through here rather than the variable.
+            // input.js sends this as the MOUSE_DELTA flags byte, so the host knows whether the
+            // deltas have been through an OS pointer curve. Never assign the variable directly.
             function setPointerLockUnadjusted(on) {
                 pointerLockUnadjusted = !!on;
                 try {
@@ -977,9 +1005,8 @@
                     let threw = false;
                     try { p = el.requestPointerLock({ unadjustedMovement: true }); } catch (_) { threw = true; }
                     if (threw) {
-                        // The options bag was rejected outright, so *no lock was requested at
-                        // all*. Without the plain retry, relative movement was dead for the
-                        // whole session and every mouse move went down the absolute path.
+                        // the options bag was rejected outright, so no lock was requested at all:
+                        // retry plain, or relative movement is dead for the whole session
                         noteSuppressed();
                         setPointerLockUnadjusted(false);
                         degrade(DEG.UNADJUSTED_MOVEMENT_UNAVAILABLE);
@@ -987,10 +1014,8 @@
                         return;
                     }
                     if (p && typeof p.then === 'function') {
-                        // Set on fulfilment, not on the mere fact that a Promise came back: an
-                        // engine that returns one and ignores unknown dictionary members
-                        // resolves normally, and reporting raw deltas we are not getting is
-                        // worse than reporting none.
+                        // set on fulfilment, not because a Promise came back: reporting raw deltas
+                        // that are not arriving is worse than reporting none
                         p.then(function () {
                             setPointerLockUnadjusted(true);
                             undegrade(DEG.UNADJUSTED_MOVEMENT_UNAVAILABLE);
@@ -1002,9 +1027,8 @@
                         return;
                     }
                     // No Promise came back. Chrome 88-110 honours unadjustedMovement and still
-                    // returns undefined, so this is genuinely unknown rather than unavailable —
-                    // but the bit is the only channel there is, and over-reporting raw deltas
-                    // is the more misleading of the two.
+                    // returns undefined, so this is unknown, not unavailable; over-reporting raw
+                    // deltas is the more misleading of the two.
                     degrade(DEG.UNADJUSTED_MOVEMENT_UNAVAILABLE);
                     setPointerLockUnadjusted(false);
                 } catch (_) { noteSuppressed(); degrade(DEG.POINTER_LOCK_DENIED); }
@@ -1042,7 +1066,7 @@
                 if (gestureHandler) return;
                 gestureHandler = () => {
                     if (!locked) return;
-                    // A dialog is up: the user is reaching for the page, not for the stage.
+                    // a dialog is up: the user is reaching for the page, not the stage
                     if (modalSuspend) return;
                     if (!fullscreenMode) {
                         if (!document.pointerLockElement) acquirePointerLock(stage);
@@ -1079,12 +1103,9 @@
                 try { noSleepImpl.disable(); } catch (_) { noteSuppressed(); }
             }
 
-            // Safari added `navigator.wakeLock` in 16.4 but a standalone home-screen app is the
-            // documented case where the request fulfils and the screen sleeps anyway. Probing
-            // for the constructor and stopping at "it resolved" therefore made the shim
-            // unreachable on exactly the devices the comment below names. There is nothing to
-            // feature-detect — the API reports success — so the shim runs *beneath* the wake
-            // lock there rather than only on refusal. It costs one muted looping clip.
+            // Safari has `navigator.wakeLock` from 16.4, but in a standalone home-screen app the
+            // request fulfils and the screen sleeps anyway. Nothing to feature-detect, so the shim
+            // runs beneath the wake lock there (one muted looping clip).
             function standaloneApp() {
                 try {
                     if (navigator.standalone === true) return true;
@@ -1093,10 +1114,8 @@
                 return false;
             }
 
-            // Tiered: the real Wake Lock API first, the looping-video shim where it is missing,
-            // refuses, or is known not to hold the screen. On iOS below 18.4 (and in a
-            // standalone home-screen app even at 18.4) the shim is still the only thing that
-            // works.
+            // Tiered: the Wake Lock API first, the looping-video shim where it is missing, refuses,
+            // or is known not to hold the screen (iOS below 18.4, a standalone app even at 18.4).
             function enableNoSleep() {
                 if (hasWakeLockApi) {
                     const alsoShim = standaloneApp();
@@ -1131,13 +1150,10 @@
                 visibilityHandler = async () => {
                     if (!locked || document.visibilityState !== 'visible') return;
                     enableNoSleep();
-                    // iOS suspends the context when the page is backgrounded and nothing
-                    // resumed it: the picture came back and the audio did not.
+                    // iOS suspends the AudioContext when the page is backgrounded; resume it
                     try { if (window.SEAudio) SEAudio.resume(); } catch (_) { noteSuppressed(); }
                     if (!fullscreenMode || modalSuspend) return;
-                    // Fullscreen first: navigator.keyboard.lock() is specified to reject
-                    // outside it, so asking on the way back from the background asked at the
-                    // one moment it could not succeed and the rejection was swallowed.
+                    // fullscreen first: navigator.keyboard.lock() is specified to reject outside it
                     if (!currentFullscreenEl()) { try { await enterFullscreen(fullscreenTarget()); } catch (_) { noteSuppressed(); } }
                     if (currentFullscreenEl()) await acquireKeyboardLock();
                 };
@@ -1215,19 +1231,9 @@
                 }
             }
 
-            // Anything this page puts in front of the user — a modal, a card, or the browser's
-            // own output picker — is unreachable while the session still owns the input. The
-            // pointer is locked to the stage, so the cursor the user is looking for does not
-            // exist; the keyboard is locked, so Esc and Tab go to the host; and every click
-            // lands on the host's desktop instead of on the button. The only way to answer a
-            // card was from devtools.
-            //
-            // So a dialog takes the input back first: leave fullscreen (a fullscreen element
-            // renders only its own subtree, so a sibling modal is invisible inside one), drop
-            // pointer lock, unlock the keyboard, and tell the host focus is gone so it releases
-            // any modifier it is holding down. The gesture handler stands down for the duration
-            // rather than re-taking all three on the very tap that dismisses the dialog; the
-            // next tap after that re-enters, which is the path Esc already takes.
+            // A dialog is unreachable while the session owns the input, so it first leaves
+            // fullscreen (a fullscreen element renders only its own subtree), drops the pointer and
+            // keyboard locks and tells the host focus is gone. The next tap after it re-enters.
             let modalDepth = 0;
             let modalSuspend = false;
             function exitPointerLockNow() {
@@ -1256,8 +1262,8 @@
                 try {
                     if (window.RemoteInput && RemoteInput.setSuspended) suspended = !!RemoteInput.setSuspended(true);
                 } catch (_) { noteSuppressed(); }
-                // Only a session that was actually forwarding input has anything to report; a
-                // card raised on the join form suspended nothing.
+                // only a session that was forwarding input has something to report; a card on the
+                // join form suspended nothing
                 if (suspended) degrade(DEG.INPUT_SUSPENDED_FOR_MODAL);
                 exitPointerLockNow();
                 try {
@@ -1270,18 +1276,13 @@
                 modalDepth--;
                 if (modalDepth > 0) return;
                 modalSuspend = false;
-                // Lifts input.js's gate only for a stream that is live; one still connecting
-                // stays suspended until `onStreamLive`.
+                // lifts input.js's gate only for a live stream; one still connecting stays
+                // suspended until `onStreamLive`
                 syncInputGate();
             }
-            // `beginModal()` only *starts* the release: a pointer-lock exit is delivered on
-            // `pointerlockchange` and a fullscreen exit on `fullscreenchange`, both in a later
-            // task, and `webkitExitFullscreen` returns nothing at all. A page modal is a sibling
-            // of `#stage`, so revealing it while the fullscreen element is still `#stage` shows
-            // the user nothing — which is the failure this whole mechanism exists to fix. So the
-            // dialog is revealed from the confirmation, under the same 1500 ms fallback the
-            // deleted `offerPermModalNow` carried: an exit that never lands must not strand the
-            // caller with an invisible dialog and the input still suspended.
+            // `beginModal()` only starts the release: the exits land in a later task. A page modal
+            // is a sibling of `#stage`, invisible while that is the fullscreen element, so it is
+            // revealed on the change event; the 1500 ms fallback covers an exit that never lands.
             const MODAL_RELEASE_MS = 1500;
             const MODAL_RELEASE_EVENTS = ['fullscreenchange', 'webkitfullscreenchange',
                 'mozfullscreenchange', 'MSFullscreenChange', 'pointerlockchange',
@@ -1305,12 +1306,9 @@
                 MODAL_RELEASE_EVENTS.forEach((ev) => document.addEventListener(ev, check));
                 timer = setTimeout(finish, MODAL_RELEASE_MS);
             }
-            // Wraps anything that puts UI in front of the user. `fn` is handed a `done` callback
-            // it must call exactly once; the counter tolerates being unbalanced only downwards.
-            // `immediate` is for UI the *browser* draws — the output picker — which is not a
-            // subtree of the page, so no fullscreen exit has to have landed for it to be
-            // visible, and which must run inside the gesture's transient activation rather than
-            // a task later.
+            // Wraps anything that puts UI in front of the user; `fn` must call `done` exactly once.
+            // `immediate` is for UI the browser draws (the output picker): it needs no fullscreen
+            // exit to be visible, and must run inside the gesture's transient activation.
             function withModal(fn, immediate) {
                 beginModal();
                 let closed = false;
@@ -1319,25 +1317,16 @@
                 if (immediate) body(); else whenInputReleased(body);
             }
 
-            // The sink id a refusal was last reported for, so a refused sink — carried by every
-            // `/reconfig` poll — is reported once rather than once a second.
+            // the sink id a refusal was last reported for: every `/reconfig` poll carries a refused
+            // sink, and it is reported once, not once a second
             let lastOfferedSinkId = null;
-            // The sink the audio graph is already playing on, so `/reconfig` can command it once
-            // per change rather than once per poll. Cleared whenever the graph goes, because the
-            // next one starts on the device's default and has to be told again.
+            // The sink the audio graph is playing on, so `/reconfig` commands it once per change,
+            // not per poll. Cleared with the graph: the next one starts on the default output.
             let appliedSinkId = null;
             let leaveSent = false;
-            // `pagehide` is the page going away, so whatever join this tab holds is released —
-            // whether or not the picture is up yet and whether or not a reconfigure is in flight.
-            // Gating it on `isLive && !reconfiguring` (as the old app did too) left a page closed
-            // during a rebuild, or between the answer and the first frame, holding its display
-            // until ICE failed and the grace ran out: about 45 s, during which the next join made
-            // a second one. A page that never got a join id has nothing to release.
-            //
-            // It is also the user's own "leave": the page has no cancel control, so closing,
-            // reloading or navigating away is the only way to abandon a join. The whole restore
-            // runs, not just the beacon: a page kept in the back/forward cache comes back on its
-            // join form holding no wake lock, no locks and no `beforeunload` prompt.
+            // `pagehide` releases the join unconditionally: gated on `isLive && !reconfiguring`, a
+            // page closed mid-rebuild leaves the host holding its display for about 45 s. The whole
+            // restore runs, so a page revived from the back/forward cache holds no locks or prompt.
             function sendLeave() {
                 if (leaveSent) return;
                 leaveSent = true;
@@ -1345,11 +1334,9 @@
             }
             window.addEventListener('pagehide', sendLeave);
 
-            // `/ice-config` answers with the servers *and* the host's own view of where this
-            // client is, which is the only reliable source for whether the session will be
-            // relayed. An older host sends no `locality` field; `unknown` is then the honest
-            // answer and the wait falls back to reading the server list, which is what this
-            // page did before the field existed.
+            // `/ice-config` answers with the servers and the host's view of where this client is,
+            // the only reliable source for whether the session will be relayed. An older host sends
+            // no `locality`: `unknown`, and the wait falls back to reading the server list.
             async function getIceConfig() {
                 try {
                     const r = await fetch('/ice-config');
@@ -1364,14 +1351,9 @@
                 return { iceServers: [], locality: 'unknown' };
             }
 
-            // `/net-config` is read by the HTTPS upsell and by the join, so it is fetched once
-            // and shared. Priming it at load is what keeps it off the join path: by the time
-            // Connect is pressed the answer is already here, and the trickle decision costs a
-            // property read rather than a round trip.
-            // Only a *successful* body is memoised. A page that raced the server coming up, or a
-            // single dropped request, would otherwise be pinned for its whole life to "no trickle
-            // and port 8443" — and this is primed at module scope, which is exactly the moment
-            // that race is most likely.
+            // `/net-config` is read by the HTTPS upsell and by the join: fetched once, primed at
+            // load to keep the round trip off the join path. Only a successful body is memoised, so
+            // one dropped request cannot pin the page to "no trickle and port 8443".
             let netConfigPromise = null;
             function getNetConfig() {
                 if (!netConfigPromise) {
@@ -1390,18 +1372,12 @@
                 }
                 return netConfigPromise;
             }
-            // Guarded because this is module scope: a browser with no `fetch` cannot reach any
-            // fast path on this page anyway, but a throw here would take the join form with it.
+            // guarded: this is module scope, and a throw here would take the join form with it
             if (typeof fetch === 'function') { try { getNetConfig(); } catch (_) { noteSuppressed(); } }
 
-            // Two first-use costs sat between Connect and the offer on a browser's first join:
-            // the first `enumerateDevices()` (1.3-2.4 s headless, measured; the join's output
-            // detection awaits an enumeration before the offer, and this makes it a warm one) and the
-            // first `new RTCPeerConnection()` (a 350-700 ms main-thread task while the WebRTC
-            // stack starts). Both are paid here, while the user is still reading the form, so
-            // the join finds them warm. Neither prompts: an enumeration without a grant only
-            // returns unlabelled devices, and a peer connection with no tracks and no offer
-            // gathers nothing.
+            // Pays two first-use costs while the user reads the form: `enumerateDevices()`
+            // (1.3-2.4 s headless) and `new RTCPeerConnection()` (a 350-700 ms main-thread task).
+            // Neither prompts: an ungranted list is unlabelled, and no offer means no gathering.
             function warmJoinPath() {
                 try {
                     const md = navigator.mediaDevices;
@@ -1417,12 +1393,9 @@
             setTimeout(warmJoinPath, 0);
 
             // A relay candidate is a full TURN ALLOCATE round trip behind the host candidates, so
-            // waiting for one is only right when nothing else can carry the session. The host
-            // serves TURN to same-subnet clients on purpose, as a backup — so "a TURN entry is in
-            // the list" is not the question. On a LAN the host candidate is what gets nominated,
-            // it arrives in milliseconds, and refusing to end the wait on it cost every join on a
-            // TURN-configured host the difference; a TURN server that is merely unreachable cost
-            // the whole 6 s deadline before the WHEP POST was even sent.
+            // wait for one only when nothing else can carry the session. A TURN entry in the list
+            // is not the test: the host serves TURN to same-subnet clients as a backup, and an
+            // unreachable server would cost the whole 6 s deadline before the WHEP POST.
             function relayNeeded(cfg) {
                 if (cfg.locality === 'same-network') return false;
                 if (cfg.locality === 'cross-network') return hasTurnServer(cfg.iceServers);
@@ -1436,20 +1409,14 @@
                     return arr.some((u) => typeof u === 'string' && /^turns?:/i.test(u));
                 });
             }
-            // WHEP is a single POST, so the offer has to carry every candidate we intend to
-            // use — there is no PATCH to trickle them in later. That does not mean waiting
-            // for gathering to *finish*: on a LAN the host candidates are the ones that will
-            // be nominated, they arrive in the first few milliseconds, and everything after
-            // them is a STUN round trip whose result the connection will never use. So the
-            // wait ends a short grace period after the last useful candidate rather than at
-            // the full deadline, and the deadline is only reached when nothing arrived.
+            // Without trickle the offer must carry every candidate the session will use, but not
+            // wait for gathering to finish: on a LAN the host candidates arrive in milliseconds and
+            // are the ones nominated. The wait ends a short grace after the last useful candidate.
             const ICE_HOST_GRACE_MS = 200;
             const ICE_RELAY_GRACE_MS = 400;
-            // Split out so it can be asserted without a browser — scripts/test-client-ice.mjs
-            // extracts these three from this file and drives them directly. The gating is the
-            // whole correctness of a TURN join: on a relayed session a host candidate must not
-            // end the wait, because the relay allocation is a full round trip behind it and
-            // WHEP has no PATCH to trickle it in afterwards.
+            // scripts/test-client-ice.mjs extracts these three functions from this file and drives
+            // them directly. On a relayed session a host candidate must not end the wait: the relay
+            // allocation is a full round trip behind it.
             function iceCandidateType(c) {
                 if (!c) return '';
                 if (c.type) return c.type;
@@ -1494,23 +1461,15 @@
                 });
             }
 
-            // Trickle ICE, RFC 9725 §4.6. The wait above is the whole reason a relayed join is
-            // slow: the offer is a single POST, so every candidate the session will ever use has
-            // to be in it, and a TURN allocation is a full round trip. A host that answers with a
-            // `Location` takes the rest by PATCH, so the offer can leave the moment it exists.
-            //
-            // Both halves are probed and neither is assumed. `/net-config`'s `trickleIce` decides
-            // whether to skip the wait; the `Location` header on the answer decides whether
-            // anything is actually sent. A host without either keeps the gather-then-post shape
-            // byte for byte, which is what every shipped host does.
+            // Trickle ICE, RFC 9725 section 4.6: a host that answers with a `Location` takes the
+            // rest of the candidates by PATCH, so the offer leaves at once. Both halves are probed:
+            // `/net-config`'s `trickleIce` skips the wait, the `Location` header gates the sending.
             const TRICKLE_MAX_BATCH = 24;
-            // How long the first PATCH has to be acknowledged. A verb a proxy rejects outright
-            // answers inside two round trips and the status says so; one that is black-holed
-            // never answers at all, and this is the only thing that notices.
+            // How long the first PATCH has to be acknowledged. A proxy that rejects the verb
+            // answers with a status; one that black-holes it never answers, and only this notices.
             const TRICKLE_FIRST_ACK_MS = 2000;
-            // Statuses that mean this verb will never work here, however many times it is tried:
-            // a proxy that does not route PATCH, a WAF that rejects the media type, a gateway
-            // that forbids it. 404 is not one of them — that is the session being over.
+            // Statuses that mean the verb will never work here (a proxy that does not route PATCH,
+            // a WAF that rejects the media type). Not 404, which is the session being over.
             function trickleIsFatal(status) {
                 return status === 403 || status === 405 || status === 415 || status === 501;
             }
@@ -1525,10 +1484,9 @@
                 } catch (_) { noteSuppressed(); return ''; }
             }
 
-            // An `application/trickle-ice-sdpfrag` body: a partial SDP, no library needed. One
-            // `m=` section for the batch — the page is `max-bundle`, so every candidate belongs
-            // to the first media section — and the mid beside it, which is what the host prefers
-            // over the m-line index it counts.
+            // An `application/trickle-ice-sdpfrag` body. One `m=` section per batch (the page is
+            // `max-bundle`, so every candidate belongs to the first media section) plus its mid,
+            // which the host prefers over the m-line index.
             function trickleFragment(ufrag, cands, end) {
                 let body = '';
                 if (ufrag) body += 'a=ice-ufrag:' + ufrag + '\r\n';
@@ -1545,9 +1503,8 @@
                 return body;
             }
 
-            // Buffers from the moment the offer exists, because gathering starts there and the
-            // resource URL only arrives with the answer: a candidate produced in between is one
-            // the host would otherwise never see.
+            // Buffers from the moment the offer exists: gathering starts there, but the resource
+            // URL only arrives with the answer.
             function startTrickle(peer, onDead, onSettled) {
                 const queue = [];
                 let url = null;
@@ -1570,15 +1527,10 @@
                     flush();
                 }
 
-                // The end of gathering has two signals and the page must accept either. Waiting
-                // only for the null candidate made the whole sender depend on one event: a
-                // browser that reports completion through the state alone, or one whose null
-                // candidate landed in the task before this listener was attached, never sets
-                // `ended`, never sends `a=end-of-candidates`, and therefore never settles — and
-                // the page then holds the streaming stage for the full deadline and reports a
-                // gathering timeout on a session that gathered perfectly well. Measured on
-                // Chrome 141/Windows: `icegatheringstatechange` to `complete` is dispatched
-                // *before* the null candidate, so this is also the earlier of the two.
+                // Either end-of-gathering signal must be accepted: a browser that reports
+                // completion through the state alone, or whose null candidate landed before the
+                // listener was attached, would never send `a=end-of-candidates` and never settle.
+                // On Chrome 141/Windows the state reaches `complete` before the null candidate.
                 function onGathering() {
                     if (closed) return;
                     if (peer.iceGatheringState !== 'complete') return;
@@ -1595,11 +1547,9 @@
                     try { peer.removeEventListener('icegatheringstatechange', onGathering); } catch (_) { noteSuppressed(); }
                 }
 
-                // "This sender will send nothing more", whichever way it got there: the final
-                // batch carrying `a=end-of-candidates` was acknowledged, the session is gone, or
-                // the verb is refused. The page holds the streaming stage back until this fires,
-                // so that a rejoin with a gathered offer can only ever happen *before* there is
-                // a picture — never behind one the user is already using.
+                // "This sender will send nothing more": the final batch was acknowledged, the
+                // session is gone, or the verb is refused. The page holds the stage until this
+                // fires, so a rejoin with a gathered offer can only precede the picture.
                 function settle() {
                     if (settled) return;
                     settled = true;
@@ -1608,11 +1558,9 @@
 
                 function stop() { quiesce(); settle(); }
 
-                // Nothing this sender carries ever reached the host, and the offer that was
-                // posted carries no candidates either — so the session cannot connect and the
-                // page has to be told, once. Everything else about the sender stops here too:
-                // there is no third thing to try. `onDead` runs before the settle so a rejoin
-                // replaces the gate rather than racing it.
+                // Nothing reached the host and the posted offer carries no candidates, so the
+                // session cannot connect: tell the page, once. `onDead` runs before the settle so a
+                // rejoin replaces the gate rather than racing it.
                 function dead(reason) {
                     if (deadCalled) return;
                     deadCalled = true;
@@ -1623,11 +1571,9 @@
 
                 function flush() {
                     if (closed || !url || flushing) return;
-                    // A candidate the offer already carried would be added a second time and
-                    // the host has no way to tell the copy apart, so it would build a duplicate
-                    // pair for it. Filtered across the whole queue rather than off its head:
-                    // that the duplicates all precede the fresh ones is a property of how the
-                    // browser fills `localDescription`, not of anything here.
+                    // A candidate the offer already carried would be added twice and the host would
+                    // build a duplicate pair for it. Filter the whole queue, not just its head:
+                    // that duplicates come first is the browser's doing, not a guarantee.
                     const batch = [];
                     while (queue.length && batch.length < TRICKLE_MAX_BATCH) {
                         const c = queue.shift();
@@ -1637,11 +1583,9 @@
                     if (!batch.length && !done) return;
                     const ufrag = (batch.length && batch[0].usernameFragment) || localIceUfrag(peer);
                     let requeued = false;
-                    // One retry, then give up on the batch. A candidate lost to a transient
-                    // failure can be the relay one, and PATCH is the only way it ever reaches the
-                    // host — but a second failure in a row is the endpoint, not the packet, and
-                    // an endpoint that refuses this verb refuses every batch, which is why giving
-                    // up is `dead()` and not a silent drop.
+                    // One retry, since a candidate lost to a transient failure can be the relay
+                    // one. A second failure in a row is the endpoint, which refuses every batch, so
+                    // giving up is `dead()` and not a silent drop.
                     function requeue(reason) {
                         noteSuppressed();
                         if (failStreak++ > 0) { dead(reason); return; }
@@ -1650,9 +1594,8 @@
                     }
                     flushing = true;
                     attempts++;
-                    // The device token is the second factor on the resource. It used to be the
-                    // peer's address, which a roam or a lease renewal changed under a live
-                    // session — so a client that had done nothing wrong lost trickle mid-join.
+                    // the device token is the second factor on the resource; an address would
+                    // change under a roam or a lease renewal
                     const patchHeaders = { 'Content-Type': 'application/trickle-ice-sdpfrag' };
                     const patchToken = readDeviceToken();
                     if (patchToken) patchHeaders['X-Device-Token'] = patchToken;
@@ -1661,8 +1604,7 @@
                         headers: patchHeaders,
                         body: trickleFragment(ufrag, batch, done),
                     }).then(function (r) {
-                        // 404 is the session being over, not a transport failure: there is
-                        // nothing left to send it to, and nothing a rejoin would fix.
+                        // 404 is the session being over: nothing a rejoin would fix
                         if (r.status === 404) { stop(); return; }
                         if (trickleIsFatal(r.status)) { dead('PATCH ' + r.status); return; }
                         if (r.ok) {
@@ -1683,18 +1625,16 @@
 
                 peer.addEventListener('icecandidate', onCandidate);
                 peer.addEventListener('icegatheringstatechange', onGathering);
-                // Gathering can already be over by the time this runs — the sender is built one
-                // task after `setLocalDescription` resolves — and a state that is already
-                // `complete` fires no further event.
+                // gathering can already be over (the sender is built one task after
+                // `setLocalDescription` resolves), and a state already `complete` fires no event
                 onGathering();
                 return {
-                    // `offerSdp` is the offer as it went out, not `localDescription` as it reads
-                    // later — that one keeps growing as candidates are gathered.
+                    // `offerSdp` is the offer as it went out; `localDescription` keeps growing as
+                    // candidates are gathered
                     open: function (resourceUrl, offerSdp) {
                         url = resourceUrl;
                         posted = offerSdp || '';
-                        // A PATCH that is answered with a status can be acted on; one that is
-                        // black-holed never settles, and then nothing above ever runs again.
+                        // a black-holed PATCH never settles, so nothing above would ever run again
                         ackTimer = setTimeout(function () {
                             ackTimer = 0;
                             if (closed || sentCount > 0 || attempts === 0) return;
@@ -1717,36 +1657,27 @@
                 }
             }
 
-            // Bumped by every teardown, checked by start() after each of its awaits. start()
-            // reads and writes pc, worker and usingFallback across seven suspension points and
-            // both watchdogs can tear the session down inside one of them; without a token the
-            // resumed call would POST a second /whep for the same device and hand the fresh
-            // connection the previous one's answer.
+            // Bumped by every teardown and checked by start() after each of its awaits: a watchdog
+            // can tear the session down inside one, and a stale resume would POST a second /whep
+            // and hand the fresh connection the previous one's answer.
             let startGen = 0;
 
-            // `keepJoin` is the difference between renegotiating and leaving.
-            //
-            // Every rejoin on this page — a reconfigure, a demotion to <video>, the legacy
-            // transform, a trickle latch — goes through here and calls `start()` again. Those
-            // are the *same* session continuing: the page offers again, presents the join id it
-            // already holds, and the host keeps the session and the virtual display it created.
-            // Releasing it instead is what made a settings change look like a disconnect — the
-            // host removed the display, the dashboard raised "device left" and then "device
-            // joined", and every window the user had on that display was shuffled back onto the
-            // primary monitor before a brand-new display appeared.
-            //
-            // Without `keepJoin` this is a departure: the host takes the display down now rather
-            // than after the disconnect grace. Only two things want that — the page going away
-            // (`pagehide`) and a session the host has already ended (`kickDevice`). A lost link
-            // is not one of them: the page is still open and still offering to reconnect, and the
-            // grace is precisely the mechanism for that.
+            // `keepJoin` separates renegotiating from leaving. Every rejoin (reconfigure, demotion
+            // to <video>, legacy transform, trickle latch) is the same session continuing on its
+            // join id, so the host keeps the display. Without it: `pagehide` and a kick only.
             function teardownSession(keepJoin) {
                 startGen++;
                 webcodecsPainted = false;
+                framesArrived = false;
+                frameWatchdogHeld = false;
+                pageVisibilityHook = null;
+                decoderRestarted = false;
                 if (!keepJoin) releaseJoin();
                 releaseIceHold();
                 iceEverConnected = false;
                 streamInputArmed = false;
+                // before the input teardown, whose host-state reset must find nothing to release
+                clearPicturePending();
                 try { if (window.RemoteInput) RemoteInput.teardown(); } catch (_) { noteSuppressed(); }
                 if (transformWatchdog) { clearTimeout(transformWatchdog); transformWatchdog = null; }
                 if (watchdog) { clearTimeout(watchdog); watchdog = null; }
@@ -1764,46 +1695,10 @@
                 pc = null;
             }
 
-            // The one way a session ends: a join that failed for good (a refused or unanswered
-            // `/whep` after its retry, a renegotiation that cannot complete), a lost link, a
-            // kick, and the page going away all come here, so whatever the join armed is given
-            // back in one place and the page is left exactly as it was before Connect, plus the
-            // error. Everything the join path arms, where, and what undoes it:
-            //
-            //   armed                                            when                 undone by
-            //   peer connection, transceivers, ICE handlers       start(), pre-offer   teardownSession
-            //   input.js: 3 data channels; window keydown/keyup   start() (channels    teardownSession
-            //     capture with preventDefault (blocked typing      are in the offer);   (RemoteInput.
-            //     and Ctrl+C), copy/cut/paste forwarding, stage    listeners held        teardown)
-            //     pointer/touch/wheel/contextmenu/drag handlers,   suspended until
-            //     blur/focus/visibility/pointerlockchange,         onStreamLive
-            //     #imeSink focus, PING/STATS 1 s interval          (channel open)
-            //   transform worker + canvas transfer, videostats    start() / ontrack    teardownSession
-            //     1 s poll, liveWatch 2 s, DEBUG statsPoll, rVFC
-            //   transform 2.5 s + frame 5 s watchdogs             ICE connected        teardownSession
-            //   trickle sender + 2 s ack timer, ICE settle 8 s    offer / answer       teardownSession
-            //   WHEP 10 s abort timer                             the POST             its finally
-            //   /reconfig probe (1 s / 300 ms)                    onStreamLive         teardownSession
-            //   reconfig 15 s deadline                            reconfigure()        here
-            //   <video> srcObject, "Tap to start playback"        ontrack / tryPlay    here
-            //   link-status pill, stale canvas                    degraded / rebuild   here / chrome
-            //   SEAudio per connection: decoder worker,           ontrack/datachannel  teardownSession
-            //     DataChannel, fallback <audio>                                         (SEAudio.teardown)
-            //   SEAudio per session: AudioContext running,        Connect click /      SEAudio.endSession
-            //     device watch (devicechange + poll + POSTs),     discovery / host
-            //     earpiece microphone hold, chooser's pending     command
-            //     sink, speaker identity
-            //   join form faded + hidden (450 ms timer), stage    onStreamLive         restorePageChrome
-            //   startLock: wake lock + NoSleep clip, fullscreen,  onStreamLive         restorePageChrome
-            //     pointer lock, keyboard lock, gesture re-entry,                       (stopLock)
-            //     visibilitychange/pageshow re-arm, beforeunload
-            //     prompt, viewport sizing, inline cursor/select
-            //   Connect disabled + "Connecting" spinner           submit               restorePageChrome
-            //
-            // Not undone here, on purpose: modals (they are raised before the offer only and end
-            // by their own buttons), the join id when `keepJoin` (the host's disconnect grace is
-            // what lets the next Connect continue on the same display), the device token, and the
-            // load-time warm-up and `/net-config` cache, which belong to the page, not a session.
+            // The one way a session ends (failed join, lost link, kick, page going away), so all
+            // the join armed is given back here: per-connection state in `teardownSession`,
+            // per-session audio in `SEAudio.endSession`, locks and form in `restorePageChrome`.
+            // Kept: the join id when `keepJoin`, the device token, modals, the load-time priming.
             function restorePreJoinPage(msg, keepJoin) {
                 teardownSession(keepJoin);
                 reconfiguring = false;
@@ -1822,9 +1717,8 @@
             let transformStarted = false;
             let transformWatchdog = null;
 
-            // One step down, not all the way: losing RTCRtpScriptTransform costs the
-            // keyframe request, losing WebCodecs entirely costs the whole jitter buffer
-            // (~90 ms) as well.
+            // One step down, not all the way: losing RTCRtpScriptTransform costs the keyframe
+            // request, losing WebCodecs entirely costs the jitter buffer (~90 ms) as well.
             function retryWithLegacyTransform(reason) {
                 if (forceLegacyTransform || !hasLegacyEncodedStreams) {
                     fallbackToVideo(reason);
@@ -1836,34 +1730,24 @@
                 start(true, true);
             }
 
-            // Trickle was advertised and then did not work: the resource was missing, the verb
-            // was refused, or nothing was ever acknowledged. The offer that went out carries no
-            // candidates, so unless ICE has already come up there is nothing to salvage — latch
-            // trickle off for the page and join again with a gathered offer. `trickleOff` is
-            // never cleared, so this happens at most once per page load and a manual reconnect
-            // does not repeat it.
+            // Trickle was advertised and did not work. The offer that went out carries no
+            // candidates, so unless ICE has already come up, latch trickle off and join again with
+            // a gathered offer. `trickleOff` is never cleared: at most once per page load.
             function trickleFailed(reason, preferWebCodecs) {
                 if (trickleOff) return;
                 trickleOff = true;
                 degrade(DEG.TRICKLE_ICE_UNAVAILABLE);
                 console.warn('[ice] trickled candidates are not reaching the host (' + reason + ')');
-                // Enough candidates got through before this to nominate a pair, so tearing the
-                // session down would cost more than the latch is worth and the latch is all the
-                // next join needs. The test is the *current* peer connection, not `isLive`: a
-                // reconfigure keeps the old picture on screen while the new connection is still
-                // negotiating, and that one does need the rejoin.
+                // If a pair was already nominated the latch is all the next join needs. Test the
+                // current peer connection, not `isLive`: a reconfigure keeps the old picture up
+                // while the new connection is still negotiating, and that one needs the rejoin.
                 const connected = iceEverConnected || (!!pc && (pc.connectionState === 'connected'
                     || pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed'));
                 if (connected) return;
                 console.warn('[ice] rejoining with a gathered offer');
-                // No `/leave` and no `DELETE` first, deliberately: `start_session` stops the
-                // previous capture for this client before it starts a new one, so a replacement
-                // join is the host's own designed path, and signalling a leave would set the
-                // teardown running *concurrently* with the display the rejoin is creating. The
-                // two sibling rungs — `fallbackToVideo` and `retryWithLegacyTransform` — rejoin
-                // the same way for the same reason. All three present the join id they already
-                // hold, so the host reuses the session and its display rather than building a
-                // second one beside it.
+                // No `/leave` or `DELETE` first, deliberately: the host stops the previous capture
+                // itself, and a leave would run its teardown concurrently with the display the
+                // rejoin is creating. The join id it presents makes the host reuse the session.
                 start(preferWebCodecs, true);
             }
 
@@ -1875,15 +1759,10 @@
                 start(false, true);
             }
 
-            // Presentation tier 2: decoded frames written into a track generator and played
-            // by the <video> element, which on some platforms lets the compositor take a
-            // hardware overlay instead of a texture upload. Opt-in (`?present=track`) — no
-            // public measurement says the overlay actually happens, and the constructor
-            // exists on Chrome (legacy name) and Safari 18 (new name) but nowhere else.
-            // Runs from inside the worker's onmessage, where a throw is swallowed by the
-            // event loop and leaves the page with no video sink at all: no canvas, no
-            // generator, and a <video> nothing writes to. transferControlToOffscreen can
-            // throw — every other call of it is inside a try for exactly that reason.
+            // Presentation tier 2 (`?present=track`, opt-in): a track generator feeds the <video>
+            // element, which may win a hardware overlay; only Chrome (legacy name) and Safari 18
+            // (new name) have the constructor. This fallback runs inside the worker's onmessage,
+            // where a throw is swallowed, and transferControlToOffscreen can throw.
             function useCanvasInstead() {
                 try {
                     if (worker) {
@@ -1911,16 +1790,14 @@
                 } catch (err) {
                     noteSuppressed();
                     console.warn('[webcodecs] track generator attach failed:', err);
-                    // Without the canvas transfer the worker has no sink at all: it kept
-                    // writing into a generator attached to nothing and the page showed black.
+                    // without the canvas transfer the worker has no sink at all: a black page
                     useCanvasInstead();
                 }
             }
 
             async function handleRenderCount(n) {
-                // pc.getStats() is a suspension point, and both watchdogs tear the session down
-                // and rebuild it from inside one. Without this the resumed call demotes the
-                // *new* session on the old one's stall count.
+                // getStats() suspends and a watchdog can rebuild the session meanwhile; the token
+                // stops the resumed call demoting the new session on the old stall count
                 const gen = startGen;
                 let bytes = -1;
                 try {
@@ -1943,13 +1820,9 @@
                 if (rendersAdvanced) { renderStalls = 0; return; }
                 if (bytesAdvanced) {
                     renderStalls++;
-                    // Ask for a keyframe first — that is what a stall usually needs, and
-                    // until this page could ask, the only remedy was to throw the whole
-                    // fast path away and take the jitter buffer back.
-                    // Nothing below reads the reply — the keyTier two lines down comes
-                    // from the once-a-second `videostats` message — so this only ever
-                    // fed a console.log, once every two seconds, for the whole of a
-                    // stall, on a page whose other diagnostics are behind ?debug.
+                    // Ask for a keyframe first: that is what a stall usually needs. The `stats`
+                    // post only feeds a console.log, hence DEBUG; keyTier below comes from the
+                    // once-a-second `videostats` message.
                     if (DEBUG && worker) worker.postMessage({ type: 'stats' });
                     let asked = false;
                     try { asked = !!(window.RemoteInput && RemoteInput.requestKeyframe && RemoteInput.requestKeyframe()); } catch (_) { noteSuppressed(); }
@@ -1981,27 +1854,18 @@
                 return null;
             }
 
-            // ---------------------------------------------------------------------
-            // Client-side telemetry.
-            //
-            // The host can see its own pipeline as far as the socket and no further. Which
-            // path this device actually ended up on — hardware decode into a canvas, or the
-            // <video> element because WebCodecs was missing; a SharedArrayBuffer audio ring or
-            // the postMessage fallback — is only knowable here, and every one of those is a
-            // silent degradation the host would otherwise never learn about. `SEVideo.getStats`
-            // is the read side; input.js ships the same numbers to the host once a second.
+            // Client-side telemetry: which path this device ended up on (canvas or <video>, shared
+            // ring or postMessage) is only knowable here. `SEVideo.getStats` is the read side;
+            // input.js ships the same numbers to the host once a second.
             const VIDEO_PATH = { none: 0, webcodecsCanvas: 1, webcodecsVideo: 2, videoElement: 3 };
-            // 4 is appended rather than folded into 2: 2 has always meant "the page relays
-            // every packet", and a host reading it must go on meaning that. The
-            // MessagePort transport is a different, faster thing and gets its own code.
+            // 4 is appended, not folded into 2: to a host, 2 means "the page relays every packet",
+            // and the MessagePort transport is a different, faster thing.
             const AUDIO_PATH = { none: 0, workletSab: 1, workletPost: 2, opusTrack: 3, workletPort: 4 };
 
             let videoWorkerStats = null;
             const fallbackStats = {
-                // The <video> path has no per-frame hooks except requestVideoFrameCallback,
-                // which reports the RTP timestamp on the browsers that implement it. Where it
-                // is missing this path reports frame counts only, and that gap is itself
-                // visible on the host as an absent percentile.
+                // the <video> path's only per-frame hook is requestVideoFrameCallback, which
+                // reports the RTP timestamp; without it this path reports frame counts only
                 samples: [],
                 painted: 0,
                 rvfcSupported: false,
@@ -2025,6 +1889,8 @@
                 fallbackStats.rvfcSupported = true;
                 const step = function (_now, meta) {
                     fallbackStats.painted++;
+                    // a painted frame settles a pending picture, as 'rendered' does on WebCodecs
+                    if (picturePending) setPicturePending(false);
                     if (video.videoWidth > 0) {
                         try { if (window.RemoteInput) RemoteInput.setPictureSize(video.videoWidth, video.videoHeight); } catch (_) { noteSuppressed(); }
                     }
@@ -2033,9 +1899,8 @@
                         const paintMs = TIME_ORIGIN_MS +
                             (typeof meta.expectedDisplayTime === 'number' ? meta.expectedDisplayTime : performance.now());
                         const lag = paintMs - (hostMs - hostClockOffsetMs);
-                        // The RTP timestamp is 32 bits and wraps every ~13 h; a sample that
-                        // lands on the far side of a wrap is nonsense, so drop the impossible
-                        // ones rather than poison the window.
+                        // the RTP timestamp is 32 bits and wraps every ~13 h: drop the impossible
+                        // samples rather than poison the window
                         if (lag >= 0 && lag < 10000) {
                             fallbackStats.samples.push(lag);
                             if (fallbackStats.samples.length > FALLBACK_WINDOW) fallbackStats.samples.shift();
@@ -2073,13 +1938,12 @@
                 return AUDIO_PATH.workletPost;
             }
 
-            // One definition, so the flag the host is told cannot disagree with the branch the
-            // page took: the other one omitted mozFullScreenElement.
+            // one definition, so the flag sent to the host cannot disagree with the branch taken
             function isFullscreen() {
                 return !!currentFullscreenEl();
             }
 
-            // Tier codes, mirrored in docs/TELEMETRY.md and in transform-worker.js.
+            // tier codes, mirrored in transform-worker.js
             const TRANSPORT_TIER = { none: 0, scriptTransform: 1, encodedStreams: 2 };
             const RENDER_TIER = { none: 0, canvas2d: 1, trackGenerator: 2, videoElement: 3 };
 
@@ -2092,32 +1956,22 @@
             let audioFastRetired = false;
             window.SEVideo = {
                 noteSuppressed,
-                // The client claimed the WebCodecs audio path and the decoder or the worklet
-                // then gave up. Where the host honoured `wantsFallbackTrack` — every host in
-                // this repo does — audio.js has already attached the spare Opus track and this
-                // is never reached: the step-down is seamless and costs no renegotiation.
-                //
-                // This is the older-host case, where the answer carried no audio track at all.
-                // It used to rebuild the whole peer connection to ask for one, mid-session,
-                // behind a picture the user was watching. It no longer does: the claim is
-                // dropped so the *next* join gets a track, the loss is reported as `degraded`
-                // bit 6 and `audioPath` 0, and the picture is not touched. Nothing on this page
-                // renegotiates on its own account once the stage is up.
+                // The WebCodecs audio path failed and the answer carried no spare track (only a
+                // host that ignores `wantsFallbackTrack`). Nothing renegotiates once the stage is
+                // up: the next join gets a track; reported as `degraded` bit 6 and `audioPath` 0.
                 onAudioFastLost() {
                     if (audioFastRetired || !audioFast) return;
                     audioFastRetired = true;
                     audioFast = false;
-                    // No DataChannel on the track path, so no redundancy to advertise either,
-                    // and no spare track to ask for: the next answer's audio track is the one
-                    // that gets fed. `verified` survives — the decoder really was probed, and
-                    // what it says about this device is what the host should log.
+                    // the track path has no DataChannel, so no redundancy to advertise and no spare
+                    // track to ask for; `verified` survives because the decoder really was probed
                     audioCaps = {
                         webcodecsOpus: false, worklet: audioCaps.worklet, redundancy: false,
                         verified: !!audioCaps.verified, wantsFallbackTrack: false,
                     };
                     degrade(DEG.AUDIO_OPUS_UNSUPPORTED);
                     console.warn('[audio] fast path lost and this host sent no spare track; ' +
-                        'audio stays off for this session — a rejoin gets a standard track');
+                        'audio stays off for this session. A rejoin gets a standard track');
                 },
                 getStats() {
                     const w = videoWorkerStats;
@@ -2149,8 +2003,8 @@
                         audioUnderruns: audio.underruns || 0,
                         audioOverruns: audio.overruns || 0,
                         rvfcSupported: fallbackStats.rvfcSupported,
-                        // Which mechanism is live on each axis, so a device on a slow path
-                        // is distinguishable from a device on the fast one.
+                        // which mechanism is live on each axis, so a device on a slow path is
+                        // distinguishable from one on the fast path
                         transportTier: usingFallback ? TRANSPORT_TIER.none : ((w && w.transportTier) || TRANSPORT_TIER.none),
                         renderTier: renderTierNow(),
                         keyTier: (w && w.keyTier) || 0,
@@ -2163,6 +2017,10 @@
                         audioOutputLatencyMs: audio.outputLatencyMs || 0,
                         audioRedundantUsed: audio.redundantUsed || 0,
                         audioRedundantDiscarded: audio.redundantDiscarded || 0,
+                        videoCatchUps: w ? (w.lateCatchUps || 0) : 0,
+                        videoFramesStale: w ? (w.framesStale || 0) : 0,
+                        videoLateMs: w ? (w.lateMs || 0) : 0,
+                        videoLateState: w ? (w.lateState || 0) : 0,
                     };
                 },
             };
@@ -2171,17 +2029,15 @@
             function startVideoStatsPoll() {
                 if (videoStatsPoll) clearInterval(videoStatsPoll);
                 const tick = function () { if (worker) worker.postMessage({ type: 'videostats' }); };
-                // A plain setInterval's first tick is a full second out, and until it lands
-                // videoWorkerStats is null — which is also the whole first second after every
-                // reconfigure, because teardownSession clears it.
+                // tick now: setInterval's first tick is a full second out, and until it lands
+                // videoWorkerStats is null (teardownSession clears it on every reconfigure)
                 tick();
                 videoStatsPoll = setInterval(tick, 1000);
             }
 
             if (window.SEClock) {
                 SEClock.subscribe(function (offsetMs) {
-                    // Every other consumer screens this with isFinite; this one assigned it
-                    // straight through and then reported clockValid for a NaN offset.
+                    // a NaN offset must not be stored: clockValid would report it as valid
                     if (typeof offsetMs !== 'number' || !isFinite(offsetMs)) { noteSuppressed(); return; }
                     hostClockOffsetMs = offsetMs;
                     try { if (worker) worker.postMessage({ type: 'clockoffset', offsetMs: offsetMs }); } catch (_) { noteSuppressed(); }
@@ -2189,10 +2045,9 @@
                 });
             }
 
-            // The out-of-band keyframe request is a tier only if the host parses the opcode.
-            // It says so in the PONG capability bits, which land about a second into the
-            // session, so the worker starts at "no way to ask" — which keeps its own give-up
-            // signal and the page's stall demotion armed — and is told if that changes.
+            // The out-of-band keyframe request is a tier only if the host parses the opcode, which
+            // the PONG capability bits say about a second in. Until then the worker assumes "no way
+            // to ask", keeping its give-up signal and the stall demotion armed.
             function relayOutOfBandKey() {
                 if (!worker) return;
                 let available = false;
@@ -2205,9 +2060,22 @@
             if (window.RemoteInput && RemoteInput.onHostCapabilities) {
                 RemoteInput.onHostCapabilities(relayOutOfBandKey);
             }
+            if (window.RemoteInput && RemoteInput.onHostState) {
+                RemoteInput.onHostState(function () {
+                    noteHostStateSeen(RemoteInput.picturePending());
+                });
+            }
+
+            // the worker's start bounds stop while the page is hidden; one created on a hidden page
+            // is told at once, not at the next change
+            function tellWorkerVisibility(w) {
+                if (!w) return;
+                try { w.postMessage({ type: 'visibility', hidden: document.visibilityState !== 'visible' }); } catch (_) { noteSuppressed(); }
+            }
 
             let __workerBlobUrl = null;
             async function makeTransformWorker() {
+                let w;
                 try {
                     if (!__workerBlobUrl) {
                         const src = await fetch('/transform-worker.js').then((r) => {
@@ -2216,11 +2084,13 @@
                         });
                         __workerBlobUrl = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
                     }
-                    return new Worker(__workerBlobUrl);
+                    w = new Worker(__workerBlobUrl);
                 } catch (e) {
                     console.warn('[webcodecs] blob worker load failed (' + e + '); trying direct URL');
-                    return new Worker('/transform-worker.js');
+                    w = new Worker('/transform-worker.js');
                 }
+                tellWorkerVisibility(w);
+                return w;
             }
 
             const TRANSFORM_START_TIMEOUT_MS = 2500;
@@ -2228,44 +2098,24 @@
             const WHEP_TIMEOUT_MS = 10000;
             const ANSWER_TIMEOUT_TEXT = 'The host did not answer in time.';
 
-            // What a failed setup leads to. A host that did not answer in time says nothing about
-            // the video path, so it is not a reason to give up WebCodecs: it used to be answered
-            // with `fallbackToVideo`, and a session that lost one answer then ran on the <video>
-            // element and its jitter buffer for good. It is offered again once on the same tier,
-            // presenting whatever join id this tab holds. (A first join that lost its answer
-            // holds none; the host recognises the retry by this page load's `attemptId` and
-            // continues the join it answered instead of opening a second one beside it.)
-            //
-            // A host-side failure gets that one retry and no more. It used to fall through to
-            // the decoder rule below once the retry was spent, so a host that kept answering 500
-            // ("virtual display 0 did not attach within timeout") was offered a *third* time on
-            // the <video> tier — another display attempt on a host already failing to make one,
-            // ten more seconds of spinner, and a session demoted for nothing its decoder did.
-            //
-            // There is no 'poll' any more. It kept a live renegotiation that had failed "on the
-            // picture": but `start()` has already closed that peer connection, so what stayed on
-            // screen was a frozen frame with the wake lock, fullscreen and the leave prompt still
-            // held, kept alive indefinitely by a `/reconfig` poll that the host kept answering.
-            // A renegotiation that cannot complete ends the session like any other failure —
-            // with the join kept, so Connect continues on the same display.
+            // A host-side failure (no answer in time, a refused POST, a dropped connection) says
+            // nothing about this browser's decoder: one retry on the same tier with the join id
+            // held, then an error with the join kept, never a third offer on the <video> tier.
             let answerRetried = false;
             function setupFailureAction(err, s) {
                 const msg = (err && err.message) || '';
                 if (/Invalid session ID or OTP/.test(msg)) return 'error';
-                // The same holds for a POST the host refused or a connection that dropped: none
-                // of them is about this browser's decoder.
                 const hostSide = msg === ANSWER_TIMEOUT_TEXT || /^WHEP POST failed: 5\d\d|Failed to fetch|NetworkError|network error/i.test(msg);
                 if (hostSide) return s.answerRetried ? 'error' : 'retry';
                 if (s.webcodecsTier) return 'video';
                 return 'error';
             }
 
-            // `keepJoin` says this is the same session offering again rather than a new one.
-            // `teardownSession` has already decided whether `currentJoinId` survives, so the
-            // body below can present it unconditionally: it is the empty string on a fresh join.
+            // `keepJoin`: the same session offering again. `teardownSession` decides whether
+            // `currentJoinId` survives, so the body always presents it (empty on a fresh join).
             async function start(preferWebCodecs, keepJoin) {
                 teardownSession(keepJoin);
-                // After teardownSession, so this call owns the newest generation.
+                // after teardownSession, so this call owns the newest generation
                 const gen = ++startGen;
                 const stale = () => gen !== startGen;
                 let localTrickle = null;
@@ -2273,27 +2123,21 @@
                     const webcodecs = preferWebCodecs && canWebCodecs && !usingFallback;
 
                     const useScriptTransform = useScriptTransformNow();
-                    // Primed at load, so this is normally already resolved. Read before the ICE
-                    // config so both are in hand before the peer connection exists.
+                    // primed at load, so normally already resolved
                     const netConfig = await getNetConfig();
                     if (stale()) return;
                     const canTrickle = !trickleOff && netConfig.trickleIce === true;
                     const iceConfig = await getIceConfig();
                     if (stale()) return;
                     const iceServers = iceConfig.iceServers;
-                    // Computed once and carried into the gathering wait: without it the wait took
-                    // the LAN branch on every session and cut gathering ~200 ms in, before any
-                    // TURN allocation could return. It comes from the host's locality rather than
-                    // from the server list, because a LAN host hands out TURN as a backup.
+                    // Carried into the gathering wait, which would otherwise take the LAN branch
+                    // and stop ~200 ms in, before a TURN allocation can return. Taken from the
+                    // host's locality, not the server list: a LAN host hands out TURN as a backup.
                     const needRelay = relayNeeded(iceConfig);
                     if (DEBUG) console.log('[ice] locality=' + iceConfig.locality + ' needRelay=' + needRelay);
-                    // The worker has to exist before the video transceiver does. Chrome
-                    // short-circuits a receiver's encoded transform when nothing is installed
-                    // within one task of the transceiver being created: a transform assigned
-                    // after that still fires `rtctransform`, but every frame goes straight to the
-                    // built-in decoder and none reaches the worker. Awaiting the worker fetch in
-                    // between was exactly that, on every join — the decoder never saw a frame and
-                    // the 5 s watchdog demoted the session to <video>. See UX-WEBCODECS-START.
+                    // The worker must exist before the video transceiver: Chrome short-circuits an
+                    // encoded transform not installed in the task that creates the transceiver
+                    // (`rtctransform` still fires, but every frame goes to the built-in decoder).
                     let preparedWorker = null;
                     if (webcodecs) {
                         preparedWorker = await makeTransformWorker();
@@ -2309,9 +2153,8 @@
                     try {
                         if (window.RemoteInput) {
                             RemoteInput.setup(pc);
-                            // `setup` switches input.js's listeners on, and `teardown()` cleared
-                            // its suspension flag; hold them off until this stream is live (see
-                            // `streamInputArmed`), and for as long as a dialog is up.
+                            // `setup` switches input.js's listeners on; hold them off until this
+                            // stream is live (`streamInputArmed`) and while a dialog is up
                             syncInputGate();
                         }
                     } catch (_) { noteSuppressed(); }
@@ -2323,38 +2166,28 @@
                                 }
                             };
                         }
-                        // The recvonly audio section goes in on both paths now. Off the fast
-                        // path it carries the track the host feeds. On the fast path it is the
-                        // spare `wantsFallbackTrack` asks for — and an SDP answer may not add an
-                        // m-line the offer did not contain (RFC 3264 §6), so without a section
-                        // here the host's spare track has nowhere to land and is simply dropped
-                        // from the answer. WHEP has no renegotiation verb, so this is the only
-                        // moment it can exist at all: without it a decoder that says "supported"
-                        // and then fails on real packets is silence for the rest of the session.
+                        // Off the fast path this recvonly section carries the track the host feeds;
+                        // on it, the spare `wantsFallbackTrack` asks for. An SDP answer may not add
+                        // an m-line the offer lacks (RFC 3264 section 6) and WHEP has no
+                        // renegotiation verb, so the spare can only exist if it is offered here.
                         if (!audioFast || audioCaps.wantsFallbackTrack) {
                             try { pc.addTransceiver('audio', { direction: 'recvonly' }); } catch (_) { noteSuppressed(); }
                         }
                     }
-                    // Both of these — and the host's PlayoutDelayExtension(0, 0) — only affect
-                    // a client that ends up on the <video> element. An encoded transform takes
-                    // the frame from RtpVideoStreamReceiver2::OnAssembledFrame *instead of*
-                    // entering the reference finder and the frame buffer, and the frame buffer
-                    // is what these are inputs to. Set them anyway: they cost nothing and they
-                    // are correct for the fallback, which is the one path that has a jitter
-                    // buffer at all. See findings and docs/OPTIMIZATIONS.md — the same branch
-                    // is why every receive-side timing field in getStats() reads zero here.
+                    // Jitter-buffer hints (like the host's PlayoutDelayExtension(0, 0)) only affect
+                    // the <video> path: an encoded transform takes the frame at
+                    // RtpVideoStreamReceiver2::OnAssembledFrame, before the frame buffer (hence
+                    // receive-side timing in getStats() reads zero). Set anyway for the fallback.
                     try {
                         if ('playoutDelayHint' in videoTransceiver.receiver) videoTransceiver.receiver.playoutDelayHint = 0;
                     } catch (_) { noteSuppressed(); }
 
                     if (webcodecs) {
-                        // No await from here to the transform assignment below; see above.
+                        // no await from here to the transform assignment below
                         worker = preparedWorker;
-                        // A worker whose script fails to load or parse is constructed
-                        // successfully and then simply never posts anything, so without this
-                        // the only net is a timeout — 2.5 s where there is a legacy transform
-                        // to fall back to, and five seconds of black screen on Safari, where
-                        // there is not.
+                        // a worker whose script fails to load or parse still constructs and then
+                        // never posts; without this the only net is a timeout (5 s of black on
+                        // Safari, which has no legacy transform to fall back to)
                         worker.onerror = (ev) => {
                             noteSuppressed();
                             fallbackToVideo('transform worker failed: ' + ((ev && ev.message) || 'unknown'));
@@ -2364,6 +2197,7 @@
                             if (m.data.type === 'rendered') {
                                 webcodecsPainted = true;
                                 onStreamLive();
+                                if (picturePending) setPicturePending(false);
                             } else if (m.data.type === 'decodeerror') {
                                 console.warn('[webcodecs] decode error:', m.data.message);
                             } else if (m.data.type === 'painterror') {
@@ -2377,24 +2211,29 @@
                             } else if (m.data.type === 'backlog') {
                                 console.warn('[webcodecs] ' + m.data.inFlight + ' decodes still outstanding; skipping to the next keyframe');
                             } else if (m.data.type === 'requestkey') {
-                                // The legacy transform cannot ask for an IDR itself; relay it
-                                // over the reliable input channel instead of freezing.
+                                // the legacy transform cannot ask for an IDR itself: relay it over
+                                // the reliable input channel
                                 let sent = false;
                                 try { sent = !!(window.RemoteInput && RemoteInput.requestKeyframe && RemoteInput.requestKeyframe()); } catch (_) { noteSuppressed(); }
                                 if (!sent) degrade(DEG.KEYFRAME_REQUEST_IMPOSSIBLE);
                             } else if (m.data.type === 'nokeyframe') {
-                                // Only now is a demotion the right answer: we asked by every
-                                // means available and the host still sent no keyframe.
+                                // demote only now: every way of asking was tried, no keyframe came
                                 console.warn('[webcodecs] no keyframe after ' + Math.round(m.data.waitedMs) + ' ms (keyTier=' + m.data.keyTier + ')');
                                 if (!m.data.keyTier) fallbackToVideo('no keyframe and no way to ask for one');
                             } else if (m.data.type === 'transformstart') {
                                 transformStarted = true;
                                 if (transformWatchdog) { clearTimeout(transformWatchdog); transformWatchdog = null; }
-                                console.log('[webcodecs] transform started — transport=' + m.data.transport + ' sendKeyFrameRequest=' + m.data.hasSendKey);
+                                console.log('[webcodecs] transform started: transport=' + m.data.transport + ' sendKeyFrameRequest=' + m.data.hasSendKey);
                             } else if (m.data.type === 'trackgen') {
                                 attachTrackGenerator(m.data.track);
                             } else if (m.data.type === 'firstframe') {
-                                console.log('[webcodecs] FIRST encoded frame reached transform readable; type=' + m.data.frameType);
+                                onFirstEncodedFrame(m.data.frameType);
+                            } else if (m.data.type === 'diag') {
+                                console.log('[webcodecs] ' + m.data.text);
+                            } else if (m.data.type === 'restartrefused') {
+                                onDecoderGaveUp('frames arrived, none painted, and no keyframe can be asked for');
+                            } else if (m.data.type === 'decodernotstarting') {
+                                onDecoderGaveUp('the decoder did not start (' + m.data.reason + ')');
                             } else if (m.data.type === 'size') {
                                 try { if (window.RemoteInput) RemoteInput.setPictureSize(m.data.width, m.data.height); } catch (_) { noteSuppressed(); }
                             } else if (m.data.type === 'rendercount') {
@@ -2403,17 +2242,10 @@
                                 try { if (window.SEAudio) SEAudio.setVideoDelay(m.data.videoDelayMs); } catch (_) { noteSuppressed(); }
                             } else if (m.data.type === 'videostats') {
                                 videoWorkerStats = m.data.stats;
-                                // Latched here rather than in SEVideo.getStats(), which is the
-                                // documented console read-side: typing it must not change what
-                                // the host is told.
-                                // The poll fires its first tick immediately, before the
-                                // transform is installed, and the worker answers from its
-                                // initial state: keyTier 0 because no transform has fired and
-                                // no PONG has landed, decoderHardware false because
-                                // doConfigure has not run. Latching either from that reply set
-                                // both bits on every session for the rest of its life. Both
-                                // conditions are re-evaluated instead, and only once the thing
-                                // that determines them has actually happened.
+                                // Set here, not in SEVideo.getStats() (the console read-side must
+                                // not change what the host is told). The poll's first tick precedes
+                                // the transform and gets the worker's initial state (keyTier 0,
+                                // decoderHardware false), so each bit waits for its cause.
                                 if (m.data.stats) {
                                     const w = m.data.stats;
                                     if (w.configured) {
@@ -2457,11 +2289,10 @@
                                 fallbackToVideo('createEncodedStreams failed: ' + err.message);
                                 return;
                             }
-                            // The writable goes too: the worker hands keyframes back to the
-                            // receiver so its own decoder stops asking for them (see
-                            // transform-worker.js, "The receiver's own decoder").
-                            // A WritableStream is not transferable everywhere createEncodedStreams
-                            // exists (Chrome 86); a DataCloneError throws before anything moves.
+                            // The writable goes too: the worker hands keyframes back so the
+                            // receiver's own decoder stops asking for them. A WritableStream is not
+                            // transferable everywhere createEncodedStreams exists (Chrome 86): a
+                            // DataCloneError throws before anything moves.
                             let sentWritable = false;
                             if (writable) {
                                 try {
@@ -2471,34 +2302,24 @@
                             }
                             if (!sentWritable) worker.postMessage({ type: 'encodedstream', readable }, [readable]);
                         }
-                        // Both of these are inert on this path and deliberately kept: the
-                        // transform runs in place of libwebrtc's reference finder, so the
-                        // frame buffer they configure is never reached. They are set anyway
-                        // so a future engine that moves the transform downstream does not
-                        // silently reintroduce a jitter buffer.
+                        // inert on this path (the transform bypasses the frame buffer) but kept, so
+                        // an engine that moves the transform downstream does not silently
+                        // reintroduce a jitter buffer
                         try {
                             if ('jitterBufferTarget' in videoTransceiver.receiver) videoTransceiver.receiver.jitterBufferTarget = 0;
                         } catch (_) { noteSuppressed(); }
                         if (PRESENT_PREF !== 'track') showCanvas();
                     }
 
-                    // `onrtctransform` cannot fire until ICE has connected and the first
-                    // encoded frame has arrived, so 2500 ms measured from installing the
-                    // transform is well inside the setup budget this same function allots to
-                    // ICE alone — a slow or cross-network join was demoted off
-                    // RTCRtpScriptTransform for being slow, permanently losing
-                    // sendKeyFrameRequest(). Measure from the first sign that packets should
-                    // be flowing instead.
+                    // `onrtctransform` cannot fire before ICE connects and a frame arrives, so the
+                    // 2500 ms runs from when packets should be flowing, not from installing the
+                    // transform: a slow join must not lose sendKeyFrameRequest() for being slow.
                     let transformWatchdogArmed = false;
-                    // Both watchdogs are armed from the same event, and it is this one: the
-                    // moment packets should be flowing. They used to start from different
-                    // origins — this one at ICE-connected, the 5 s demotion at `ontrack`, which
-                    // is during setRemoteDescription and therefore *earlier* — so any join whose
-                    // ICE took more than about 2.5 s after the answer had the 5 s timer fire
-                    // first and skip the ladder entirely. A cross-network or relayed join
-                    // reaching 3 s of ICE is ordinary, and the cost was landing on <video> for
-                    // the whole session instead of stepping one rung to createEncodedStreams.
+                    // Both watchdogs are armed from this one event. Armed at `ontrack` (during
+                    // setRemoteDescription), the 5 s demotion would beat the 2.5 s rung on any join
+                    // whose ICE takes ~3 s, ordinary cross-network, and skip createEncodedStreams.
                     function armTransformWatchdog() {
+                        if (picturePending) { pictureHeld = true; return; }
                         armFrameWatchdog();
                         if (transformWatchdogArmed || transformStarted) return;
                         if (!(webcodecs && useScriptTransform && hasLegacyEncodedStreams)) return;
@@ -2509,18 +2330,57 @@
                         }, TRANSFORM_START_TIMEOUT_MS);
                     }
 
-                    // The bottom of the ladder, but it steps rather than jumps: a script
-                    // transform that never fired still has a rung below it that keeps WebCodecs
-                    // and the ~90 ms the <video> element costs. retryWithLegacyTransform falls
-                    // through to fallbackToVideo where there is no legacy transform, so this
-                    // stays bounded either way.
+                    rearmPictureWatchdogs = function () {
+                        transformWatchdogArmed = false;
+                        armTransformWatchdog();
+                    };
+                    // the no-picture clock counts from the first encoded frame reaching the worker
+                    function onFirstEncodedFrame(frameType) {
+                        console.log('[webcodecs] FIRST encoded frame reached transform readable; type=' + frameType);
+                        framesArrived = true;
+                        if (watchdog) { clearTimeout(watchdog); watchdog = null; armFrameWatchdog(); }
+                    }
+                    // The worker says its decoder will not paint: demote now, not when the
+                    // no-picture clock runs out. Never once a frame has painted.
+                    function onDecoderGaveUp(reason) {
+                        if (webcodecsPainted) return;
+                        console.warn('[webcodecs] ' + reason);
+                        if (watchdog) { clearTimeout(watchdog); watchdog = null; }
+                        fallbackToVideo(reason);
+                    }
+                    // A hidden tab may have decoding suspended while timers run, so no paint there
+                    // is not evidence of a dead decoder: the no-picture clock and the worker's
+                    // bounds stop while hidden and restart in full when shown.
+                    function onPageVisibility() {
+                        const hidden = document.visibilityState !== 'visible';
+                        tellWorkerVisibility(worker);
+                        if (hidden) {
+                            if (watchdog) { clearTimeout(watchdog); watchdog = null; frameWatchdogHeld = true; }
+                        } else if (frameWatchdogHeld) {
+                            frameWatchdogHeld = false;
+                            armFrameWatchdog();
+                        }
+                    }
+                    pageVisibilityHook = onPageVisibility;
                     function armFrameWatchdog() {
-                        // Only the WebCodecs path has anything to demote to; the <video> path
-                        // is already the floor and its liveness is the reconfig poll's job.
+                        // only the WebCodecs path has anything to demote to; the <video> path is
+                        // the floor and its liveness is the reconfig poll's job
+                        if (picturePending) { pictureHeld = true; return; }
                         if (watchdog || !webcodecs || webcodecsPainted) return;
+                        if (document.visibilityState !== 'visible') { frameWatchdogHeld = true; return; }
                         watchdog = setTimeout(() => {
                             watchdog = null;
                             if (webcodecsPainted) return;
+                            if (document.visibilityState !== 'visible') { frameWatchdogHeld = true; return; }
+                            // frames arrive and none has painted: a fresh decoder and a keyframe
+                            // first, once, then the demotion
+                            if (framesArrived && !decoderRestarted && worker) {
+                                decoderRestarted = true;
+                                console.warn('[webcodecs] frames arrived and none painted within 5s; restarting the decoder');
+                                try { worker.postMessage({ type: 'resetdecoder' }); } catch (_) { noteSuppressed(); }
+                                armFrameWatchdog();
+                                return;
+                            }
                             if (webcodecs && useScriptTransform && hasLegacyEncodedStreams && !transformStarted) {
                                 retryWithLegacyTransform('no WebCodecs frame within 5s');
                             } else {
@@ -2531,18 +2391,16 @@
 
                     pc.ontrack = (e) => {
                         if (e.track.kind === 'audio') {
-                            // Remembered, not attached: on the fast path this track is the
-                            // spare `wantsFallbackTrack` asked for, and playing it now would
-                            // report the slow path while the worklet is still running.
+                            // remembered, not attached: on the fast path this is the spare track,
+                            // and playing it now would report the slow path
                             try { if (window.SEAudio) SEAudio.noteFallbackStream(e.streams[0]); } catch (_) { noteSuppressed(); }
                             return;
                         }
                         if (e.track.kind !== 'video') return;
 
                         if (webcodecs) {
-                            // ontrack lands after a network round trip, well after the worker
-                            // answered `trackgen`, so an unguarded showCanvas() here hid the
-                            // <video> the generator had just been attached to.
+                            // ontrack lands well after the worker answered `trackgen`, so an
+                            // unguarded showCanvas() would hide the <video> the generator feeds
                             if (PRESENT_PREF !== 'track') showCanvas();
                             if (DEBUG) statsPoll = setInterval(() => {
                                 if (worker) worker.postMessage({ type: 'stats' });
@@ -2576,9 +2434,8 @@
                             }, 2000);
                         } else {
                             video.srcObject = e.streams[0];
-                            // These are real on this path, unlike on the WebCodecs one: the
-                            // <video> element goes through libwebrtc's frame buffer, so the
-                            // target it is given is the target it keeps.
+                            // these take effect here, unlike on the WebCodecs path: the <video>
+                            // element goes through libwebrtc's frame buffer
                             try {
                                 if (e.receiver && 'jitterBufferTarget' in e.receiver) e.receiver.jitterBufferTarget = 30;
                                 try { if ('playoutDelayHint' in e.receiver) e.receiver.playoutDelayHint = 0.03; } catch (_) { noteSuppressed(); }
@@ -2594,16 +2451,13 @@
                         if (pc !== localPc) return;
                         const s = pc.iceConnectionState;
                         if (s === 'connected' || s === 'completed') {
-                            // A pair is nominated, so a trickle failure can no longer produce a
-                            // rejoin (`trickleFailed` returns early on a connected session, and
-                            // `iceEverConnected` keeps that true for the rest of this one). The
-                            // hold exists only to keep a rejoin in front of the join form, so
-                            // from here it protects nothing and the picture should not wait on
-                            // the last PATCH being acknowledged.
+                            // a pair is nominated, so a trickle failure can no longer rejoin and
+                            // the hold protects nothing: the picture must not wait on the last
+                            // PATCH being acknowledged
                             iceEverConnected = true;
                             iceSettled();
                             armTransformWatchdog();
-                            if (usingFallback || !canWebCodecs) onStreamLive();
+                            if (usingFallback || !canWebCodecs) liveOnConnect();
                         } else if (s === 'failed') {
                             linkLost('Connection failed.');
                         }
@@ -2623,17 +2477,14 @@
                     await pc.setLocalDescription(offer);
                     if (stale()) return;
                     if (canTrickle) {
-                        // No wait at all: the offer goes out with whatever `setLocalDescription`
-                        // had — usually nothing — and every candidate follows over PATCH. This is
-                        // the whole win on a relayed join, where the wait was a TURN allocation
-                        // the POST had no reason to be behind.
+                        // no wait: the offer goes out with whatever `setLocalDescription` had
+                        // (usually nothing) and every candidate follows over PATCH
                         holdStageForIce();
                         localTrickle = startTrickle(pc, function (reason) {
                             if (stale()) { noteSuppressed(); return; }
                             trickleFailed(reason, preferWebCodecs);
                         }, function () {
-                            // A settle from a sender this call no longer owns belongs to the
-                            // generation that replaced it, which armed its own hold.
+                            // a stale sender's settle belongs to the generation that replaced it
                             if (stale()) return;
                             iceSettled();
                         });
@@ -2644,6 +2495,9 @@
                         if (stale()) return;
                     }
                     const offerSdp = pc.localDescription.sdp;
+                    // the host may answer before its picture is ready only for a page that will
+                    // hear the PONG saying so
+                    pendingAsked = !!(window.RemoteInput && RemoteInput.onHostState && RemoteInput.picturePending);
 
                     const storedToken = readDeviceToken();
                     const whepOpts = {
@@ -2653,11 +2507,14 @@
                             sessionId: joinData.sessionId,
                             otp: joinData.otp,
                             deviceToken: storedToken,
-                            // Empty unless this is the same tab renegotiating. The host honours
-                            // it only while the session is still live and still belongs to this
-                            // device token, so a stale one costs a fresh join and nothing else.
+                            // Empty unless this tab is renegotiating. The host honours it only
+                            // while the session is live and belongs to this device token, so a
+                            // stale one just costs a fresh join.
                             joinId: currentJoinId,
                             attemptId: attemptId,
+                            // the page holds its no-picture timers while the host says the picture
+                            // is pending, so the host may answer before its capture opens
+                            pendingPicture: pendingAsked,
                             deviceName: joinData.deviceName,
                             os: joinData.os,
                             refreshRate: joinData.refreshRate,
@@ -2668,10 +2525,9 @@
                             audioCapabilities: audioCaps,
                         }),
                     };
-                    // A host that accepts the connection and never answers — a wedged
-                    // display-correlation lock, a suspended VM, a black-holed route — parked
-                    // this await forever, and on the reconfigure path that is a frozen picture
-                    // with every recovery mechanism switched off.
+                    // a host that accepts the connection and never answers (a wedged lock, a
+                    // suspended VM, a black-holed route) would park this await forever; on the
+                    // reconfigure path that is a frozen picture with every recovery path off
                     let whepAbort = null;
                     let whepTimer = 0;
                     if (typeof AbortController === 'function') {
@@ -2693,21 +2549,17 @@
                     if (stale()) return;
                     if (resp.status === 401) throw new Error('Invalid session ID or OTP.');
                     if (!resp.ok) throw new Error('WHEP POST failed: ' + resp.status + ' ' + (await resp.text()));
-                    // An answer arrived, so a later lost one gets its own retry.
+                    // an answer arrived, so a later lost one gets its own retry
                     answerRetried = false;
-                    // Read before anything can return: this join was accepted, and the token it
-                    // issued is what a rejoin — including the one two lines below — presents
-                    // instead of the OTP.
+                    // read before anything can return: the join was accepted, and a rejoin (the
+                    // trickle one below included) presents this token instead of the OTP
                     const issuedToken = resp.headers.get('X-Device-Token');
                     if (issuedToken) { try { localStorage.setItem(DEVICE_TOKEN_KEY, issuedToken); } catch (_) { noteSuppressed(); } }
                     let trickleResource = null;
                     try { trickleResource = resp.headers.get('Location'); } catch (_) { noteSuppressed(); }
-                    // The session's name. `X-Join-Id` is the direct form; the WHEP resource in
-                    // `Location` is the same id, so either header answers and a proxy has to
-                    // strip both to leave this tab nameless. The host also sets an `se_join`
-                    // cookie, which covers a page cached from before the id existed — but a
-                    // cookie is per-origin and two tabs share it, so this page never reads it
-                    // and always sends the explicit parameter.
+                    // The session's name: `X-Join-Id`, or the same id at the end of the WHEP
+                    // resource in `Location`. The `se_join` cookie is never read: a cookie is
+                    // per-origin and two tabs share it, so the explicit parameter is always sent.
                     let issuedJoin = '';
                     try { issuedJoin = resp.headers.get('X-Join-Id') || ''; } catch (_) { noteSuppressed(); }
                     if (!issuedJoin && trickleResource) {
@@ -2725,14 +2577,14 @@
                     if (localTrickle) {
                         if (trickleResource) {
                             localTrickle.open(trickleResource, offerSdp);
-                            // Only now can the sender do anything, so only now is there
-                            // something for a deadline to be a deadline on.
+                            // the deadline starts here, not at the offer: only now can the sender
+                            // act, and the WHEP round trip creates a display (the host allows 5 s
+                            // for the attach alone, and serialises joins)
                             armIceSettleDeadline();
                         } else {
-                            // The host said it takes trickled candidates and then handed back no
-                            // resource — a proxy that strips the header, or the cloud relay,
-                            // which tunnels /whep but has no URL space of its own. The offer that
-                            // went out carries no candidates, so there is nothing to salvage.
+                            // The host advertised trickle but named no resource: a proxy stripped
+                            // the header, or this is the cloud relay, which tunnels /whep but has
+                            // no URL space of its own. The offer carried no candidates, so rejoin.
                             localTrickle.stop();
                             trickleFailed('the answer named no resource', preferWebCodecs);
                             return;
@@ -2753,9 +2605,8 @@
                     if (webcodecs && worker) {
                         const plid = negotiatedProfileLevelId(answerSdp);
                         if (!plid) degrade(DEG.NO_H264_FMTP);
-                        // The coded size goes with it: isConfigSupported can only answer
-                        // honestly about a configuration it has been given in full, and the
-                        // host was asked for exactly this size.
+                        // the coded size goes with it: isConfigSupported can only answer honestly
+                        // about a full configuration, and the host was asked for exactly this size
                         const dpr = getDpr();
                         worker.postMessage({
                             type: 'codechint',
@@ -2766,11 +2617,10 @@
                     }
                 } catch (err) {
                     console.error(err);
-                    // Stopping is idempotent, and this one belongs to the connection that just
-                    // failed whether or not a newer start() has taken over.
+                    // stopping is idempotent, and this sender belongs to the connection that failed
+                    // whether or not a newer start() has taken over
                     if (localTrickle) localTrickle.stop();
-                    // A newer start() already owns pc and worker; this one's failure is about a
-                    // connection nobody is using any more.
+                    // a newer start() owns pc and worker; this failure is about a dead connection
                     if (stale()) { noteSuppressed(); return; }
                     const action = setupFailureAction(err, {
                         answerRetried: answerRetried,
@@ -2778,13 +2628,13 @@
                     });
                     if (action === 'retry') {
                         answerRetried = true;
-                        console.warn('[join] ' + errorText(err) + ' — offering again on the same video path');
+                        console.warn('[join] ' + errorText(err) + ', offering again on the same video path');
                         start(preferWebCodecs, true);
                     } else if (action === 'video') {
                         fallbackToVideo('setup error: ' + errorText(err));
                     } else {
-                        // The join is kept: a reconnect presents it, and a host still holding a
-                        // display for it continues there instead of building a second one.
+                        // the join is kept: a reconnect presents it, and a host still holding a
+                        // display for it continues there instead of building a second one
                         restorePreJoinPage(errorText(err), true);
                     }
                 }
@@ -2821,11 +2671,9 @@
                 });
             }
 
-            // `true`, so a reconnect after a lost link presents the join this tab still holds
-            // rather than asking for a second display beside the one the host is keeping for it.
-            // It is the empty string on a first join, on a reload (`releaseStaleJoin`) and after
-            // a kick, so those are new joins exactly as before — and an id naming a session this
-            // host does not have, or one belonging to another device, is a new join too.
+            // `keepJoin` is true so a reconnect after a lost link presents the join this tab still
+            // holds instead of asking for a second display. The id is empty on a first join, after
+            // a reload and after a kick; an id the host does not honour is a new join too.
             function beginStreaming() {
                 if (location.protocol === 'http:' && !canWebCodecs) offerHttpsUpgrade();
                 else start(true, true);
@@ -2910,19 +2758,9 @@
                 const r = window.screen && window.screen.refreshRate;
                 return (typeof r === 'number' && r >= 24 && r <= 500) ? clampRefresh(r) : 0;
             }
-            // The measured rate is folded into joinData *before* the offer goes out, so the
-            // host builds the display at the right rate the first time. It used to be
-            // measured after the stream went live and then applied by tearing the session
-            // down and rebuilding it — every 90, 120 or 144 Hz client renegotiated about a
-            // second after connecting, retaking the host's display-correlation lock on the
-            // way. If the rate is still unknown at submit time it stays unknown: a later
-            // refinement only updates joinData, so the next reconfigure that happens for
-            // some other reason (an orientation change, a host setting) carries it.
-            // Long enough for REFRESH_SAMPLES rAF callbacks at 60 Hz (~383 ms) with room to
-            // spare. It used to be 400 ms against a 60-sample measurement, i.e. ~1 s at 60 Hz —
-            // so resolveRefreshRate returned 0 on essentially every join and the true rate was
-            // applied only if some unrelated reconfigure happened later, which for most
-            // sessions is never. A 120 Hz client ran the host display at the default rate.
+            // The measured rate goes into joinData before the offer, so the host builds the display
+            // at the right rate the first time. The deadline must cover REFRESH_SAMPLES rAF
+            // callbacks at 60 Hz (~383 ms), or resolveRefreshRate returns 0 on every join.
             const REFRESH_DEADLINE_MS = 500;
             const AUDIO_PREPARE_DEADLINE_MS = 2000;
             async function resolveRefreshRate() {
@@ -2935,17 +2773,9 @@
                 ]);
                 return clampRefresh(measured) || 0;
             }
-            // The refinement is the safety net for a join-time measurement that was wrong, not
-            // the normal path: with REFRESH_SAMPLES at 24 the measurement lands inside the
-            // deadline and the first offer already carries the right rate. It is wrong when
-            // the page spent its first half-second in a background tab or behind a layout
-            // storm, where rAF is throttled and the measured rate is far too low.
-            //
-            // It used to answer that by rebuilding the session about a second after the picture
-            // came up — a renegotiation the user did not ask for, over a screen they had just
-            // started using, and one that retook the host's display-correlation lock on the way.
-            // It now only updates `joinData`, so the corrected rate rides the next reconfigure
-            // that happens for a reason of its own: a rotation, or a change made on the host.
+            // Safety net for a wrong join-time measurement (a background tab or a layout storm
+            // throttles rAF). It only updates `joinData`, never forcing a renegotiation over a
+            // screen the user has just started using: the next reconfigure carries the rate.
             function noteRefinedRefreshRate(rate) {
                 if (!joinData || !rate) return;
                 const cur = joinData.refreshRate || 60;
@@ -3025,10 +2855,8 @@
             sessionInput.addEventListener('input', validate);
             nameInput.addEventListener('input', validate);
 
-            // performance.timeOrigin is Safari 15; input.js already computes it the long
-            // way for the clock offset and this is the other consumer. Without it every
-            // <video>-path lag sample was NaN, failed `lag >= 0`, and was discarded — so
-            // host-to-paint read 0 on precisely the old browsers that take that path.
+            // performance.timeOrigin is Safari 15+. Without the fallback every <video>-path lag
+            // sample is NaN and discarded, on exactly the old browsers that take that path.
             const TIME_ORIGIN_MS = (typeof performance.timeOrigin === 'number' && isFinite(performance.timeOrigin))
                 ? performance.timeOrigin
                 : (Date.now() - performance.now());
@@ -3065,16 +2893,9 @@
                         severity: 'blocking',
                     });
                 }
-                // `httpsFixable` is read by the compat gate below and only ever on an http
-                // page, where it means "do not list this row; offer the switch to HTTPS
-                // instead". The switch itself is offered on every system, deliberately: a
-                // secure context is the precondition for both fast paths whether or not this
-                // particular engine would then have them, and an offer that is right for almost
-                // every device beats a per-engine guess.
-                //
-                // The one exception is `http://localhost`, which *is* a secure context — so the
-                // fast paths are missing there for some other reason, and suppressing the rows
-                // would hide the only explanation the user gets. That is the same-device join.
+                // `httpsFixable`: on an http page the compat gate hides this row and offers HTTPS
+                // instead (a secure context is the precondition for both fast paths). Not on
+                // `http://localhost`, already a secure context: the rows are all the user gets.
                 const httpsFixable = location.protocol === 'http:' &&
                     !(typeof window.isSecureContext === 'boolean' && window.isSecureContext);
                 if (!canWebCodecs) {
@@ -3085,12 +2906,9 @@
                         httpsFixable: httpsFixable,
                     });
                 }
-                // One row, gated on the pair, and the original wording: this modal's rendered
-                // content is not this branch's to change. Splitting it into a row per capability
-                // showed two rows where one used to appear on Safari 16.4-17 and Firefox 130+,
-                // and added a third for cross-origin isolation that is close to unreachable —
-                // WebCodecs needs a secure context, and on one the host's own COOP/COEP headers
-                // make `crossOriginIsolated` true.
+                // One row, gated on the pair: a row per capability shows two where one is enough on
+                // Safari 16.4-17 and Firefox 130+. No row for cross-origin isolation either: on a
+                // secure context the host's COOP/COEP headers make `crossOriginIsolated` true.
                 if (!audioFast) {
                     unsupported.push({
                         name: 'WebCodecs audio and AudioWorklet',
@@ -3138,7 +2956,7 @@
                     const b = document.createElement('b');
                     b.textContent = api.name;
                     li.appendChild(b);
-                    li.appendChild(document.createTextNode(' — ' + api.description));
+                    li.appendChild(document.createTextNode(' - ' + api.description));
                     listEl.appendChild(li);
                 });
 
@@ -3174,9 +2992,8 @@
                 if (blocking.length > 0) {
                     compatBlocked = true;
                     connectBtn.disabled = true;
-                    // No dismiss button on the blocking form, so this one is never closed and
-                    // never releases: there is no session for it to be holding anything back
-                    // from either.
+                    // the blocking form has no dismiss button, so this modal is never ended; there
+                    // is no session for it to hold anything back from
                     beginModal();
                     renderCompatModal(blocking, true);
                     return;
@@ -3227,11 +3044,9 @@
                 });
             }
 
-            // The card is raised in exactly one place: the Join handler, before the offer, when
-            // the outputs could not be detected without a permission and a microphone grant can
-            // reveal them (`SEAudio.prepareOutputsForJoin` / `outputPlan`). There is no stage and
-            // no lock yet, so it drops nothing. Skip always ends it; a decline (Skip, or a refused
-            // browser prompt) is remembered on this device and reported as `degraded` bit 9.
+            // Raised in exactly one place: the Join handler, before the offer, when no output could
+            // be detected and a microphone grant can reveal them. There is no stage and no lock
+            // yet, so it drops nothing. Skip is reported as `degraded` bit 9.
             function micCard(onContinue, onSkip) {
                 showPermModal(onContinue, () => {
                     degrade(DEG.AUDIO_OUTPUT_LABELS_UNAVAILABLE);
@@ -3243,16 +3058,12 @@
                 e.preventDefault();
                 if (connectBtn.disabled) return;
 
-                // Before any await: iOS only resumes an AudioContext from inside the gesture
-                // that created it, and everything after the first `await` in this handler is
-                // outside that window.
+                // before any await: iOS only resumes an AudioContext inside its creating gesture
                 let audioReady = null;
                 try { if (window.SEAudio) audioReady = SEAudio.beginFromGesture(); } catch (_) { noteSuppressed(); }
 
-                // Output discovery, API 1: the browser's own output chooser
-                // (`selectAudioOutput()`), on every engine that has one. Synchronous: it needs
-                // this click's transient activation, which the first `await` would spend. It is
-                // bounded inside SEAudio and resolves `unsupported` where absent.
+                // the browser's own output chooser (`selectAudioOutput()`), also before any await:
+                // it needs this click's transient activation (resolves `unsupported` where absent)
                 let pickerDone = null;
                 try {
                     if (window.SEAudio && SEAudio.startPicker) pickerDone = SEAudio.startPicker();
@@ -3260,15 +3071,9 @@
 
                 connectBtn.disabled = true;
 
-                // Everything that can ask the user anything is settled here, before the offer:
-                // the host builds no display and no session for someone still reading a card, no
-                // answer deadline or retry can fire behind it, and nothing is raised later over a
-                // live stage. Every discovery API runs in order with its own bounded timeout
-                // (SEAudio.prepareOutputsForJoin); the microphone card only when none of them
-                // found a routable output. The report the host gets at the answer is final when
-                // this returns, so the offer below never goes out with the question open. The
-                // card always has Skip, and no timer on the join path is running yet: the
-                // audio-prepare and refresh-rate deadlines below start after it.
+                // Everything that can ask the user anything is settled here, before the offer: the
+                // host builds no display for someone reading a card, no deadline or retry fires
+                // behind it (no join-path timer runs yet), and nothing is raised over a live stage.
                 try {
                     if (window.SEAudio && SEAudio.prepareOutputsForJoin) {
                         const plan = await SEAudio.prepareOutputsForJoin(micCard, pickerDone);
@@ -3306,19 +3111,13 @@
 
                 console.log('[join] connecting with', joinData);
 
-                // The fast audio path is decided here rather than from constructor
-                // existence, because the host reads `audioCapabilities` once and, if we
-                // claim the fast path, sends Opus on a DataChannel and puts no audio track
-                // in the answer at all. A prepare() that fails after that point is total
-                // silence with no way back. Safari 26 and Firefox 130 both newly pass the
-                // old constructor sniff, which is what made this urgent.
-                // All three overlap: the worklet module is a fetch, the decoder probe is
-                // async on some engines, and the refresh-rate measurement has its own
-                // deadline. Serialising them would put the sum in front of the picture.
+                // The fast audio path is decided here, by probing: the host reads
+                // `audioCapabilities` once and a claimed fast path gets no audio track, so a later
+                // failure is silence. The three waits (worklet, decoder, refresh rate) overlap.
                 const capsPromise = (window.SEAudio ? SEAudio.verifyCapabilities() : Promise.resolve(null))
                     .catch(() => { noteSuppressed(); return { webcodecsOpus: false, worklet: false }; });
-                // A worklet module that never loads must not hold the join open: past the
-                // deadline the client simply does not claim the fast path.
+                // a worklet module that never loads must not hold the join open: past the deadline
+                // the client does not claim the fast path
                 const readyPromise = audioReady
                     ? Promise.race([
                         Promise.resolve(audioReady).catch(() => { noteSuppressed(); return false; }),
@@ -3332,12 +3131,10 @@
                     if (!results[1]) { audioCaps.worklet = false; degrade(DEG.AUDIO_PREPARE_FAILED); }
                     audioFast = audioCaps.webcodecsOpus && audioCaps.worklet;
                     if (!audioCaps.webcodecsOpus) degrade(DEG.AUDIO_OPUS_UNSUPPORTED);
-                    // verifyCapabilities() derived this from a worklet that was still expected
-                    // to load. It did not, so the host is about to send a fed track and a
-                    // second spare one would be the same audio twice.
+                    // verifyCapabilities() assumed the worklet would load; if it did not, the host
+                    // sends a fed track and a spare would be the same audio twice
                     audioCaps.wantsFallbackTrack = audioFast;
-                    // No DataChannel off the fast path, so there is nothing for a
-                    // redundant body to ride and nothing true to claim.
+                    // no DataChannel off the fast path, so nothing for a redundant body to ride
                     audioCaps.redundancy = audioFast;
                 }
                 joinData.refreshRate = results[2];

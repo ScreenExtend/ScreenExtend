@@ -1,7 +1,7 @@
 pub fn code_to_scancode(code: &str) -> Option<(u16, bool)> {
     // (scancode, is_extended)
     let v = match code {
-        // ── Row 1 ─────────────────────────────────────────────
+        // row 1
         "Escape" => (0x01, false),
         "Digit1" => (0x02, false),
         "Digit2" => (0x03, false),
@@ -16,7 +16,7 @@ pub fn code_to_scancode(code: &str) -> Option<(u16, bool)> {
         "Minus" => (0x0C, false),
         "Equal" => (0x0D, false),
         "Backspace" => (0x0E, false),
-        // ── Row 2 ─────────────────────────────────────────────
+        // row 2
         "Tab" => (0x0F, false),
         "KeyQ" => (0x10, false),
         "KeyW" => (0x11, false),
@@ -31,7 +31,7 @@ pub fn code_to_scancode(code: &str) -> Option<(u16, bool)> {
         "BracketLeft" => (0x1A, false),
         "BracketRight" => (0x1B, false),
         "Enter" => (0x1C, false),
-        // ── Row 3 ─────────────────────────────────────────────
+        // row 3
         "ControlLeft" => (0x1D, false),
         "KeyA" => (0x1E, false),
         "KeyS" => (0x1F, false),
@@ -47,7 +47,7 @@ pub fn code_to_scancode(code: &str) -> Option<(u16, bool)> {
         "Backquote" => (0x29, false),
         "ShiftLeft" => (0x2A, false),
         "Backslash" => (0x2B, false),
-        // ── Row 4 ─────────────────────────────────────────────
+        // row 4
         "KeyZ" => (0x2C, false),
         "KeyX" => (0x2D, false),
         "KeyC" => (0x2E, false),
@@ -63,7 +63,7 @@ pub fn code_to_scancode(code: &str) -> Option<(u16, bool)> {
         "AltLeft" => (0x38, false),
         "Space" => (0x39, false),
         "CapsLock" => (0x3A, false),
-        // ── Function keys ─────────────────────────────────────
+        // function keys
         "F1" => (0x3B, false),
         "F2" => (0x3C, false),
         "F3" => (0x3D, false),
@@ -76,7 +76,7 @@ pub fn code_to_scancode(code: &str) -> Option<(u16, bool)> {
         "F10" => (0x44, false),
         "F11" => (0x57, false),
         "F12" => (0x58, false),
-        // ── Numpad ────────────────────────────────────────────
+        // numpad
         "NumLock" => (0x45, false),
         "ScrollLock" => (0x46, false),
         "Numpad7" => (0x47, false),
@@ -95,7 +95,7 @@ pub fn code_to_scancode(code: &str) -> Option<(u16, bool)> {
         "IntlBackslash" => (0x56, false),
         "IntlRo" => (0x73, false),
         "IntlYen" => (0x7D, false),
-        // ── Extended (E0-prefixed) keys ───────────────────────
+        // extended (E0-prefixed) keys
         "NumpadEnter" => (0x1C, true),
         "ControlRight" => (0x1D, true),
         "NumpadDivide" => (0x35, true),

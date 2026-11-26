@@ -1,25 +1,11 @@
-//! Encoder recipes: a whole VideoToolbox configuration expressed as data.
+//! Encoder recipes: a whole VideoToolbox configuration expressed as data, used by the production
+//! encoder as an optional override (`SE_VT_RECIPE=<file.json>`) and by the `bench` harness.
 //!
-//! A [`Recipe`] names the codec, the encoder specification, the session properties (applied in
-//! order) and the per-frame options. Keys are *short* names resolved at runtime with `dlsym`:
-//!
-//! | list | resolved as |
-//! |---|---|
-//! | `spec` | `kVTVideoEncoderSpecification_<name>` |
-//! | `props` | `kVTCompressionPropertyKey_<name>` |
-//! | `frame_opts` | `kVTEncodeFrameOptionKey_<name>` |
-//!
-//! A name that already starts with `kVT`/`kCV`/`kCM` is looked up verbatim, and `lit:<text>`
-//! uses `<text>` as the key string without any lookup. A symbol that does not resolve is the
-//! outcome `missing_symbol` — on an old macOS that *is* the capability probe — and never an
-//! error. Every property records whether it resolved, whether the session's own supported-property
-//! dictionary advertises it, the `OSStatus` of the set, and a read-back of the value afterwards, so
-//! "accepted but not applied" is visible rather than inferred.
-//!
-//! Used by the production encoder as an optional override (`EncoderConfig.recipe`, or
-//! `SE_VT_RECIPE=<file.json>` for a running host) and by the `bench` harness. Nothing here links
-//! a symbol newer than the 10.15 floor: every constant is `dlsym`'d and every function used is
-//! from 10.8 or earlier.
+//! Keys are short names resolved at runtime with `dlsym` under their `kVT...` prefix (`props` are
+//! applied in order); a name starting with `kVT`/`kCV`/`kCM` is looked up verbatim, and
+//! `lit:<text>` is the key string itself. A symbol that does not resolve is the outcome
+//! `missing_symbol`, never an error: on an old macOS that is the capability probe. Nothing here
+//! may link a symbol newer than the 10.15 floor.
 
 use std::collections::HashSet;
 use std::ffi::c_void;
@@ -163,7 +149,7 @@ pub enum Outcome {
     Rejected,
     /// The key's symbol does not exist in this process.
     MissingSymbol,
-    /// A `{"sym": …}` value did not resolve, so nothing was set.
+    /// A `{"sym": ...}` value did not resolve, so nothing was set.
     MissingValueSymbol,
     /// Put into a specification / frame-options dictionary (no per-key status exists there).
     Included,
@@ -171,7 +157,7 @@ pub enum Outcome {
     Read,
 }
 
-/// What one key did.
+/// What one key did. The read-back is what shows a set that was accepted but not applied.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PropResult {
     pub key: String,
@@ -215,7 +201,7 @@ impl PropResult {
         }
     }
 
-    /// A short token for one-line logs: `ok`, `rejected(-12900)`, `no-symbol`…
+    /// A short token for one-line logs: `ok`, `rejected(-12900)`, `no-symbol`...
     pub fn short(&self) -> String {
         match self.outcome {
             Outcome::Set => "ok".into(),
@@ -265,10 +251,6 @@ pub fn resolve_key(kind: KeyKind, name: &str) -> Result<(CFRetained<CFString>, S
     }
 }
 
-// ---------------------------------------------------------------------------------------------
-// The tier-fallback deny hook. TESTING ONLY.
-// ---------------------------------------------------------------------------------------------
-
 /// What `SE_VT_DENY` hides from this process, so every fallback rung can be driven on a Mac that
 /// has the capability the rung exists for.
 ///
@@ -283,10 +265,8 @@ pub fn resolve_key(kind: KeyKind, name: &str) -> Result<(CFRetained<CFString>, S
 /// | `read:<key>` | `VTSessionCopyProperty` of it returns `-12900` |
 /// | `create:lowlatency` | creating a low-latency session (the ladder's first rung, or a recipe whose spec sets `EnableLowLatencyRateControl`) fails with `-12902` without calling VideoToolbox |
 ///
-/// **It cannot be switched on by accident.** It is read once per process and honoured only when
-/// `SE_TEST_HOOKS=1` is set beside it; a lone `SE_VT_DENY` is ignored with a log line, and an
-/// honoured one prints a loud line naming every item. The bench runner clears both variables from
-/// every child and sets them only from a plan group's `"deny": [...]`.
+/// Read once per process and honoured only with `SE_TEST_HOOKS=1` beside it; a lone `SE_VT_DENY`
+/// is ignored with a log line.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Deny {
     pub props: HashSet<String>,
@@ -301,7 +281,7 @@ pub const DENIED_STATUS: i32 = -12900;
 /// `kVTCouldNotFindVideoEncoderErr`.
 pub const DENIED_CREATE_STATUS: i32 = -12902;
 
-/// A key's bare name: no `lit:`, no `kVT…Key_` prefix — the string VideoToolbox itself uses.
+/// A key's bare name (no `lit:`, no `kVT...Key_` prefix): the string VideoToolbox itself uses.
 fn short_name(kind: KeyKind, name: &str) -> String {
     let n = name.strip_prefix("lit:").unwrap_or(name);
     n.strip_prefix(kind.prefix()).unwrap_or(n).to_string()
@@ -383,13 +363,15 @@ impl Deny {
 /// variable (`SE_VT_DENY`, `SE_VT_RECIPE`, `SE_VT_QP_BPS`, `SE_VT_SIM_HOLD`). Read once.
 pub fn test_hooks() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("SE_TEST_HOOKS").as_deref() == Ok("1"))
+    *ON.get_or_init(|| crate::envcfg::var("SE_TEST_HOOKS").as_deref() == Ok("1"))
 }
 
 /// A developer-only variable, honoured only with `SE_TEST_HOOKS=1`. A lone one is ignored with
 /// one log line (callers read each variable once, so the line is printed at most once).
 pub fn hook_var(name: &str) -> Option<String> {
-    let v = std::env::var(name).ok().filter(|v| !v.trim().is_empty())?;
+    let v = crate::envcfg::var(name)
+        .ok()
+        .filter(|v| !v.trim().is_empty())?;
     if !test_hooks() {
         teprintln!(
             "[vt] {name} is set but IGNORED: it is a developer hook and is honoured only together \
@@ -404,7 +386,7 @@ pub fn hook_var(name: &str) -> Option<String> {
 pub fn deny() -> &'static Deny {
     static DENY: OnceLock<Deny> = OnceLock::new();
     DENY.get_or_init(|| {
-        let Some(text) = std::env::var("SE_VT_DENY")
+        let Some(text) = crate::envcfg::var("SE_VT_DENY")
             .ok()
             .filter(|t| !t.trim().is_empty())
         else {
@@ -474,7 +456,7 @@ pub fn build_value(v: &Val) -> Result<(Option<CFRetained<CFType>>, Option<String
             None,
         ),
         Val::Int(i) => {
-            // i32 when it fits, which is how the production encoder has always passed numbers.
+            // i32 when it fits: that is how the production encoder passes numbers
             let n = match i32::try_from(*i) {
                 Ok(small) => CFNumber::new_i32(small),
                 Err(_) => CFNumber::new_i64(*i),
@@ -617,7 +599,7 @@ pub fn dictionary_entries(dict: &CFDictionary) -> Vec<(String, &CFType)> {
 }
 
 /// The session's own supported-property dictionary (`VTSessionCopySupportedPropertyDictionary`,
-/// 10.8): what *this* encoder instance says it takes, which is the only honest answer.
+/// 10.8): what *this* encoder instance says it takes.
 pub fn supported_dictionary(session: &VTSession) -> Result<CFRetained<CFDictionary>, i32> {
     let mut out: *const CFDictionary = ptr::null();
     let st = unsafe { VTSessionCopySupportedPropertyDictionary(session, &mut out) };
@@ -725,7 +707,7 @@ pub fn build_dict(
                     keys.push(k);
                     vals.push(v);
                 }
-                // NULL in a dictionary means "leave the key out".
+                // NULL in a dictionary means "leave the key out"
                 Ok((None, _)) => r.outcome = Outcome::Included,
                 Err(_) => r.outcome = Outcome::MissingValueSymbol,
             }
@@ -795,7 +777,7 @@ pub fn create_session(
     match NonNull::new(session_ptr) {
         Some(p) if status == 0 => Ok(unsafe { CFRetained::from_raw(p) }),
         Some(p) => {
-            // A session handed back alongside a failure status is still ours to release.
+            // a session handed back with a failure status is still ours to release
             drop(unsafe { CFRetained::from_raw(p) });
             Err(status)
         }

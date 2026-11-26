@@ -1,16 +1,9 @@
-//! One way to take a `std::sync::Mutex` in the streamer core, and it is not `.unwrap()`.
+//! `lock_recover()`: the one way to take a `std::sync::Mutex` in the streamer core.
 //!
-//! Every shared-state lock in the transport guards the same handful of `Arc<Mutex<…>>` values,
-//! and those `Arc`s are shared across every network adapter's server and the cloud relay thread.
-//! So one panic that unwinds while any of those guards is live poisons the lock for the *whole
-//! host*, not for one session: after that, every `/whep`, `/reconfig`, `/leave` and every UI
-//! command touching that state panics on `unwrap()`. axum catches panics per task, so the visible
-//! symptom is not a crash but every request returning 500 and the device list going inert, with
-//! nothing in the log that explains it.
-//!
-//! Recovering the guard is the right call here: the guarded data is plain maps, counters and
-//! epochs. A torn update to one of those is far less harmful than a host that has to be
-//! restarted. What must not happen is the recovery being silent, so the first one is logged.
+//! These locks are shared by every adapter's server and the cloud relay thread, so one panic
+//! under a guard would poison state for the whole host (axum catches the panic per task, so
+//! every request then returns 500 with nothing in the log). The data is maps, counters and
+//! epochs, where a torn update costs less than a restart. The first recovery is logged.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -21,7 +14,7 @@ static REPORTED: AtomicBool = AtomicBool::new(false);
 fn report_poison() {
     if !REPORTED.swap(true, Ordering::Relaxed) {
         teprintln!(
-            "[lock] recovered a poisoned mutex — a thread panicked while holding streamer state. \
+            "[lock] recovered a poisoned mutex: a thread panicked while holding streamer state. \
              The host keeps serving, but something above this panicked and is worth finding."
         );
     }
@@ -76,7 +69,7 @@ mod tests {
         drop(g);
         assert!(poison_recoveries() > before);
 
-        // And it stays usable: the host must not need a restart.
+        // stays usable: the host must not need a restart
         m.lock_recover().push(5);
         assert_eq!(m.lock_recover().len(), 5);
     }

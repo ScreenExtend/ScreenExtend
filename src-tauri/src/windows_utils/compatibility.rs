@@ -34,9 +34,18 @@ struct Probes {
 }
 
 impl Probes {
-    /// Used only when the probe thread itself could not run, so that a machine is never told it
-    /// is unsupported because we failed to ask.
-    fn optimistic() -> Self {
+    /// Used only when the probe thread itself could not run: a machine is never told it is
+    /// unsupported because we failed to ask, and never told it works either.
+    ///
+    /// The capture flags stay `true` because they are the verdict (`os_supported`) and a probe
+    /// that did not run is not evidence against the machine; everything else reads `unknown`.
+    /// The display driver is still asked: that probe needs no COM, and its answer decides whether
+    /// the bootstrap offers the install.
+    fn fallback(why: &str) -> Self {
+        teprintln!(
+            "[compatibility] the capability probe did not run ({why}); reporting what could not \
+             be probed as unknown"
+        );
         Self {
             wgc: true,
             dxgi: true,
@@ -48,7 +57,7 @@ impl Probes {
                 backend: "unknown".to_string(),
                 software_adapter_only: false,
             },
-            display_backend: DisplayBackend::IddDriver,
+            display_backend: probe_display_backend(),
             hosted_network: HostedNetworkBackend::Unsupported,
         }
     }
@@ -93,15 +102,15 @@ fn read_os_info() -> (String, u32) {
     (os_version, build_num)
 }
 
-/// Every probe below runs on a thread of this function's own, and that is load-bearing twice
-/// over: the WinRT and WMI calls want an MTA (a blocking `join()` on a Tauri STA has no message
-/// pump behind it), and an app-spawned thread is the only kind this crate is allowed to
-/// initialize. The caller's apartment therefore cannot reach the answer — which is what
+/// Every probe runs on a thread of this function's own: the WinRT and WMI calls want an MTA (a
+/// blocking `join()` on a Tauri STA has no message pump behind it), and an app-spawned thread is
+/// the only kind this crate may initialize. The caller's apartment cannot reach the answer, as
 /// `com::test::the_compatibility_report_does_not_depend_on_the_callers_apartment` asserts.
 fn run_probes() -> Probes {
     std::thread::spawn(|| -> Probes {
-        let Ok((_com, com_con)) = super::com::wmi_for_this_thread("compatibility-probe") else {
-            return Probes::optimistic();
+        let (_com, com_con) = match super::com::wmi_for_this_thread("compatibility-probe") {
+            Ok(pair) => pair,
+            Err(e) => return Probes::fallback(&format!("COM/WMI could not start: {e}")),
         };
 
         let wmi = WMIConnection::with_namespace_path("root\\StandardCimv2", com_con).is_ok();
@@ -128,13 +137,12 @@ fn run_probes() -> Probes {
         }
     })
     .join()
-    .unwrap_or_else(|_| Probes::optimistic())
+    .unwrap_or_else(|_| Probes::fallback("the probe thread panicked"))
 }
 
 /// The report and the capture path must never disagree about whether WGC is available, so this
-/// is a thin call into the one predicate the capture path itself gates on. It used to be a second
-/// copy that dropped upstream's `UniversalApiContract 8` conjunct while
-/// `GraphicsCaptureApi::is_supported()` kept it — which on a build where that gate binds made the
+/// is a thin call into the one predicate the capture path itself gates on. A second copy that
+/// lost a conjunct (upstream's `UniversalApiContract 8`, where that gate binds) would make the
 /// report claim WGC on a host where capture would refuse to start.
 fn wgc_supported() -> bool {
     crate::windows_capture::graphics_capture_api::wgc_supported()
@@ -142,17 +150,21 @@ fn wgc_supported() -> bool {
 
 /// Whether the DXGI Desktop Duplication *fallback* can actually run here.
 ///
-/// This used to be `CreateDXGIFactory1().is_ok()`, which is true on every Windows since 7 and
-/// says nothing about duplication. On a hybrid-graphics laptop `DuplicateOutput` returns
-/// `DXGI_ERROR_UNSUPPORTED` on the primary display, so the report claimed a fallback that could
-/// never start. Duplication is created and immediately dropped, once, on the probe thread.
+/// `CreateDXGIFactory1().is_ok()` is true on every Windows since 7 and says nothing about
+/// duplication: on a hybrid-graphics laptop `DuplicateOutput` returns `DXGI_ERROR_UNSUPPORTED`
+/// on the primary display. So duplication is created and immediately dropped, once, on the
+/// probe thread.
 fn dxgi_supported() -> bool {
     if unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }.is_err() {
         return false;
     }
     match super::streamer::dxgi::probe_duplication() {
         Ok(api) => {
-            tprintln!("dxgi: duplication fallback available via {}", api.name());
+            tprintln!(
+                "dxgi: duplication works on at least one attached output (via {}); whether it \
+                 works on a virtual display is decided when one is captured",
+                api.name()
+            );
             true
         }
         Err(e) => {
@@ -169,9 +181,35 @@ fn type_present(type_name: &str) -> bool {
     ApiInformation::IsTypePresent(&HSTRING::from(type_name)).unwrap_or(false)
 }
 
-/// System audio is WASAPI loopback on a render endpoint. With no default output device there
-/// is nothing to loop back, and the audio toggle can never work.
+/// System audio is WASAPI loopback, in one of two tiers, and the report names which.
+///
+/// `wasapi-process` is process loopback (the faster tier), `wasapi-endpoint` the default render
+/// endpoint's loopback. Process loopback is probed by attempting the activation, as capture
+/// does (`process_loopback::available`), and `SE_ENDPOINT_LOOPBACK=1` forces the endpoint tier
+/// here as it does there. With no default output device neither tier has anything to loop back.
 fn probe_audio_backend() -> &'static str {
+    match probe_default_endpoint() {
+        "none" => "none",
+        _ => audio_tier_name(
+            crate::envcfg::var("SE_ENDPOINT_LOOPBACK").as_deref() == Ok("1"),
+            super::audio::process_loopback::available,
+        ),
+    }
+}
+
+/// Which tier the capture path will pick, by its own rule (`loopback.rs::acquire`).
+fn audio_tier_name(
+    endpoint_forced: bool,
+    process_available: impl FnOnce() -> bool,
+) -> &'static str {
+    if !endpoint_forced && process_available() {
+        "wasapi-process"
+    } else {
+        "wasapi-endpoint"
+    }
+}
+
+fn probe_default_endpoint() -> &'static str {
     use windows::Win32::Media::Audio::{
         eConsole, eRender, IMMDeviceEnumerator, MMDeviceEnumerator,
     };
@@ -184,7 +222,10 @@ fn probe_audio_backend() -> &'static str {
         Ok(())
     };
     match probe() {
-        Ok(()) => "wasapi",
+        // process loopback is tried first and the gate learns from the first real capture, so
+        // before any capture this names the tier that will be tried (no activation here)
+        Ok(()) if super::audio::process_loopback::refused() => "wasapi-endpoint",
+        Ok(()) => "wasapi-process",
         Err(e) => {
             tprintln!("[compatibility] no default audio output endpoint: {e}");
             "none"
@@ -192,23 +233,17 @@ fn probe_audio_backend() -> &'static str {
     }
 }
 
-/// Which encoder the pipeline would reach for. `EncoderVendor::Auto` tries NVENC, then Quick
-/// Sync, then AMF, then x264.
+/// Which encoder the pipeline would reach for. `EncoderVendor::Auto` tries NVENC, then AMF,
+/// then Quick Sync, then x264.
 ///
-/// Adapters are classified by **PCI vendor id**, not by their description string: descriptions are
-/// localized and OEM-rebranded, and WARP's contains no vendor name at all while reporting
-/// Microsoft's `0x1414`. `select_vendor` stays as the fallback for an adapter whose id is not one
-/// we know, which is the only case a name can still help with.
-///
-/// The AMD arm goes further than the other two and actually asks AMF whether it would open here.
-/// It used to report `"x264 (no AMD hardware encoder)"` unconditionally, which stopped being true
-/// the day the AMF backend landed, and that string is shown in the compatibility card and read by
-/// `doctor --json` — so an AMD user was being told the product could not use their GPU.
+/// Adapters are classified by **PCI vendor id**, not description string: descriptions are
+/// localized and OEM-rebranded, and WARP's names no vendor while reporting Microsoft's `0x1414`.
+/// `select_vendor` is the fallback for an adapter whose id is unknown.
 fn probe_encoder() -> EncoderProbe {
     let mut has_nvidia = false;
     let mut has_intel = false;
     let mut has_amd = false;
-    // The first hardware adapter's vendor, which is the one the capture device lands on.
+    // the first hardware adapter's vendor: the one the capture device lands on
     let mut first_hardware: Option<Vendor> = None;
     let mut hardware_adapters = 0usize;
     let mut software_adapters = 0usize;
@@ -259,28 +294,145 @@ fn probe_encoder() -> EncoderProbe {
         }
     }
 
-    let backend = if has_nvidia {
-        "nvenc".to_string()
-    } else if has_intel {
-        "quicksync".to_string()
-    } else if has_amd {
-        amd_backend_name(first_hardware == Some(Vendor::Amd))
-    } else {
-        "x264".to_string()
+    // each hardware tier is asked the way the pipeline asks it, by opening an encoder: adapter
+    // presence would report `nvenc` for a GeForce MX with no NVENC block or a rejected API version
+    let tiers = EncoderTiers {
+        nvenc: has_nvidia.then(nvenc_opens),
+        quicksync: has_intel.then(quicksync_opens),
+        amd: has_amd.then(|| amd_backend_name(first_hardware == Some(Vendor::Amd))),
+        x264: x264_loads(),
     };
 
     EncoderProbe {
-        backend,
+        backend: encoder_backend_name(&tiers),
         software_adapter_only: hardware_adapters == 0 && software_adapters > 0,
     }
 }
 
+/// What each encoder tier said when it was tried. `None` for a vendor with no adapter here.
+struct EncoderTiers {
+    nvenc: Option<Result<(), String>>,
+    quicksync: Option<Result<(), String>>,
+    /// [`amd_backend_name`]'s answer, which already names an AMF refusal.
+    amd: Option<String>,
+    x264: Result<(), String>,
+}
+
+/// The first tier of `EncoderVendor::Auto`'s chain (NVENC, AMF, Quick Sync, x264) that opened,
+/// naming why a present vendor's hardware tier did not. `none` when not even x264 loads.
+fn encoder_backend_name(t: &EncoderTiers) -> String {
+    if let Some(Ok(())) = t.nvenc {
+        return "nvenc".to_string();
+    }
+    if let Some(amd) = t.amd.as_deref().filter(|name| name.starts_with("amf")) {
+        return amd.to_string();
+    }
+    if let Some(Ok(())) = t.quicksync {
+        return "quicksync".to_string();
+    }
+    if let Err(e) = &t.x264 {
+        tprintln!("[compatibility] x264 does not load either: {e}");
+        return "none".to_string();
+    }
+    let why = [
+        t.nvenc
+            .as_ref()
+            .and_then(|r| r.as_ref().err())
+            .map(|e| format!("NVENC unavailable: {e}")),
+        t.quicksync
+            .as_ref()
+            .and_then(|r| r.as_ref().err())
+            .map(|e| format!("Quick Sync unavailable: {e}")),
+    ]
+    .into_iter()
+    .flatten()
+    .next();
+    match (why, t.amd.as_deref()) {
+        (Some(why), _) => format!("x264 ({why})"),
+        // already `x264 (AMF unavailable: ...)`
+        (None, Some(amd)) => amd.to_string(),
+        (None, None) => "x264".to_string(),
+    }
+}
+
+/// Small and legal everywhere: nothing is encoded, so the geometry only has to pass the
+/// encoder's own range check.
+fn probe_config() -> super::streamer::nvidia::encoder::EncoderConfig {
+    super::streamer::nvidia::encoder::EncoderConfig {
+        width: 1280,
+        height: 720,
+        fps: 60,
+        bitrate_bps: 6_000_000,
+        max_bitrate_bps: 6_000_000,
+        profile: crate::streamer::config::H264Profile::High,
+        qp: None,
+        min_qp: None,
+        intra_refresh: false,
+    }
+}
+
+/// An `anyhow` chain flattened to one short clause, so it can sit inside the card's string.
+fn one_line(e: &anyhow::Error) -> String {
+    const MAX: usize = 140;
+    let s = format!("{e:#}")
+        .replace(['\r', '\n'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if s.chars().count() > MAX {
+        s.chars().take(MAX - 1).collect::<String>() + "…"
+    } else {
+        s
+    }
+}
+
+/// Open an NVENC session on the NVIDIA adapter and close it again.
+///
+/// Once per process. The report is asked for by the bootstrap, by `doctor` and again by the
+/// compatibility card, and on a hybrid laptop each open wakes the discrete GPU; the answer only
+/// changes with a driver update, which restarts the app anyway.
+fn nvenc_opens() -> Result<(), String> {
+    static ANSWER: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    ANSWER
+        .get_or_init(|| {
+            super::streamer::nvidia::encoder::Encoder::new(probe_config())
+                .map(drop)
+                .map_err(|e| one_line(&e))
+        })
+        .clone()
+}
+
+/// Open a Quick Sync session on the Intel adapter and close it again. Once per process, like
+/// [`nvenc_opens`].
+fn quicksync_opens() -> Result<(), String> {
+    static ANSWER: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    ANSWER
+        .get_or_init(|| {
+            super::streamer::intel::encoder::Encoder::new(probe_config())
+                .map(drop)
+                .map_err(|e| one_line(&e))
+        })
+        .clone()
+}
+
+/// Whether the software fallback can load at all. Once per process.
+fn x264_loads() -> Result<(), String> {
+    static ANSWER: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    ANSWER
+        .get_or_init(|| {
+            super::streamer::x264::x264_sys::X264Api::load()
+                .map(drop)
+                .map_err(|e| one_line(&e))
+        })
+        .clone()
+}
+
 /// The AMD arm of [`probe_encoder`], split out so the AMF probe is one call.
 ///
-/// `same_adapter` is whether the first hardware adapter — the one the capture device is created
-/// on — is the AMD one. When it is not, `Backend::Amf` refuses ("AMD AMF requires an AMD D3D11
-/// device") and the pipeline falls to `Backend::AmfCpu`, which is a readback per frame and worth
-/// saying out loud.
+/// `same_adapter` is whether the first hardware adapter (the one the capture device is created
+/// on) is the AMD one. When it is not, `Backend::Amf` refuses ("AMD AMF requires an AMD D3D11
+/// device") and the pipeline falls to `Backend::AmfCpu`, a readback per frame, which the name
+/// reports.
 fn amd_backend_name(same_adapter: bool) -> String {
     use super::streamer::amd::encoder::{probe_availability, AmfAvailability};
     match probe_availability() {
@@ -292,15 +444,13 @@ fn amd_backend_name(same_adapter: bool) -> String {
 
 /// Turn what was probed into the capability notes the report carries.
 ///
-/// Pure, and separate from [`check_system_requirements`], because the severities are a policy
-/// question — *which* missing capability is allowed to stop startup — and a policy is only
-/// worth anything if it can be tested against a machine that does not have the fault.
+/// Pure, and separate from [`check_system_requirements`], so the severity policy (which missing
+/// capability may stop startup) can be tested on a machine that does not have the fault.
 fn capability_notes(probes: &Probes) -> Vec<UnsupportedApi> {
     let mut unsupported: Vec<UnsupportedApi> = Vec::new();
 
-    // The only bare-minimum row this platform can produce: with neither backend there is no
-    // picture to send, and no fallback left to try. One of the two missing is not a verdict —
-    // the other one streams — so it is `optional` and the user is offered "Continue anyway".
+    // With neither backend there is no picture to send: blocking. With one missing the other
+    // still streams, so that is `optional` and the user is offered "Continue anyway".
     if !probes.wgc && !probes.dxgi {
         unsupported.push(UnsupportedApi::blocking(
             BareMinimum::Capture,
@@ -319,22 +469,18 @@ fn capability_notes(probes: &Probes) -> Vec<UnsupportedApi> {
 
     match probes.display_backend {
         DisplayBackend::IddDriver => {}
-        // The driver is the one "unsupported API" the app can fix by itself: the bootstrap
-        // runs the elevated installer and retries, which is the flow every first launch (and
-        // every fresh install, whose pre-uninstall hook removes the previous driver) goes
-        // through. `installable` keeps the row visible to `doctor` and `status` without the
-        // desktop UI treating a missing driver as an unsupported operating system.
+        // The app can fix a missing driver itself: the bootstrap runs the elevated installer and
+        // retries (every first launch goes through this). `installable` keeps the row visible to
+        // `doctor` and `status` without the desktop UI treating it as an unsupported OS.
         DisplayBackend::DriverNotInstalled => unsupported.push(UnsupportedApi::installable(
             api_key::DISPLAY_DRIVER,
             "Virtual Display Driver",
             "Not installed. Each connected device needs one; install the driver to continue.",
             "Windows 10 20H1 (build 19041)",
         )),
-        // Installed, healthy, and somebody else has it. `optional`, not `installable`: there is
-        // nothing here to install, and the bootstrap must not reach for the elevated installer
-        // against a driver whose only problem is that another one of our own processes got
-        // there first. Not `blocking` either — quitting that process fixes it, so this is not a
-        // verdict on the machine.
+        // Installed, healthy, and held by another of our own processes. `optional`, not
+        // `installable`: the bootstrap must not run the elevated installer against a working
+        // driver. Not `blocking` either: quitting that process fixes it.
         DisplayBackend::DriverBusy { holder } => unsupported.push(UnsupportedApi::optional(
             api_key::DISPLAY_DRIVER_BUSY,
             "Virtual Display Driver",
@@ -357,8 +503,18 @@ fn capability_notes(probes: &Probes) -> Vec<UnsupportedApi> {
         )),
     }
 
-    // A WARP-only machine is slow, not incapable: x264 encodes what WARP composes, so this
-    // costs latency and CPU rather than the ability to stream.
+    // not even x264 loads and no hardware encoder opened: nothing can encode a frame
+    if probes.encoder.backend == "none" {
+        unsupported.push(UnsupportedApi::blocking(
+            BareMinimum::Encoder,
+            "H.264 encoder",
+            "No hardware encoder opened and the bundled software encoder (libx264) could not be \
+             loaded; reinstall ScreenExtend.",
+            "any",
+        ));
+    }
+
+    // a WARP-only machine is slow, not incapable: x264 encodes what WARP composes
     if probes.encoder.software_adapter_only {
         unsupported.push(UnsupportedApi::optional(
             api_key::GPU_ADAPTER,
@@ -407,14 +563,20 @@ fn capability_notes(probes: &Probes) -> Vec<UnsupportedApi> {
     unsupported
 }
 
-#[tauri::command]
+/// `async` in the Tauri sense: it runs on the async runtime rather than the UI's main thread,
+/// which every probe below (the driver handshake (5 s deadline), WMI, DXGI duplication, the
+/// encoder sessions) used to freeze. Still a plain function for `doctor` and the tests.
+#[tauri::command(async)]
 #[specta::specta]
 pub fn check_system_requirements() -> CompatibilityReport {
+    super::blocking_off_the_workers(check_system_requirements_blocking)
+}
+
+fn check_system_requirements_blocking() -> CompatibilityReport {
     let (os_version, build_num) = read_os_info();
 
     let probes = run_probes();
-    // Supported means "a capture backend actually works here", not "the build number is high
-    // enough". The build number stays as the text we show.
+    // supported means a capture backend works here, not that the build number is high enough
     let os_supported = probes.wgc || probes.dxgi;
     let unsupported = capability_notes(&probes);
 
@@ -434,7 +596,9 @@ pub fn check_system_requirements() -> CompatibilityReport {
         audio_backend: probes.audio_backend.to_string(),
         display_backend: probes.display_backend.as_str().to_string(),
         capture_backend: probes.capture_backend.to_string(),
-        encoder_backend: probes.encoder.backend.to_string(),
+        encoder_backend: super::streamer::pipeline::started_backend()
+            .map(str::to_string)
+            .unwrap_or_else(|| probes.encoder.backend.to_string()),
         hosted_network_backend: probes.hosted_network.as_str().to_string(),
         input_backend: crate::streamer::input::probe_backend().as_str().to_string(),
         display_driver_holder_pid: probes.display_backend.holder(),
@@ -452,7 +616,7 @@ mod test {
             dxgi: true,
             wifi_radios: true,
             wmi: true,
-            audio_backend: "wasapi",
+            audio_backend: "wasapi-process",
             capture_backend: "WindowsGraphicsCapture",
             encoder: EncoderProbe {
                 backend: "nvenc".to_string(),
@@ -476,9 +640,9 @@ mod test {
         assert!(capability_notes(&healthy()).is_empty());
     }
 
-    /// The rule the owner set: only a host that cannot create a display, cannot capture, or
-    /// cannot encode may be stopped. Everything else is a degraded feature and the user gets
-    /// "Continue anyway", so no combination of the optional faults may produce a blocking row.
+    /// Only a host that cannot create a display, cannot capture, or cannot encode may be
+    /// stopped. Everything else is a degraded feature and the user gets "Continue anyway", so
+    /// no combination of the optional faults may produce a blocking row.
     #[test]
     fn no_optional_fault_can_stop_startup() {
         let cases: Vec<(&str, Probes)> = vec![
@@ -592,9 +756,8 @@ mod test {
     }
 
     /// A driver whose pipe is merely taken is the one display-driver state that must **not** be
-    /// remediated. It used to arrive here as `DriverNotResponding`, which is `installable`, so
-    /// the bootstrap removed and reinstalled a healthy signed driver — one elevation prompt per
-    /// pass — probed again, found the pipe still held by the other process, and went round.
+    /// remediated: as an `installable` row the bootstrap would remove and reinstall a healthy
+    /// signed driver, one elevation prompt per pass, and still find the pipe held.
     #[test]
     fn a_busy_driver_is_reported_but_never_installed() {
         for holder in [Some(71848u32), None] {
@@ -625,8 +788,8 @@ mod test {
         }
     }
 
-    /// `DriverBusy` is a value of an existing string field, so nothing on the wire changed
-    /// shape — but the value itself is compared against a literal on the other side.
+    /// `DriverBusy` travels in an existing string field, and the other side compares the value
+    /// against a literal.
     #[test]
     fn the_busy_backend_reports_its_holder_separately() {
         let backend = DisplayBackend::DriverBusy {
@@ -636,7 +799,93 @@ mod test {
         assert_eq!(backend.holder(), Some(71848));
     }
 
-    /// No capture backend at all is the one thing that genuinely cannot be worked around.
+    #[test]
+    fn no_encoder_at_all_is_the_bare_minimum() {
+        let notes = capability_notes(&Probes {
+            encoder: EncoderProbe {
+                backend: "none".to_string(),
+                software_adapter_only: false,
+            },
+            ..healthy()
+        });
+        assert_eq!(
+            keys(&notes, crate::SEVERITY_BLOCKING),
+            vec![api_key::ENCODER.to_string()]
+        );
+    }
+
+    /// The encoder row names the tier that actually opens, not the vendor whose adapter is present.
+    #[test]
+    fn the_encoder_row_names_the_tier_that_opened() {
+        let tiers = |nvenc, quicksync, amd: Option<&str>, x264| EncoderTiers {
+            nvenc,
+            quicksync,
+            amd: amd.map(str::to_string),
+            x264,
+        };
+        let refused = |why: &str| Some(Err(why.to_string()));
+        assert_eq!(
+            encoder_backend_name(&tiers(Some(Ok(())), None, None, Ok(()))),
+            "nvenc"
+        );
+        // an NVIDIA adapter without a working NVENC on a hybrid laptop: Quick Sync is next
+        assert_eq!(
+            encoder_backend_name(&tiers(refused("no NVENC"), Some(Ok(())), None, Ok(()))),
+            "quicksync"
+        );
+        assert_eq!(
+            encoder_backend_name(&tiers(refused("no NVENC"), None, None, Ok(()))),
+            "x264 (NVENC unavailable: no NVENC)"
+        );
+        assert_eq!(
+            encoder_backend_name(&tiers(None, None, Some("amf"), Ok(()))),
+            "amf"
+        );
+        // a Radeon beside an Intel iGPU: AMF comes before Quick Sync
+        assert_eq!(
+            encoder_backend_name(&tiers(None, Some(Ok(())), Some("amf"), Ok(()))),
+            "amf"
+        );
+        // and Quick Sync is what is left when AMF does not open
+        assert_eq!(
+            encoder_backend_name(&tiers(
+                None,
+                Some(Ok(())),
+                Some("x264 (AMF unavailable: no runtime)"),
+                Ok(())
+            )),
+            "quicksync"
+        );
+        assert_eq!(
+            encoder_backend_name(&tiers(
+                None,
+                None,
+                Some("x264 (AMF unavailable: no runtime)"),
+                Ok(())
+            )),
+            "x264 (AMF unavailable: no runtime)"
+        );
+        assert_eq!(
+            encoder_backend_name(&tiers(None, None, None, Ok(()))),
+            "x264"
+        );
+        assert_eq!(
+            encoder_backend_name(&tiers(refused("x"), None, None, Err("gone".into()))),
+            "none"
+        );
+    }
+
+    /// The two WASAPI tiers are told apart, by the same rule capture uses.
+    #[test]
+    fn the_audio_row_names_the_loopback_tier() {
+        assert_eq!(audio_tier_name(false, || true), "wasapi-process");
+        assert_eq!(audio_tier_name(false, || false), "wasapi-endpoint");
+        assert_eq!(
+            audio_tier_name(true, || panic!("a forced endpoint tier must not probe")),
+            "wasapi-endpoint"
+        );
+    }
+
     #[test]
     fn losing_every_capture_backend_is_the_bare_minimum() {
         let notes = capability_notes(&Probes {
@@ -652,7 +901,7 @@ mod test {
     }
 
     /// `bare_minimum_missing` is what the startup gate asks, so an `installable` row must
-    /// never answer it — that is the whole point of the severity.
+    /// never answer it: that is the whole point of the severity.
     #[test]
     fn an_installable_row_is_not_a_verdict() {
         let mut report = CompatibilityReport {
@@ -664,7 +913,7 @@ mod test {
                 display_backend: DisplayBackend::DriverNotInstalled,
                 ..healthy()
             }),
-            audio_backend: "wasapi".into(),
+            audio_backend: "wasapi-process".into(),
             display_backend: "none".into(),
             capture_backend: "WindowsGraphicsCapture".into(),
             encoder_backend: "nvenc".into(),
@@ -681,12 +930,9 @@ mod test {
 
     /// The compatibility report and the capture path must answer the same question the same way.
     ///
-    /// They used to be two copies of the predicate that disagreed by one conjunct
-    /// (`UniversalApiContract 8`), so a host where that gate bound was told WGC works while
-    /// `GraphicsCaptureApi::new` returned `Unsupported` and every optional knob read absent. This
-    /// passes trivially while both go through
+    /// This passes trivially while both go through
     /// `windows_capture::graphics_capture_api::wgc_supported`, which is the point: it fails the
-    /// moment somebody re-adds a term to one side only.
+    /// moment somebody adds a term (such as `UniversalApiContract 8`) to one side only.
     #[test]
     fn the_report_and_the_capture_path_share_one_wgc_predicate() {
         let report = wgc_supported();
@@ -701,7 +947,7 @@ mod test {
         );
 
         // `wgc_features()` gates on the same answer, so an unsupported host must report every
-        // knob absent rather than a mix.
+        // knob absent rather than a mix
         let features = crate::windows_capture::graphics_capture_api::wgc_features();
         if !report {
             assert_eq!(
@@ -713,7 +959,7 @@ mod test {
         }
     }
 
-    /// Prints every probed backend on this machine. Run with `--ignored --nocapture`.
+    /// Prints every probed backend on this machine.
     #[test]
     #[ignore = "read-only report of this machine's probed backends; run with --ignored --nocapture"]
     fn report_backends() {

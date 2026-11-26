@@ -2,17 +2,10 @@
 //!
 //! Rust has no header, so every `extern "C"` block is an independent claim
 //! about a symbol's type, and the compiler only compares two claims when they
-//! are in the same crate *and* it happens to notice. `ax.rs` carries a comment
-//! about exactly that hazard — its `CFBooleanGetValue` must keep matching the
-//! one in `macos_utils/streamer/encoder.rs` or the linker rejects the crate —
-//! and the two files in this module had drifted into declaring
-//! `CFPreferencesCopyAppValue`, `CFRelease` and `CFGetTypeID` twice apiece.
-//!
-//! So they are declared here once and imported. `CFTypeRef` is deliberately a
-//! single opaque pointer type rather than the family of `CFStringRef` /
-//! `CFArrayRef` aliases: the aliases were all `*const c_void` anyway, and
-//! having one of them made the duplicate declarations look different when they
-//! were not.
+//! are in the same crate *and* it happens to notice. So each symbol is declared
+//! here once and imported. `CFTypeRef` is deliberately a single opaque pointer
+//! type rather than the family of `CFStringRef` / `CFArrayRef` aliases, which
+//! are all `*const c_void` anyway.
 //!
 //! Everything here is 10.0-era. Nothing in this file can add a dyld symbol the
 //! 10.15 floor does not have.

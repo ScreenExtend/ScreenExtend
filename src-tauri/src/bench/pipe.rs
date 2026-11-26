@@ -1,18 +1,10 @@
 //! The `pipe` stage: a clip through the REAL production encode path.
 //!
-//! The lab engine submits every frame straight to an `Encoder`. This one plays the part of the
-//! capture backend instead: frames are published into the production latest-frame slot
-//! (`frame::frame_channel`) on the clip's schedule, and `pipeline::spawn_pipeline` does the rest
-//! exactly as it does for a live session — `run_encode_loop` with its `MAX_FRAMES_IN_FLIGHT`
-//! back-pressure, the stall bypass, the idle repeater and keepalive, IDR requests, `submit_one`,
-//! the drain thread's Annex B conversion and the broadcast. A subscriber then runs each
-//! `EncodedFrame` through the production RTP packetizer (`streamer::packetizer`) at the LAN MTU,
-//! the way `webrtc_session.rs`'s writer does, stamps `packetize_done` and folds the frame into the
-//! session telemetry with `record_frame` — without a network, so there is no socket stage.
-//!
-//! The stamps are the production ones: `capture_available_ns` = the moment this stage offered the
-//! frame (the role of the OS frame time), `capture_cb_entry_ns` = when the encode loop took it,
-//! `encode_submit_ns`, `encode_done_ns` (drain thread), `packetize_done_ns`.
+//! This stage plays the capture backend: frames are published into the production latest-frame
+//! slot (`frame::frame_channel`) on the clip's schedule and `pipeline::spawn_pipeline` does the
+//! rest as it does for a live session. A subscriber packetizes each `EncodedFrame` at the LAN MTU
+//! and folds it into the session telemetry with `record_frame`. There is no network, so no socket
+//! stage; `capture_available_ns` is the moment this stage offered the frame.
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -102,10 +94,10 @@ fn client_frame_ms() -> f64 {
 }
 
 /// A modelled client, so the hold push's client guard has STATS to read in a stage with no
-/// browser: each packetized frame is "painted" FIFO at a fixed per-frame cost, and once a second a
-/// STATS frame with arrival->paint p50 over the last 512 frames and the painted count is put in
-/// the session telemetry exactly where the real parser puts it. A client slower than twice the
-/// frame rate builds a queue under hold push, as a real one does.
+/// browser: each packetized frame is "painted" FIFO at a fixed per-frame cost, and once a second
+/// a STATS frame (arrival->paint p50 over the last 512 frames, painted count) goes into the
+/// session telemetry where the real parser puts it. A client slower than twice the frame rate
+/// queues under hold push, as a real one does.
 struct SyntheticClient {
     /// `SE_BENCH_CLIENT_FRAME_MS=off|tier0|p50zero`: no STATS at all, STATS from a page that cannot
     /// measure paint, and STATS whose p50 is 0. All three must keep hold push out of immediate mode.
@@ -153,8 +145,8 @@ impl SyntheticClient {
             telemetry.set_client_stats(crate::streamer::telemetry::ClientStats {
                 received_host_ns: crate::streamer::audio::host_now_ns(),
                 version: 3,
-                // A client that paints through WebCodecs: without these the host takes the frame
-                // for a page that cannot measure paint, and hold push never goes immediate.
+                // a client that paints through WebCodecs: without these the host takes the frame
+                // for a page that cannot measure paint, and hold push never goes immediate
                 video_path: 1,
                 transport_tier: u8::from(!self.tier0),
                 arrival_to_paint_p50_us: if self.p50zero {
@@ -216,15 +208,15 @@ pub fn run(spec: &RunSpec) -> Json {
     let fps = ((spec.workload.fps as f64) * speed).round().max(1.0) as u32;
     let fire = event_schedule(&spec.events, &at);
 
-    // What `Streamer::prepare` and `start_on_monitor` do around a live session.
+    // what `Streamer::prepare` and `start_on_monitor` do around a live session
     tuning::apply_process_tuning();
     let activity = activity::begin_if_enabled();
 
-    // Reader: clip records into IOSurface-backed pool buffers, ahead of the clock.
+    // reader: clip records into IOSurface-backed pool buffers, ahead of the clock
     let frame_bytes = ow * oh * 3 / 2;
     let depth = (256_000_000 / frame_bytes.max(1)).clamp(8, 64);
-    // The encode loop holds the last frame for the keepalive and VideoToolbox holds up to the
-    // stall bypass's bound, so the pool must outlast the read-ahead by more than that.
+    // the encode loop holds the last frame for the keepalive and VideoToolbox holds up to the
+    // stall bypass's bound, so the pool must outlast the read-ahead by more than that
     let pool = match cf::Pool::new(ow, oh, depth + 24) {
         Ok(p) => p,
         Err(st) => return setup_error(spec, format!("CVPixelBufferPoolCreate failed: {st}")),
@@ -260,7 +252,6 @@ pub fn run(spec: &RunSpec) -> Json {
             .expect("spawn reader")
     };
 
-    // The production pipeline.
     let cfg = production_config(spec, ow as u32, oh as u32, fps);
     let telemetry = SessionTelemetry::new_shared();
     telemetry.encoder.set("videotoolbox".into());
@@ -282,7 +273,6 @@ pub fn run(spec: &RunSpec) -> Json {
     };
     let create_ms = create_t.elapsed().as_secs_f64() * 1e3;
 
-    // The transport's half: subscribe, packetize, fold into the telemetry.
     let mut brx = pipeline.tx.subscribe();
     let client_frame_ms = client_frame_ms();
     let packetizer = {
@@ -290,7 +280,7 @@ pub fn run(spec: &RunSpec) -> Json {
         std::thread::Builder::new()
             .name("bench-packetize".into())
             .spawn(move || {
-                // The writer is a tokio worker in production; give this thread its tuning.
+                // the writer is a tokio worker in production: give this thread its tuning
                 crate::streamer::platform::tune_transport_thread();
                 let mut pk = H264Packetizer::new();
                 let mut payloads: Vec<Bytes> = Vec::with_capacity(64);
@@ -346,7 +336,7 @@ pub fn run(spec: &RunSpec) -> Json {
             .expect("spawn packetizer")
     };
 
-    // Prefill the read-ahead before the clock starts.
+    // prefill the read-ahead before the clock starts
     let pre = Instant::now();
     while frx.len() < depth.min(total)
         && !reader.is_finished()
@@ -355,10 +345,8 @@ pub fn run(spec: &RunSpec) -> Json {
         std::thread::sleep(Duration::from_millis(2));
     }
 
-    // The offer loop: this thread plays the capture callback. Its *timing* must be the clip's,
-    // not the scheduler's, so it is a deadline thread like the lab's submit loop: measured at
-    // USER_INTERACTIVE QoS alone (on a Mac in low-power mode) 413 of 600 offers were > 2 ms late,
-    // p50 3.4 ms, which is the harness's error, not the pipeline's.
+    // this thread plays the capture callback on the clip's timing, so it is a deadline thread:
+    // at USER_INTERACTIVE QoS alone (low-power mode) 413 of 600 offers were > 2 ms late, p50 3.4 ms
     crate::macos_utils::streamer::qos::pin_current_thread_time_constraint(
         1_000_000_000 / fps as u64,
     );
@@ -395,8 +383,8 @@ pub fn run(spec: &RunSpec) -> Json {
             }
             let left = deadline - now;
             if left > Duration::from_micros(2000) {
-                // In slices: one long sleep (a 10 fps clip's ~98 ms) overslept by ~7 ms on every
-                // frame (timer slack grows with the interval), which made a 10 fps run invalid.
+                // in slices: one long sleep (a 10 fps clip's ~98 ms) overslept by ~7 ms a frame,
+                // because timer slack grows with the interval
                 std::thread::sleep(
                     (left - Duration::from_micros(1500)).min(Duration::from_millis(10)),
                 );
@@ -406,7 +394,7 @@ pub fn run(spec: &RunSpec) -> Json {
         }
         let i = g % n_src;
         if g != 0 && i != 0 && info.idr[i] {
-            // The recording's own keyframes were client requests; replay them as requests.
+            // the recording's own keyframes were client requests: replay them as requests
             pipeline.request_idr();
             idr_requests += 1;
         }
@@ -427,7 +415,7 @@ pub fn run(spec: &RunSpec) -> Json {
             }
         }
         if fr.unchanged {
-            // A capture backend delivers nothing for an unchanged screen.
+            // a capture backend delivers nothing for an unchanged screen
             skipped_unchanged += 1;
             continue;
         }
@@ -455,7 +443,7 @@ pub fn run(spec: &RunSpec) -> Json {
     }
     let offer_end = Instant::now();
 
-    // Let what is in flight come out, then stop the loop the way `SessionCapture` does.
+    // let what is in flight come out, then stop the loop the way `SessionCapture` does
     let settle = Instant::now();
     loop {
         let sub = telemetry.frames_submitted.load(Ordering::Relaxed);
@@ -481,7 +469,6 @@ pub fn run(spec: &RunSpec) -> Json {
         .unwrap_or_else(|_| Err("reader panicked".into()));
     drop(activity);
 
-    // ---- metrics -------------------------------------------------------------------------
     let by_offer: HashMap<u64, usize> = offered_ns
         .iter()
         .enumerate()
@@ -561,7 +548,7 @@ pub fn run(spec: &RunSpec) -> Json {
             ..Default::default()
         });
     }
-    // Offered frames that never came out as a picture: coalesced in the slot, or rate-dropped.
+    // offered frames that never came out as a picture: coalesced in the slot, or rate-dropped
     for g in 0..total {
         if offered_ns[g] != 0 && !got[g] {
             rows.push(Row {
@@ -572,9 +559,9 @@ pub fn run(spec: &RunSpec) -> Json {
         }
     }
     out_events.sort_unstable();
-    // What the client would see: the RTP timestamp is the host clock at `EncodedFrame.capture`,
-    // so `packetized - capture` is the host side of "host capture -> paint", per kind of frame,
-    // and a non-increasing RTP timestamp in output order is what the writer's clamp would fix.
+    // the RTP timestamp is the host clock at `EncodedFrame.capture`, so `packetized - capture` is
+    // the host side of "host capture -> paint", per kind of frame; a non-increasing RTP timestamp
+    // in output order is what the writer's clamp would fix
     let (mut stamp_real, mut stamp_rep) = (Vec::new(), Vec::new());
     let mut rtp_would_clamp = 0usize;
     let mut last_rtp: Option<u32> = None;
@@ -591,9 +578,9 @@ pub fn run(spec: &RunSpec) -> Json {
         }
         last_rtp = Some(ts);
     }
-    // Repeats submitted after each real frame and before the next one, within 190 ms of it (the
-    // keepalive comes at 200 ms): the hold pushes that frame got. More than two would be a push of
-    // a push or a third push, which the hold-push state machine must never do.
+    // repeats submitted after a real frame and before the next, within 190 ms of it (the keepalive
+    // comes at 200 ms), are that frame's hold pushes; more than two would be a push of a push or
+    // a third push, which the hold-push state machine must never do
     let mut by_submit: Vec<(u64, bool)> = recs
         .iter()
         .map(|r| (r.timing.encode_submit_ns, r.timing.repeated))
@@ -690,7 +677,7 @@ pub fn run(spec: &RunSpec) -> Json {
             "transient_errors": deg("encoder_transient_errors"),
             "encoder_resets": deg("encoder_resets"),
         },
-        // The lab's names, so the runner's one-line summary reads the same for both stages.
+        // the lab's names, so the runner's one-line summary reads the same for both stages
         "submitted": submitted,
         "dropped": rate_drops,
         "emitted": recs.len(),

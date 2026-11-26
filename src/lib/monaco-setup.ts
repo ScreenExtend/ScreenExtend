@@ -1,11 +1,6 @@
-// editor.all.js pulls all 58 contributions; this is the subset this editor actually
-// uses. Dropped: code actions, codelens, colour picker, comments, document symbols,
-// goto-symbol, inlay hints, inline completions/edits, linked editing, links, parameter
-// hints, placeholder text, rename, section headers, semantic tokens, smart select,
-// sticky scroll, unicode highlighter, word highlighter, drop/paste providers, font zoom,
-// in-place replace, indentation commands, transpose/caret ops and the diff editor --
-// every one of them either has no provider registered for json or is already off in
-// editorOptions. Re-add a line here if a shortcut turns out to be missed.
+// editor.all.js pulls all 58 contributions; this is the subset this editor uses. The rest
+// have no provider registered for json or are off in editorOptions. Re-add a line here if
+// a shortcut turns out to be missed.
 import "monaco-editor/esm/vs/base/browser/ui/codicons/codiconStyles.js";
 import "monaco-editor/esm/vs/editor/common/standaloneStrings.js";
 import "monaco-editor/esm/vs/editor/browser/coreCommands.js";
@@ -151,11 +146,10 @@ monaco.languages.json.jsonDefaults.setModeConfiguration({
   ...monaco.languages.json.jsonDefaults.modeConfiguration,
   foldingRanges: false,
   colors: false,
-  // monaco's own DiagnosticsAdapter revalidates 500 ms after every keystroke, and that
-  // literal is unreachable -- no option, no constructor hook. json-editor.tsx runs the
-  // same worker call itself once typing settles instead.
+  // monaco's DiagnosticsAdapter revalidates 500 ms after every keystroke with no option to
+  // change it; json-editor.tsx runs the same worker call itself once typing settles
   diagnostics: false,
-  // each of these is a json-worker round trip we never surface: no outline or
+  // each of these is a json-worker round trip that is never surfaced: no outline or
   // breadcrumbs in a standalone editor, no expand-selection binding, and the
   // format button uses the whole-document provider
   documentSymbols: false,
@@ -230,15 +224,10 @@ export const editorOptions: monaco.editor.IStandaloneEditorConstructionOptions =
   },
 };
 
-// Monaco does not ship its theme as a stylesheet: `defineTheme` writes every `.mtk*` token
-// colour, every codicon glyph and every `--vscode-*` variable into one `<style
-// class="monaco-colors">` it appends to the head at runtime. That element carries no CSP
-// nonce, so any policy that nonces `style-src` -- which is what Tauri does the moment
-// index.html contains an inline <style> -- drops it whole, with no error anywhere: the
-// editor still renders, still validates and still saves, and only *looks* broken (no
-// syntax colours, an unstyled gutter, unstyled scrollbars). That shipped once. A style
-// element the browser refused leaves `.sheet` null, which is the one observable difference,
-// so say so where `error-reporting.ts` will carry it into the log bus.
+// `defineTheme` writes the theme into one `<style class="monaco-colors">` appended at runtime
+// with no CSP nonce. A policy that nonces `style-src` (Tauri does once index.html has an
+// inline <style>) drops it with no error: the editor works but renders unstyled. A refused
+// style element leaves `.sheet` null, so report that through console.error into the log bus.
 function assertThemeStylesApplied(): void {
   const blocked = [...document.querySelectorAll<HTMLStyleElement>("style.monaco-colors")]
     .filter(style => style.textContent && style.sheet === null);

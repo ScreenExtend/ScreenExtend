@@ -31,12 +31,12 @@ pub const CLEARED_VARS: &[&str] = &[
     "SE_FRAME_TRACE",
     "SE_INTRA_REFRESH",
     "SE_REQUIRE_HW",
-    // Set per group from the plan (`deny`, `tune_on`, `tune_off`), never inherited.
+    // set per group from the plan (`deny`, `tune_on`, `tune_off`), never inherited
     "SE_VT_DENY",
     "SE_TEST_HOOKS",
     "SE_TUNE_OFF",
     "SE_TUNE_ON",
-    // Live stage: capture switches, the Screen Recording test hook and the private data dir.
+    // live stage: capture switches, the Screen Recording test hook and the private data dir
     "SE_SCK_QUEUE_DEPTH",
     "SE_SCK_MIN_INTERVAL",
     "SE_SCK_PIXEL_FORMAT",
@@ -71,7 +71,7 @@ pub fn collect(out_dir: &Path, parent_env: &Json) -> Json {
         },
         "process": {
             "arch": std::env::consts::ARCH,
-            // Absent on a Mac with no Rosetta (and on 10.15 Intel): reported as 0 there.
+            // absent on a Mac with no Rosetta (and on 10.15 Intel): reported as 0 there
             "translated": translated.unwrap_or(0),
             "translated_sysctl_present": translated.is_some(),
         },

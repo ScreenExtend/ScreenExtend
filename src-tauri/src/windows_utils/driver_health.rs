@@ -1,41 +1,33 @@
 //! The virtual display driver's host process: how big it has grown, and restarting it.
 //!
-//! The bundled IddCx driver (`VirtualDisplayDriver.dll`, hosted in its own `WUDFHost.exe` —
-//! the INF sets `UmdfHostProcessSharing = ProcessSharingDisabled`) leaks ~47–124 MB of commit,
-//! ~37 handles and ~5 threads per display creation or mode change and never returns them
-//! (`docs/overhaul-new/G04.md` §3). At ~36 GB / ~3,200 threads `SetDisplayConfig` fails with
-//! error 31 and every join times out waiting for its display. A device restart frees it; that
-//! needs Administrator, so it runs as `ScreenExtend drivers restart` behind a UAC prompt.
+//! The bundled IddCx driver runs in its own `WUDFHost.exe` (the INF disables process sharing)
+//! and leaks ~47-124 MB of commit, ~37 handles and ~5 threads per display creation or mode
+//! change. At ~36 GB / ~3,200 threads `SetDisplayConfig` fails with error 31 and every join times
+//! out. Only a device restart frees it, which needs Administrator (`drivers restart` behind UAC).
 //!
-//! **Which `WUDFHost.exe` is ours.** A machine has several (every UMDF driver gets one), and an
-//! unelevated process can open none of them — `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)`
-//! is refused for a LocalService host, so their command lines and loaded modules are out of
-//! reach. What *is* in reach is the driver's own named pipe: a client handle to
-//! `\\.\pipe\virtualdisplaydriver` answers `GetNamedPipeServerProcessId` with the pid of the
-//! process serving it, which is the driver's host and nothing else. The counters come from
-//! `NtQuerySystemInformation(SystemProcessInformation)`, which needs no handle to the process.
-//! Only when the pipe cannot name its server (every instance busy) does this fall back to the
-//! largest `WUDFHost.exe`, and the result says so.
+//! Finding our `WUDFHost.exe` unelevated: `OpenProcess` is refused for a LocalService host, but
+//! `GetNamedPipeServerProcessId` on `\\.\pipe\virtualdisplaydriver` names the process serving the
+//! pipe, and `NtQuerySystemInformation(SystemProcessInformation)` reads its counters without a
+//! handle. Only when the pipe cannot name its server does this fall back to the largest
+//! `WUDFHost.exe`, and the result says so.
 
 use std::os::windows::io::AsRawHandle;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::{DisplayDriverHealth, DriverRestartOutcome};
 
 /// Default commit threshold, MB.
 ///
-/// Measured: the host is ~10 MB / 19 threads after a boot and grows ~47 MB per 1080p display
-/// creation (94–124 MB at hi-res or with a DPR ladder). It failed outright at ~36 GB. 8 GB is
-/// ~170 ordinary joins or mode changes — weeks of normal use, never one evening's — and a
-/// quarter of the failure point, so the prompt arrives long before anything breaks and long
-/// after anything a single session could cause.
+/// The host is ~10 MB after a boot, grows ~47 MB per 1080p display creation (94-124 MB at hi-res
+/// or with a DPR ladder) and fails at ~36 GB. 8 GB is ~170 ordinary joins or mode changes (weeks
+/// of normal use) and a quarter of the failure point.
 pub const DEFAULT_THRESHOLD_MB: u32 = 8 * 1024;
 
-/// Default thread threshold. The same quarter-of-failure point on the other axis: ~3,200 threads
-/// at failure, ~86 threads per GB measured (1,270 threads at 14.7 GB on 2026-10-06), so 800 is
-/// ~9 GB. It is there for a leak that grows threads faster than commit, which the measurements
-/// have not shown but the failure mode (thread exhaustion inside WUDFHost) would.
+/// Default thread threshold: a quarter of the ~3,200 threads at failure. At the measured ~86
+/// threads per GB that is ~9 GB, so it only matters for a leak that grows threads faster than
+/// commit.
 pub const DEFAULT_THRESHOLD_THREADS: u32 = 800;
 
 /// Overrides the commit threshold, in MB, for testing. Setting it switches the thread criterion
@@ -55,7 +47,12 @@ pub const READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// restart and its [`READY_TIMEOUT`].
 const ELEVATED_TIMEOUT: Duration = Duration::from_secs(120);
 
-// Exit codes of `drivers restart`. 2 is usage and 3 is `doctor`'s; these stay clear of both.
+/// How long the desktop app waits for an elevated `installdrivers` / `removedrivers`. `nefconc`
+/// creates or removes a devnode and stages or uninstalls the driver package, which is tens of
+/// seconds on a slow disk, not minutes.
+pub const DRIVER_COMMAND_TIMEOUT: Duration = Duration::from_secs(180);
+
+// exit codes of `drivers restart`: 2 is usage and 3 is `doctor`'s, so these stay clear of both
 pub const EXIT_RESTARTED: i32 = 0;
 pub const EXIT_FAILED: i32 = 1;
 pub const EXIT_NOT_ELEVATED: i32 = 4;
@@ -84,8 +81,8 @@ pub fn reason_for_exit(code: i32) -> &'static str {
 pub struct HostProcess {
     pub pid: u32,
     pub image: String,
-    /// Private commit (`PrivatePageCount`), the number Task Manager shows as "Commit size" and
-    /// .NET as `PrivateMemorySize64` — the same figure the test handler has logged all along.
+    /// Private commit (`PrivatePageCount`): what Task Manager shows as "Commit size" and .NET
+    /// as `PrivateMemorySize64`.
     pub commit_bytes: u64,
     pub threads: u32,
     pub handles: u32,
@@ -131,10 +128,9 @@ fn is_wudfhost(image: &str) -> bool {
 
 /// Pick the driver's host out of a process list. Pure, so the choice can be tested.
 ///
-/// The pipe server wins when it is a `WUDFHost.exe`; anything else serving that pipe is not the
-/// driver (a test mock, say) and is not trusted. Without one, the largest `WUDFHost.exe` — on a
-/// machine where this driver has leaked it is the largest by gigabytes, and on one where it has
-/// not, the answer does not matter because nothing is over the threshold.
+/// The pipe server wins when it is a `WUDFHost.exe`; anything else serving that pipe (a test
+/// mock, say) is not trusted. Without one, the largest `WUDFHost.exe`: a leaking driver host is
+/// the largest by gigabytes, and otherwise nothing is over the threshold anyway.
 pub fn select_driver_host(
     procs: &[HostProcess],
     pipe_server: Option<u32>,
@@ -188,8 +184,8 @@ impl Thresholds {
 
     pub fn from_env() -> Self {
         Self::from_values(
-            std::env::var(THRESHOLD_MB_ENV).ok().as_deref(),
-            std::env::var(THRESHOLD_THREADS_ENV).ok().as_deref(),
+            crate::envcfg::var(THRESHOLD_MB_ENV).ok().as_deref(),
+            crate::envcfg::var(THRESHOLD_THREADS_ENV).ok().as_deref(),
         )
     }
 
@@ -250,7 +246,7 @@ pub fn assess(
         thresholds.commit_mb,
         threads_limit,
         if health.needs_restart {
-            " — RESTART NEEDED"
+            ". RESTART NEEDED"
         } else {
             ""
         }
@@ -269,7 +265,7 @@ pub fn process_list() -> Result<Vec<HostProcess>, String> {
     const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC000_0004_u32 as i32;
     let mut size: usize = 1 << 20;
     for _ in 0..8 {
-        // u64 elements so every entry, which the kernel aligns to 8, is aligned in memory too.
+        // u64 elements so every entry, which the kernel aligns to 8, is aligned in memory too
         let mut buf = vec![0u64; size / 8];
         let mut needed = 0u32;
         let status = unsafe {
@@ -328,8 +324,8 @@ pub fn process_list() -> Result<Vec<HostProcess>, String> {
     Err("NtQuerySystemInformation kept asking for a larger buffer".to_string())
 }
 
-/// Ask the driver's pipe who serves it. Opens one client handle and closes it at once — the
-/// same thing the backend probe's existence test has always done to this pipe.
+/// Ask the driver's pipe who serves it. Opens one client handle and closes it at once, the same
+/// thing the backend probe's existence test does to this pipe.
 pub fn probe_pipe_server() -> PipeProbe {
     probe_pipe_server_at(Path::new(DRIVER_PIPE))
 }
@@ -350,7 +346,7 @@ fn probe_pipe_server_at(path: &Path) -> PipeProbe {
         Err(e) => match e.raw_os_error() {
             // ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND
             Some(2) | Some(3) => PipeProbe::Absent,
-            // ERROR_PIPE_BUSY, ERROR_SEM_TIMEOUT, or anything else from a name that exists.
+            // ERROR_PIPE_BUSY, ERROR_SEM_TIMEOUT, or anything else from a name that exists
             _ => PipeProbe::Present,
         },
     }
@@ -380,6 +376,26 @@ pub fn read_health() -> DisplayDriverHealth {
     }
     tprintln!("[driver-health] {}", health.detail);
     health
+}
+
+/// The same read as [`read_health`], silent unless the driver host is over threshold.
+///
+/// For the places the startup gate never reaches: `serve`, which has no gate, and a host left
+/// running for days. At the failure point every join waits out the attach timeout, and this
+/// line is the only thing in the log that points at the driver. Costs one
+/// `NtQuerySystemInformation` and one pipe open, off the frame path.
+pub fn warn_if_over_threshold(context: &str) -> Option<DisplayDriverHealth> {
+    let pipe = probe_pipe_server();
+    let procs = process_list().ok()?;
+    let health = assess(&procs, pipe, Thresholds::from_env());
+    if health.needs_restart {
+        teprintln!(
+            "[driver-health] {context}: {}. Restart the display driver (`ScreenExtend drivers \
+             restart`, or restart the app and accept its prompt) before joins start failing.",
+            health.detail
+        );
+    }
+    Some(health)
 }
 
 // the restart itself (elevated)
@@ -430,9 +446,9 @@ fn join_pids(pids: &[u32]) -> String {
 /// Whether a restart may go ahead. Pure over what was asked.
 ///
 /// - `stats`: the running instance's `STATS` reply, if one answered. Its `joins` key exists only
-///   once `AppState` does — once `setup` has run and the host holds a driver client — so its
-///   presence alone is a refusal, whatever the count: an idle host would be left holding a dead
-///   pipe. The desktop app's own startup gate asks *before* `setup`, which is why it gets through.
+///   once `setup` has run and the host holds a driver client, so its presence alone is a
+///   refusal, whatever the count: an idle host would be left holding a dead pipe. The desktop
+///   app's own startup gate asks *before* `setup`, which is why it gets through.
 /// - `running_pid`: that instance's pid, from `PING`.
 /// - `monitors`: the driver's own display list, which is machine-wide.
 /// - `others`: other processes running this executable, not counting this one.
@@ -463,16 +479,16 @@ pub fn restart_refusal(
             joins: sessions,
         });
     }
-    // The instance that answered without `joins` has not set up — it is the desktop app asking
-    // for this restart from its startup gate — so it owns no displays and is not "another" host.
+    // the instance that answered without `joins` has not set up (it is the desktop app asking
+    // from its startup gate), so it owns no displays and is not "another" host
     let others: Vec<u32> = others
         .iter()
         .copied()
         .filter(|p| Some(*p) != running_pid)
         .collect();
     if others.is_empty() {
-        // Any monitors left in the list belong to nobody alive: a host that crashed with them
-        // attached. The restart is exactly what clears them.
+        // monitors left in the list belong to a host that crashed with them attached, and the
+        // restart is what clears them
         return None;
     }
     match monitors {
@@ -485,7 +501,7 @@ pub fn restart_refusal(
     }
 }
 
-/// One devnode of ours: its handle and its instance id.
+/// One devnode of ours, by its instance id.
 #[derive(Debug, Clone)]
 pub struct DriverDevice {
     pub instance_id: String,
@@ -568,8 +584,10 @@ fn for_each_driver_device(
         }
         bytes.truncate(needed as usize);
         let units: Vec<u16> = bytes
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&c| u16::from_le_bytes(c))
             .collect();
         if !multi_sz(&units)
             .iter()
@@ -595,7 +613,7 @@ fn for_each_driver_device(
     Ok(found)
 }
 
-/// Our driver's devnodes. Normally exactly one (`ROOT\DISPLAY\0000` on the development box).
+/// Our driver's devnodes. Normally exactly one (`ROOT\DISPLAY\0000`).
 pub fn find_driver_devices() -> Result<Vec<DriverDevice>, String> {
     let mut out = Vec::new();
     for_each_driver_device(|_, _, instance_id| out.push(DriverDevice { instance_id }))?;
@@ -609,10 +627,10 @@ pub enum RestartError {
 }
 
 /// Restart every devnode of ours in place: `DIF_PROPERTYCHANGE` with `DICS_PROPCHANGE`, the
-/// class-installer request Device Manager and devcon's `restart` make. It stops the device —
-/// which, with process sharing disabled, ends its `WUDFHost.exe` and everything that leaked
-/// into it — and starts it again. Needs Administrator. A device that refuses to stop leaves
-/// `DI_NEEDREBOOT` behind, which is reported rather than called a success.
+/// class-installer request Device Manager and devcon's `restart` make. Stopping the device ends
+/// its `WUDFHost.exe` (process sharing is disabled) and everything that leaked into it. Needs
+/// Administrator. A device that refuses to stop leaves `DI_NEEDREBOOT` behind, which is
+/// reported rather than called a success.
 pub fn restart_driver_devices() -> Result<usize, RestartError> {
     use windows::Win32::Devices::DeviceAndDriverInstallation::{
         SetupDiCallClassInstaller, SetupDiGetDeviceInstallParamsW, SetupDiSetClassInstallParamsW,
@@ -715,55 +733,79 @@ pub fn write_report(path: &Path, outcome: &DriverRestartOutcome) {
 
 // the desktop app's half (unelevated)
 
-/// Run `drivers restart` elevated and wait for it.
+/// Set while an elevated driver operation this process started is still running, including one
+/// it stopped waiting for. Install, remove and restart all reconfigure the same devnode, so a
+/// second one must not start over the first.
+static ELEVATED_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// Holds [`ELEVATED_IN_FLIGHT`] until dropped.
+#[derive(Debug)]
+pub struct ElevatedSlot(());
+
+impl Drop for ElevatedSlot {
+    fn drop(&mut self) {
+        ELEVATED_IN_FLIGHT.store(false, Ordering::Release);
+    }
+}
+
+/// Claim the one elevated-operation slot, or `None` while another operation holds it.
+pub fn claim_elevated_slot() -> Option<ElevatedSlot> {
+    ELEVATED_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .ok()
+        .map(|_| ElevatedSlot(()))
+}
+
+/// How an elevated run of this executable ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Elevated {
+    /// The UAC prompt was dismissed.
+    Declined,
+    /// It could not be started.
+    Failed(String),
+    /// Another elevated driver operation from this process is still running.
+    Busy,
+    /// It ran to completion with this exit code.
+    Exited(i32),
+    /// It was still running at the deadline. It is left to finish (killing an elevated process
+    /// halfway through a devnode change is worse than letting it complete) and watched to the
+    /// end, so the slot stays taken until it really has.
+    TimedOut,
+}
+
+/// Run this executable elevated with `params`, and wait for it.
 ///
-/// The install path's `elevated-command` crate cannot be used here: on Windows it is a bare
-/// `ShellExecuteW("runas")`, which returns as soon as the process is created, gives no exit code
-/// and no handle to wait on (its `status` is ShellExecute's instance value, so `success()` is
-/// false for every launch that worked). The restart has to be waited for — setup must not race a
-/// driver that is mid-restart — so this is the same UAC route through `ShellExecuteExW` with
-/// `SEE_MASK_NOCLOSEPROCESS`, which hands back the process to wait on and its exit code.
-pub fn restart_elevated(owner: Option<isize>) -> DriverRestartOutcome {
+/// The `elevated-command` crate cannot do this: on Windows it is a bare `ShellExecuteW("runas")`,
+/// which returns as soon as the process is created, with no exit code and no handle to wait on.
+/// `ShellExecuteExW` with `SEE_MASK_NOCLOSEPROCESS` is the same UAC route and hands back both.
+///
+/// `leftover` is removed once the child has exited, on the timeout path too.
+pub fn run_elevated(
+    params: &str,
+    owner: Option<isize>,
+    timeout: Duration,
+    leftover: Option<PathBuf>,
+) -> Elevated {
     use windows::core::{HSTRING, PCWSTR};
-    use windows::Win32::Foundation::{CloseHandle, ERROR_CANCELLED, HWND, WAIT_OBJECT_0};
-    use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+    use windows::Win32::Foundation::{CloseHandle, ERROR_CANCELLED, HANDLE, HWND, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, INFINITE};
     use windows::Win32::UI::Shell::{
         ShellExecuteExW, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS,
         SHELLEXECUTEINFOW,
     };
     use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
-    let fail = |reason: &str, detail: String| {
-        teprintln!("[driver-restart] {reason}: {detail}");
-        DriverRestartOutcome {
-            ok: false,
-            reason: reason.to_string(),
-            detail,
-            ..Default::default()
-        }
+    let Some(slot) = claim_elevated_slot() else {
+        return Elevated::Busy;
     };
-
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
-            return fail(
-                "failed",
-                format!("could not resolve the executable path: {e}"),
-            )
+            return Elevated::Failed(format!("could not resolve the executable path: {e}"));
         }
     };
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or_default();
-    let report = std::env::temp_dir().join(format!(
-        "screenextend-driver-restart-{}-{nonce}.json",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_file(&report);
-
     let file = HSTRING::from(exe.as_os_str());
-    let params = HSTRING::from(format!("drivers restart --report \"{}\"", report.display()));
+    let params = HSTRING::from(params);
     let verb = HSTRING::from("runas");
     let mut info = SHELLEXECUTEINFOW {
         cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
@@ -775,43 +817,105 @@ pub fn restart_elevated(owner: Option<isize>) -> DriverRestartOutcome {
         nShow: SW_HIDE.0,
         ..Default::default()
     };
-    tprintln!("[driver-restart] asking for elevation to restart the display driver");
     if let Err(e) = unsafe { ShellExecuteExW(&mut info) } {
         if e.code() == ERROR_CANCELLED.to_hresult() {
-            return fail(
-                "declined",
-                "the administrator prompt was dismissed".to_string(),
-            );
+            return Elevated::Declined;
         }
-        return fail(
-            "failed",
-            format!("could not start the elevated restart: {e}"),
-        );
+        return Elevated::Failed(format!("could not start the elevated process: {e}"));
     }
     if info.hProcess.is_invalid() {
-        return fail(
-            "failed",
-            "the elevated restart started but returned no process to wait on".to_string(),
+        return Elevated::Failed(
+            "the elevated process started but returned no process to wait on".to_string(),
         );
     }
-    let waited = unsafe { WaitForSingleObject(info.hProcess, ELEVATED_TIMEOUT.as_millis() as u32) };
+    let millis = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX - 1);
+    let waited = unsafe { WaitForSingleObject(info.hProcess, millis) };
     if waited != WAIT_OBJECT_0 {
-        let _ = unsafe { CloseHandle(info.hProcess) };
-        return fail(
-            "timeout",
-            format!(
-                "the elevated restart did not finish within {} s",
-                ELEVATED_TIMEOUT.as_secs()
-            ),
-        );
+        // watched to the end on its own thread, which holds the slot so nothing this process
+        // starts later can race it, then removes what the child was going to leave behind
+        let raw = info.hProcess.0 as usize;
+        let spawned = std::thread::Builder::new()
+            .name("se-elevated-watch".into())
+            .spawn(move || {
+                let process = HANDLE(raw as *mut core::ffi::c_void);
+                let _ = unsafe { WaitForSingleObject(process, INFINITE) };
+                let _ = unsafe { CloseHandle(process) };
+                if let Some(path) = leftover {
+                    let _ = std::fs::remove_file(path);
+                }
+                drop(slot);
+                tprintln!("[drivers] the elevated operation that outlived its deadline has exited");
+            });
+        if spawned.is_err() {
+            // the closure (and the slot in it) is dropped with the failed spawn, so the app is
+            // not wedged; the process handle is leaked rather than closed under a child that may
+            // still be running
+            teprintln!("[drivers] could not start a watcher for the timed-out elevated process");
+        }
+        return Elevated::TimedOut;
     }
     let mut code = 0u32;
     let got = unsafe { GetExitCodeProcess(info.hProcess, &mut code) };
     let _ = unsafe { CloseHandle(info.hProcess) };
-    let code = if got.is_ok() {
-        code as i32
-    } else {
-        EXIT_FAILED
+    drop(slot);
+    if got.is_err() {
+        return Elevated::Exited(EXIT_FAILED);
+    }
+    Elevated::Exited(code as i32)
+}
+
+/// Run `drivers restart` elevated and wait for it: setup must not race a driver that is
+/// mid-restart.
+pub fn restart_elevated(owner: Option<isize>) -> DriverRestartOutcome {
+    let fail = |reason: &str, detail: String| {
+        teprintln!("[driver-restart] {reason}: {detail}");
+        DriverRestartOutcome {
+            ok: false,
+            reason: reason.to_string(),
+            detail,
+            ..Default::default()
+        }
+    };
+
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let report = std::env::temp_dir().join(format!(
+        "screenextend-driver-restart-{}-{nonce}.json",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&report);
+
+    let params = format!("drivers restart --report \"{}\"", report.display());
+    tprintln!("[driver-restart] asking for elevation to restart the display driver");
+    let code = match run_elevated(&params, owner, ELEVATED_TIMEOUT, Some(report.clone())) {
+        Elevated::Exited(code) => code,
+        Elevated::Declined => {
+            return fail(
+                "declined",
+                "the administrator prompt was dismissed".to_string(),
+            )
+        }
+        Elevated::Failed(detail) => return fail("failed", detail),
+        Elevated::Busy => {
+            return fail(
+                "timeout",
+                "an earlier display-driver operation started by this app is still running; \
+                 wait for it to finish, then try again"
+                    .to_string(),
+            )
+        }
+        Elevated::TimedOut => {
+            return fail(
+                "timeout",
+                format!(
+                    "the elevated restart did not finish within {} s. It is still running and \
+                     may yet complete; wait for it rather than starting another",
+                    ELEVATED_TIMEOUT.as_secs()
+                ),
+            )
+        }
     };
 
     let written = std::fs::read_to_string(&report)
@@ -824,7 +928,7 @@ pub fn restart_elevated(owner: Option<isize>) -> DriverRestartOutcome {
         detail: format!("`drivers restart` exited with {code} and left no report"),
         ..Default::default()
     });
-    // The exit code is the verdict; the report only explains it.
+    // the exit code is the verdict; the report only explains it
     outcome.ok = code == EXIT_RESTARTED;
     if outcome.ok {
         tprintln!(

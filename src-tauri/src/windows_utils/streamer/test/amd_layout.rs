@@ -1,21 +1,21 @@
-//! AMF C-ABI layout assertions — generated, do not hand-edit the `abi_matches_*` bodies.
+//! AMF C-ABI layout assertions, generated, do not hand-edit the `abi_matches_*` bodies.
 //!
 //! `amd_sys` binds AMF through COM-like C vtables. A wrong slot index is not a compile error and
 //! not a runtime error message; it is a call through the wrong function pointer, which is memory
 //! corruption. `AMFContext::CreateSurfaceFromDX11Native` is slot **49 of 55** and the
 //! OpenCL/OpenGL/XV/Gralloc blocks in between make hand-counting to it an obvious way to be off
-//! by one — so the numbers below were measured by a C compiler, not read off the header by eye.
+//! by one, so the numbers below were measured by a C compiler, not read off the header by eye.
 //!
 //! No machine on this project has an AMD GPU. These assertions are what makes the FFI verifiable
 //! anyway: everything except *behaviour* is checked here, and only behaviour needs a Radeon.
 //!
 //! ## Provenance
 //!
-//! * Headers: `src-tauri/resources/amf-headers/{core,components}` — GPUOpen-LibrariesAndSDKs/AMF
+//! * Headers: `src-tauri/resources/amf-headers/{core,components}`, GPUOpen-LibrariesAndSDKs/AMF
 //!   at AMF 1.5.2.0, MIT. SHA-256 of every file is pinned in `src-tauri/resources/SHA256SUMS`
 //!   and recorded in `resources/PROVENANCE.md`.
 //! * Generator: `src-tauri/tools/amf_layout_gen.c`, compiled **in C mode** (`cl /TC`) so the
-//!   `#else /* !__cplusplus */` branch — the one `amd_sys` binds — is what gets measured.
+//!   `#else /* !__cplusplus */` branch, the one `amd_sys` binds, is what gets measured.
 //!   `offsetof(SomeVtbl, member) / sizeof(void *)` **is** the vtable slot index, because a C-API
 //!   vtable struct is exactly an array of function pointers.
 //! * Toolchain: `cl.exe 19.44.35227 for x64` (MSVC Build Tools 2022, `VC\Tools\MSVC\14.44.35207`),
@@ -36,7 +36,7 @@
 //!
 //! `amf_layout_build.bat` also compiles `amf_layout_cpp_check.cpp` with `/TP` and dumps the C++
 //! layouts. Any struct whose C and C++ builds disagree must be modelled from the **C++** side,
-//! because `amfrt64.dll` is compiled from the C++ headers. Today exactly one struct diverges —
+//! because `amfrt64.dll` is compiled from the C++ headers. Today exactly one struct diverges,
 //! `AMFPropertyInfo`, 112 bytes with `name` at 0 in C and 120 bytes with `name` at 8 in C++
 //! (it has a virtual destructor). `amd_sys` sidesteps it entirely by never calling
 //! `GetPropertyInfo` and probing optional properties with `HasProperty` instead, which is why
@@ -52,7 +52,7 @@ use crate::windows_utils::streamer::amd_sys::*;
 /// Size of a function-pointer slot; the divisor that turns a byte offset into a slot index.
 const PTR: usize = size_of::<*const std::ffi::c_void>();
 
-/// `offsetof(Vtbl, member) / sizeof(void *)` — the vtable slot index of a member.
+/// `offsetof(Vtbl, member) / sizeof(void *)`, the vtable slot index of a member.
 macro_rules! slot {
     ($vtbl:ty, $member:ident) => {
         offset_of!($vtbl, $member) / PTR
@@ -111,7 +111,7 @@ fn abi_struct_layout_matches_amf_headers() {
     assert_eq!(offset_of!(AMFSize, height), 4, "AMFSize.height");
     assert_eq!(offset_of!(AMFRate, num), 0, "AMFRate.num");
     assert_eq!(offset_of!(AMFRate, den), 4, "AMFRate.den");
-    // AMFPropertyInfo: C sizeof=112 name@0 — not modelled in Rust, see amf_layout_cpp_check.cpp
+    // AMFPropertyInfo: C sizeof=112 name@0, not modelled in Rust, see amf_layout_cpp_check.cpp
 }
 
 /// Vtable slot indices, plus the **total slot count** of every vtable.
@@ -793,8 +793,8 @@ fn abi_enum_values_match_amf_headers() {
 
     // Colour signalling. `amd/encoder.rs` transcribes these as plain `i64` constants rather than
     // binding the enums, so this pins the transcription against the header. The enum is not
-    // densely packed — FULL_709 is 7, not 4, because `ColorSpace.h` leaves the G10/G2084 values
-    // commented out in between — so counting instead of reading is how it goes wrong.
+    // densely packed (FULL_709 is 7, not 4, because `ColorSpace.h` leaves the G10/G2084 values
+    // commented out in between), so counting instead of reading is how it goes wrong.
     assert_eq!(
         enc::COLOR_PRIMARIES_BT709,
         1,
@@ -1354,13 +1354,13 @@ fn abi_property_names_match_amf_headers() {
 // Hand-written tests. Everything above this line is generated.
 // ===========================================================================================
 
-/// This box has no AMD GPU and no `amfrt64.dll`, and neither does the macOS dev machine — so the
+/// This box has no AMD GPU and no `amfrt64.dll`, and neither does the macOS dev machine, so the
 /// only outcome the loader can be tested for here is that it *fails cleanly*: a typed `Err` that
 /// names the DLL, never a panic and never a partially-initialised loader. On a Radeon box the
 /// same test proves the two exported symbols resolve.
 ///
-/// `LoadLibrary` error 126 is a normal "no AMF here" — it also shows up on minimal driver
-/// installs and machines missing the VC runtime — which is why this is not something the app
+/// `LoadLibrary` error 126 is a normal "no AMF here", it also shows up on minimal driver
+/// installs and machines missing the VC runtime, which is why this is not something the app
 /// surfaces to the user.
 #[test]
 fn amf_loader_handles_a_missing_runtime() {
@@ -1426,27 +1426,31 @@ fn vendors_are_identified_by_pci_id() {
 
 /// The ULTRA_LOW_LATENCY probe is AMD's own: set `Usage`, then read a property back; if the read
 /// errors, the usage did not take and `Init()` would fail outright on pre-RDNA parts from driver
-/// 23.7.1 onward. This asserts the decision, which is the part that has to be right without
-/// hardware.
+/// 23.7.1 onward. This asserts the decision `configure_and_init` actually calls
+/// (`enc::usage_after_probe`, then `enc::retry_usage_after_init_failure`), which is the part that
+/// has to be right without hardware. It used to assert a copy of the decision defined inside the
+/// test, which passed whatever the shipped code did.
 #[test]
 fn ull_probe_failure_selects_low_latency() {
-    fn usage_after_probe(probe_ok: bool) -> AMF_VIDEO_ENCODER_USAGE {
-        if probe_ok {
-            AMF_VIDEO_ENCODER_USAGE_ULTRA_LOW_LATENCY
-        } else {
-            AMF_VIDEO_ENCODER_USAGE_LOW_LATENCY
-        }
-    }
     assert_eq!(
-        usage_after_probe(true),
+        enc::usage_after_probe(true),
         AMF_VIDEO_ENCODER_USAGE_ULTRA_LOW_LATENCY
     );
     assert_eq!(
-        usage_after_probe(false),
+        enc::usage_after_probe(false),
         AMF_VIDEO_ENCODER_USAGE_LOW_LATENCY
     );
-    // ULL and LL differ only in rate control, VBV size and LowLatencyInternal — all of which the
-    // property table overrides explicitly — so the fallback costs nothing.
+    // An Init failure under ULL is retried under LL, and nothing below LL is tried.
+    assert_eq!(
+        enc::retry_usage_after_init_failure(enc::usage_after_probe(true)),
+        Some(AMF_VIDEO_ENCODER_USAGE_LOW_LATENCY)
+    );
+    assert_eq!(
+        enc::retry_usage_after_init_failure(enc::usage_after_probe(false)),
+        None
+    );
+    // ULL and LL differ only in rate control, VBV size and LowLatencyInternal, all of which the
+    // property table overrides explicitly, so the fallback costs nothing.
     assert_ne!(
         AMF_VIDEO_ENCODER_USAGE_ULTRA_LOW_LATENCY,
         AMF_VIDEO_ENCODER_USAGE_LOW_LATENCY
@@ -1493,7 +1497,7 @@ fn result_codes_classify_into_retry_rebuild_and_give_up() {
 /// A NULL out-pointer means "not finished yet"; a real output object carrying no bytes means
 /// "finished, and there was nothing in it". Folding the second into the first is what made an
 /// empty buffer a two-second stall and then a torn-down session, so the distinction is asserted
-/// here — it cannot be exercised on hardware this project has.
+/// here, it cannot be exercised on hardware this project has.
 #[test]
 fn an_empty_output_buffer_is_a_consumed_frame_not_nothing_yet() {
     use enc::{classify_query_output, QueryClass};
@@ -1518,7 +1522,7 @@ fn an_empty_output_buffer_is_a_consumed_frame_not_nothing_yet() {
         );
     }
     // A real output object. The reference is ours either way, so an empty one is consumed and
-    // will never come back — the caller must not poll for it.
+    // will never come back, the caller must not poll for it.
     assert_eq!(
         classify_query_output(false, true, AMF_OK),
         QueryClass::Empty
@@ -1539,9 +1543,10 @@ fn an_empty_output_buffer_is_a_consumed_frame_not_nothing_yet() {
     );
 }
 
-/// `AMFInit` is asked for a **lower** version than the headers we vendor. AMF serves clients
-/// built against older SDKs and rejects newer ones, so pinning high is the one way to lock out
-/// hardware that would otherwise work.
+/// `AMFInit` is asked for a **lower** version than the headers we vendor. Whether a runtime older
+/// than the request refuses it is not established (AMD's README says the SDK is backward
+/// compatible, and FFmpeg and OBS ask for their newest), so the pin stays low and `Encoder::open`
+/// retries once with the runtime's own version when it is lower still (`init_version_retry`).
 #[test]
 fn amfinit_version_is_pinned_below_the_vendored_headers() {
     const {
@@ -1613,4 +1618,344 @@ fn dxgi_formats_map_to_amf_surface_formats() {
     // Today the pipeline hands us BGRA; when scaler.rs learns NV12 this constant moves and the
     // encoder's retune path stops being exercised.
     assert!(amf_surface_format(PREFERRED_INPUT_FORMAT).is_some());
+}
+
+/// The type a property's value is written or read as, against the type the header documents for
+/// it. `SetProperty` with the wrong variant type is not a crash: AMF either casts it or refuses it
+/// with a code the gated writes log and move past, so a property written as a bool where the
+/// header wants an `amf_int64` enum is a setting that silently does nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Written {
+    Int,
+    Bool,
+    Size,
+    Rate,
+    Interface,
+}
+
+fn header_type(comment: &str) -> Option<Written> {
+    let t = comment.trim_start_matches(['/', ' ']).trim_start();
+    if t.starts_with("amf_int64") {
+        Some(Written::Int)
+    } else if t.starts_with("bool") || t.starts_with("amf_bool") {
+        Some(Written::Bool)
+    } else if t.starts_with("AMFSize") {
+        Some(Written::Size)
+    } else if t.starts_with("AMFRate") {
+        Some(Written::Rate)
+    } else if t.starts_with("AMFInterface") {
+        Some(Written::Interface)
+    } else {
+        None
+    }
+}
+
+/// `L"..."` and the type comment of one `#define` in the vendored AVC header.
+fn header_define(header: &str, macro_name: &str) -> (String, Option<Written>) {
+    let line = header
+        .lines()
+        .find(|l| {
+            let mut words = l.split_whitespace();
+            words.next() == Some("#define") && words.next() == Some(macro_name)
+        })
+        .unwrap_or_else(|| panic!("{macro_name} is not defined in VideoEncoderVCE.h"));
+    let open = line.find("L\"").expect("a wide-string value") + 2;
+    let close = open + line[open..].find('"').expect("closing quote");
+    let comment = line[close..]
+        .find("//")
+        .map(|i| &line[close + i..])
+        .unwrap_or("");
+    (line[open..close].to_string(), header_type(comment))
+}
+
+#[test]
+fn every_property_the_encoder_touches_matches_the_header_by_name_and_type() {
+    use Written::*;
+    let header = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/resources/amf-headers/components/VideoEncoderVCE.h"
+    ));
+    let table: &[(&[u16], &str, Written)] = &[
+        (
+            props::AMF_VIDEO_ENCODER_USAGE,
+            "AMF_VIDEO_ENCODER_USAGE",
+            Int,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_QUALITY_PRESET,
+            "AMF_VIDEO_ENCODER_QUALITY_PRESET",
+            Int,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_FRAMESIZE,
+            "AMF_VIDEO_ENCODER_FRAMESIZE",
+            Size,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_FRAMERATE,
+            "AMF_VIDEO_ENCODER_FRAMERATE",
+            Rate,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_PROFILE,
+            "AMF_VIDEO_ENCODER_PROFILE",
+            Int,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_PROFILE_LEVEL,
+            "AMF_VIDEO_ENCODER_PROFILE_LEVEL",
+            Int,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD,
+            "AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD",
+            Int,
+        ),
+        (props::AMF_VIDEO_ENCODER_QP_I, "AMF_VIDEO_ENCODER_QP_I", Int),
+        (props::AMF_VIDEO_ENCODER_QP_P, "AMF_VIDEO_ENCODER_QP_P", Int),
+        (
+            props::AMF_VIDEO_ENCODER_MIN_QP,
+            "AMF_VIDEO_ENCODER_MIN_QP",
+            Int,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_TARGET_BITRATE,
+            "AMF_VIDEO_ENCODER_TARGET_BITRATE",
+            Int,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_PEAK_BITRATE,
+            "AMF_VIDEO_ENCODER_PEAK_BITRATE",
+            Int,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_VBV_BUFFER_SIZE,
+            "AMF_VIDEO_ENCODER_VBV_BUFFER_SIZE",
+            Int,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_MAX_AU_SIZE,
+            "AMF_VIDEO_ENCODER_MAX_AU_SIZE",
+            Int,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_ENFORCE_HRD,
+            "AMF_VIDEO_ENCODER_ENFORCE_HRD",
+            Bool,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_FILLER_DATA_ENABLE,
+            "AMF_VIDEO_ENCODER_FILLER_DATA_ENABLE",
+            Bool,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_RATE_CONTROL_SKIP_FRAME_ENABLE,
+            "AMF_VIDEO_ENCODER_RATE_CONTROL_SKIP_FRAME_ENABLE",
+            Bool,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_B_PIC_PATTERN,
+            "AMF_VIDEO_ENCODER_B_PIC_PATTERN",
+            Int,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_MAX_CONSECUTIVE_BPICTURES,
+            "AMF_VIDEO_ENCODER_MAX_CONSECUTIVE_BPICTURES",
+            Int,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_LOWLATENCY_MODE,
+            "AMF_VIDEO_ENCODER_LOWLATENCY_MODE",
+            Bool,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_PREENCODE_ENABLE,
+            "AMF_VIDEO_ENCODER_PREENCODE_ENABLE",
+            Int,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_PRE_ANALYSIS_ENABLE,
+            "AMF_VIDEO_ENCODER_PRE_ANALYSIS_ENABLE",
+            Bool,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_ENABLE_VBAQ,
+            "AMF_VIDEO_ENCODER_ENABLE_VBAQ",
+            Bool,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_HIGH_MOTION_QUALITY_BOOST_ENABLE,
+            "AMF_VIDEO_ENCODER_HIGH_MOTION_QUALITY_BOOST_ENABLE",
+            Bool,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_IDR_PERIOD,
+            "AMF_VIDEO_ENCODER_IDR_PERIOD",
+            Int,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_INTRA_PERIOD,
+            "AMF_VIDEO_ENCODER_INTRA_PERIOD",
+            Int,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_HEADER_INSERTION_SPACING,
+            "AMF_VIDEO_ENCODER_HEADER_INSERTION_SPACING",
+            Int,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_DE_BLOCKING_FILTER,
+            "AMF_VIDEO_ENCODER_DE_BLOCKING_FILTER",
+            Bool,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_SLICES_PER_FRAME,
+            "AMF_VIDEO_ENCODER_SLICES_PER_FRAME",
+            Int,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_OUTPUT_MODE,
+            "AMF_VIDEO_ENCODER_OUTPUT_MODE",
+            Int,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_CABAC_ENABLE,
+            "AMF_VIDEO_ENCODER_CABAC_ENABLE",
+            Int,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_INPUT_FULL_RANGE_COLOR,
+            "AMF_VIDEO_ENCODER_INPUT_FULL_RANGE_COLOR",
+            Bool,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_OUTPUT_FULL_RANGE_COLOR,
+            "AMF_VIDEO_ENCODER_OUTPUT_FULL_RANGE_COLOR",
+            Bool,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_OUTPUT_COLOR_PRIMARIES,
+            "AMF_VIDEO_ENCODER_OUTPUT_COLOR_PRIMARIES",
+            Int,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_OUTPUT_TRANSFER_CHARACTERISTIC,
+            "AMF_VIDEO_ENCODER_OUTPUT_TRANSFER_CHARACTERISTIC",
+            Int,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_OUTPUT_MATRIX_COEFF,
+            "AMF_VIDEO_ENCODER_OUTPUT_MATRIX_COEFF",
+            Int,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_OUTPUT_COLOR_PROFILE,
+            "AMF_VIDEO_ENCODER_OUTPUT_COLOR_PROFILE",
+            Int,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_ENABLE_SMART_ACCESS_VIDEO,
+            "AMF_VIDEO_ENCODER_ENABLE_SMART_ACCESS_VIDEO",
+            Bool,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_INPUT_QUEUE_SIZE,
+            "AMF_VIDEO_ENCODER_INPUT_QUEUE_SIZE",
+            Int,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_INTRA_REFRESH_NUM_MBS_PER_SLOT,
+            "AMF_VIDEO_ENCODER_INTRA_REFRESH_NUM_MBS_PER_SLOT",
+            Int,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_MAX_LTR_FRAMES,
+            "AMF_VIDEO_ENCODER_MAX_LTR_FRAMES",
+            Int,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_LTR_MODE,
+            "AMF_VIDEO_ENCODER_LTR_MODE",
+            Int,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_QUERY_TIMEOUT,
+            "AMF_VIDEO_ENCODER_QUERY_TIMEOUT",
+            Int,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_EXTRADATA,
+            "AMF_VIDEO_ENCODER_EXTRADATA",
+            Interface,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_FORCE_PICTURE_TYPE,
+            "AMF_VIDEO_ENCODER_FORCE_PICTURE_TYPE",
+            Int,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_INSERT_AUD,
+            "AMF_VIDEO_ENCODER_INSERT_AUD",
+            Bool,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_INSERT_SPS,
+            "AMF_VIDEO_ENCODER_INSERT_SPS",
+            Bool,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_INSERT_PPS,
+            "AMF_VIDEO_ENCODER_INSERT_PPS",
+            Bool,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_MARK_CURRENT_WITH_LTR_INDEX,
+            "AMF_VIDEO_ENCODER_MARK_CURRENT_WITH_LTR_INDEX",
+            Int,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_FORCE_LTR_REFERENCE_BITFIELD,
+            "AMF_VIDEO_ENCODER_FORCE_LTR_REFERENCE_BITFIELD",
+            Int,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_STATISTICS_FEEDBACK,
+            "AMF_VIDEO_ENCODER_STATISTICS_FEEDBACK",
+            Bool,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE,
+            "AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE",
+            Int,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_OUTPUT_MARKED_LTR_INDEX,
+            "AMF_VIDEO_ENCODER_OUTPUT_MARKED_LTR_INDEX",
+            Int,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_OUTPUT_REFERENCED_LTR_INDEX_BITFIELD,
+            "AMF_VIDEO_ENCODER_OUTPUT_REFERENCED_LTR_INDEX_BITFIELD",
+            Int,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_STATISTIC_AVERAGE_QP,
+            "AMF_VIDEO_ENCODER_STATISTIC_AVERAGE_QP",
+            Int,
+        ),
+        (
+            props::AMF_VIDEO_ENCODER_STATISTIC_FRAME_QP,
+            "AMF_VIDEO_ENCODER_STATISTIC_FRAME_QP",
+            Int,
+        ),
+    ];
+    for &(ours, macro_name, written) in table {
+        let (value, documented) = header_define(header, macro_name);
+        assert_wide(ours, &value, macro_name);
+        assert_eq!(
+            documented,
+            Some(written),
+            "{macro_name}: the header documents a different type than the encoder uses"
+        );
+    }
 }

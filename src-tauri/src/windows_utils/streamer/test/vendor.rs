@@ -1,9 +1,5 @@
-//! Adapter identification and the encoder fallback ladder.
-//!
-//! Both are pure decisions that decide which encoder a machine gets, and both were untested:
-//! the ladder is the whole Windows compatibility story and nothing exercised it, while
-//! `select_vendor` is string matching over an adapter description that no test had ever fed a
-//! real description to. Neither of these needs a GPU, so they run everywhere.
+//! Adapter identification and the encoder fallback ladder: pure decisions about which encoder
+//! a machine gets, so these tests need no GPU and run everywhere.
 
 use crate::streamer::config::EncoderVendor;
 use crate::windows_utils::streamer::pipeline::{encoder_ladder, BackendKind};
@@ -16,19 +12,17 @@ fn a_pci_id_beats_a_description_because_descriptions_are_rebranded() {
     assert_eq!(Vendor::from_pci_id(NVIDIA_PCI_VENDOR_ID), Vendor::Nvidia);
     assert_eq!(Vendor::from_pci_id(INTEL_PCI_VENDOR_ID), Vendor::Intel);
     assert_eq!(Vendor::from_pci_id(AMD_PCI_VENDOR_ID), Vendor::Amd);
-    // Microsoft's id, which WARP reports. It must not resolve to a hardware vendor.
+    // Microsoft's id, which WARP reports: not a hardware vendor
     assert_eq!(Vendor::from_pci_id(0x1414), Vendor::Unknown);
     assert_eq!(Vendor::from_pci_id(0), Vendor::Unknown);
-    // AMD's *CPU* vendor id. It never appears on a display adapter and adding it would make
-    // every Ryzen box claim a Radeon.
+    // AMD's CPU vendor id: never on a display adapter, and accepting it would make every Ryzen
+    // box claim a Radeon
     assert_eq!(Vendor::from_pci_id(0x1022), Vendor::Unknown);
 }
 
 #[test]
 fn real_adapter_descriptions_resolve_to_their_vendor() {
-    // Strings as `IDXGIAdapter::GetDesc` reports them on machines this project has seen or
-    // expects: a discrete NVIDIA, an Intel iGPU across two generations of naming, and AMD under
-    // all three names it ships under.
+    // strings as `IDXGIAdapter::GetDesc` reports them, AMD under all three names it ships under
     for (description, want) in [
         ("NVIDIA GeForce RTX 3080 Ti Laptop GPU", Vendor::Nvidia),
         ("NVIDIA GeForce GTX 1650", Vendor::Nvidia),
@@ -76,13 +70,13 @@ fn every_ladder_ends_in_software_so_a_session_is_always_possible() {
 }
 
 #[test]
-fn auto_tries_nvenc_then_quick_sync_then_amf_then_software() {
+fn auto_tries_nvenc_then_amf_then_quick_sync_then_software() {
     assert_eq!(
         encoder_ladder(EncoderVendor::Auto),
         &[
             BackendKind::Nvenc,
-            BackendKind::Intel,
             BackendKind::Amf,
+            BackendKind::Intel,
             BackendKind::X264
         ]
     );
@@ -90,9 +84,8 @@ fn auto_tries_nvenc_then_quick_sync_then_amf_then_software() {
 
 #[test]
 fn an_explicit_vendor_tries_that_vendor_and_then_software_only() {
-    // Asking for one vendor must not silently hand the session to a different one: the fallback
-    // is x264, never the other GPU. A machine set to Intel that quietly encoded on NVENC would
-    // make every "is Quick Sync working" answer a lie.
+    // the fallback is x264, never the other GPU: a host set to Intel that quietly encoded on
+    // NVENC could not say whether Quick Sync works
     assert_eq!(
         encoder_ladder(EncoderVendor::Nvidia),
         &[BackendKind::Nvenc, BackendKind::X264]
@@ -109,8 +102,8 @@ fn an_explicit_vendor_tries_that_vendor_and_then_software_only() {
 
 #[test]
 fn software_never_touches_a_hardware_encoder() {
-    // `disableGpuEncode` in the UI is exactly this ladder. If it probed a GPU encoder first the
-    // setting would not do what its name says on a machine whose driver is the problem.
+    // `disableGpuEncode` in the UI is exactly this ladder: probing a GPU encoder first would
+    // defeat it on a machine whose driver is the problem
     assert_eq!(
         encoder_ladder(EncoderVendor::Software),
         &[BackendKind::X264]
@@ -141,9 +134,8 @@ fn the_capture_gpu_preference_matches_the_first_rung_of_each_ladder() {
     use crate::windows_capture::d3d11::GpuPreference;
     use crate::windows_utils::streamer::capture_gpu_preference;
 
-    // The capture device must land on the adapter the encoder will run on, or every frame pays a
-    // GPU->CPU->GPU round trip. That makes this a property of the ladder, not an independent
-    // choice, and the two drifting apart is silent.
+    // capture must land on the adapter the encoder runs on, or every frame pays a
+    // GPU->CPU->GPU round trip; the two drifting apart is silent
     assert_eq!(
         capture_gpu_preference(EncoderVendor::Nvidia),
         GpuPreference::Vendor(NVIDIA_PCI_VENDOR_ID)
@@ -156,13 +148,13 @@ fn the_capture_gpu_preference_matches_the_first_rung_of_each_ladder() {
         capture_gpu_preference(EncoderVendor::Amd),
         GpuPreference::Vendor(AMD_PCI_VENDOR_ID)
     );
-    // Auto leads with NVENC, which lives on the discrete card.
+    // Auto leads with NVENC, which lives on the discrete card
     assert_eq!(
         capture_gpu_preference(EncoderVendor::Auto),
         GpuPreference::HighPerformance
     );
     // x264 reads every frame back to the CPU, so the iGPU that already composes the desktop is
-    // the cheap place to read from.
+    // the cheap place to read from
     assert_eq!(
         capture_gpu_preference(EncoderVendor::Software),
         GpuPreference::MinimumPower

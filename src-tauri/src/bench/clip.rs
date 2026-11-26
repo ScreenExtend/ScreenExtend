@@ -9,6 +9,9 @@ use std::fs::File;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
+#[cfg(windows)]
+use super::win::clipfmt::HEADER;
+#[cfg(target_os = "macos")]
 use crate::macos_utils::streamer::raw_capture::HEADER;
 
 use super::plan::Workload;
@@ -24,6 +27,18 @@ pub struct ClipInfo {
     pub times: Vec<u64>,
     pub idr: Vec<bool>,
     pub repeated: Vec<bool>,
+    /// Windows: where the pictures are and what they are. A legacy (macOS) take is NV12 at offset 0.
+    #[cfg(windows)]
+    pub layout: super::win::clipfmt::Layout,
+    /// Windows: each record's `os_ns` field as written (0 = none), not made relative.
+    #[cfg(windows)]
+    pub os_ns: Vec<u64>,
+    /// Windows: each record's last header word as written (in a v2 take, `win::clipfmt::FLAG_*`).
+    #[cfg(windows)]
+    pub flags: Vec<u32>,
+    /// Windows: where each record of a v3 clip is; `None` for fixed-size records.
+    #[cfg(windows)]
+    pub table: Option<std::sync::Arc<super::win::clipfmt::FrameTable>>,
 }
 
 impl ClipInfo {
@@ -53,6 +68,7 @@ fn header(h: &[u8]) -> (u64, usize, usize, bool, bool) {
     )
 }
 
+#[cfg(target_os = "macos")]
 pub fn scan(path: &Path) -> Result<ClipInfo, String> {
     let mut f = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let len = f.metadata().map_err(|e| e.to_string())?.len();
@@ -86,12 +102,98 @@ pub fn scan(path: &Path) -> Result<ClipInfo, String> {
                 "record {i} is {w2}x{h2}, not {w}x{ht}: variable-size clips are not supported"
             ));
         }
-        // Monotonic by construction; a clock step in a recording is clamped, not trusted.
+        // a clock step in a recording is clamped, not trusted
         let t = t.max(last);
         last = t;
         info.times.push(t - t0);
         info.idr.push(idr);
         info.repeated.push(rep);
+    }
+    if frames == 0 {
+        return Err("clip has no complete records".into());
+    }
+    Ok(info)
+}
+
+/// Windows: reads every container in `win::clipfmt`. No magic means the legacy macOS layout,
+/// read exactly as the macOS `scan` reads it.
+#[cfg(windows)]
+pub fn scan(path: &Path) -> Result<ClipInfo, String> {
+    use super::win::clipfmt::{FileHeader, Layout, FILE_HEADER, FLAG_REPEATED};
+
+    let mut f = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let len = f.metadata().map_err(|e| e.to_string())?.len();
+    let mut first = [0u8; FILE_HEADER];
+    let got = f
+        .read(&mut first)
+        .map_err(|e| format!("first header: {e}"))?;
+    if super::win::clipfmt::is_variable(&first[..got]) {
+        return super::win::clipfmt::scan_variable(path, true);
+    }
+    let layout = match FileHeader::parse(&first[..got]) {
+        Some(fh) => fh?.layout(),
+        None => {
+            if got < HEADER {
+                return Err("first header: file is shorter than one record header".into());
+            }
+            let (_, w, ht, _, _) = header(&first[..HEADER]);
+            if w == 0 || ht == 0 || w % 2 != 0 || ht % 2 != 0 || w > 16384 || ht > 16384 {
+                return Err(format!("implausible picture size {w}x{ht}"));
+            }
+            Layout::legacy_nv12(w, ht)
+        }
+    };
+    let (w, ht) = (layout.width, layout.height);
+    let rec_size = layout.rec_size;
+    let frames = (len.saturating_sub(layout.data_offset) / rec_size) as usize;
+    let mut info = ClipInfo {
+        width: w,
+        height: ht,
+        frames,
+        rec_size,
+        times: Vec::with_capacity(frames),
+        idr: Vec::with_capacity(frames),
+        repeated: Vec::with_capacity(frames),
+        layout,
+        os_ns: Vec::with_capacity(frames),
+        flags: Vec::with_capacity(frames),
+        table: None,
+    };
+    let mut h = [0u8; HEADER];
+    let mut t0 = 0;
+    let mut last = 0;
+    for i in 0..frames {
+        f.seek(SeekFrom::Start(
+            info.layout.data_offset + i as u64 * rec_size,
+        ))
+        .map_err(|e| e.to_string())?;
+        f.read_exact(&mut h)
+            .map_err(|e| format!("header {i}: {e}"))?;
+        let (t, w2, h2, idr, _) = header(&h);
+        if (w2, h2) != (w, ht) {
+            return Err(format!(
+                "record {i} is {w2}x{h2}, not {w}x{ht}: variable-size clips are not supported"
+            ));
+        }
+        let os = u64::from_le_bytes(h[8..16].try_into().unwrap());
+        let word = u32::from_le_bytes(h[28..32].try_into().unwrap());
+        if i == 0 {
+            t0 = t;
+            last = t;
+        }
+        // a clock step in a recording is clamped, not trusted
+        let t = t.max(last);
+        last = t;
+        info.times.push(t - t0);
+        info.idr.push(idr);
+        // legacy: the whole word is `repeated`; v2: bit 0 is, and the other bits are flags
+        info.repeated.push(if info.layout.v2 {
+            word & FLAG_REPEATED != 0
+        } else {
+            word != 0
+        });
+        info.os_ns.push(os);
+        info.flags.push(word);
     }
     if frames == 0 {
         return Err("clip has no complete records".into());
@@ -207,9 +309,21 @@ pub struct ClipReader {
     f: std::io::BufReader<File>,
     pub width: usize,
     pub height: usize,
+    /// Windows: picture bytes per record (NV12 `w*h*3/2`, BGRA `stride*h`).
+    #[cfg(windows)]
+    pub payload: usize,
+    /// Windows: fixed-size records start here, this far apart (for `seek_frame`).
+    #[cfg(windows)]
+    data_offset: u64,
+    #[cfg(windows)]
+    rec_size: u64,
+    /// Windows: a v3 clip's records (decoded and CRC-checked on read).
+    #[cfg(windows)]
+    var: Option<super::win::clipfmt::VarCursor>,
 }
 
 impl ClipReader {
+    #[cfg(target_os = "macos")]
     pub fn open(path: &Path, info: &ClipInfo) -> std::io::Result<ClipReader> {
         Ok(ClipReader {
             f: std::io::BufReader::with_capacity(8 << 20, File::open(path)?),
@@ -218,7 +332,106 @@ impl ClipReader {
         })
     }
 
+    /// Windows: positioned at the first record of either container.
+    #[cfg(windows)]
+    pub fn open(path: &Path, info: &ClipInfo) -> std::io::Result<ClipReader> {
+        let mut f = File::open(path)?;
+        f.seek(SeekFrom::Start(info.layout.data_offset))?;
+        Ok(ClipReader {
+            f: std::io::BufReader::with_capacity(8 << 20, f),
+            width: info.width,
+            height: info.height,
+            payload: info.layout.payload,
+            data_offset: info.layout.data_offset,
+            rec_size: info.rec_size,
+            var: info.table.as_ref().map(|t| {
+                super::win::clipfmt::VarCursor::new(
+                    std::sync::Arc::clone(t),
+                    info.layout.payload,
+                    info.layout.data_offset,
+                )
+            }),
+        })
+    }
+
+    /// Windows: the next `next` returns frame `frame` (0-based).
+    #[cfg(windows)]
+    pub fn seek_frame(&mut self, frame: usize) -> std::io::Result<()> {
+        match self.var.as_mut() {
+            Some(v) => {
+                v.seek(frame);
+                Ok(())
+            }
+            None => self
+                .f
+                .seek(SeekFrom::Start(
+                    self.data_offset + frame as u64 * self.rec_size,
+                ))
+                .map(|_| ()),
+        }
+    }
+
+    /// Windows: read the next record's picture into `buf` (`payload` bytes, in the clip's own
+    /// pixel format; see `info.layout.format`).
+    /// A v3 clip's frame is decompressed into `buf` and its CRC-32 checked; a bad frame is an
+    /// `InvalidData` error naming it.
+    #[cfg(windows)]
+    pub fn next(&mut self, buf: &mut Vec<u8>) -> std::io::Result<()> {
+        if let Some(v) = self.var.as_mut() {
+            return v.read_next(&mut self.f, buf);
+        }
+        let mut h = [0u8; HEADER];
+        self.f.read_exact(&mut h)?;
+        buf.resize(self.payload, 0);
+        self.f.read_exact(buf)
+    }
+
+    /// Windows: [`ClipReader::next`] into a caller's buffer of exactly `payload` bytes.
+    #[cfg(windows)]
+    pub fn next_into(&mut self, out: &mut [u8]) -> std::io::Result<()> {
+        use std::io::{Error, ErrorKind};
+        if out.len() != self.payload {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "a {} byte buffer for {} byte pictures",
+                    out.len(),
+                    self.payload
+                ),
+            ));
+        }
+        if let Some(v) = self.var.as_mut() {
+            let i = v.position();
+            let mut stored = Vec::new();
+            let word = v.read_stored(&mut self.f, &mut stored)?;
+            return super::win::clipfmt::decode_frame_into(i, &word, &stored, self.payload, out)
+                .map_err(|m| Error::new(ErrorKind::InvalidData, m));
+        }
+        let mut h = [0u8; HEADER];
+        self.f.read_exact(&mut h)?;
+        self.f.read_exact(out)
+    }
+
+    /// Windows: the next record as stored. A v3 frame comes back as its word and its stored
+    /// (possibly LZ4) bytes, for `clipfmt::decode_frame` on another thread; a fixed-size record
+    /// comes back as `None` with the picture itself in `stored`.
+    #[cfg(windows)]
+    pub fn next_stored(
+        &mut self,
+        stored: &mut Vec<u8>,
+    ) -> std::io::Result<Option<super::win::clipfmt::FrameWord>> {
+        if let Some(v) = self.var.as_mut() {
+            return v.read_stored(&mut self.f, stored).map(Some);
+        }
+        let mut h = [0u8; HEADER];
+        self.f.read_exact(&mut h)?;
+        stored.resize(self.payload, 0);
+        self.f.read_exact(stored)?;
+        Ok(None)
+    }
+
     /// Read the next record's picture into `buf` (`w*h*3/2` bytes).
+    #[cfg(target_os = "macos")]
     pub fn next(&mut self, buf: &mut Vec<u8>) -> std::io::Result<()> {
         let mut h = [0u8; HEADER];
         self.f.read_exact(&mut h)?;
@@ -226,10 +439,6 @@ impl ClipReader {
         self.f.read_exact(buf)
     }
 }
-
-// ---------------------------------------------------------------------------------------------
-// Synthetic clips.
-// ---------------------------------------------------------------------------------------------
 
 /// Upper bound for one rendered clip on disk.
 pub const CLIP_BUDGET_BYTES: u64 = 2_500_000_000;
@@ -327,7 +536,7 @@ pub(super) fn stress_desktop(w: usize, h: usize, seed: u64) -> Vec<u8> {
             );
         }
     }
-    // Icons down the right edge.
+    // icons down the right edge
     let icon = (h / 16).max(24);
     let mut rng = Rng(seed ^ 0x1C0);
     let mut y0 = 40;
@@ -342,7 +551,7 @@ pub(super) fn stress_desktop(w: usize, h: usize, seed: u64) -> Vec<u8> {
         }
         y0 += icon * 3 / 2;
     }
-    // Menu bar with text-like glyphs.
+    // menu bar with text-like glyphs
     let bar = (h / 45).max(12);
     for y in 0..bar {
         for x in 0..w {
@@ -375,7 +584,7 @@ pub(super) fn stress_window(w: usize, h: usize, seed: u64) -> Vec<u8> {
             }
             let ly = (y - title) / line;
             let in_line = (y - title) % line < 13;
-            // Words: runs of glyph cells with gaps, per line a different length.
+            // words: runs of glyph cells with gaps, a different length per line
             let cell = x / 7;
             let word_gap = hash2(cell / 6, ly, seed ^ 0x77) & 7 == 0;
             let line_len = 40 + (hash2(0, ly, seed) % (w as u32 / 7)) as usize;
@@ -394,7 +603,7 @@ pub(super) fn stress_window(w: usize, h: usize, seed: u64) -> Vec<u8> {
             }
         }
     }
-    // An embedded photo-like block of noise in the lower right quarter.
+    // photo-like block of noise in the lower right quarter
     let (px, py) = (w * 3 / 5, h * 3 / 5);
     for y in py..h.saturating_sub(12) {
         for x in px..w.saturating_sub(12) {
@@ -437,7 +646,7 @@ pub(super) fn drag_path(
         cur = target;
     }
     let _ = cur;
-    // Return home with whatever is left, ending on a short pause.
+    // return home with whatever is left, ending on a short pause
     let rest = frames - used;
     let back = rest.saturating_sub(pause_last).max(1);
     segs.push((back, start));
@@ -493,7 +702,7 @@ pub fn render(w: &Workload, path: &Path) -> Result<ClipInfo, String> {
         out.write_all(nv12).map_err(|e| e.to_string())
     };
 
-    // `stress_then_noise`: the drag, then every pixel new from five seconds in.
+    // `stress_then_noise`: the drag, then every pixel new from five seconds in
     let noise_from = (pattern == "stress_then_noise").then_some(5 * w.fps as usize);
     if pattern == "window_drag_stress" || noise_from.is_some() {
         let ww = (width * 55 / 100) & !1;

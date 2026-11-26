@@ -2,43 +2,17 @@
 //!
 //! Run with `cd src-tauri && cargo run --example audio_spike`.
 //!
-//! It exists to answer three questions that between them determined how
-//! `windows_utils::audio` is built. The answers below were measured, not recalled, on
-//! **Windows 11 Home 10.0.26200**, default render endpoint reporting
-//! 48000 Hz / 2ch / 32-bit IEEE_FLOAT (`nBlockAlign` 8) — i.e. the 48 kHz fast path.
+//! It answers the three questions `windows_utils::audio` is built on:
 //!
-//! **Q1. Does `AUDCLNT_STREAMFLAGS_LOOPBACK` work with
-//! `IAudioClient3::InitializeSharedAudioStream`?** No.
-//! `InitializeSharedAudioStream(LOOPBACK|EVENTCALLBACK, min_period)` fails with `0x88890021`
-//! (`AUDCLNT_E_INVALID_STREAM_FLAG`); its documented supported-flag list really is just
-//! `EVENTCALLBACK`. So capture uses the legacy `IAudioClient::Initialize` loopback path, which
-//! succeeds. This is also why the *render* companion, not the capture stream, is what
-//! negotiates a low-latency engine period in `silence.rs`.
-//!
-//! **Q2. Does event-driven loopback actually signal?** Only while something is rendering on
-//! the endpoint. 20 iterations x 200 ms wait, host idle:
-//!
-//! | scenario | event signals | timeouts | packets |
-//! |---|---|---|---|
-//! | no silent companion | **0 / 20** | 20 | 0 |
-//! | with silent companion | **20 / 20** | 0 | 19 (interval avg 9.39 ms, max 10.29 ms) |
-//!
-//! The companion is therefore not an idle-silence patch — it is the clock source that makes
-//! the capture event fire at all, which is why `silence.rs` is mandatory whenever capture runs.
-//! Also observed: the first packet after start carries
-//! `AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY`, and companion-driven idle packets carry
-//! `AUDCLNT_BUFFERFLAGS_SILENT`.
-//!
-//! **Q3. What is the engine-period floor on this hardware?**
-//! `GetSharedModeEnginePeriod` reports `default = fundamental = minimum = maximum = 480 frames
-//! (10.000 ms)`. This endpoint exposes no sub-10 ms variant at all, so the 10 ms capture period
-//! is a hardware floor here rather than a choice — reported honestly rather than quietly
-//! missed. Other hardware differs: the in-box High Definition Audio Device driver is documented
-//! at 128-480 frames, and Microsoft's own worked example shows a 48-frame minimum.
-//!
-//! Re-confirmed 2026-09 against the shipping code path with
-//! `ScreenExtend probe --audio`, which reports the same 480-frame period and a measured
-//! capture-thread wake interval of p50 9.44 ms / max 10.6 ms.
+//! - Q1: `IAudioClient3::InitializeSharedAudioStream` rejects `AUDCLNT_STREAMFLAGS_LOOPBACK`
+//!   (`0x88890021`, `AUDCLNT_E_INVALID_STREAM_FLAG`), so capture uses the legacy
+//!   `IAudioClient::Initialize` loopback path.
+//! - Q2: the loopback event signals only while something renders on the endpoint: 0 of 20
+//!   waits on an idle host, 20 of 20 with a silent render companion (the capture's clock source).
+//!   The first packet after start carries `AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY`; idle
+//!   companion-driven packets carry `AUDCLNT_BUFFERFLAGS_SILENT`.
+//! - Q3: `GetSharedModeEnginePeriod` gives the engine-period floor: 480 frames (10 ms) on the
+//!   endpoint measured; the in-box HD Audio driver is documented at 128-480 frames.
 
 #[cfg(not(windows))]
 fn main() {

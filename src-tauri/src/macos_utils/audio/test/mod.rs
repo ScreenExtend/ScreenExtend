@@ -2,8 +2,8 @@ mod clock;
 mod format;
 mod tiering;
 
-/// Below 12.3 there is no native system-audio API at all, so the answer must be the driver — an
-/// action the user can take — and never `Unsupported`, which the UI presents as a dead end.
+/// Without a native system-audio API the answer must be the driver (an action the user can take),
+/// never `Unsupported`, which the UI presents as a dead end.
 #[test]
 fn probe_without_a_native_tier_is_actionable_not_unsupported() {
     use crate::macos_utils::audio::{probe_audio_backend, AudioBackend};

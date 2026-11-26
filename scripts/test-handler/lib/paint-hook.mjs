@@ -1,12 +1,8 @@
-// The readback that produces the primary metric. Installed in every worker the client page
-// starts (before the worker's own script runs, through the debugger's auto-attach) and in the
-// page itself. It wraps `drawImage` on 2D canvas contexts: when the page paints a decoded
-// VideoFrame, the hook stamps the moment of the paint call and reads the clock stamp out of
-// *that frame* — a clone, cropped to the stamp strip, read asynchronously so the paint itself
-// is not delayed. For the <video> path the page script samples the element on
-// requestVideoFrameCallback instead (expectedDisplayTime). Both page generations paint with
-// `ctx.drawImage(frame, ...)` in their transform worker, so the same hook covers old and new.
-//
+// The readback behind the primary metric, installed in the page and in every worker it starts
+// (debugger auto-attach, before the worker's own script). It wraps `drawImage` on 2D canvas
+// contexts, which every page generation's transform worker paints through: a painted VideoFrame
+// gets its paint time and the clock stamp from a cropped clone, read asynchronously so the paint
+// is not delayed. The <video> path is sampled on requestVideoFrameCallback (expectedDisplayTime).
 // Off (cfg = null) it costs one property read per paint. It never creates or dispatches events.
 
 export const HOOK_SOURCE = `(() => {

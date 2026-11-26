@@ -123,7 +123,7 @@ pub fn hevc_sps_info(param_sets: &[Vec<u8>]) -> Json {
     let r = rbsp(&sps[2..]);
     // sps_video_parameter_set_id(4) max_sub_layers_minus1(3) temporal_id_nesting(1) = 1 byte,
     // then general_profile_space(2) tier(1) profile_idc(5), 4 bytes compat, 6 bytes constraint,
-    // general_level_idc(8).
+    // general_level_idc(8)
     if r.len() < 13 {
         return json!({ "error": "short SPS", "sps_hex": hex(sps) });
     }
@@ -228,7 +228,7 @@ mod tests {
             (150_000_000, 1000),
             (160_000_000, 1000),
         ];
-        // 100 ms window: the last two land 10 ms apart.
+        // 100 ms window: the last two land 10 ms apart
         assert_eq!(peak_rate_bps(&ev, 100_000_000), 2000.0 * 8.0 * 10.0);
     }
 
@@ -242,20 +242,20 @@ mod tests {
 
     #[test]
     fn max_num_ref_frames_from_real_sps() {
-        // SPS bytes VideoToolbox emitted in BENCH-M2 runs on an M1 (macOS 26.7.1), hand-decoded.
+        // SPS bytes VideoToolbox emitted on an M1 (macOS 26.7.1), hand-decoded
         let hex = |s: &str| -> Vec<u8> {
             (0..s.len())
                 .step_by(2)
                 .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
                 .collect()
         };
-        // Low-latency encoder, BaseFrameQP 15 recipe: level 4.2, max_num_ref_frames 4.
+        // low-latency encoder, BaseFrameQP 15 recipe: level 4.2, max_num_ref_frames 4
         let ll = hex("27640c2aac1314501e0089f966e0202020f0804258");
         assert_eq!(h264_max_num_ref_frames(&ll), Some(4));
-        // Low-latency encoder under the 300 Mbps constant-QP ceiling: level 5.1, 15.
+        // low-latency encoder under the 300 Mbps constant-QP ceiling: level 5.1, 15
         let qp = hex("27640c33ac13141001e0089f966e0202020f08042108");
         assert_eq!(h264_max_num_ref_frames(&qp), Some(15));
-        // The standard hardware encoder (`ave.avc`): 1.
+        // standard hardware encoder (`ave.avc`): 1
         let std = hex("2764002aac5680780227e59b80808081");
         assert_eq!(h264_max_num_ref_frames(&std), Some(1));
         assert_eq!(h264_max_num_ref_frames(&[0x68, 1, 2, 3]), None);

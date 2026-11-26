@@ -71,12 +71,16 @@ pub struct QuadRenderer {
 }
 
 fn compile(entry: PCSTR, target: PCSTR) -> Result<Vec<u8>> {
+    compile_src(SHADER_SRC, entry, target)
+}
+
+fn compile_src(src: &str, entry: PCSTR, target: PCSTR) -> Result<Vec<u8>> {
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     let res = unsafe {
         D3DCompile(
-            SHADER_SRC.as_ptr() as *const core::ffi::c_void,
-            SHADER_SRC.len(),
+            src.as_ptr() as *const core::ffi::c_void,
+            src.len(),
             None,
             None,
             None,
@@ -189,6 +193,23 @@ impl QuadRenderer {
         target_w: u32,
         target_h: u32,
     ) -> Result<()> {
+        self.draw_with(&self.ps, None, rtv, srv, blend, verts, target_w, target_h)
+    }
+
+    /// [`Self::draw`] with another pixel shader, and optionally a constant buffer bound to that
+    /// shader's slot `b0`. The vertex stage, sampler and blend states are this renderer's own.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_with(
+        &self,
+        ps: &ID3D11PixelShader,
+        ps_cbuf: Option<&ID3D11Buffer>,
+        rtv: &ID3D11RenderTargetView,
+        srv: &ID3D11ShaderResourceView,
+        blend: BlendKind,
+        verts: &QuadVerts,
+        target_w: u32,
+        target_h: u32,
+    ) -> Result<()> {
         let ctx = &self.context;
         unsafe {
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
@@ -222,14 +243,104 @@ impl QuadRenderer {
             ctx.IASetInputLayout(None);
             ctx.VSSetShader(&self.vs, None);
             ctx.VSSetConstantBuffers(0, Some(&[Some(self.cbuf.clone())]));
-            ctx.PSSetShader(&self.ps, None);
+            ctx.PSSetShader(ps, None);
+            if let Some(cb) = ps_cbuf {
+                ctx.PSSetConstantBuffers(0, Some(&[Some(cb.clone())]));
+            }
             ctx.PSSetShaderResources(0, Some(&[Some(srv.clone())]));
             ctx.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
             ctx.Draw(4, 0);
             ctx.PSSetShaderResources(0, Some(&[None]));
+            if ps_cbuf.is_some() {
+                ctx.PSSetConstantBuffers(0, Some(&[None]));
+            }
             ctx.OMSetRenderTargets(None, None);
         }
         Ok(())
+    }
+}
+
+/// Pixel shader for an scRGB (linear, BT.709 primaries, FP16) desktop image: scale so the
+/// display's SDR white lands on 1.0, clip, and encode as sRGB for a BGRA8 target.
+///
+/// This is a clip, not a tone map. Everything above SDR white saturates and anything outside the
+/// BT.709 gamut is clamped, which is what an SDR stream of an HDR desktop can carry anyway.
+const SCRGB_SHADER_SRC: &str = "\
+cbuffer Tone : register(b0) { float4 tone; };\n\
+struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n\
+Texture2D tex0 : register(t0);\n\
+SamplerState smp0 : register(s0);\n\
+float3 srgb(float3 c) {\n\
+    c = saturate(c);\n\
+    float3 lo = c * 12.92f;\n\
+    float3 hi = 1.055f * pow(c, 1.0f / 2.4f) - 0.055f;\n\
+    return (c <= 0.0031308f) ? lo : hi;\n\
+}\n\
+float4 psmain(VSOut i) : SV_Target {\n\
+    float4 s = tex0.Sample(smp0, i.uv);\n\
+    return float4(srgb(s.rgb * tone.x), 1.0f);\n\
+}\n";
+
+/// Converts an scRGB FP16 duplication surface into the BGRA8 desktop copy, on the GPU.
+///
+/// `CopyResource` between two formats outside one typeless family is invalid and D3D11 drops it
+/// with nothing but a debug-layer message, so an FP16 surface has to be drawn, not copied.
+pub struct ScRgbPass {
+    ps: ID3D11PixelShader,
+    cbuf: ID3D11Buffer,
+}
+
+impl ScRgbPass {
+    /// `white_scale` multiplies the scRGB value before encoding: `1.0` treats 80 nits as white,
+    /// `1000 / SDRWhiteLevel` puts the display's own SDR white level there.
+    pub fn new(device: &ID3D11Device, white_scale: f32) -> Result<Self> {
+        let bytes = compile_src(SCRGB_SHADER_SRC, s!("psmain"), s!("ps_4_0"))?;
+        let mut ps: Option<ID3D11PixelShader> = None;
+        unsafe { device.CreatePixelShader(&bytes, None, Some(&mut ps)) }
+            .context("CreatePixelShader (scRGB)")?;
+        let tone: [f32; 4] = [white_scale, 0.0, 0.0, 0.0];
+        let desc = D3D11_BUFFER_DESC {
+            ByteWidth: std::mem::size_of_val(&tone) as u32,
+            Usage: D3D11_USAGE_IMMUTABLE,
+            BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+            StructureByteStride: 0,
+        };
+        let init = D3D11_SUBRESOURCE_DATA {
+            pSysMem: tone.as_ptr() as *const core::ffi::c_void,
+            SysMemPitch: 0,
+            SysMemSlicePitch: 0,
+        };
+        let mut cbuf: Option<ID3D11Buffer> = None;
+        unsafe { device.CreateBuffer(&desc, Some(&init), Some(&mut cbuf)) }
+            .context("CreateBuffer (scRGB tone)")?;
+        Ok(Self {
+            ps: ps.context("scRGB pixel shader was null")?,
+            cbuf: cbuf.context("scRGB tone buffer was null")?,
+        })
+    }
+
+    /// Draw `srv` over the whole of `rtv`.
+    pub fn draw(
+        &self,
+        renderer: &QuadRenderer,
+        rtv: &ID3D11RenderTargetView,
+        srv: &ID3D11ShaderResourceView,
+        verts: &QuadVerts,
+        target_w: u32,
+        target_h: u32,
+    ) -> Result<()> {
+        renderer.draw_with(
+            &self.ps,
+            Some(&self.cbuf),
+            rtv,
+            srv,
+            BlendKind::Opaque,
+            verts,
+            target_w,
+            target_h,
+        )
     }
 }
 
@@ -388,10 +499,9 @@ pub fn build_sprite(
 /// A pointer shape read from an `HCURSOR`, in exactly the encoding Desktop Duplication hands to
 /// [`build_sprite`].
 ///
-/// The WGC path has no `GetFramePointerShape`: it gets an `HCURSOR` out of `GetCursorInfo` and
-/// nothing else. Rather than write a second sprite builder for it, the GDI bitmaps are converted
-/// into DXGI's own three-shape encoding and handed to the one that already exists — which is also
-/// what keeps the two capture backends drawing the *same* pointer.
+/// The WGC path has no `GetFramePointerShape`, only an `HCURSOR` out of `GetCursorInfo`, so the
+/// GDI bitmaps are converted into DXGI's own three-shape encoding. One sprite builder is what
+/// keeps the two capture backends drawing the *same* pointer.
 pub struct PointerShape {
     pub info: DXGI_OUTDUPL_POINTER_SHAPE_INFO,
     pub data: Vec<u8>,
@@ -419,8 +529,7 @@ impl Drop for Bmp {
 ///
 /// Always 32 bpp, including for the 1-bpp AND/XOR masks. A monochrome DDB read at its own depth
 /// comes back as palette indices, and which index is "set" depends on the palette GDI happens to
-/// attach — a coin toss that decides whether the cursor is drawn or its negative is. Read at 32
-/// bpp the question does not arise: black is 0 and white is not.
+/// attach, so the cursor or its negative gets drawn. At 32 bpp black is 0 and white is not.
 fn bitmap_bgra(
     dc: windows::Win32::Graphics::Gdi::HDC,
     bmp: windows::Win32::Graphics::Gdi::HBITMAP,
@@ -437,7 +546,7 @@ fn bitmap_bgra(
         bmiHeader: BITMAPINFOHEADER {
             biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
             biWidth: w,
-            // Negative: top-down, so row 0 is the top row and the pitch is a plain w * 4.
+            // negative: top-down, so row 0 is the top row and the pitch is a plain w * 4
             biHeight: -h,
             biPlanes: 1,
             biBitCount: 32,
@@ -465,8 +574,8 @@ fn bitmap_bgra(
 
 /// Converts the cursor `hcursor` names into DXGI's pointer-shape encoding.
 ///
-/// The three cases are the three DXGI shape types, and they are decided by what
-/// `GetIconInfoExW` hands back — never by a version or a size:
+/// The three cases are the three DXGI shape types, decided by what `GetIconInfoExW` hands back,
+/// never by a version or a size:
 ///
 /// * no colour bitmap: a monochrome cursor, whose mask is 2H tall (AND rows then XOR rows);
 /// * a colour bitmap with a real alpha channel: a modern 32-bit cursor;
@@ -505,7 +614,7 @@ pub fn shape_from_hcursor(
     let want = std::mem::size_of::<BITMAP>() as i32;
 
     if colour.0.is_invalid() {
-        // Monochrome: one bitmap, 2H tall. Repack to the 1-bpp rows `build_sprite` reads.
+        // monochrome: one bitmap, 2H tall, repacked to the 1-bpp rows `build_sprite` reads
         if unsafe { GetObjectW(mask.0.into(), want, Some((&raw mut bm).cast())) } != want {
             bail!("GetObjectW(cursor mask) failed");
         }
@@ -538,16 +647,20 @@ pub fn shape_from_hcursor(
     }
     let (w, h) = (bm.bmWidth, bm.bmHeight);
     let mut bgra = bitmap_bgra(dc.0, colour.0, w, h)?;
-    let has_alpha = bgra.chunks_exact(4).any(|p| p[3] != 0);
+    let has_alpha = bgra.as_chunks::<4>().0.iter().any(|p| p[3] != 0);
 
     let kind = if has_alpha {
         DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR
     } else {
-        // The alpha byte is where `MASKED_COLOR` keeps the AND mask: 0xFF means "XOR this pixel
-        // with the screen" (so black leaves the screen alone and white inverts it), 0x00 means
-        // "replace it".
+        // the alpha byte is where `MASKED_COLOR` keeps the AND mask: 0xFF means "XOR this pixel
+        // with the screen" (black leaves the screen alone, white inverts it), 0x00 "replace it"
         let mask_bgra = bitmap_bgra(dc.0, mask.0, w, h)?;
-        for (px, m) in bgra.chunks_exact_mut(4).zip(mask_bgra.chunks_exact(4)) {
+        for (px, m) in bgra
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(mask_bgra.as_chunks::<4>().0)
+        {
             let set = m[0] != 0 || m[1] != 0 || m[2] != 0;
             px[3] = if set { 0xFF } else { 0x00 };
         }

@@ -1,6 +1,6 @@
 //! The `churn` child: create a session, encode K frames, destroy it, M times. It answers whether
 //! a session lifecycle leaks (memory, descriptors, mach ports, threads) and how long a create
-//! takes when the hardware encoder is handed back and asked for again — which is exactly what a
+//! takes when the hardware encoder is handed back and asked for again, which is what a
 //! renegotiation or an encoder reset does in production.
 
 use std::time::{Duration, Instant};
@@ -160,7 +160,7 @@ pub fn run(spec: &RunSpec) -> Json {
             res_samples.push(json!({ "cycle": cycle + 1, "res": cf::resources() }));
         }
     }
-    // Let VideoToolbox's own teardown finish before the closing count.
+    // let VideoToolbox's own teardown finish before the closing count
     std::thread::sleep(Duration::from_millis(500));
     let res_end = cf::resources();
     res_samples.push(json!({ "cycle": c.cycles, "at": "end+500ms", "res": res_end }));

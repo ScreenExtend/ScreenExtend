@@ -1,28 +1,25 @@
 'use strict';
 
 const SR = 48000;
-// seq u32 LE, capture_ns u64 LE, flags u8 — see streamer/audio/protocol.rs, which is the
-// authority on this layout.
+// seq u32 LE, capture_ns u64 LE, flags u8; streamer/audio/protocol.rs owns this layout
 const HDR_BYTES = 13;
 const FLAG_SILENT = 1 << 0;
 const FLAG_DISCONTINUITY = 1 << 1;
-// The body carries two payloads: a u16 LE length, this frame's Opus packet, then the previous
-// frame's. RFC 2198-style redundancy without the RTP framing, and the only loss-robustness
-// tool this path has — the host's encoder is CELT-only at 5 ms, where libopus's in-band FEC is
-// structurally inert. The host sets it only when the join advertised `redundancy`, so an older
-// client is never handed a body it cannot split.
+// The body is a u16 LE length, this frame's Opus packet, then the previous frame's (RFC 2198
+// style, without the RTP framing). The only loss-robustness tool here: the host encodes
+// CELT-only at 5 ms, where libopus's in-band FEC is inert. Set only when the join advertised
+// `redundancy`, so an older client is never handed a body it cannot split.
 const FLAG_REDUNDANT = 1 << 2;
 const REDUNDANCY_PREFIX_LEN = 2;
 const SYNC_POST_INTERVAL_MS = 250;
-// The host encodes 5 ms frames; a seq gap is that many frames of missing audio.
+// the host encodes 5 ms frames, so a seq gap is that many frames of missing audio
 const FRAME_MS = 5;
 const FRAMES_PER_PACKET = SR * FRAME_MS / 1000;
-// Beyond this a gap is a stall, not a loss: concealing it would just be noise.
+// beyond this a gap is a stall, not a loss: concealing it would just be noise
 const MAX_CONCEAL_PACKETS = 6;
 
-// This file is only ever loaded once AudioDecoder has been probed and answered yes, which is
-// why it may use syntax and APIs the rest of the client page may not. It still avoids BigInt:
-// the u64 capture stamp is read as two u32 halves, exactly the bytes getBigUint64 would see.
+// Only loaded once AudioDecoder has been probed, so it may use syntax and APIs the rest of the
+// client page may not. Still no BigInt: the u64 capture stamp is read as two u32 halves.
 const U32 = 4294967296;
 function readU64(dv, off) {
     return dv.getUint32(off, true) + dv.getUint32(off + 4, true) * U32;
@@ -44,9 +41,8 @@ let shared = false;
 let decoder = null;
 let lastSeq = null;
 let preEnqueueEmaMs = null;
-// Host-to-local clock offset from the page (see input.js). 0 until the first PONG carrying a
-// host stamp lands, which reproduces the old epoch-biased number; the video worker carries
-// the identical bias, so the A/V sync difference is unaffected either way.
+// host-to-local clock offset from the page (input.js): 0 until the first PONG carrying a host
+// stamp lands, and the video worker carries the same bias, so the A/V difference is unaffected
 let hostOffsetMs = 0;
 let lastSyncPostAt = 0;
 let scratchL = null;
@@ -108,9 +104,9 @@ function writeShared(l, r, frames) {
     Atomics.store(ctrl, W, (w + n) >>> 0);
 }
 
-// Set once the page has handed over one end of a MessageChannel whose other end the worklet
-// took. Until then — and on any engine that will not transfer a port into an
-// AudioWorkletGlobalScope — samples go to the page, which re-posts them to the worklet.
+// One end of a MessageChannel whose other end the worklet took. Until the page hands it over
+// (never, on an engine that will not transfer a port into an AudioWorkletGlobalScope), samples
+// go to the page, which re-posts them to the worklet.
 let samplePort = null;
 
 function postSamples(l, r, frames) {
@@ -123,8 +119,7 @@ function postSamples(l, r, frames) {
     if (samplePort) samplePort.postMessage(msg, transfer);
     else self.postMessage(msg, transfer);
 }
-// The worklet reads these on the same port, so they must not overtake or fall behind the
-// samples they describe.
+// same port as the samples, so a message cannot overtake or fall behind the ones it describes
 function postToWorklet(msg) {
     if (samplePort) samplePort.postMessage(msg);
     else self.postMessage(msg);
@@ -151,9 +146,8 @@ function onDecoded(ad) {
         else r.set(l);
     } catch (e) {
         ad.close();
-        // A copyTo that refuses the format conversion drops every packet the decoder
-        // produces. Swallowed frame by frame it was permanent silence with the client still
-        // reporting the fast audio path and audioUnderruns climbing for no visible reason.
+        // a copyTo that refuses the format conversion drops every packet: counted, so the
+        // page is told instead of playing silence while reporting the fast audio path
         copyFailures++;
         if (copyFailures === MAX_COPY_FAILURES) {
             self.postMessage({
@@ -166,14 +160,13 @@ function onDecoded(ad) {
     }
     ad.close();
     copyFailures = 0;
-    // "Three failures in a row", the way the video worker counts them — not three in the
-    // lifetime of a four-hour session with one transient decode error an hour.
+    // resets count failures in a row, as the video worker does, not failures per session
     decoderResets = 0;
 
     const enqueueAbsMs = performance.timeOrigin + performance.now();
     const pre = enqueueAbsMs - (captureHostMs - hostOffsetMs);
-    // Same asymmetric min-tracking estimator as transform-worker.js: the A/V target is the
-    // difference of these two numbers, so a mismatched filter would bias it for no reason.
+    // same asymmetric min-tracking estimator as transform-worker.js: the A/V target is the
+    // difference of the two numbers, so a mismatched filter would bias it
     if (preEnqueueEmaMs === null) {
         preEnqueueEmaMs = pre;
     } else {
@@ -191,16 +184,16 @@ function onDecoded(ad) {
         });
     }
 
-    // Anything owed in front of this packet goes in first, from this same task, which is what
-    // makes the ring order match the wire order.
+    // concealment owed in front of this packet goes in first, from this same task, so the
+    // ring order matches the wire order
     flushConceal(ad.timestamp);
     rememberDecoded(l, r, frames);
     if (shared) writeShared(l, r, frames);
     else postSamples(l, r, frames);
 }
 
-// A decoder that errors on every packet must not be rebuilt forever: past this the page is
-// told, so it can drop to the browser's own Opus track instead of playing silence.
+// a decoder that errors on every packet is not rebuilt forever: past this the page is told,
+// so it can drop to the browser's own Opus track instead of playing silence
 const MAX_DECODER_RESETS = 3;
 let decoderResets = 0;
 const MAX_COPY_FAILURES = 4;
@@ -231,27 +224,22 @@ function makeDecoder() {
     }
 }
 
-// Conceal a loss rather than let the ring starve. The worklet's own concealment only sees an
-// empty ring — by then the depth has already collapsed and it re-primes, which costs a whole
-// buffer of silence. Filling the hole here keeps the ring at depth and the loss inaudible.
+// conceal a loss here rather than let the ring starve: the worklet only sees an empty ring,
+// and by then it re-primes, which costs a whole buffer of silence
 let concealed = 0;
-// A redundant copy that filled a real hole, and one that arrived for a packet we already had.
-// The second number is the cost of the feature and the first is what it bought.
+// a redundant copy that filled a real hole (what the feature bought), and one that arrived
+// for a packet already received (what it cost)
 let redundantUsed = 0;
 let redundantDiscarded = 0;
 let lastDecodedL = null;
 let lastDecodedR = null;
 let lastDecodedFrames = 0;
 
-// Concealment used to be written inline, from the packet-arrival task. Real samples only reach
-// the ring from the decoder's output callback, which is a *separate* task, so under load — three
-// 5 ms packets queued behind one 15 ms stall — the concealment for a lost packet landed in the
-// ring before the output of the packet it follows. That plays two 5 ms blocks in the wrong
-// order, precisely in the conditions concealment exists for.
-//
-// So it is queued against the capture timestamp of the packet it must precede, and emitted from
-// that packet's own output task. A timestamp whose decode never produces an output would leak an
-// entry, so the map is bounded and drops oldest-first.
+// Concealment is queued against the capture timestamp of the packet it must precede and
+// emitted from that packet's own output task. Real samples reach the ring from the decoder's
+// output callback, a separate task from packet arrival, so concealment written at arrival
+// can land ahead of the output of the packet it follows. A decode that never produces an
+// output would leak an entry, so the map is bounded and drops oldest-first.
 const pendingConceal = new Map();
 const MAX_PENDING_CONCEAL = 16;
 function queueConceal(beforeTimestampUs, n) {
@@ -280,8 +268,8 @@ function concealPackets(n) {
         }
         const l = scratchL.subarray(0, frames);
         const r = scratchR.subarray(0, frames);
-        // Attenuate as the gap widens: a repeated waveform is convincing for a few
-        // milliseconds and buzzy after that.
+        // attenuate as the gap widens: a repeated waveform is convincing for a few
+        // milliseconds and buzzy after that
         const g = Math.pow(0.55, p + 1);
         for (let i = 0; i < frames; i++) {
             l[i] = lastDecodedL[i] * g;
@@ -346,14 +334,13 @@ function handlePacket(buf) {
     const discontinuity = !!(flags & FLAG_DISCONTINUITY);
     const captureUs = Math.round(captureNs / 1000);
 
-    // The trailing copy is the payload for `seq - 1` and nothing else, so it is worth
-    // decoding only when that packet never arrived. Otherwise it is a duplicate of audio
-    // already in the ring and playing it would double the frame, not repair anything.
+    // the trailing copy is the payload for `seq - 1` only: decode it when that packet never
+    // arrived, otherwise it would double a frame already in the ring
     let recovered = false;
     if (prevLen > 0 && !discontinuity) {
         if (gap > 0) {
-            // The copy reaches back exactly one frame; anything older is still a hole, and it
-            // belongs in front of the copy rather than in front of this packet.
+            // the copy reaches back exactly one frame: anything older is still a hole, and it
+            // belongs in front of the copy, not in front of this packet
             if (gap > 1) queueConceal(captureUs - FRAME_MS * 1000, gap - 1);
             submit(buf, prevOff, prevLen, captureUs - FRAME_MS * 1000);
             redundantUsed++;
@@ -362,14 +349,14 @@ function handlePacket(buf) {
             redundantDiscarded++;
         }
     }
-    // The host is telling us the capture itself broke, so there is nothing to bridge: let
-    // the worklet resynchronise instead of pretending the missing audio existed.
+    // a discontinuity means the capture itself broke, so there is nothing to bridge: the
+    // worklet resynchronises instead
     if (!recovered && gap > 0 && !discontinuity) queueConceal(captureUs, gap);
 
     lastSeq = seq;
     if (discontinuity) {
         lastDecodedFrames = 0;
-        // Rides the same channel as the samples it sits between, or it could overtake them.
+        // rides the same channel as the samples it sits between, or it could overtake them
         postToWorklet({ type: 'discontinuity' });
     }
     submit(buf, primaryOff, primaryLen, captureUs);
@@ -391,17 +378,16 @@ self.onmessage = (ev) => {
         redundantDiscarded = 0;
         decoderResets = 0;
         copyFailures = 0;
-        // Re-initialising must not leave the previous decoder open: the mode handshake below
-        // can send a second `init` in the same session.
+        // close the previous decoder: the mode handshake can send a second `init` in the
+        // same session
         try { if (decoder && decoder.state !== 'closed') decoder.close(); } catch (_) {}
         decoder = null;
         lastDecodedFrames = 0;
         clearShared();
         if (d.sab) setupShared(d.sab, d.capFrames);
-        // The reader validates the same buffer independently, and if the two ever disagreed
-        // the writer would fill a ring nobody reads while the reader primed forever on a write
-        // position nobody advances — permanent silence with both halves believing they work.
-        // Say which mode this side actually ended up in.
+        // say which mode this side ended up in: the reader validates the same buffer
+        // independently, and a disagreement is a ring nobody reads while the reader primes
+        // forever (permanent silence)
         self.postMessage({ type: 'mode', shared: shared });
         makeDecoder();
     } else if (d.type === 'clockoffset') {
@@ -410,8 +396,8 @@ self.onmessage = (ev) => {
             hostOffsetMs = d.offsetMs;
         }
     } else if (d.type === 'ringport' && d.port) {
-        // The page only sends this once the worklet has confirmed it took the other end, so
-        // from here the samples go straight across and the main thread is out of the path.
+        // sent only once the worklet has confirmed it took the other end: from here samples
+        // go straight across and the main thread is out of the path
         samplePort = d.port;
     }
 };

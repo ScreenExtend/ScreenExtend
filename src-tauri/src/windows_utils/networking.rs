@@ -5,7 +5,7 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Manager};
 use tauri_plugin_store::StoreExt;
 use tauri_specta::Event;
 use wmi::{COMLibrary, WMIConnection};
@@ -16,8 +16,8 @@ use super::{com, AppState};
 /// (an adapter appearing usually fires several) costs one WMI round trip.
 const DEBOUNCE: Duration = Duration::from_millis(250);
 
-/// Backstop re-enumeration for anything iphlpapi does not notify us about (a connection
-/// profile renamed, a hosted network coming up). Two WMI ticks a minute instead of 180.
+/// Backstop re-enumeration for anything iphlpapi does not notify about (a connection profile
+/// renamed, a hosted network coming up).
 const SAFETY_POLL: Duration = Duration::from_secs(30);
 
 /// An empty adapter list tears down every streamer, so demand agreement before believing it.
@@ -32,6 +32,8 @@ struct NetAdapter {
     interface_index: Option<u32>,
     #[serde(rename = "DriverDescription")]
     driver_description: Option<String>,
+    #[serde(rename = "ComponentID")]
+    component_id: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -59,7 +61,8 @@ pub struct NetworkInfo {
     pub ip_addresses: Vec<String>,
 }
 
-const ADAPTER_QUERY: &str = "SELECT Name, InterfaceIndex, DriverDescription FROM MSFT_NetAdapter \
+const ADAPTER_QUERY: &str = "SELECT Name, InterfaceIndex, DriverDescription, ComponentID \
+FROM MSFT_NetAdapter \
 WHERE EndPointInterface = False \
 AND (NdisPhysicalMedium = 1 OR NdisPhysicalMedium = 9 OR NdisPhysicalMedium = 14) \
 AND OperationalStatusDownMediaDisconnected = False";
@@ -69,7 +72,24 @@ WHERE AddressFamily = 2 OR AddressFamily = 23";
 
 const PROFILE_QUERY: &str = "SELECT InterfaceIndex, Name FROM MSFT_NetConnectionProfile";
 
-const WIFI_DIRECT_DRIVER: &str = "Microsoft Wi-Fi Direct Virtual Adapter";
+/// The hardware id prefix of the adapters Windows puts a hosted network on, from the inbox
+/// `netvwifimp.inf`: `...\vwifimp_wfd` is the Wi-Fi Direct virtual adapter both the Mobile
+/// Hotspot and the Wi-Fi Direct legacy AP ride (seen on Windows 11 26200), `...\vwifimp` the
+/// older hosted-network adapter of the netsh tier. A hardware id is never localized; the driver
+/// description, an INF display string, is.
+const HOSTED_AP_COMPONENT_PREFIX: &str = "{5d624f94-8850-40c3-a3fa-a4fd2080baf3}\\vwifimp";
+
+/// The English description, kept only for an adapter whose component id did not come back.
+const WIFI_DIRECT_DRIVER: &str = "Wi-Fi Direct Virtual Adapter";
+
+fn is_hosted_ap_adapter(component_id: Option<&str>, driver_description: Option<&str>) -> bool {
+    match component_id.filter(|id| !id.is_empty()) {
+        Some(id) => id
+            .get(..HOSTED_AP_COMPONENT_PREFIX.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(HOSTED_AP_COMPONENT_PREFIX)),
+        None => driver_description.is_some_and(|d| d.contains(WIFI_DIRECT_DRIVER)),
+    }
+}
 
 fn hosted_network_name(app: &AppHandle) -> String {
     let stored_name = app
@@ -91,11 +111,8 @@ fn hosted_network_name(app: &AppHandle) -> String {
 /// kinds of thread: a Tauri command (already in Tauri's STA), the watcher thread the app spawns
 /// (no apartment), and a `spawn_blocking` worker under `link_medium_for_local_ip` (likewise).
 ///
-/// It used to be `COMLibrary::new()` — an unconditional `CoInitializeEx(MTA)` — with a fallback
-/// to `assume_initialized()` when that was refused. On a Tauri thread it always was:
-/// `[network] CoInitializeEx failed (0x80010106)` is `RPC_E_CHANGED_MODE`, and it appeared once
-/// per enumeration in the log of a perfectly healthy host. Ask first instead; see
-/// `windows_utils::com`.
+/// Never `COMLibrary::new()`: its unconditional `CoInitializeEx(MTA)` is refused on a Tauri
+/// thread with `RPC_E_CHANGED_MODE` (0x80010106). `windows_utils::com` asks first.
 fn com_for_this_thread(site: &'static str) -> Result<(com::ComScope, COMLibrary), String> {
     com::wmi_for_this_thread(site).map_err(|e| format!("{e:#}"))
 }
@@ -106,8 +123,8 @@ fn com_for_this_thread(site: &'static str) -> Result<(com::ComScope, COMLibrary)
 /// Returns `Err` rather than an empty list when the enumeration itself failed: an empty list is
 /// load-bearing (it stops every streamer) and must not be produced by a transient WMI hiccup.
 fn enumerate_adapters(hosted_network_label: Option<&str>) -> Result<Vec<NetworkInfo>, String> {
-    // The scope is declared first so it outlives the connection: Rust drops locals in reverse,
-    // and releasing the apartment before the WMI proxy would be releasing it under a live object.
+    // `_com` is declared first so it outlives the connection: locals drop in reverse, and the
+    // apartment must not be released under a live WMI proxy
     let (_com, com_con) = com_for_this_thread("network")?;
     let wmi_con = WMIConnection::with_namespace_path("root\\StandardCimv2", com_con)
         .map_err(|e| format!("WMI connect to root\\StandardCimv2 failed: {e}"))?;
@@ -141,7 +158,10 @@ fn enumerate_adapters(hosted_network_label: Option<&str>) -> Result<Vec<NetworkI
         .filter_map(|adapter| {
             let interface_index = adapter.interface_index?;
 
-            let is_wifi_direct = adapter.driver_description.as_deref() == Some(WIFI_DIRECT_DRIVER);
+            let is_wifi_direct = is_hosted_ap_adapter(
+                adapter.component_id.as_deref(),
+                adapter.driver_description.as_deref(),
+            );
             let network_name = if is_wifi_direct {
                 hosted_network_label
                     .unwrap_or("Personal Hotspot")
@@ -178,14 +198,25 @@ fn hosted_label(app: &AppHandle) -> Option<String> {
     running.then(|| hosted_network_name(app))
 }
 
+/// Three WMI queries: on the blocking pool, not on the UI's main thread, where a sync command
+/// runs and where the pages polling it stalled the window.
 #[tauri::command]
 #[specta::specta]
-pub fn get_network_adapters(app: AppHandle, state: State<'_, AppState>) -> Vec<NetworkInfo> {
-    let label = (*state.hosted_network_running.lock().unwrap()).then(|| hosted_network_name(&app));
-    match enumerate_adapters(label.as_deref()) {
+pub async fn get_network_adapters(app: AppHandle) -> Vec<NetworkInfo> {
+    let enumerate = move || {
+        let label = hosted_label(&app);
+        match enumerate_adapters(label.as_deref()) {
+            Ok(adapters) => adapters,
+            Err(e) => {
+                teprintln!("[network] adapter enumeration failed: {e}");
+                Vec::new()
+            }
+        }
+    };
+    match tauri::async_runtime::spawn_blocking(enumerate).await {
         Ok(adapters) => adapters,
         Err(e) => {
-            teprintln!("[network] adapter enumeration failed: {e}");
+            teprintln!("[network] adapter enumeration failed on its worker thread: {e}");
             Vec::new()
         }
     }
@@ -201,12 +232,12 @@ pub fn cli_adapters() -> Vec<NetworkInfo> {
     }
 }
 
-/// IPv4 addresses currently held by the virtual adapter Windows creates for a hosted network
-/// (both the Wi-Fi Direct legacy AP and the Mobile Hotspot ride "Microsoft Wi-Fi Direct Virtual
-/// Adapter"). An AP that came up but is not serving DHCP has none, which is how "we asked for a
-/// hotspot" is told apart from "a client can actually get an address".
+/// IPv4 addresses held by the virtual adapter Windows creates for a hosted network (the Wi-Fi
+/// Direct legacy AP and the Mobile Hotspot both ride "Microsoft Wi-Fi Direct Virtual Adapter").
+/// An AP that came up but is not serving DHCP has none.
 pub fn hosted_network_ipv4() -> Vec<String> {
-    const ANY_ADAPTER: &str = "SELECT InterfaceIndex, Name, DriverDescription FROM MSFT_NetAdapter";
+    const ANY_ADAPTER: &str =
+        "SELECT InterfaceIndex, Name, DriverDescription, ComponentID FROM MSFT_NetAdapter";
 
     let (_com, com_con) = match com_for_this_thread("hosted-network") {
         Ok(pair) => pair,
@@ -233,10 +264,10 @@ pub fn hosted_network_ipv4() -> Vec<String> {
     let indices: Vec<u32> = adapters
         .iter()
         .filter(|adapter| {
-            adapter
-                .driver_description
-                .as_deref()
-                .is_some_and(|d| d.contains("Wi-Fi Direct Virtual Adapter"))
+            is_hosted_ap_adapter(
+                adapter.component_id.as_deref(),
+                adapter.driver_description.as_deref(),
+            )
         })
         .filter_map(|adapter| adapter.interface_index)
         .collect();
@@ -257,7 +288,7 @@ pub fn hosted_network_ipv4() -> Vec<String> {
     ips.iter()
         .filter(|ip| ip.interface_index.is_some_and(|i| indices.contains(&i)))
         .filter_map(|ip| ip.ip_address.clone())
-        // 169.254/16 is what Windows assigns when the AP came up but DHCP did not.
+        // 169.254/16 is what Windows assigns when the AP came up but DHCP did not
         .filter(|ip| !ip.starts_with("169.254."))
         .collect()
 }
@@ -287,8 +318,7 @@ unsafe extern "system" fn on_unicast_address_change(
     }
 }
 
-/// Register for OS interface/address change notifications. Returns false if either
-/// registration failed, in which case the watcher falls back to the safety poll alone.
+/// Returns false if either registration failed: the watcher then runs on the safety poll alone.
 fn register_change_notifications() -> bool {
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::NetworkManagement::IpHelper::{
@@ -296,7 +326,7 @@ fn register_change_notifications() -> bool {
     };
     use windows::Win32::Networking::WinSock::AF_UNSPEC;
 
-    // The cancel handles are deliberately leaked: the watcher lives as long as the process.
+    // cancel handles are leaked on purpose: the watcher lives as long as the process
     let mut interface_handle = HANDLE::default();
     let mut address_handle = HANDLE::default();
 
@@ -337,6 +367,8 @@ pub fn watch_for_network_changes(app: AppHandle) {
     if WATCHER_STARTED.swap(true, Ordering::SeqCst) {
         return;
     }
+    // give back a Mobile Hotspot a crashed run left configured (no-op without a breadcrumb)
+    super::hosted_network::spawn_crash_recovery(&app);
 
     let (tx, rx) = crossbeam_channel::bounded::<()>(1);
     let _ = WAKE.set(tx);
@@ -352,8 +384,8 @@ pub fn watch_for_network_changes(app: AppHandle) {
     );
 
     std::thread::spawn(move || {
-        // This thread is the app's own, so it is the one that owns the apartment; every
-        // `enumerate_adapters` below then finds it already up and does nothing.
+        // the app's own thread, so it owns the apartment: every `enumerate_adapters` below
+        // finds it already up
         let _com = match com::ensure_for_this_thread("network-watcher", com::Apartment::Mta) {
             Ok(scope) => scope,
             Err(e) => {
@@ -373,9 +405,8 @@ pub fn watch_for_network_changes(app: AppHandle) {
         apply(&app, previous.clone());
 
         loop {
-            // Wait for a change notification, or wake on the safety poll.
             let _ = rx.recv_timeout(SAFETY_POLL);
-            // Coalesce the burst that follows any single real change.
+            // coalesce the burst that follows a single change
             while rx.recv_timeout(DEBOUNCE).is_ok() {}
 
             let label = hosted_label(&app);
@@ -387,7 +418,7 @@ pub fn watch_for_network_changes(app: AppHandle) {
                 }
             };
 
-            // Losing every adapter stops every streamer. Confirm it before believing it.
+            // losing every adapter stops every streamer: confirm it before believing it
             let current = if current.is_empty() && !previous.is_empty() {
                 match confirm_empty(label.as_deref()) {
                     Some(confirmed) => confirmed,
@@ -444,10 +475,9 @@ fn apply(app: &AppHandle, adapters: Vec<NetworkInfo>) {
 /// Physical medium of the adapter holding a local address, from `MSFT_NetAdapter`'s
 /// `NdisPhysicalMedium`.
 ///
-/// The values that matter here are `NdisPhysicalMedium802_3` (14) and `NdisPhysicalMediumNative802_11`
-/// (9) — the same pair `ADAPTER_QUERY` already filters on. **USB tethering and RNDIS both present
-/// as 802.3**, which is the whole point: a phone on a cable is an ordinary IP interface and joins
-/// with no code change at all, and until now nothing on the host could tell that apart from Wi-Fi.
+/// The values that matter are `NdisPhysicalMedium802_3` (14) and
+/// `NdisPhysicalMediumNative802_11` (9), the pair `ADAPTER_QUERY` filters on. USB tethering and
+/// RNDIS both present as 802.3, so a phone on a cable reads as wired.
 #[derive(Deserialize, Debug)]
 struct NetAdapterMedium {
     #[serde(rename = "InterfaceIndex")]
@@ -481,4 +511,57 @@ pub fn link_medium_for_local_ip(ip: &str) -> Option<crate::streamer::platform::L
         1 | 9 => LinkMedium::Wireless,
         _ => LinkMedium::Other,
     })
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn hosted_ap_adapter_is_recognised_by_component_id() {
+        // as `Get-NetAdapter -IncludeHidden` reports it on Windows 11 26200
+        let wfd = Some(r"{5d624f94-8850-40c3-a3fa-a4fd2080baf3}\vwifimp_wfd");
+        assert!(is_hosted_ap_adapter(
+            wfd,
+            Some("Microsoft Wi-Fi Direct Virtual Adapter")
+        ));
+        // a localized description does not matter
+        assert!(is_hosted_ap_adapter(
+            wfd,
+            Some("Adaptateur virtuel Microsoft Wi-Fi Direct")
+        ));
+        assert!(is_hosted_ap_adapter(
+            Some(r"{5D624F94-8850-40C3-A3FA-A4FD2080BAF3}\VWIFIMP_WFD"),
+            None
+        ));
+        // the older hosted-network virtual adapter of the netsh tier
+        assert!(is_hosted_ap_adapter(
+            Some(r"{5d624f94-8850-40c3-a3fa-a4fd2080baf3}\vwifimp"),
+            Some("Microsoft Hosted Network Virtual Adapter")
+        ));
+        // the physical Wi-Fi card and a VM adapter are not
+        assert!(!is_hosted_ap_adapter(
+            Some(r"PCI\VEN_8086&DEV_51F0&SUBSYS_00948086"),
+            Some("Intel(R) Wi-Fi 6E AX211 160MHz")
+        ));
+        assert!(!is_hosted_ap_adapter(
+            Some("*VMnetAdapter8"),
+            Some("VMware Virtual Ethernet Adapter for VMnet8")
+        ));
+        // a component id that is present decides alone
+        assert!(!is_hosted_ap_adapter(
+            Some(r"ROOT\SOMETHING"),
+            Some("Microsoft Wi-Fi Direct Virtual Adapter")
+        ));
+        // with no component id, the English description is the fallback
+        assert!(is_hosted_ap_adapter(
+            None,
+            Some("Microsoft Wi-Fi Direct Virtual Adapter #2")
+        ));
+        assert!(is_hosted_ap_adapter(
+            Some(""),
+            Some("Microsoft Wi-Fi Direct Virtual Adapter")
+        ));
+        assert!(!is_hosted_ap_adapter(None, None));
+    }
 }

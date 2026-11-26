@@ -6,8 +6,7 @@
     "parsed by `streamer::input::protocol`'s `client_golden_vectors_still_parse`. A change to",
     "the bytes on either side fails against this file rather than silently diverging.",
     "",
-    "`hex` is the whole DataChannel message. `channel` is which of the three it went out on.",
-    "docs/INPUT-PROTOCOL.md is the prose."
+    "`hex` is the whole DataChannel message. `channel` is which of the three it went out on."
   ],
   "vectors": [
     {
@@ -54,6 +53,11 @@
       "name": "mouse_delta_locked",
       "channel": "fast",
       "hex": "5400fbff0300020000"
+    },
+    {
+      "name": "client_stats_v4",
+      "channel": "reliable",
+      "hex": "6204010100000000000000000000000000000000000000000000000000000000000000000000000000000000881300000c0000000000000001000000000000000000000000000000010102010000000000000000000000000000000000000000000000000000000003000000fa000000da23020002000000"
     }
   ]
 }

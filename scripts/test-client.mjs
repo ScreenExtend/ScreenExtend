@@ -1,13 +1,9 @@
 #!/usr/bin/env node
 // Runs every client-page harness in one go: `pnpm test:client`.
 //
-// The client page has no build step and no dependencies, and that constraint was read as also
-// excluding a test runner. It does not have to — these harnesses need nothing but Node, load
-// the shipped `.js` files with `vm` and the smallest possible browser stubs, and leave
-// `src-tauri/src/streamer/static/` byte-identical.
-//
-// Each harness exits non-zero on a failed assertion; this exits non-zero if any of them did,
-// after running all of them, so one failure does not hide the rest.
+// The harnesses need nothing but Node: they load the shipped `.js` files with `vm` and minimal
+// browser stubs, and leave `src-tauri/src/streamer/static/` byte-identical. All of them run
+// before this exits non-zero, so one failure does not hide the rest.
 import { spawnSync } from 'node:child_process';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';

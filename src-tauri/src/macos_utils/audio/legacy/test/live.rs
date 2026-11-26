@@ -73,15 +73,14 @@ fn legacy_live_latency_and_monotonicity() {
         return;
     }
 
-    // W8 replaced `AudioCapture::rx` with a broadcast `AudioSink` the backends publish into, so
-    // subscribe before starting: a receiver created after the fact would miss the head of the run.
+    // subscribe before starting: a receiver created afterwards would miss the head of the run
     let (tx, mut rx) = tokio::sync::broadcast::channel(64);
     let capture =
         crate::macos_utils::audio::start_capture(crate::streamer::audio::AudioSink::new(tx))
             .expect("start_capture");
-    // Two phrases with a gap between them. The virtual device runs no IO cycle while nothing is
-    // playing, so the gap is a real pause in the packet stream - the case where a sample-counter
-    // timestamp would drift behind the hardware for good if it never re-seated.
+    // Two phrases with a gap: the virtual device runs no IO cycle while nothing plays, so the
+    // gap is a real pause in the packet stream, where a sample-counter timestamp that never
+    // re-seated would drift behind the hardware for good.
     std::thread::spawn(|| {
         let _ = std::process::Command::new("say")
             .arg("measuring capture to packet latency, one two three four five")

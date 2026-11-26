@@ -3,8 +3,8 @@ import { commands } from "@/lib/bindings";
 export const AVATAR_OUTPUT_SIZE = 256;
 
 const bytesToBase64 = (bytes: Uint8Array): string => {
-  // In chunks, because `String.fromCharCode.apply` on a 50 KB argument list overflows the
-  // call stack in the WebKit on the floor.
+  // chunked: `String.fromCharCode.apply` on a 50 KB argument list overflows the call stack
+  // in the macOS 10.15 WebKit
   let binary = "";
   const CHUNK = 0x8000;
   for (let i = 0; i < bytes.length; i += CHUNK) {
@@ -13,8 +13,6 @@ const bytesToBase64 = (bytes: Uint8Array): string => {
   return btoa(binary);
 };
 
-// The command hands back base64, which is what an `<img src>` wants, so there is nothing
-// left to convert: no `number[]` to walk, no `Uint8Array`, no `Blob`, no `FileReader`.
 export const loadAvatar = async (): Promise<string | null> => {
   try {
     const encoded = await commands.getAvatar();

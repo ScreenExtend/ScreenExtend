@@ -2,16 +2,9 @@
 //! layer shows one of a small ring of BGRA IOSurfaces, swapped once per workload frame.
 //!
 //! AppKit and Core Animation are reached through the runtime only (`AnyClass::get` +
-//! `msg_send!`): no `objc2-app-kit` / `objc2-quartz-core` dependency and no link-time reference
-//! to a class or symbol newer than 10.15 (everything used here is 10.5-era API). The window is
-//! created and closed on the main thread; the per-frame swap runs on a presenter thread inside an
-//! explicit `CATransaction` that it commits and flushes itself, so nothing depends on the main
-//! run loop spinning (it does not: the live child runs inside Tauri's `setup`).
-//!
-//! The window is placed by CoreGraphics' global display bounds converted to Cocoa coordinates,
-//! not through `NSScreen`, whose list AppKit only refreshes from its event loop. Where it actually
-//! landed is read back from the window server (`CGWindowListCopyWindowInfo`, no permission
-//! needed) and reported.
+//! `msg_send!`): no link-time reference newer than 10.15. The window is created and closed on
+//! the main thread; the per-frame swap runs on a presenter thread in an explicit `CATransaction`
+//! it commits and flushes itself, because the main run loop does not spin inside Tauri's `setup`.
 
 use std::ffi::c_void;
 use std::ptr::{self, NonNull};
@@ -51,7 +44,7 @@ unsafe extern "C" {
 }
 
 unsafe extern "C-unwind" {
-    // Same signature as the other declarations in the crate, or rustc warns about the clash.
+    // same signature as the crate's other declarations, or rustc warns about the clash
     fn CFDictionaryGetValue(the_dict: *const CFDictionary, key: *const c_void) -> *const c_void;
 }
 
@@ -78,7 +71,7 @@ pub struct Surface {
     pub height: usize,
 }
 
-// An IOSurface is a kernel object with its own locking; the handle may move between threads.
+// an IOSurface is a kernel object with its own locking, so the handle may move between threads
 unsafe impl Send for Surface {}
 unsafe impl Sync for Surface {}
 
@@ -130,8 +123,7 @@ impl Surface {
     }
 
     fn as_object(&self) -> *mut AnyObject {
-        // IOSurfaceRef is toll-free bridged to the `IOSurface` class, which is what
-        // `CALayer.contents` accepts.
+        // IOSurfaceRef is toll-free bridged to `IOSurface`, which `CALayer.contents` accepts
         self.raw.as_ptr().cast()
     }
 }
@@ -223,7 +215,7 @@ pub fn app_events(seconds: f64) {
 /// Let AppKit hear about a display that was just created. Its screen list is refreshed from a
 /// reconfiguration callback delivered on the main run loop, which nothing runs while the live
 /// child sits inside Tauri's `setup`. A window placed on a screen AppKit does not know about is
-/// moved onto one it does — the user's own display.
+/// moved onto one it does: the user's own display.
 fn wait_for_appkit_screen(display: u32, timeout: std::time::Duration) -> Option<CGRect> {
     let start = std::time::Instant::now();
     loop {
@@ -260,7 +252,7 @@ impl Window {
                 "AppKit never listed display {display} as a screen; refusing to place a window"
             ));
         };
-        // Cocoa's global origin is the bottom-left of the main display, y up.
+        // Cocoa's global origin is the bottom-left of the main display, y up
         let cocoa_cg = CGRect {
             origin: CGPoint {
                 x: b.origin.x,
@@ -308,11 +300,11 @@ impl Window {
             let gravity = objc2_foundation::NSString::from_str("resize");
             let _: () = msg_send![layer.as_ref(), setContentsGravity: &*gravity];
             let _: () = msg_send![layer.as_ref(), setOpaque: Bool::YES];
-            // A layer-hosting view: the view adopts our layer instead of drawing its own.
+            // layer-hosting view: the view adopts our layer instead of drawing its own
             let _: () = msg_send![view.as_ref(), setLayer: layer.as_ref()];
             let _: () = msg_send![view.as_ref(), setWantsLayer: Bool::YES];
             let _: () = msg_send![w, setContentView: view.as_ref()];
-            // The window retains its content view.
+            // the window retains its content view
             let _: () = msg_send![view.as_ref(), release];
             let _: () = msg_send![w, setFrame: cocoa, display: Bool::YES];
             let _: () = msg_send![w, orderFrontRegardless];
@@ -351,6 +343,7 @@ impl Window {
     }
 
     /// The window's bounds as the window server has them (CG global points), if it lists it.
+    /// `CGWindowListCopyWindowInfo` needs no permission for this.
     pub fn server_bounds(&self) -> Option<(f64, f64, f64, f64)> {
         unsafe {
             let list: *const c_void =
@@ -432,9 +425,7 @@ pub fn available() -> bool {
             .unwrap_or(false)
 }
 
-// ---------------------------------------------------------------------------------------------
-// The frame stamp: a frame counter barcode the receiver reads back out of the decoded picture.
-// ---------------------------------------------------------------------------------------------
+// frame stamp: a frame-counter barcode the receiver reads back out of the decoded picture
 
 /// Bits of frame index carried (about 4.8 hours at 60 fps).
 const STAMP_BITS: u32 = 20;
@@ -529,7 +520,7 @@ pub fn read_stamp(
         lumas[i] = (sum / n) as u8;
     }
     if !bits[0] || bits[STAMP_CELLS - 1] {
-        // Once per run: what is where the barcode should be.
+        // once per run: log what sits where the barcode should be
         static SAID: std::sync::Once = std::sync::Once::new();
         SAID.call_once(|| tprintln!("[live] stamp guards unreadable; cell luma {lumas:?}"));
         return None;

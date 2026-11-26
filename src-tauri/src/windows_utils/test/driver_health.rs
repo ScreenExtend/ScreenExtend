@@ -11,8 +11,8 @@ fn proc(pid: u32, image: &str, mb: u64, threads: u32) -> HostProcess {
     }
 }
 
-/// The 2026-10-06 machine, as `Get-Process WUDFHost` printed it: one leaked host and four
-/// small ones belonging to other UMDF drivers.
+/// A real machine as `Get-Process WUDFHost` printed it: one leaked host and four small ones
+/// belonging to other UMDF drivers.
 fn machine() -> Vec<HostProcess> {
     vec![
         proc(4, "System", 0, 300),
@@ -27,7 +27,7 @@ fn machine() -> Vec<HostProcess> {
 #[test]
 fn the_pipe_server_is_chosen_over_a_larger_host() {
     let mut procs = machine();
-    // Make a stranger the largest: the pipe still decides.
+    // a stranger is the largest: the pipe still decides
     procs.push(proc(7777, "wudfhost.exe", 50_000, 10));
     let (host, how) = select_driver_host(&procs, Some(3832)).unwrap();
     assert_eq!(host.pid, 3832);
@@ -45,11 +45,11 @@ fn without_a_pipe_server_the_largest_wudfhost_is_a_labelled_guess() {
 #[test]
 fn a_pipe_served_by_something_other_than_wudfhost_is_not_trusted() {
     let procs = machine();
-    // ScreenExtend.exe itself serving the name (a test mock) must not be measured as the driver.
+    // ScreenExtend.exe itself serving the name (a test mock) must not be measured as the driver
     let (host, how) = select_driver_host(&procs, Some(54508)).unwrap();
     assert_eq!(host.pid, 1992);
     assert_eq!(how, Identified::LargestWudfHost);
-    // And a pid that has already exited falls back the same way.
+    // a pid that has already exited falls back the same way
     assert_eq!(
         select_driver_host(&procs, Some(1)).unwrap().1,
         Identified::LargestWudfHost
@@ -66,13 +66,13 @@ fn no_wudfhost_at_all_is_no_answer() {
 fn the_default_thresholds_trip_on_the_measured_leak_and_not_on_a_fresh_host() {
     let t = Thresholds::default();
     assert_eq!((t.commit_mb, t.threads), (8192, 800));
-    // A fresh boot, and a long evening of joins (60 × 47 MB, 60 × 5 threads).
+    // a fresh boot, and a long evening of joins (60 x 47 MB, 60 x 5 threads)
     assert!(!t.exceeded(10, 19));
     assert!(!t.exceeded(10 + 60 * 47, 19 + 60 * 5));
-    // The machine today, and the failure point.
+    // the leaked host above, and the point where joins fail
     assert!(t.exceeded(14_752, 1270));
     assert!(t.exceeded(36 * 1024, 3200));
-    // Either axis alone.
+    // either axis alone
     assert!(t.exceeded(8192, 0));
     assert!(t.exceeded(0, 800));
     assert!(!t.exceeded(8191, 799));
@@ -82,17 +82,16 @@ fn the_default_thresholds_trip_on_the_measured_leak_and_not_on_a_fresh_host() {
 fn the_env_override_replaces_the_commit_threshold_and_switches_threads_off() {
     let t = Thresholds::from_values(Some("999999"), None);
     assert_eq!((t.commit_mb, t.threads), (999_999, 0));
-    // With threads off, a thread-heavy host no longer trips it: the override really suppresses.
+    // with threads off, a thread-heavy host no longer trips it
     assert!(!t.exceeded(14_752, 1270));
-    // A small value forces it.
+    // a small value forces it
     assert!(Thresholds::from_values(Some("1"), None).exceeded(9, 19));
-    // Both given.
     let both = Thresholds::from_values(Some("100"), Some("50"));
     assert_eq!((both.commit_mb, both.threads), (100, 50));
-    // Threads alone keeps the default commit threshold.
+    // threads alone keeps the default commit threshold
     let threads = Thresholds::from_values(None, Some("10"));
     assert_eq!((threads.commit_mb, threads.threads), (8192, 10));
-    // Garbage and zero are ignored rather than turning the gate into "always".
+    // garbage and zero are ignored rather than turning the gate into "always"
     assert_eq!(
         Thresholds::from_values(Some("lots"), None),
         Thresholds::default()
@@ -118,7 +117,7 @@ fn assess_reports_the_leaked_host_and_asks_for_a_restart() {
 
 #[test]
 fn assess_never_asks_when_the_driver_is_not_running() {
-    // The largest WUDFHost is huge, but no pipe means it is somebody else's driver.
+    // the largest WUDFHost is huge, but no pipe means it is somebody else's driver
     let h = assess(&machine(), PipeProbe::Absent, Thresholds::default());
     assert!(!h.needs_restart);
     assert_eq!(h.pid, None);
@@ -156,11 +155,9 @@ fn hardware_ids_are_read_out_of_a_multi_sz() {
     assert!(multi_sz(&[0, 0]).is_empty());
 }
 
-// the refusal paths of `drivers restart`
-
 #[test]
 fn a_set_up_host_refuses_even_when_idle() {
-    // `joins` exists only once AppState does, i.e. the host holds a driver client.
+    // `joins` exists only once AppState does, i.e. the host holds a driver client
     let stats = json!({ "sessions": {}, "joins": [] , "live_transport_sessions": 0 });
     assert_eq!(
         restart_refusal(Some(&stats), Some(42), Ok(0), &[42]),
@@ -191,7 +188,7 @@ fn the_desktop_apps_own_startup_gate_is_let_through() {
     // is the only other ScreenExtend process, and the driver lists nothing.
     let stats = json!({ "sessions": {}, "live_transport_sessions": 0 });
     assert_eq!(restart_refusal(Some(&stats), Some(42), Ok(0), &[42]), None);
-    // Even when the driver's list could not be read: the only other process is the caller.
+    // even when the driver's list could not be read: the only other process is the caller
     assert_eq!(
         restart_refusal(Some(&stats), Some(42), Err("busy".into()), &[42]),
         None
@@ -200,7 +197,7 @@ fn the_desktop_apps_own_startup_gate_is_let_through() {
 
 #[test]
 fn displays_owned_by_another_host_refuse() {
-    // An isolated `serve` (its own data dir, so no control socket here) holding a display.
+    // an isolated `serve` (its own data dir, so no control socket here) holding a display
     let r = restart_refusal(None, None, Ok(1), &[9001]).unwrap();
     assert_eq!(
         r,
@@ -240,7 +237,7 @@ fn every_exit_code_has_a_reason_the_ui_knows() {
     assert_eq!(reason_for_exit(EXIT_NOT_INSTALLED), "notInstalled");
     assert_eq!(reason_for_exit(EXIT_FAILED), "failed");
     assert_eq!(reason_for_exit(2), "failed");
-    // Distinct from usage (2) and from `doctor`'s permission code (3).
+    // distinct from usage (2) and from `doctor`'s permission code (3)
     let codes = [
         EXIT_FAILED,
         EXIT_NOT_ELEVATED,
@@ -279,7 +276,7 @@ fn reads_the_live_driver_host_unelevated() {
             let (host, how) = select_driver_host(&procs, Some(pid)).expect("a host");
             assert_eq!(how, Identified::PipeServer, "pid {pid} is not a WUDFHost");
             eprintln!(
-                "driver host pid {} — {} MB commit, {} threads, {} handles",
+                "driver host pid {}: {} MB commit, {} threads, {} handles",
                 host.pid,
                 host.commit_mb(),
                 host.threads,
@@ -287,4 +284,19 @@ fn reads_the_live_driver_host_unelevated() {
             );
         }
     }
+}
+
+/// Install, remove and restart all reconfigure the same devnode, so only one elevated operation
+/// may be in flight, including one whose wait timed out and is still running. Exercised on the
+/// slot alone: the real runner would raise a UAC prompt.
+#[test]
+fn only_one_elevated_driver_operation_at_a_time() {
+    let first = claim_elevated_slot().expect("the slot starts free");
+    assert!(
+        claim_elevated_slot().is_none(),
+        "a second operation must not start while the first holds the slot"
+    );
+    drop(first);
+    let again = claim_elevated_slot().expect("released when the first finishes");
+    drop(again);
 }

@@ -1,0 +1,882 @@
+{
+ "version": 1,
+ "name": "win-encoders",
+ "workloads": [
+  {
+   "id": "motion-720p30",
+   "kind": "synthetic",
+   "pattern": "motion",
+   "width": 1280,
+   "height": 720,
+   "fps": 30,
+   "seconds": 10
+  },
+  {
+   "id": "scroll-720p30",
+   "kind": "synthetic",
+   "pattern": "scroll",
+   "width": 1280,
+   "height": 720,
+   "fps": 30,
+   "seconds": 10
+  },
+  {
+   "id": "mixed-720p30",
+   "kind": "synthetic",
+   "pattern": "mixed",
+   "width": 1280,
+   "height": 720,
+   "fps": 30,
+   "seconds": 10
+  },
+  {
+   "id": "rec-720p30",
+   "kind": "recording",
+   "fps": 30,
+   "transform": "fps:30,crop:1280x720",
+   "max_frames": 1200
+  },
+  {
+   "id": "motion-720p60",
+   "kind": "synthetic",
+   "pattern": "motion",
+   "width": 1280,
+   "height": 720,
+   "fps": 60,
+   "seconds": 10
+  },
+  {
+   "id": "scroll-720p60",
+   "kind": "synthetic",
+   "pattern": "scroll",
+   "width": 1280,
+   "height": 720,
+   "fps": 60,
+   "seconds": 10
+  },
+  {
+   "id": "mixed-720p60",
+   "kind": "synthetic",
+   "pattern": "mixed",
+   "width": 1280,
+   "height": 720,
+   "fps": 60,
+   "seconds": 10
+  },
+  {
+   "id": "rec-720p60",
+   "kind": "recording",
+   "fps": 60,
+   "transform": "fps:60,crop:1280x720",
+   "max_frames": 1200
+  },
+  {
+   "id": "motion-720p120",
+   "kind": "synthetic",
+   "pattern": "motion",
+   "width": 1280,
+   "height": 720,
+   "fps": 120,
+   "seconds": 10
+  },
+  {
+   "id": "scroll-720p120",
+   "kind": "synthetic",
+   "pattern": "scroll",
+   "width": 1280,
+   "height": 720,
+   "fps": 120,
+   "seconds": 10
+  },
+  {
+   "id": "mixed-720p120",
+   "kind": "synthetic",
+   "pattern": "mixed",
+   "width": 1280,
+   "height": 720,
+   "fps": 120,
+   "seconds": 10
+  },
+  {
+   "id": "rec-720p120",
+   "kind": "recording",
+   "fps": 120,
+   "transform": "fps:120,crop:1280x720",
+   "max_frames": 1200
+  },
+  {
+   "id": "motion-1080p30",
+   "kind": "synthetic",
+   "pattern": "motion",
+   "width": 1920,
+   "height": 1080,
+   "fps": 30,
+   "seconds": 10
+  },
+  {
+   "id": "scroll-1080p30",
+   "kind": "synthetic",
+   "pattern": "scroll",
+   "width": 1920,
+   "height": 1080,
+   "fps": 30,
+   "seconds": 10
+  },
+  {
+   "id": "mixed-1080p30",
+   "kind": "synthetic",
+   "pattern": "mixed",
+   "width": 1920,
+   "height": 1080,
+   "fps": 30,
+   "seconds": 10
+  },
+  {
+   "id": "rec-1080p30",
+   "kind": "recording",
+   "fps": 30,
+   "transform": "fps:30",
+   "max_frames": 1200
+  },
+  {
+   "id": "motion-1080p60",
+   "kind": "synthetic",
+   "pattern": "motion",
+   "width": 1920,
+   "height": 1080,
+   "fps": 60,
+   "seconds": 10
+  },
+  {
+   "id": "scroll-1080p60",
+   "kind": "synthetic",
+   "pattern": "scroll",
+   "width": 1920,
+   "height": 1080,
+   "fps": 60,
+   "seconds": 10
+  },
+  {
+   "id": "mixed-1080p60",
+   "kind": "synthetic",
+   "pattern": "mixed",
+   "width": 1920,
+   "height": 1080,
+   "fps": 60,
+   "seconds": 10
+  },
+  {
+   "id": "rec-1080p60",
+   "kind": "recording",
+   "fps": 60,
+   "transform": "fps:60",
+   "max_frames": 1200
+  },
+  {
+   "id": "motion-1080p120",
+   "kind": "synthetic",
+   "pattern": "motion",
+   "width": 1920,
+   "height": 1080,
+   "fps": 120,
+   "seconds": 10
+  },
+  {
+   "id": "scroll-1080p120",
+   "kind": "synthetic",
+   "pattern": "scroll",
+   "width": 1920,
+   "height": 1080,
+   "fps": 120,
+   "seconds": 10
+  },
+  {
+   "id": "mixed-1080p120",
+   "kind": "synthetic",
+   "pattern": "mixed",
+   "width": 1920,
+   "height": 1080,
+   "fps": 120,
+   "seconds": 10
+  },
+  {
+   "id": "rec-1080p120",
+   "kind": "recording",
+   "fps": 120,
+   "transform": "fps:120",
+   "max_frames": 1200
+  },
+  {
+   "id": "motion-1440p30",
+   "kind": "synthetic",
+   "pattern": "motion",
+   "width": 2560,
+   "height": 1440,
+   "fps": 30,
+   "seconds": 10
+  },
+  {
+   "id": "scroll-1440p30",
+   "kind": "synthetic",
+   "pattern": "scroll",
+   "width": 2560,
+   "height": 1440,
+   "fps": 30,
+   "seconds": 10
+  },
+  {
+   "id": "mixed-1440p30",
+   "kind": "synthetic",
+   "pattern": "mixed",
+   "width": 2560,
+   "height": 1440,
+   "fps": 30,
+   "seconds": 10
+  },
+  {
+   "id": "rec-1440p30",
+   "kind": "recording",
+   "fps": 30,
+   "transform": "fps:30,tile2x2,crop:2560x1440",
+   "max_frames": 1200
+  },
+  {
+   "id": "motion-1440p60",
+   "kind": "synthetic",
+   "pattern": "motion",
+   "width": 2560,
+   "height": 1440,
+   "fps": 60,
+   "seconds": 10
+  },
+  {
+   "id": "scroll-1440p60",
+   "kind": "synthetic",
+   "pattern": "scroll",
+   "width": 2560,
+   "height": 1440,
+   "fps": 60,
+   "seconds": 10
+  },
+  {
+   "id": "mixed-1440p60",
+   "kind": "synthetic",
+   "pattern": "mixed",
+   "width": 2560,
+   "height": 1440,
+   "fps": 60,
+   "seconds": 10
+  },
+  {
+   "id": "rec-1440p60",
+   "kind": "recording",
+   "fps": 60,
+   "transform": "fps:60,tile2x2,crop:2560x1440",
+   "max_frames": 1200
+  },
+  {
+   "id": "motion-1440p120",
+   "kind": "synthetic",
+   "pattern": "motion",
+   "width": 2560,
+   "height": 1440,
+   "fps": 120,
+   "seconds": 10
+  },
+  {
+   "id": "scroll-1440p120",
+   "kind": "synthetic",
+   "pattern": "scroll",
+   "width": 2560,
+   "height": 1440,
+   "fps": 120,
+   "seconds": 10
+  },
+  {
+   "id": "mixed-1440p120",
+   "kind": "synthetic",
+   "pattern": "mixed",
+   "width": 2560,
+   "height": 1440,
+   "fps": 120,
+   "seconds": 10
+  },
+  {
+   "id": "rec-1440p120",
+   "kind": "recording",
+   "fps": 120,
+   "transform": "fps:120,tile2x2,crop:2560x1440",
+   "max_frames": 1200
+  },
+  {
+   "id": "motion-4k30",
+   "kind": "synthetic",
+   "pattern": "motion",
+   "width": 3840,
+   "height": 2160,
+   "fps": 30,
+   "seconds": 10
+  },
+  {
+   "id": "scroll-4k30",
+   "kind": "synthetic",
+   "pattern": "scroll",
+   "width": 3840,
+   "height": 2160,
+   "fps": 30,
+   "seconds": 10
+  },
+  {
+   "id": "mixed-4k30",
+   "kind": "synthetic",
+   "pattern": "mixed",
+   "width": 3840,
+   "height": 2160,
+   "fps": 30,
+   "seconds": 10
+  },
+  {
+   "id": "rec-4k30",
+   "kind": "recording",
+   "fps": 30,
+   "transform": "fps:30,tile2x2",
+   "max_frames": 1200
+  },
+  {
+   "id": "motion-4k60",
+   "kind": "synthetic",
+   "pattern": "motion",
+   "width": 3840,
+   "height": 2160,
+   "fps": 60,
+   "seconds": 10
+  },
+  {
+   "id": "scroll-4k60",
+   "kind": "synthetic",
+   "pattern": "scroll",
+   "width": 3840,
+   "height": 2160,
+   "fps": 60,
+   "seconds": 10
+  },
+  {
+   "id": "mixed-4k60",
+   "kind": "synthetic",
+   "pattern": "mixed",
+   "width": 3840,
+   "height": 2160,
+   "fps": 60,
+   "seconds": 10
+  },
+  {
+   "id": "rec-4k60",
+   "kind": "recording",
+   "fps": 60,
+   "transform": "fps:60,tile2x2",
+   "max_frames": 1200
+  },
+  {
+   "id": "motion-4k120",
+   "kind": "synthetic",
+   "pattern": "motion",
+   "width": 3840,
+   "height": 2160,
+   "fps": 120,
+   "seconds": 10
+  },
+  {
+   "id": "scroll-4k120",
+   "kind": "synthetic",
+   "pattern": "scroll",
+   "width": 3840,
+   "height": 2160,
+   "fps": 120,
+   "seconds": 10
+  },
+  {
+   "id": "mixed-4k120",
+   "kind": "synthetic",
+   "pattern": "mixed",
+   "width": 3840,
+   "height": 2160,
+   "fps": 120,
+   "seconds": 10
+  },
+  {
+   "id": "rec-4k120",
+   "kind": "recording",
+   "fps": 120,
+   "transform": "fps:120,tile2x2",
+   "max_frames": 1200
+  }
+ ],
+ "recipes": [
+  {
+   "name": "nvenc-prod",
+   "vendor": "nvenc",
+   "production": {
+    "qp": 15
+   }
+  },
+  {
+   "name": "nvenc-cbr",
+   "vendor": "nvenc",
+   "production": {}
+  },
+  {
+   "name": "nvenc-cbr-ldkfs1",
+   "vendor": "nvenc",
+   "production": {},
+   "set": [
+    [
+     "rc.lowDelayKeyFrameScale",
+     1
+    ]
+   ]
+  },
+  {
+   "name": "nvenc-cbr-multipass-quarter",
+   "vendor": "nvenc",
+   "production": {},
+   "set": [
+    [
+     "rc.multiPass",
+     "QUARTER"
+    ]
+   ]
+  },
+  {
+   "name": "nvenc-cbr-multipass-full",
+   "vendor": "nvenc",
+   "production": {},
+   "set": [
+    [
+     "rc.multiPass",
+     "FULL"
+    ]
+   ]
+  },
+  {
+   "name": "nvenc-cbr-aq",
+   "vendor": "nvenc",
+   "production": {},
+   "set": [
+    [
+     "rc.enableAQ",
+     1
+    ],
+    [
+     "rc.aqStrength",
+     8
+    ]
+   ]
+  },
+  {
+   "name": "nvenc-cbr-nonrefp",
+   "vendor": "nvenc",
+   "production": {},
+   "set": [
+    [
+     "rc.enableNonRefP",
+     1
+    ]
+   ]
+  },
+  {
+   "name": "nvenc-dpb4",
+   "vendor": "nvenc",
+   "production": {
+    "qp": 15
+   },
+   "set": [
+    [
+     "h264.maxNumRefFrames",
+     4
+    ]
+   ]
+  },
+  {
+   "name": "nvenc-slices4",
+   "vendor": "nvenc",
+   "production": {
+    "qp": 15
+   },
+   "set": [
+    [
+     "h264.sliceMode",
+     3
+    ],
+    [
+     "h264.sliceModeData",
+     4
+    ]
+   ]
+  },
+  {
+   "name": "nvenc-intra-refresh-single-slice",
+   "vendor": "nvenc",
+   "production": {
+    "qp": 15
+   },
+   "set": [
+    [
+     "h264.enableIntraRefresh",
+     1
+    ],
+    [
+     "h264.intraRefreshPeriod",
+     300
+    ],
+    [
+     "h264.intraRefreshCnt",
+     299
+    ],
+    [
+     "h264.singleSliceIntraRefresh",
+     1
+    ],
+    [
+     "h264.outputRecoveryPointSEI",
+     1
+    ]
+   ]
+  },
+  {
+   "name": "nvenc-temporal-svc2",
+   "vendor": "nvenc",
+   "production": {
+    "qp": 15
+   },
+   "set": [
+    [
+     "h264.enableTemporalSVC",
+     1
+    ],
+    [
+     "h264.numTemporalLayers",
+     2
+    ],
+    [
+     "h264.maxTemporalLayers",
+     2
+    ]
+   ]
+  },
+  {
+   "name": "nvenc-async-off",
+   "vendor": "nvenc",
+   "production": {
+    "qp": 15
+   },
+   "set": [
+    [
+     "enableEncodeAsync",
+     0
+    ]
+   ]
+  },
+  {
+   "name": "nvenc-preset-p4",
+   "vendor": "nvenc",
+   "production": {
+    "qp": 15
+   },
+   "set": [
+    [
+     "preset",
+     "P4"
+    ]
+   ]
+  },
+  {
+   "name": "nvenc-tuning-ll",
+   "vendor": "nvenc",
+   "production": {
+    "qp": 15
+   },
+   "set": [
+    [
+     "tuning",
+     "LL"
+    ]
+   ]
+  },
+  {
+   "name": "nvenc-clock-hold-off",
+   "vendor": "nvenc",
+   "production": {
+    "qp": 15
+   },
+   "gpu_clock_hold": false
+  },
+  {
+   "name": "qsv-prod",
+   "vendor": "qsv",
+   "production": {
+    "qp": 15
+   }
+  },
+  {
+   "name": "qsv-vcm",
+   "vendor": "qsv",
+   "production": {}
+  },
+  {
+   "name": "qsv-vcm-display-remoting",
+   "vendor": "qsv",
+   "production": {},
+   "set": [
+    [
+     "co3.ScenarioInfo",
+     "DISPLAY_REMOTING"
+    ]
+   ]
+  },
+  {
+   "name": "qsv-vcm-no-winbrc",
+   "vendor": "qsv",
+   "production": {},
+   "set": [
+    [
+     "co3.WinBRCSize",
+     0
+    ],
+    [
+     "co3.WinBRCMaxAvgKbps",
+     0
+    ]
+   ]
+  },
+  {
+   "name": "qsv-vbr",
+   "vendor": "qsv",
+   "production": {},
+   "set": [
+    [
+     "mfx.RateControlMethod",
+     "VBR"
+    ]
+   ]
+  },
+  {
+   "name": "qsv-adaptive-off",
+   "vendor": "qsv",
+   "production": {
+    "qp": 15
+   },
+   "set": [
+    [
+     "co3.AdaptiveRef",
+     "OFF"
+    ],
+    [
+     "co3.AdaptiveLTR",
+     "OFF"
+    ],
+    [
+     "co3.AdaptiveCQM",
+     "OFF"
+    ]
+   ]
+  },
+  {
+   "name": "qsv-tu4",
+   "vendor": "qsv",
+   "production": {
+    "qp": 15
+   },
+   "set": [
+    [
+     "mfx.TargetUsage",
+     4
+    ]
+   ]
+  },
+  {
+   "name": "qsv-lowpower-off",
+   "vendor": "qsv",
+   "production": {
+    "qp": 15
+   },
+   "set": [
+    [
+     "mfx.LowPower",
+     "OFF"
+    ]
+   ]
+  },
+  {
+   "name": "qsv-numref2",
+   "vendor": "qsv",
+   "production": {
+    "qp": 15
+   },
+   "set": [
+    [
+     "mfx.NumRefFrame",
+     2
+    ],
+    [
+     "co.MaxDecFrameBuffering",
+     2
+    ]
+   ]
+  },
+  {
+   "name": "qsv-asyncdepth2",
+   "vendor": "qsv",
+   "production": {
+    "qp": 15
+   },
+   "set": [
+    [
+     "AsyncDepth",
+     2
+    ]
+   ]
+  },
+  {
+   "name": "qsv-single-slice",
+   "vendor": "qsv",
+   "production": {
+    "qp": 15
+   },
+   "set": [
+    [
+     "co2.MaxSliceSize",
+     0
+    ],
+    [
+     "mfx.NumSlice",
+     1
+    ]
+   ]
+  },
+  {
+   "name": "qsv-nv12-input",
+   "vendor": "qsv",
+   "production": {
+    "qp": 15
+   },
+   "input": "nv12"
+  }
+ ],
+ "groups": [
+  {
+   "name": "NVENC settings sweep",
+   "recipes": [
+    "nvenc-*"
+   ],
+   "workloads": [
+    "motion-720p30",
+    "scroll-720p30",
+    "mixed-720p30",
+    "rec-720p30",
+    "motion-720p60",
+    "scroll-720p60",
+    "mixed-720p60",
+    "rec-720p60",
+    "motion-720p120",
+    "scroll-720p120",
+    "mixed-720p120",
+    "rec-720p120",
+    "motion-1080p30",
+    "scroll-1080p30",
+    "mixed-1080p30",
+    "rec-1080p30",
+    "motion-1080p60",
+    "scroll-1080p60",
+    "mixed-1080p60",
+    "rec-1080p60",
+    "motion-1080p120",
+    "scroll-1080p120",
+    "mixed-1080p120",
+    "rec-1080p120",
+    "motion-1440p30",
+    "scroll-1440p30",
+    "mixed-1440p30",
+    "rec-1440p30",
+    "motion-1440p60",
+    "scroll-1440p60",
+    "mixed-1440p60",
+    "rec-1440p60",
+    "motion-1440p120",
+    "scroll-1440p120",
+    "mixed-1440p120",
+    "rec-1440p120",
+    "motion-4k30",
+    "scroll-4k30",
+    "mixed-4k30",
+    "rec-4k30",
+    "motion-4k60",
+    "scroll-4k60",
+    "mixed-4k60",
+    "rec-4k60",
+    "motion-4k120",
+    "scroll-4k120",
+    "mixed-4k120",
+    "rec-4k120"
+   ]
+  },
+  {
+   "name": "Quick Sync settings sweep",
+   "recipes": [
+    "qsv-*"
+   ],
+   "workloads": [
+    "motion-720p30",
+    "scroll-720p30",
+    "mixed-720p30",
+    "rec-720p30",
+    "motion-720p60",
+    "scroll-720p60",
+    "mixed-720p60",
+    "rec-720p60",
+    "motion-720p120",
+    "scroll-720p120",
+    "mixed-720p120",
+    "rec-720p120",
+    "motion-1080p30",
+    "scroll-1080p30",
+    "mixed-1080p30",
+    "rec-1080p30",
+    "motion-1080p60",
+    "scroll-1080p60",
+    "mixed-1080p60",
+    "rec-1080p60",
+    "motion-1080p120",
+    "scroll-1080p120",
+    "mixed-1080p120",
+    "rec-1080p120",
+    "motion-1440p30",
+    "scroll-1440p30",
+    "mixed-1440p30",
+    "rec-1440p30",
+    "motion-1440p60",
+    "scroll-1440p60",
+    "mixed-1440p60",
+    "rec-1440p60",
+    "motion-1440p120",
+    "scroll-1440p120",
+    "mixed-1440p120",
+    "rec-1440p120",
+    "motion-4k30",
+    "scroll-4k30",
+    "mixed-4k30",
+    "rec-4k30",
+    "motion-4k60",
+    "scroll-4k60",
+    "mixed-4k60",
+    "rec-4k60",
+    "motion-4k120",
+    "scroll-4k120",
+    "mixed-4k120",
+    "rec-4k120"
+   ]
+  }
+ ],
+ "order": {
+  "cooldown_ms": 1000
+ }
+}

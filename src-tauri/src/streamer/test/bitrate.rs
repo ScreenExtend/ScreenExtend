@@ -101,8 +101,7 @@ fn estimate_probe_is_capped_by_delivered_rate() {
 
 #[test]
 fn estimate_reacts_across_the_old_dead_band() {
-    // 2 % to 10 % loss used to be a literal no-op: a visibly broken picture with the rate held
-    // flat. Every sample in that range must now move the estimate down, monotonically.
+    // 2 % to 10 % loss must cut monotonically: a flat rate there is a visibly broken picture
     let mut last = u32::MAX;
     for pct in [2u32, 3, 5, 8, 9] {
         let est = estimate_from_loss(10_000_000, 10_000_000, pct as f64 / 100.0);
@@ -117,8 +116,7 @@ fn estimate_reacts_across_the_old_dead_band() {
 
 #[test]
 fn the_loss_response_is_continuous_where_the_branches_meet() {
-    // At 10 % the gentle ramp and GCC's own `1 - 0.5 * loss` must agree, or the controller has
-    // a step discontinuity exactly where loss becomes severe.
+    // at 10 % the gentle ramp must meet GCC's `1 - 0.5 * loss`, or the rate steps there
     let below = estimate_from_loss(10_000_000, 10_000_000, 0.0999);
     let at = estimate_from_loss(10_000_000, 10_000_000, 0.10);
     assert!(
@@ -130,18 +128,16 @@ fn the_loss_response_is_continuous_where_the_branches_meet() {
 
 #[test]
 fn ordinary_wireless_background_loss_still_probes_upward() {
-    // Below 1 % is the background of any wireless link and must not be read as congestion,
-    // or a healthy 5 GHz session never reaches its ceiling.
+    // under 1 % is the background of any wireless link, not congestion, or a healthy 5 GHz
+    // session never reaches its ceiling
     let est = estimate_from_loss(10_000_000, 10_000_000, 0.005);
     assert!(est > 10_000_000, "0.5% loss must not stop the probe: {est}");
 }
 
 #[test]
 fn a_sub_deadband_cut_compounds_instead_of_stalling() {
-    // The estimator runs on its own value, not the emitted target. A 5 % loss produces a ~2 %
-    // cut, which the controller's 4 % cut deadband would swallow — so if the estimate were
-    // recomputed from the unchanged target each interval, nothing would ever move. Feeding it
-    // its own output is what makes moderate loss actually converge.
+    // the estimator feeds on its own output, not the emitted target: 5 % loss is a ~2 % cut,
+    // which the controller's 4 % cut deadband would swallow every interval
     let mut est = 10_000_000u32;
     for _ in 0..10 {
         est = estimate_from_loss(est, est, 0.05);
@@ -242,9 +238,7 @@ fn drive(rtt_ms_series: &[f64], fraction_lost: f64, polls: usize) -> u32 {
 
 #[test]
 fn lan_rtt_never_cuts_the_target() {
-    // 5 ms is a normal Wi-Fi LAN RTT. Before the unit fix this was multiplied by 1000,
-    // crossed the 80 ms clamp on every poll, and walked the target to the 1 Mbps floor
-    // within a couple of seconds.
+    // 5 ms is a normal Wi-Fi LAN RTT; a unit slip (x1000) would walk the target to the 1 Mbps floor
     let target = drive(&[5.0], 0.0, 200);
     assert_eq!(
         target, MAX,
@@ -254,8 +248,7 @@ fn lan_rtt_never_cuts_the_target() {
 
 #[test]
 fn steady_wan_rtt_never_cuts_the_target() {
-    // 150 ms steady is an ordinary cross-continent RTT and carries no congestion signal:
-    // the old absolute 80 ms threshold pinned every such session at the floor.
+    // a steady 150 ms is an ordinary cross-continent RTT: only a rise over baseline is congestion
     let target = drive(&[150.0, 152.0, 148.0, 151.0], 0.0, 200);
     assert_eq!(target, MAX, "steady high RTT is not congestion");
 }

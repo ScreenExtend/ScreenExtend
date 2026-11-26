@@ -8,10 +8,9 @@
 // Options:
 //   --key <k>        which entry of `baselines` to compare against. Required.
 //   --input <file>   read the measurement text from a file instead of stdin. Repeatable:
-//                    with several runs the LOWEST value per metric is used, which is the
-//                    one closest to the uncontended cost. On a machine with other work on
-//                    it a single run is nearly meaningless — the x264 p95 on the dev box
-//                    ranged 4405-9067 us across runs depending on what else was compiling.
+//                    with several runs the LOWEST value per metric is used, the one closest
+//                    to the uncontended cost (one x264 p95 ranged 4405-9067 us across runs
+//                    on a busy machine).
 //   --baseline <f>   default ci/perf-baseline.json.
 //   --out <file>     write the observed numbers as JSON (a CI artifact; also what you
 //                    paste back into the baseline file to re-seed a runner).
@@ -24,9 +23,8 @@
 // Exit 0 = within tolerance, or nothing to compare against yet; 1 = regression;
 // 2 = usage/parse error.
 //
-// Why the metrics live here and the numbers live in JSON: the regexes are tied to the
-// exact strings the Rust side prints, so they belong next to the parser, while the
-// numbers are per machine and get re-seeded per runner without touching code.
+// The metric regexes live here because they match the exact strings the Rust side prints;
+// the numbers are per machine and live in JSON, so a runner is re-seeded without a code change.
 
 import { readFileSync, writeFileSync } from "node:fs";
 import { resolve, dirname } from "node:path";
@@ -34,13 +32,12 @@ import { fileURLToPath } from "node:url";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
-// Each metric names the line it comes from, so a failure report says what to run to
-// reproduce it. The capture group is already in `unit`; nothing is rescaled.
+// `source` is what to run to reproduce a failure. The capture group is already in `unit`:
+// nothing is rescaled.
 const METRICS = {
   x264_p95_encode_us: {
-    // `x264 smoke OK: ... p95_encode=4537us (budget 16666us)` — the x264 unit test.
-    // Anchored on its own prefix: other harnesses print a `p95_encode=` of their own, and an
-    // unanchored pattern quietly reported one encoder's number under another's name.
+    // `x264 smoke OK: ... p95_encode=4537us (budget 16666us)`, from the x264 unit test.
+    // Anchored on the prefix: other harnesses print a `p95_encode=` of their own.
     pattern: /x264 smoke OK:[^\n]*p95_encode=(\d+)us/,
     unit: "us",
     source: "cargo test --release --lib x264_encoder -- --nocapture",
@@ -51,7 +48,7 @@ const METRICS = {
     source: "cargo test --release --lib x264_encoder -- --nocapture",
   },
   probe_encode_p99_ms: {
-    // `telemetry: ... encode=<p50>/<p90>/<p99>/<max>` — any probe run that encodes.
+    // `telemetry: ... encode=<p50>/<p90>/<p99>/<max>`, from any probe run that encodes
     pattern: /\bencode=[\d.]+\/[\d.]+\/([\d.]+)\/[\d.]+/,
     unit: "ms",
     source: "ScreenExtend probe --encode",
@@ -62,10 +59,8 @@ const METRICS = {
     source: "ScreenExtend probe --whep-selftest --duration 30",
   },
   // `windows capture->encoded OK: ... capture_to_encoded=<p50>/<p90>/<p99>/<max> (p50/p90/p99/max ms)`
-  // — the Windows counterpart to the macOS end_to_end_latency harness. This is the only
-  // metric in the table that spans capture as well as encode, which is what makes it the one
-  // worth watching: an encode-side win that costs a capture-side stall shows up here and
-  // nowhere else. It needs an interactive desktop, so it is a dev-box number, not a runner one.
+  // The only metric spanning capture as well as encode: an encode-side win that costs a
+  // capture-side stall shows up only here. Needs an interactive desktop, so no CI runner has it.
   windows_capture_to_encoded_p99_ms: {
     pattern: /\bcapture_to_encoded=[\d.]+\/[\d.]+\/([\d.]+)\/[\d.]+/,
     unit: "ms",
@@ -78,20 +73,16 @@ const METRICS = {
     source:
       "cargo test --release --lib windows_capture_to_encoded -- --ignored --nocapture",
   },
-  // The encode stage of the same run, spelled differently from the x264 one on purpose: it is
-  // whichever encoder the `Auto` ladder picked on that machine, so comparing it against an
-  // x264 baseline would be comparing NVENC with libx264.
+  // Encode stage of the same run. Not named like the x264 metric on purpose: this is whichever
+  // encoder the `Auto` ladder picked, so it must not be compared against an x264 baseline.
   windows_capture_encode_p95_us: {
     pattern: /\bcapture_encode_p95=(\d+)us/,
     unit: "us",
     source:
       "cargo test --release --lib windows_capture_to_encoded -- --ignored --nocapture",
   },
-  // `videotoolbox encode OK: ... vt_encode_p95=<n>us ...` — macOS's `encode_synthetic`.
-  // This is what makes a macOS perf-gate row possible at all: until it printed a timing, the
-  // gate's Windows-only matrix was a data problem rather than a platform judgement. No display
-  // and no Screen Recording grant needed, which is why the encoder module is the one a hosted
-  // runner can measure.
+  // `videotoolbox encode OK: ... vt_encode_p95=<n>us ...`, from macOS's `encode_synthetic`.
+  // Needs no display and no Screen Recording grant, so a hosted runner can measure it.
   vt_p95_encode_us: {
     pattern: /\bvt_encode_p95=(\d+)us/,
     unit: "us",
@@ -111,8 +102,7 @@ function die(msg) {
   process.exit(2);
 }
 
-// The header comment above is the help text. Read it back rather than duplicating it, and stop
-// at the first non-comment line so extending it cannot silently truncate `--help`.
+// the header comment is the help text: read it back, stopping at the first non-comment line
 function headerComment() {
   const lines = readFileSync(fileURLToPath(import.meta.url), "utf8").split("\n").slice(1);
   const end = lines.findIndex((l) => !l.startsWith("//"));
@@ -178,7 +168,7 @@ try {
   die(`cannot read ${args.baseline}: ${e.message}`);
 }
 
-// Resolved after the baseline entry is read, so a key can tighten (or loosen) the default.
+// resolved after the baseline entry is read, so a key can override the default
 function resolveTolerance(baselineEntry) {
   const t = args.tolerance ?? baselineEntry?.tolerance ?? file.tolerance;
   if (!Number.isFinite(t)) die("no usable tolerance (set `tolerance` in the baseline file)");
@@ -188,9 +178,8 @@ const tolerance = resolveTolerance(file.baselines?.[args.key]);
 
 const runs = readRuns(args.inputs);
 
-// Best of N: the lowest reading is the one least polluted by whatever else the machine was
-// doing. Taking a mean or a median would fold the contention into the number and make the
-// gate a measure of the runner's mood.
+// Best of N: the lowest reading is the least contended. A mean or median would fold the
+// machine's other work into the number.
 const observed = {};
 const samples = {};
 for (const text of runs) {
@@ -235,9 +224,9 @@ if (args.seed) {
 
 const baseline = file.baselines?.[args.key];
 if (!baseline) {
-  // A runner the baseline file has never seen is not a regression. Say so loudly and
-  // pass; the artifact written above is what someone commits to turn this into a gate.
-  console.log(`perf-gate: no baseline for '${args.key}' yet — nothing to compare.`);
+  // An unseeded runner is not a regression: report and pass. The --out artifact is what
+  // gets committed to turn this into a gate.
+  console.log(`perf-gate: no baseline for '${args.key}' yet, nothing to compare.`);
   console.log("perf-gate: to make this a gate, add the observed numbers above to");
   console.log(`perf-gate:   ${args.baseline} under baselines['${args.key}'].`);
   process.exit(0);
@@ -270,12 +259,12 @@ for (const [name, value] of Object.entries(observed)) {
 }
 
 if (compared === 0) {
-  console.log(`perf-gate: baseline '${args.key}' has no value for any observed metric — nothing gated.`);
+  console.log(`perf-gate: baseline '${args.key}' has no value for any observed metric, nothing gated.`);
   process.exit(0);
 }
 
 if (regressed > 0) {
-  console.error(`perf-gate: FAIL — ${regressed} metric(s) beyond the ${(tolerance * 100).toFixed(1)}% tolerance.`);
+  console.error(`perf-gate: FAIL: ${regressed} metric(s) beyond the ${(tolerance * 100).toFixed(1)}% tolerance.`);
   process.exit(1);
 }
-console.log(`perf-gate: PASS — ${compared} metric(s) within tolerance.`);
+console.log(`perf-gate: PASS: ${compared} metric(s) within tolerance.`);

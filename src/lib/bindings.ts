@@ -6,21 +6,17 @@
 
 
 export const commands = {
+/**
+ * `async` in the Tauri sense: it runs on the async runtime rather than the UI's main thread,
+ * which every probe below (the driver handshake (5 s deadline), WMI, DXGI duplication, the
+ * encoder sessions) used to freeze. Still a plain function for `doctor` and the tests.
+ */
 async checkSystemRequirements() : Promise<CompatibilityReport> {
     return await TAURI_INVOKE("check_system_requirements");
 },
-/**
- * A plain `fn` command runs on the main thread. Nothing here needs to: the window-list
- * read is CoreGraphics IPC and `AXIsProcessTrusted` is a syscall, so both belong on a
- * blocking thread even at well under a millisecond apiece.
- */
 async checkPermissions() : Promise<PermissionStatus[]> {
     return await TAURI_INVOKE("check_permissions");
 },
-/**
- * `CGRequestScreenCaptureAccess` blocks until the user dismisses the OS prompt, which is
- * seconds of a frozen window if it runs on the main thread.
- */
 async requestPermission(key: string) : Promise<boolean> {
     return await TAURI_INVOKE("request_permission", { key });
 },
@@ -28,14 +24,9 @@ async openPermissionSettings(key: string) : Promise<void> {
     await TAURI_INVOKE("open_permission_settings", { key });
 },
 /**
- * Relaunch through LaunchServices rather than by spawning the executable.
- * 
- * TCC attributes a request to the *responsible* process, and a binary started by
- * another process inherits that process's attribution instead of establishing its
- * own — the documented reason an app launched from a terminal never appears in the
- * Screen Recording list. `open -n -a` hands the launch to LaunchServices, so the
- * new instance is its own responsible process and the grant the user just made
- * applies to it.
+ * Restart the app so it comes back as a fresh process. On macOS this is how a
+ * newly granted permission is picked up; here there is no per-process permission
+ * cache to escape, so the plain restart is enough.
  */
 async relaunchApp() : Promise<void> {
     await TAURI_INVOKE("relaunch_app");
@@ -78,6 +69,10 @@ async getAvatar() : Promise<string | null> {
 async removeAvatar() : Promise<boolean> {
     return await TAURI_INVOKE("remove_avatar");
 },
+/**
+ * Three WMI queries: on the blocking pool, not on the UI's main thread, where a sync command
+ * runs and where the pages polling it stalled the window.
+ */
 async getNetworkAdapters() : Promise<NetworkInfo[]> {
     return await TAURI_INVOKE("get_network_adapters");
 },
@@ -90,15 +85,17 @@ async startHostedNetwork(name: string, password: string) : Promise<boolean> {
 async stopHostedNetwork() : Promise<boolean> {
     return await TAURI_INVOKE("stop_hosted_network");
 },
+/**
+ * Whether the hosted network is up. Reads the platform object we already hold: it must not
+ * spawn a process, because the UI and the adapter list ask often.
+ */
 async isHostedNetwork() : Promise<boolean> {
     return await TAURI_INVOKE("is_hosted_network");
 },
 /**
- * Everything the network card can show without opening the log terminal: the tri-state,
- * the backend, the channel and band the ladder settled on, the `securityType` that was
- * accepted, and — the one that matters for consent — whether the AP carries encryption at
- * all. All of it was already logged on every start and reachable through
- * `hosted_network_status()`; none of it had a way to reach the UI.
+ * Everything the network card can show: the tri-state, the backend, the band and the
+ * authentication. It re-reads liveness through `is_hosted_network` first so a hotspot the
+ * OS took down on its own is not still reported as advertised.
  */
 async getHostedNetworkStatus() : Promise<HostedNetworkReport> {
     return await TAURI_INVOKE("get_hosted_network_status");
@@ -106,24 +103,39 @@ async getHostedNetworkStatus() : Promise<HostedNetworkReport> {
 async isWifiOn() : Promise<boolean> {
     return await TAURI_INVOKE("is_wifi_on");
 },
+/**
+ * Off the main thread: a sync command runs on the webview's thread, and a radio that is slow
+ * to answer froze the window for as long as it took.
+ */
 async turnOnWifi() : Promise<boolean> {
     return await TAURI_INVOKE("turn_on_wifi");
 },
+/**
+ * Install the driver elevated, wait for the install, and report whether the driver now answers.
+ * 
+ * `async` in the Tauri sense: it runs on the async runtime, not on the UI's main thread, which
+ * would otherwise be frozen for the whole elevated install. Still a plain function for the CLI.
+ */
 async installDrivers() : Promise<boolean> {
     return await TAURI_INVOKE("install_drivers");
 },
+/**
+ * Remove the driver elevated and wait for the removal, so an install that follows cannot race
+ * it. Runs off the UI's main thread, like [`install_drivers`].
+ */
 async removeDrivers() : Promise<boolean> {
     return await TAURI_INVOKE("remove_drivers");
 },
 /**
- * No virtual display driver process to leak on macOS: `CGVirtualDisplay` lives in WindowServer.
- * UNVERIFIED (not compiled): written on Windows, mirrors the Windows command's surface.
+ * How much the virtual display driver's host has leaked, read unelevated. The startup gate
+ * asks this before `setup` and offers [`restart_display_driver`] when it is over threshold.
  */
 async displayDriverHealth() : Promise<DisplayDriverHealth> {
     return await TAURI_INVOKE("display_driver_health");
 },
 /**
- * UNVERIFIED (not compiled).
+ * Run `ScreenExtend drivers restart` elevated (one UAC prompt), wait for it, and say how it
+ * went. Off the main thread: the prompt and the restart take seconds.
  */
 async restartDisplayDriver() : Promise<DriverRestartOutcome> {
     return await TAURI_INVOKE("restart_display_driver");
@@ -131,8 +143,8 @@ async restartDisplayDriver() : Promise<DriverRestartOutcome> {
 /**
  * Ask the other ScreenExtend instance that is holding the display driver's pipe to quit.
  * 
- * Only ever reaches an instance answering on the single-instance control socket — a desktop
- * host or a `serve` — and never this process, whose own control server may well be the one
+ * Only ever reaches an instance answering on the single-instance control socket (a desktop
+ * host or a `serve`) and never this process, whose own control server may well be the one
  * that file names by the time the desktop UI asks. A `probe --live` run, or an instance that
  * is already on its way out, has no socket to ask: the answer there is `false` and the user is
  * told to close it themselves rather than being handed a button that silently does nothing.
@@ -157,10 +169,10 @@ async setDeviceOverride(device: string, scale: number, orientation: string, refr
 },
 /**
  * Where a pointer-locked client may drive this host's cursor: `"all"` (every screen, including
- * the host's real monitors — the default) or `"display"` (only the screen it is streaming).
+ * the host's real monitors, the default) or `"display"` (only the screen it is streaming).
  * 
  * Its own command rather than another `set_device_override` argument: that one is at specta's
- * ten-argument ceiling, and this needs none of its machinery — no clamp, no rebuild verdict,
+ * ten-argument ceiling, and this needs none of its machinery: no clamp, no rebuild verdict,
  * no live display to touch. The injector reads the scope when the session is built, so a
  * change applies to the next connection, exactly like remote control itself.
  */
@@ -170,15 +182,11 @@ async setDevicePointerScope(device: string, scope: string) : Promise<void> {
 /**
  * Whether this device's stream may drop below its chosen refresh rate on its own.
  * 
- * Off is the default and the owner's ruling: the rate the user picked is the rate the stream
+ * Off is the default: the rate the user picked is the rate the stream
  * runs at, an unchanged frame is repeated rather than skipped, and no controller lowers it.
- * A separate command for the same reason as `set_device_pointer_scope` — `set_device_override`
- * is at specta's ten-argument ceiling — and read by the pipeline when the session is built, so
+ * A separate command for the same reason as `set_device_pointer_scope` (`set_device_override`
+ * is at specta's ten-argument ceiling) and read by the pipeline when the session is built, so
  * a change applies to the next connection.
- * 
- * **UNVERIFIED on macOS**: written to keep the command surface identical across the three
- * `*_utils` modules and never compiled on a Mac in this workstream. The macOS pipeline's half
- * of the ruling is not implemented at all.
  */
 async setDeviceAutoFrameRate(device: string, enabled: boolean) : Promise<void> {
     await TAURI_INVOKE("set_device_auto_frame_rate", { device, enabled });
@@ -188,10 +196,10 @@ async setDeviceAutoFrameRate(device: string, enabled: boolean) : Promise<void> {
  * quality (CBR with the slider as a QP floor, instead of constant QP at the slider), pixel
  * ratio (the ratio the device reports at each join, instead of the slider) and orientation
  * (whichever way the device is held, always, instead of the saved value). Off is the default
- * for all three and means "fixed at what the sheet shows", the same ruling as
+ * for all three and means "fixed at what the sheet shows", the same rule as
  * `set_device_auto_frame_rate`. Their own command for the same reason as that one:
  * `set_device_override` is at specta's ten-argument ceiling. Each is read when the session is
- * built, so a change takes a rebuild — only when something actually moved.
+ * built, so a change takes a rebuild (only when something actually moved).
  */
 async setDeviceAdaptiveModes(device: string, adaptiveQuality: boolean, nativeDpr: boolean, autoOrientation: boolean) : Promise<void> {
     await TAURI_INVOKE("set_device_adaptive_modes", { device, adaptiveQuality, nativeDpr, autoOrientation });
@@ -238,6 +246,10 @@ async setTurnConfig(urls: string, username: string, credential: string) : Promis
 async getTurnConfig() : Promise<TurnConfig> {
     return await TAURI_INVOKE("get_turn_config");
 },
+/**
+ * `async` so the restart below (up to 500 ms of graceful shutdown and 2 s waiting for the
+ * ports) runs on the async runtime, not on the UI's main thread.
+ */
 async setServerPorts(httpPort: number, httpsPort: number) : Promise<ServerPorts> {
     return await TAURI_INVOKE("set_server_ports", { httpPort, httpsPort });
 },
@@ -319,7 +331,7 @@ selected: string;
 /**
  * What the device reports it is *actually* playing on. The two diverge the moment the
  * user changes the output in the browser's own UI, which only the client can see.
- * `None` means this client never said — an older one, or one that has not posted yet —
+ * `None` means this client never said (an older one, or one that has not posted yet),
  * which is a different answer from `Some("")`, the device's default output.
  */
 current: string | null; 
@@ -344,12 +356,12 @@ display_driver_holder_pid: number | null;
  * It is here rather than behind a command of its own because the one thing that needs it
  * asks for this report at exactly the same moment: the startup gate's repair budget is
  * "one driver install, one reinstall and one relaunch per boot", and a restart is the
- * advice it gives when that budget runs out — so the restart has to clear it.
+ * advice it gives when that budget runs out, so the restart has to clear it.
  */
 boot_id: string }
 export type Device = { 
 /**
- * The live session this row is — one browser tab. A device with two tabs open produces two
+ * The live session this row is: one browser tab. A device with two tabs open produces two
  * rows with one `token` between them. Empty on a row that describes only a device.
  */
 joinId: string; 
@@ -363,7 +375,7 @@ ip: string;
  */
 token: string; name: string; scale: number; orientation: string; refreshRate: number; videoScale: number; videoQuality: number; remoteControl: boolean; 
 /**
- * `"display"` or `"all"` — how far a pointer-locked client may drive this host's cursor.
+ * `"display"` or `"all"`: how far a pointer-locked client may drive this host's cursor.
  * See `streamer::input::PointerScope`.
  */
 pointerScope: string; 
@@ -399,7 +411,7 @@ token: string; supported: boolean; outputs: AudioOutput[];
 selected: string; 
 /**
  * What the device says it is actually playing on right now. `None` when it never said,
- * which is not the same as `Some("")` — the device's default output.
+ * which is not the same as `Some("")` (the device's default output).
  */
 current: string | null; 
 /**
@@ -414,10 +426,10 @@ export type DisplayCapacity = { max: number | null; in_use: number; full: boolea
 /**
  * What the virtual display driver's host process has built up, read without elevation.
  * 
- * The bundled IddCx driver leaks ~47–124 MB of commit, ~37 handles and ~5 threads per display
+ * The bundled IddCx driver leaks ~47-124 MB of commit, ~37 handles and ~5 threads per display
  * creation or mode change and never gives it back; at ~36 GB / ~3,200 threads it stops attaching
  * displays at all. Only a device restart (elevated) or a reboot frees it, so the startup gate
- * reads this before `setup` and offers the restart (`docs/OPTIMIZATIONS.md` UX-DRVRESTART).
+ * reads this before `setup` and offers the restart.
  */
 export type DisplayDriverHealth = { 
 /**
@@ -434,7 +446,7 @@ needs_restart: boolean;
  */
 pid: number | null; 
 /**
- * How that pid was chosen: `pipeServer` (the process serving the driver's own named pipe —
+ * How that pid was chosen: `pipeServer` (the process serving the driver's own named pipe,
  * exact), `largestWudfHost` (a guess, used only when the pipe could not name its server),
  * `none` (no driver host found) or `unsupported`.
  */
@@ -470,21 +482,21 @@ export type HostedNetworkNoPassword = null
  * Everything the UI can say about the hosted network without opening the log terminal.
  * 
  * `state` is the tri-state both platforms already collect and neither could report:
- * - `notStarted` — nothing is being advertised.
- * - `advertised` — the platform accepted the start, and that is all that is known. An AP
+ * - `notStarted`: nothing is being advertised.
+ * - `advertised`: the platform accepted the start, and that is all that is known. An AP
  * in this state is visible to a phone and may still be unjoinable, because nothing is
  * serving DHCP.
- * - `verified` — the AP interface holds a routable IPv4, i.e. something is serving
+ * - `verified`: the AP interface holds a routable IPv4, i.e. something is serving
  * addresses, so a client that associates can actually get on.
  * 
- * `secured` is what item 6 of the UI recommendations needs: on macOS the HostAP SPI can
+ * `secured` is there because on macOS the HostAP SPI can
  * refuse every secured `securityType` and the fallback brings up an *unencrypted* AP,
  * which stays up for the session while the join URL, session id and OTP are readable by
  * anyone in range who associates. A toast cannot carry that; a badge on the card can.
  */
 export type HostedNetworkReport = { state: string; backend: string | null; ssid: string; channel: number | null; band: string | null; 
 /**
- * The security type as it was logged, e.g. `WPA2` or `securityType 2 (open — no
+ * The security type as it was logged, e.g. `WPA2` or `securityType 2 (open, no
  * encryption)`. `None` when nothing is up.
  */
 security: string | null; 
@@ -537,7 +549,7 @@ export type ServerPorts = { http: number; https: number }
  * 
  * Two things emit it: the cloud relay rotating an id it found taken, and `ScreenExtend session
  * new` replacing the pair through the single-instance control socket. An **empty `otp` means
- * the OTP did not change** — the rotation case — and the frontend must leave its copy alone
+ * the OTP did not change** (the rotation case) and the frontend must leave its copy alone
  * rather than clearing it. Without the field the UI would show the new id beside the old code
  * and then push that stale pair back through `set_session_credentials`, undoing the half of the
  * change it could not see.

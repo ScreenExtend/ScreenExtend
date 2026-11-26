@@ -72,8 +72,8 @@ unsafe impl Sync for IoCtx {}
 
 /// Host-clock time of the block an IOProc is handed, or 0 when the HAL did not stamp it.
 ///
-/// `mHostTime` is `mach_absolute_time` at the moment the hardware read the block's first frame,
-/// which is the instant A/V sync needs — not the moment the encoder worker later gets to it.
+/// `mHostTime` is `mach_absolute_time` when the hardware read the block's first frame, which is
+/// the instant A/V sync needs.
 #[inline]
 pub(super) fn block_host_ns(ts: NonNull<objc2_core_audio_types::AudioTimeStamp>) -> u64 {
     // SAFETY: the HAL passes a live AudioTimeStamp for the duration of the callback
@@ -184,7 +184,7 @@ struct TapResources {
     io_proc: AudioDeviceIOProcID,
     ctx: *mut IoCtx,
     started: bool,
-    /// the user's default output device, and the rate it was on before we changed it
+    /// the user's default output device, and its rate before it was forced to 48 kHz
     restore_rate: Option<(AudioObjectID, f64)>,
 }
 
@@ -324,10 +324,8 @@ impl ProcessTapCapture {
         let output_dev = read_default_system_output_device()?;
         let output_uid = read_device_uid(output_dev)?;
 
-        // The tap delivers whatever the output device runs at and nothing downstream resamples, so
-        // the device has to be at 48 kHz. That is the user's own interface — a 96 kHz DAC or a
-        // 44.1 kHz setting chosen for bit-perfect playback — so remember the old rate and put it
-        // back on teardown, rather than reconfiguring the machine permanently to stream to a phone.
+        // the tap delivers at the output device's rate and nothing downstream resamples, so force
+        // 48 kHz; it is the user's own interface, so the old rate is restored on teardown
         let prior_rate = super::legacy::hal::nominal_sample_rate(output_dev);
         match prior_rate {
             Some(r) if (r - 48_000.0).abs() < 1.0 => {}
@@ -351,10 +349,8 @@ impl ProcessTapCapture {
         resources.aggregate_id = aggregate_id;
         set_aggregate_buffer_size(aggregate_id, &sink.diagnostics);
 
-        // Re-read now that the aggregate exists: the tap can settle on a different format once
-        // it is attached, which is the only reason to read it twice. Falling back silently to the
-        // pre-aggregate answer is exactly wrong in the one case the second read exists for, so a
-        // failed re-read says so and the old value is used knowingly.
+        // the tap can settle on a different format once attached to the aggregate, so read again;
+        // a failed re-read is logged, not swallowed, before falling back to the first answer
         let asbd = match read_tap_format(tap_id) {
             Ok(a) => a,
             Err(e) => {
@@ -407,8 +403,8 @@ impl ProcessTapCapture {
         }
         resources.io_proc = io_proc;
 
-        // Prime the mach-to-host clock offset (a `OnceLock` that samples both clocks) off the
-        // real-time path: the IOProc must never be the thread that runs the one-time init.
+        // prime the mach-to-host clock offset (a `OnceLock`) here: the IOProc must never be the
+        // thread that runs the one-time init
         let _ = crate::macos_utils::streamer::clock::mach_ticks_to_host_ns(
             crate::macos_utils::streamer::mach::mach_now(),
         );
@@ -641,19 +637,15 @@ fn read_tap_format(
 
 /// Frames per IO cycle to ask the tap aggregate for.
 ///
-/// The default for an aggregate whose main sub-device is a built-in output is commonly 512 frames
-/// = 10.67 ms at 48 kHz, and that whole cycle is added to every sample before the ring sees it —
-/// the largest single term in the macOS host budget, next to a ring sized at 80 ms, a 125 us drain
-/// poll and Opus's 7.5 ms. Chromium runs 256 on output and treats 128 as its floor, the 256 being
-/// a *render*-side under-run guard a capture IOProc does not have.
+/// An aggregate on a built-in output commonly defaults to 512 frames (10.67 ms at 48 kHz), and
+/// that whole cycle is added to every sample before the ring sees it. Chromium treats 128 as
+/// its floor; its 256 is a *render*-side under-run guard a capture IOProc does not need.
 const TARGET_BUFFER_FRAMES: u32 = 128;
 
 /// Ask the aggregate for a short IO cycle, and record what it granted.
 ///
 /// Never fatal: an aggregate whose main sub-device is USB or Bluetooth may refuse, and whatever it
-/// grants still works. The logged range and granted value are the measurement — nobody has
-/// recorded what the HAL reports for a *tap* aggregate, the reference implementation this device
-/// is modelled on does not set it either.
+/// grants still works.
 fn set_aggregate_buffer_size(aggregate_id: AudioObjectID, diagnostics: &AudioDiagnostics) {
     use super::legacy::hal;
     let before = hal::buffer_frame_size(aggregate_id);

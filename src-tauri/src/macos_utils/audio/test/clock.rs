@@ -36,8 +36,8 @@ fn a_pre_epoch_extrapolation_reads_as_absent() {
     assert_eq!(anchored_ns(a, 0), 0);
 }
 
-/// The defect this replaced: a burst of frames drained together all claimed the drain time, so a
-/// short pass following a long one handed the client timestamps that went backwards.
+/// Stamping every frame of a burst with the drain time makes a short pass after a long one hand
+/// the client timestamps that go backwards.
 #[test]
 fn jittered_hardware_stamps_never_produce_a_decreasing_timestamp() {
     let jitter: [i64; 12] = [

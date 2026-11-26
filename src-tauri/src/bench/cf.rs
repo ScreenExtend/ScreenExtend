@@ -1,7 +1,7 @@
 //! The small amount of CoreFoundation / CoreVideo / CoreMedia / mach FFI the bench needs.
 //!
-//! Every function declared here exists on macOS 10.15 (most since 10.4–10.9); anything newer is
-//! `dlsym`'d. `scripts/build-bench-macos.sh` diffs the undefined symbols this module adds.
+//! Every function declared here exists on macOS 10.15 (most since 10.4 to 10.9); anything newer
+//! is `dlsym`'d. `scripts/build-bench-macos.sh` diffs the undefined symbols this module adds.
 
 use std::ffi::{c_char, c_void, CString};
 use std::ptr;
@@ -53,7 +53,7 @@ unsafe extern "C" {
 }
 
 unsafe extern "C-unwind" {
-    // Same signature as the other declarations in the crate, or rustc warns about the clash.
+    // same signature as the other declarations in the crate, or rustc warns about the clash
     fn CFDictionaryGetValue(the_dict: *const CFDictionary, key: *const c_void) -> *const c_void;
 }
 
@@ -227,10 +227,6 @@ pub fn parameter_sets(sb: &CMSampleBuffer, hevc: bool) -> Vec<Vec<u8>> {
     out
 }
 
-// ---------------------------------------------------------------------------------------------
-// Process / system facts.
-// ---------------------------------------------------------------------------------------------
-
 fn sysctl_raw(name: &str) -> Option<Vec<u8>> {
     let c = CString::new(name).ok()?;
     let mut len = 0usize;
@@ -396,10 +392,7 @@ pub fn video_encoder_list() -> serde_json::Value {
     cf_to_json(&v)
 }
 
-// ---------------------------------------------------------------------------------------------
-// Resource counts for leak checks (all from 10.0-era mach / POSIX).
-// ---------------------------------------------------------------------------------------------
-
+// resource counts for leak checks: all 10.0-era mach / POSIX
 unsafe extern "C" {
     fn mach_port_names(
         task: u32,

@@ -1,25 +1,12 @@
-//! The silent render companion: the clock source that makes loopback capture fire at all, and
-//! the only stream we own that is allowed to ask the engine for a smaller period.
+//! The silent render companion for endpoint loopback capture.
 //!
-//! Two jobs, and the second one is not obvious:
+//! Clock: with nothing rendering the engine parks the endpoint and the loopback event never fires
+//! (measured 0/20 event signals without a companion, 20/20 with one).
 //!
-//! 1. **Clock.** With nothing rendering, the engine parks the endpoint: no buffers, no events.
-//!    Measured on this repo's dev box (`docs/recovered/AUDIO_NOTES.md` §3.2, 20 iterations x
-//!    200 ms wait, host idle): **0/20** event signals without a companion, **20/20** with one.
-//!    OBS carries the same workaround for the same reason.
-//! 2. **Periodicity.** The engine runs one period for the whole endpoint and any stream on it
-//!    may set that period. Our *capture* stream cannot ask —
-//!    `IAudioClient3::InitializeSharedAudioStream` accepts only
-//!    `AUDCLNT_STREAMFLAGS_EVENTCALLBACK`, and the loopback flag is refused with
-//!    `AUDCLNT_E_INVALID_STREAM_FLAG` (measured, same notes §3.1). The companion has no loopback
-//!    flag, so it can ask, and the capture stream inherits the result. `acquire()` already starts
-//!    the companion *before* opening loopback, which is exactly the ordering this needs.
-//!
-//! The period request is a probed tier, never a version check: query
-//! `GetSharedModeEnginePeriod`, ask for the minimum only if the driver reports one below its
-//! default, and fall back to the legacy `Initialize` on any refusal. On hardware whose driver
-//! exposes a single period — the dev box, whose OEM driver reports 480 frames for all four
-//! values — the probe correctly declines and nothing changes.
+//! Period: it is the only stream we own that may ask the engine for a smaller period
+//! (`IAudioClient3::InitializeSharedAudioStream` refuses the loopback flag with
+//! `AUDCLNT_E_INVALID_STREAM_FLAG`), and the capture stream inherits the result, so the companion
+//! starts before loopback is opened. A driver that reports a single period makes this a no-op.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -36,12 +23,19 @@ use windows::Win32::System::Com::{CoTaskMemFree, CLSCTX_ALL};
 use super::device::{create_enumerator, default_render_endpoint};
 use super::engine;
 use super::guards::{ComGuard, EventHandle, MixFormatPtr};
+use super::loopback::{SetupReporter, StuckSetups};
+
+/// How long the companion's WASAPI open may take before the caller gives up on it. A healthy
+/// open is tens of milliseconds; this only bounds a wedged audio service or driver.
+const COMPANION_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Companion threads whose open outlived [`COMPANION_START_TIMEOUT`] and are still inside it.
+static STUCK_COMPANION_STARTS: StuckSetups = StuckSetups::new();
 
 pub struct SilenceCompanion {
     stop: Arc<AtomicBool>,
-    /// Cleared by the pump thread on the way out, so a caller can tell a live companion from a
-    /// dead one. Nothing used to notice: `pump` had three bare `break`s and the struct stayed
-    /// alive inside `Session` with the endpoint's clock gone.
+    /// Cleared by the pump thread on the way out: a dead companion means the endpoint has no
+    /// clock, and the struct itself stays alive inside `Session`.
     alive: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
     /// The engine period the companion negotiated, in frames; 0 when it took the default path.
@@ -50,36 +44,57 @@ pub struct SilenceCompanion {
 
 impl SilenceCompanion {
     pub fn start() -> Result<Self> {
+        // the capture thread retries a failed acquisition every few seconds, and against a wedged
+        // service each retry would park one more thread in the same call
+        if STUCK_COMPANION_STARTS.outstanding() > 0 {
+            anyhow::bail!(
+                "an earlier silence companion is still stuck opening the endpoint; not opening \
+                 another until it returns"
+            );
+        }
         let stop = Arc::new(AtomicBool::new(false));
         let alive = Arc::new(AtomicBool::new(true));
         let stop_thread = Arc::clone(&stop);
         let alive_thread = Arc::clone(&alive);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<u32>>();
+        let (ready_tx, token) = SetupReporter::new(ready_tx, &STUCK_COMPANION_STARTS);
 
         let join = std::thread::Builder::new()
             .name("audio-silence".to_string())
             .spawn(move || run(stop_thread, alive_thread, ready_tx))
             .context("spawning silence companion thread")?;
 
-        match ready_rx.recv() {
-            Ok(Ok(granted_period_frames)) => Ok(Self {
+        match super::loopback::await_ready(&ready_rx, COMPANION_START_TIMEOUT) {
+            super::loopback::Ready::Started(granted_period_frames) => Ok(Self {
                 stop,
                 alive,
                 join: Some(join),
                 granted_period_frames,
             }),
-            Ok(Err(e)) => {
+            super::loopback::Ready::Failed(e) => {
                 let _ = join.join();
                 Err(e)
             }
-            Err(_) => {
+            super::loopback::Ready::Exited => {
                 let _ = join.join();
                 anyhow::bail!("silence companion thread exited during setup")
+            }
+            super::loopback::Ready::TimedOut => {
+                // wedged inside the audio service: the thread leaves once the call returns (it
+                // checks `stop` before pumping) and is detached, because joining it would wedge
+                // the caller and through it the whole audio hub
+                stop.store(true, Ordering::Relaxed);
+                STUCK_COMPANION_STARTS.abandon(&token);
+                drop(join);
+                anyhow::bail!(
+                    "silence companion did not start within {} s",
+                    COMPANION_START_TIMEOUT.as_secs()
+                )
             }
         }
     }
 
-    /// False once the pump loop has exited — the endpoint has no clock and capture will starve.
+    /// False once the pump loop has exited: the endpoint has no clock and capture will starve.
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Relaxed)
     }
@@ -98,19 +113,22 @@ impl Drop for SilenceCompanion {
     }
 }
 
-fn run(
-    stop: Arc<AtomicBool>,
-    alive: Arc<AtomicBool>,
-    ready_tx: std::sync::mpsc::Sender<Result<u32>>,
-) {
+fn run(stop: Arc<AtomicBool>, alive: Arc<AtomicBool>, ready_tx: SetupReporter<u32>) {
     let result = unsafe { setup() };
     match result {
-        Ok((client, render, event, buffer_frames, granted, _com)) => {
+        Ok((client, render, event, buffer_frames, granted, com)) => {
             let _ = ready_tx.send(Ok(granted));
             unsafe { pump(&client, &render, &event, buffer_frames, &stop) };
             unsafe {
                 let _ = client.Stop();
             }
+            // release the COM interfaces before `com`: in the tuple pattern it is declared last
+            // and would drop first, and `CoUninitialize` ahead of them is survivable only because
+            // `keep_process_com_alive` pins the MTA
+            drop(render);
+            drop(client);
+            drop(event);
+            drop(com);
         }
         Err(e) => {
             let _ = ready_tx.send(Err(e));
@@ -137,8 +155,8 @@ unsafe fn init_render_stream(
     }
 
     if let Some(min_frames) = periods.and_then(|p| p.lower_than_default()) {
-        // A refused `InitializeSharedAudioStream` leaves this client in an undefined state as
-        // far as a second `Initialize` is concerned, so the fallback gets a fresh one.
+        // a refused `InitializeSharedAudioStream` leaves this client in an undefined state for a
+        // second `Initialize`, so the fallback gets a fresh one
         if let Ok(c3) = client.cast::<IAudioClient3>() {
             match c3.InitializeSharedAudioStream(
                 AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
@@ -172,7 +190,6 @@ unsafe fn init_render_stream(
                 }
             }
         }
-        // Fall through to the default path on a fresh client.
         let fresh: IAudioClient = device
             .Activate(CLSCTX_ALL, None)
             .context("re-Activate IAudioClient after a refused low-latency request")?;

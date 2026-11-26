@@ -7,22 +7,19 @@ export type AudioOutputsInfo = {
   /** The sink the host has asked for, i.e. what is stored against the device. */
   selected: string;
   /**
-   * The sink the client is actually playing on, as the client last reported it. It can
-   * diverge from `selected`: `setSinkId` needs transient activation in some engines, so a
-   * host-side change made while nobody is touching the phone does not apply until the next
-   * gesture, and Firefox's own output picker can change it behind the host's back.
+   * The sink the client last reported it is playing on. It can diverge from `selected`:
+   * `setSinkId` needs transient activation in some engines, so a host-side change waits for
+   * the next gesture, and Firefox's own output picker can change it behind the host's back.
    *
-   * Optional because it post-dates the payload and older clients will not send it — a
-   * missing field means "the client did not say", not "the default".
+   * Optional: older clients do not send it, and a missing field means "the client did not
+   * say", not "the default".
    */
   current?: string | null;
   /**
-   * Whether the ids in `outputs` came back carrying the operating system's own names.
-   * `false` means the browser withheld them -- the usual answer without a microphone
-   * grant, which this page deliberately no longer spends a prompt on -- so the client
-   * named them itself by position ("Output 1", "Default output"). Routing is unaffected:
-   * `setSinkId` takes the bare id. The host must simply not present those names as what
-   * the hardware is called.
+   * Whether the ids in `outputs` carry the operating system's own names. `false` means the
+   * browser withheld them (the usual answer without a microphone grant), so the client named
+   * them by position ("Output 1", "Default output"). Routing is unaffected: `setSinkId`
+   * takes the bare id. The host must not present those names as what the hardware is called.
    *
    * Optional, and `null` from a client that predates the field: "the client did not say",
    * which is not the same answer as `false`.
@@ -39,8 +36,8 @@ export type SessionInfo = {
   hostedNetworkOn: boolean;
 };
 
-// The setters are `useState` dispatchers, so this object can be built once and
-// never change. A component that only writes never re-renders.
+// the setters are `useState` dispatchers, so this object is built once and never changes:
+// a component that only writes never re-renders
 export type GlobalSetters = {
   setHostedNetworkOn: React.Dispatch<React.SetStateAction<boolean>>;
   setOtp: React.Dispatch<React.SetStateAction<string>>;

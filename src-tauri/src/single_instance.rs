@@ -15,44 +15,34 @@ pub const CTRL_FILE: &str = "screenextend.ctrl";
 pub enum Command {
     Focus,
     Quit,
-    /// Ask the running host for its live telemetry as one line of JSON. `ScreenExtend status`
-    /// runs in a separate process from the host, so this is the only way it can report
-    /// per-session counters that exist only in the host's memory.
+    /// Ask the running host for its live telemetry as one line of JSON: per-session counters
+    /// exist only in the host's memory, and `ScreenExtend status` is a separate process.
     Stats,
-    /// "Are you there?" — answered with `OK <pid>`. This is what lets another process test for a
-    /// running host without taking the lock, which is inherently racy: the GUI is not holding
-    /// it between `acquire_lock` and `std::mem::forget`, so a concurrent lock test can win it
-    /// and make the starting instance believe it is the second one.
+    /// Liveness, answered with `OK <pid>`. Testing for a host by taking the lock is racy: the
+    /// GUI does not hold it between `acquire_lock` and `std::mem::forget`, so a concurrent lock
+    /// test can win it and make the starting instance believe it is the second one.
     ///
-    /// The pid is a suffix rather than a second line, so a reader that only knows about the
-    /// bare `OK` still reads the answer it expects — the prefix-stable rule the client's
-    /// telemetry frames follow. It is what lets the display-driver probe say *which* process is
-    /// holding the driver's pipe instead of calling a busy driver a broken one.
+    /// The pid is a suffix, not a second line, so a reader that only knows the bare `OK` still
+    /// reads it. The display-driver probe uses it to name the process holding the driver's pipe.
     Ping,
     /// Re-read `config.json` and replay it into the running host's `AppState`, so a change
     /// made by `devices set` / `turn set` / `config set` applies live instead of at the next
     /// start. Answered with `OK` once the replay has run.
     Reload,
     /// Send back the running host's log backlog, newest last, one line per line, terminated by
-    /// a blank line. `ScreenExtend logs` runs in a fresh process whose own ring is empty, so
-    /// this is the only way for it to print anything.
+    /// a blank line. `ScreenExtend logs` runs in a fresh process whose own ring is empty.
     Logs,
-    /// Ask the running host which credentials it is *actually* serving, as one line of JSON.
+    /// Ask the running host which credentials it is actually serving, as one line of JSON.
+    /// A session id lives only in the host's memory (minted at bootstrap or at `serve` startup,
+    /// never written to `config.json`), and `qr`, `status` and `session new` each run in their
+    /// own process, so this is the only place they can read it.
     ///
-    /// `qr`, `status` and `session new` all run in their own process, and a session id lives
-    /// only in the host's memory — it is minted at bootstrap (the GUI) or at startup (`serve`)
-    /// and never written to `config.json`. Without this verb those commands had nothing to read,
-    /// so they each minted a fresh random id and printed join URLs for a session that does not
-    /// exist; a client that scanned one got `503 host offline` from the relay.
-    ///
-    /// **The reply carries the OTP.** That is a deliberate decision, not an oversight: the
-    /// socket is loopback-only and every request is authenticated with the 128-bit token in
-    /// `screenextend.ctrl`, which is written user-only — and whoever can read that file can
-    /// already `QUIT` the host or *set* its credentials with [`Command::SetSession`], so the
-    /// OTP is inside the trust boundary, not outside it. It is on the wire so that a setter can
-    /// read back what it applied (the desktop UI mirrors these two values and can push its own
-    /// copy back over them), which is a check no shipped command could otherwise make. No
-    /// shipped command prints it: `session new` prints the OTP it minted itself.
+    /// **The reply carries the OTP, deliberately.** The socket is loopback-only and every request
+    /// carries the 128-bit token from the user-only `screenextend.ctrl`; whoever can read that
+    /// file can already `QUIT` the host or set its credentials with [`Command::SetSession`], so
+    /// the OTP is inside the trust boundary. It is there so a setter can read back what it
+    /// applied (the desktop UI mirrors both values and can push its own copy back). No shipped
+    /// command prints it.
     Session,
     /// Apply new join credentials to the running host, and re-register the relay under the new
     /// id when the host has a public session. Answered with `OK` or `ERR <reason>`.
@@ -81,15 +71,14 @@ impl Command {
 /// What the running host is serving right now, carried by [`Command::Session`] in both
 /// directions: the host builds one, the reader parses one back.
 ///
-/// A `session_id` that is empty means the host is up but has not minted credentials yet — the
-/// desktop app does that from its bootstrap, so there is a window after launch where the answer
-/// is honestly "not yet" rather than an id.
+/// An empty `session_id` means the host is up but has not minted credentials yet (the desktop
+/// app does that from its bootstrap, some time after launch).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SessionInfo {
     pub session_id: String,
     pub otp: String,
-    /// Whether the host currently holds a cloud relay client, which is what "public sessions"
-    /// means to a *running* host — the persisted `publicSessionsEnabled` is only the intent.
+    /// Whether the host currently holds a cloud relay client. The persisted
+    /// `publicSessionsEnabled` is only the intent.
     pub public_sessions: bool,
     pub cloud_state: String,
     pub cloud_detail: String,
@@ -106,8 +95,8 @@ impl SessionInfo {
         })
     }
 
-    /// Parse a `SESSION` reply. `None` for anything that is not this object — which is also what
-    /// a host too old to know the verb answers, since it closes the connection saying nothing.
+    /// Parse a `SESSION` reply. `None` for anything that is not this object, which includes a
+    /// host too old to know the verb (it closes the connection saying nothing).
     pub fn from_json(v: &serde_json::Value) -> Option<Self> {
         let text = |key: &str| {
             v.get(key)
@@ -129,11 +118,8 @@ impl SessionInfo {
     }
 }
 
-/// One authenticated control request, parsed off the wire.
-///
-/// Split out from [`handle_connection`] so the wire format has a test that needs no Tauri app:
-/// the verbs that touch `AppState` cannot be exercised in a unit test, but every byte of the
-/// framing around them can.
+/// One authenticated control request, parsed off the wire. Split out from [`handle_connection`]
+/// so the wire format has a test that needs no Tauri app.
 #[derive(Debug, PartialEq)]
 pub(crate) enum Request<'a> {
     Focus,
@@ -148,9 +134,8 @@ pub(crate) enum Request<'a> {
 }
 
 /// Parse one request line. `None` means the token did not match and nothing should be done.
-///
-/// The token is compared in constant time, the same as the join OTP in `streamer/session.rs`,
-/// so the loopback port cannot be used to guess it a byte at a time.
+/// The token is compared in constant time, so the loopback port cannot be used to guess it a
+/// byte at a time.
 pub(crate) fn parse_request<'a>(line: &'a str, token: &str) -> Option<Request<'a>> {
     let mut parts = line.trim().splitn(2, ' ');
     let presented = parts.next().unwrap_or("");
@@ -188,11 +173,9 @@ pub(crate) fn parse_request<'a>(line: &'a str, token: &str) -> Option<Request<'a
 
 /// Reject credentials the host could not serve before they replace ones it can.
 ///
-/// `SessionAuth::validate` refuses an empty id or OTP outright, so applying an empty pair would
-/// silently take the host off the air; and the request line is space-separated, so a value
-/// carrying a space could not have survived the parse anyway. Everything else is a length and
-/// charset clamp — the same alphabet the minters use, plus `-` and `_` so an operator-chosen
-/// `--session-id` still passes.
+/// `SessionAuth::validate` refuses an empty id or OTP, so applying an empty pair would silently
+/// take the host off the air. The rest is a length and charset clamp: the minters' alphabet plus
+/// `-` and `_`, so an operator-chosen `--session-id` still passes.
 pub(crate) fn validate_credentials(session_id: &str, otp: &str) -> Result<(), String> {
     let ok = |s: &str| {
         s.chars()
@@ -212,12 +195,8 @@ pub(crate) fn validate_credentials(session_id: &str, otp: &str) -> Result<(), St
     Ok(())
 }
 
-/// What happened when we asked for the single-instance lock.
-///
-/// The three outcomes used to collapse into `Option::None`, so a permissions error, a read-only
-/// profile and a genuinely running second instance were indistinguishable — and every caller
-/// read them all as "already running", which for the GUI meant offering to show an instance
-/// that does not exist.
+/// What happened when we asked for the single-instance lock. A permissions error or a read-only
+/// profile (`Unavailable`) must not read as "already running" (`HeldByOther`).
 pub enum LockOutcome {
     Acquired(File),
     HeldByOther,
@@ -259,8 +238,8 @@ pub fn wait_for_lock(path: &Path, timeout: Duration) -> LockOutcome {
 
 /// Close the main window, which runs the app's own shutdown path.
 ///
-/// The headless `serve` host has no window, so it passes its own quit closure instead —
-/// `app.exit(0)` there would skip the BYE broadcast and leave every virtual display attached.
+/// The headless `serve` host has no window and passes its own quit closure instead: `app.exit(0)`
+/// there would skip the BYE broadcast and leave every virtual display attached.
 pub fn quit_main_window(app: &AppHandle) {
     crate::exit_reason::record(
         "control server: another process sent QUIT (`ScreenExtend stop`, a second instance, or \
@@ -323,6 +302,16 @@ where
     let token = format!("{:032x}", rand::rng().random::<u128>());
     write_ctrl_file(&ctrl_path, &format!("{port}\n{token}\n"))?;
 
+    // Windows: `gate` hands over a connection only once its whole request line has arrived, and
+    // a panic in one request does not end the server
+    #[cfg(windows)]
+    std::thread::spawn(move || {
+        gate::serve(listener, gate::Limits::default(), move |stream| {
+            let _ = stream.set_read_timeout(Some(CTRL_READ_TIMEOUT));
+            handle_connection(stream, &app, &token, focus, &quit, &reload);
+        });
+    });
+    #[cfg(not(windows))]
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
@@ -337,6 +326,231 @@ where
 /// a port the OS has since handed to somebody else.
 pub fn clear_control_file(ctrl_path: &Path) {
     let _ = std::fs::remove_file(ctrl_path);
+}
+
+/// The control server's accept loop on Windows, hardened against the two ways one connection
+/// could disable every verb for the life of the process.
+///
+/// * **A slow client.** Connecting takes no token, and a read timeout applies per read, not per
+///   request. So each connection waits for its line on a short-lived thread of its own, `peek`ing
+///   so the handler still reads the line itself, and is dropped when the line is longer than
+///   [`Limits::max_line`] or has not arrived by [`Limits::deadline`]. The handler never waits on
+///   a client to speak, and replies carry a write timeout.
+/// * **A panic.** The handler runs each request under `catch_unwind`.
+///
+/// Requests still execute one at a time, in the order their lines completed, on one handler
+/// thread: the verbs were written for that and the quit and reload callbacks are not `Sync`.
+#[cfg(windows)]
+mod gate {
+    use std::io::ErrorKind;
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    #[derive(Clone, Copy, Debug)]
+    pub(super) struct Limits {
+        /// Longest request line accepted. The longest real one is a `SESSION <id> <otp>` of well
+        /// under 200 bytes.
+        pub max_line: usize,
+        /// How long a connection has to deliver its whole line.
+        pub deadline: Duration,
+        /// Connections waiting for their line at once; more are closed on arrival.
+        pub max_pending: usize,
+        /// How long writing a reply may block on a client that does not read.
+        pub reply_timeout: Duration,
+    }
+
+    impl Default for Limits {
+        fn default() -> Self {
+            Self {
+                max_line: 4096,
+                deadline: Duration::from_secs(2),
+                max_pending: 32,
+                reply_timeout: Duration::from_secs(2),
+            }
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub(super) enum Arrival {
+        Ready,
+        TooLong,
+        Closed,
+        TimedOut,
+    }
+
+    const POLL: Duration = Duration::from_millis(20);
+
+    /// Wait until `stream` has a whole line buffered, without consuming any of it.
+    pub(super) fn wait_for_line(stream: &TcpStream, limits: &Limits) -> Arrival {
+        let start = Instant::now();
+        let mut buf = vec![0u8; limits.max_line];
+        let _ = stream.set_read_timeout(Some(POLL));
+        let mut seen = 0usize;
+        loop {
+            match stream.peek(&mut buf) {
+                Ok(0) => return Arrival::Closed,
+                Ok(n) => {
+                    if buf[..n].contains(&b'\n') {
+                        return Arrival::Ready;
+                    }
+                    if n >= limits.max_line {
+                        return Arrival::TooLong;
+                    }
+                    // `peek` returns at once while unread bytes are waiting, so nothing new
+                    // having arrived is the case that must sleep rather than spin.
+                    if n == seen {
+                        std::thread::sleep(POLL);
+                    }
+                    seen = n;
+                }
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                Err(_) => return Arrival::Closed,
+            }
+            if start.elapsed() >= limits.deadline {
+                return Arrival::TimedOut;
+            }
+        }
+    }
+
+    /// Accept on `listener` for the life of the process, handing each connection whose request
+    /// line has arrived to `handler`, one at a time.
+    pub(super) fn serve<H>(listener: TcpListener, limits: Limits, handler: H)
+    where
+        H: FnMut(TcpStream) + Send + 'static,
+    {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<TcpStream>(limits.max_pending);
+        let spawned = std::thread::Builder::new()
+            .name("control-handler".into())
+            .spawn(move || {
+                let mut handler = handler;
+                for stream in rx {
+                    let _ = stream.set_write_timeout(Some(limits.reply_timeout));
+                    let outcome =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(stream)));
+                    if outcome.is_err() {
+                        teprintln!(
+                            "[single-instance] a control request panicked; the control server \
+                             carries on"
+                        );
+                    }
+                }
+            });
+        if let Err(e) = spawned {
+            teprintln!("[single-instance] could not start the control handler: {e}");
+            return;
+        }
+        let pending = Arc::new(AtomicUsize::new(0));
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            if pending.fetch_add(1, Ordering::AcqRel) >= limits.max_pending {
+                pending.fetch_sub(1, Ordering::AcqRel);
+                continue; // dropping it closes it
+            }
+            let (tx, waiting) = (tx.clone(), Arc::clone(&pending));
+            let spawned = std::thread::Builder::new()
+                .name("control-conn".into())
+                .spawn(move || {
+                    if wait_for_line(&stream, &limits) == Arrival::Ready {
+                        let _ = tx.send(stream);
+                    }
+                    waiting.fetch_sub(1, Ordering::AcqRel);
+                });
+            if spawned.is_err() {
+                pending.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::{Ipv4Addr, SocketAddr};
+        use std::sync::atomic::AtomicBool;
+
+        /// A server whose handler echoes the request line, or panics on `boom`.
+        fn echo_server(limits: Limits, invoked: Arc<AtomicBool>) -> SocketAddr {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let addr = listener.local_addr().unwrap();
+            std::thread::spawn(move || {
+                serve(listener, limits, move |mut stream| {
+                    invoked.store(true, Ordering::SeqCst);
+                    let mut line = String::new();
+                    BufReader::new(stream.try_clone().unwrap())
+                        .read_line(&mut line)
+                        .unwrap();
+                    if line.trim() == "boom" {
+                        panic!("a verb panicked");
+                    }
+                    let _ = stream.write_all(format!("echo {line}").as_bytes());
+                });
+            });
+            addr
+        }
+
+        fn ask(addr: SocketAddr, line: &str) -> String {
+            let mut s = TcpStream::connect(addr).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            s.write_all(line.as_bytes()).unwrap();
+            let mut out = String::new();
+            let _ = s.read_to_string(&mut out);
+            out
+        }
+
+        #[test]
+        fn a_client_that_dribbles_does_not_hold_up_the_next_request() {
+            let limits = Limits {
+                deadline: Duration::from_secs(5),
+                ..Limits::default()
+            };
+            let addr = echo_server(limits, Arc::new(AtomicBool::new(false)));
+            let mut slow = TcpStream::connect(addr).unwrap();
+            let dribbler = std::thread::spawn(move || {
+                for _ in 0..20 {
+                    if slow.write_all(b"x").is_err() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            });
+            std::thread::sleep(Duration::from_millis(150));
+            let t0 = Instant::now();
+            assert_eq!(ask(addr, "status\n"), "echo status\n");
+            assert!(
+                t0.elapsed() < Duration::from_secs(1),
+                "the request waited behind the dribbling client ({:?})",
+                t0.elapsed()
+            );
+            dribbler.join().unwrap();
+        }
+
+        #[test]
+        fn a_panicking_request_does_not_end_the_server() {
+            let addr = echo_server(Limits::default(), Arc::new(AtomicBool::new(false)));
+            assert_eq!(ask(addr, "boom\n"), "");
+            assert_eq!(ask(addr, "again\n"), "echo again\n");
+        }
+
+        #[test]
+        fn an_oversized_or_unfinished_line_never_reaches_the_handler() {
+            let limits = Limits {
+                deadline: Duration::from_millis(300),
+                ..Limits::default()
+            };
+            let invoked = Arc::new(AtomicBool::new(false));
+            let addr = echo_server(limits, invoked.clone());
+
+            let t0 = Instant::now();
+            assert_eq!(ask(addr, &"x".repeat(5000)), "");
+            assert_eq!(ask(addr, "no newline"), "");
+            assert!(t0.elapsed() < Duration::from_secs(3));
+            assert!(!invoked.load(Ordering::SeqCst));
+            // and the server is still answering
+            assert_eq!(ask(addr, "ok\n"), "echo ok\n");
+        }
+    }
 }
 
 fn handle_connection<Q, R>(
@@ -370,13 +584,21 @@ fn handle_connection<Q, R>(
         }
         Request::Quit => quit(app),
         Request::Stats => {
-            // The telemetry registry is keyed by join id and carries no labels, so the session
-            // map supplies the names, addresses and geometry `devices list` prints beside them.
+            // the telemetry registry is keyed by join id and carries no labels: the session map
+            // supplies the names, addresses and geometry `devices list` prints beside them
             let mut snapshot = crate::streamer::telemetry::snapshot_json();
             if let Some(state) = app.try_state::<crate::AppState>() {
                 if let Some(obj) = snapshot.as_object_mut() {
                     obj.insert("joins".into(), join_rows(&state.sessions));
+                    let tier = state.audio_hub.diagnostics().map(|d| d.tier());
+                    if let Some(tier) = tier.filter(|t| !t.is_empty()) {
+                        obj.insert("audio_tier".into(), tier.into());
+                    }
                 }
+            }
+            #[cfg(windows)]
+            if let Some(obj) = snapshot.as_object_mut() {
+                obj.insert("tune".into(), tune_json());
             }
             let json = snapshot.to_string();
             let _ = stream.write_all(json.as_bytes());
@@ -400,9 +622,8 @@ fn handle_connection<Q, R>(
             let _ = stream.write_all(out.as_bytes());
             let _ = stream.flush();
         }
-        // The two `AppState` verbs are handled by `cli`, which is where the per-OS `platform`
-        // alias and the Tauri commands live; this module stays OS-independent, the same way
-        // `RELOAD` is a callback rather than a config reader.
+        // the two `AppState` verbs live in `cli`, beside the per-OS `platform` alias, so this
+        // module stays OS-independent (the same reason `RELOAD` is a callback)
         Request::Session => {
             let reply = crate::cli::live_session_info(app).to_json().to_string();
             let _ = stream.write_all(reply.as_bytes());
@@ -423,10 +644,9 @@ fn handle_connection<Q, R>(
     }
 }
 
-/// The `LOGS` reply: the backlog, one line per line.
-///
-/// Read with `backlog_snapshot`, not `get_log_backlog` — that is the desktop panel's command and
-/// arms the `LogLine` stream as a side effect, which a CLI reader that never listens must not do.
+/// The `LOGS` reply: the backlog, one line per line. Read with `backlog_snapshot`, not
+/// `get_log_backlog`: that command arms the `LogLine` stream as a side effect, which a CLI
+/// reader that never listens must not do.
 fn logs_reply() -> String {
     let mut out = String::new();
     for line in crate::logbus::backlog_snapshot() {
@@ -456,11 +676,8 @@ pub fn query_running_instance(ctrl_path: &Path, command: Command) -> Option<Stri
     Some(read_reply(&mut stream))
 }
 
-/// Read a reply to the end and decode it once.
-///
-/// Decoding each 4 KiB read on its own turned any multi-byte character that straddled a read
-/// boundary into two U+FFFD — and the `LOGS` reply is many kilobytes of lines full of `…`, `—`,
-/// `→` and `─`, so `ScreenExtend logs` mangled a few of them on every call.
+/// Read a reply to the end and decode it once: decoding each 4 KiB read on its own turns a
+/// multi-byte character that straddles a read boundary into two U+FFFD.
 fn read_reply(stream: &mut impl std::io::Read) -> String {
     let mut bytes = Vec::new();
     let mut buf = [0u8; 4096];
@@ -475,11 +692,7 @@ fn read_reply(stream: &mut impl std::io::Read) -> String {
 }
 
 /// Where this process's control file lives, remembered once so code with no `AppHandle` in
-/// reach can still ask whether a host is up and which pid it is.
-///
-/// The display-driver probe is the caller that needs it: it runs inside
-/// `check_system_requirements`, a plain Tauri command, and the answer it wants — "is the pipe
-/// held by one of ours, and which?" — is exactly what the control socket knows.
+/// reach (the display-driver probe) can still ask whether a host is up and which pid it is.
 static CTRL_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 pub fn remember_ctrl_path(path: PathBuf) {
@@ -530,6 +743,14 @@ pub fn signal_running_instance(ctrl_path: &Path, command: Command) -> bool {
         .is_ok()
 }
 
+/// The A/B switches this host has asked about, and any name the environment set that none did
+/// (a typo in `SE_TUNE_ON` is otherwise silent).
+#[cfg(windows)]
+fn tune_json() -> serde_json::Value {
+    use crate::windows_utils::streamer::tune;
+    serde_json::json!({ "switches": tune::report(), "unknown": tune::unknown() })
+}
+
 /// One JSON object per live join, for `ScreenExtend devices list` and `status --json`.
 ///
 /// Keyed by the join id, which is the session's identity. The address is a label beside it: it
@@ -571,8 +792,19 @@ fn join_rows(sessions: &crate::streamer::session::SharedSessions) -> serde_json:
 mod test {
     use super::*;
 
-    /// `PING` grew a pid on the end of its reply. A reader that predates it must still see an
-    /// `OK`, and a reader that wants the pid must not be confused by one that has none.
+    #[cfg(windows)]
+    #[test]
+    fn stats_carry_the_switches_this_host_asked_about() {
+        assert!(crate::windows_utils::streamer::tune::on(
+            "stats_selftest_ships_on"
+        ));
+        let tune = tune_json();
+        assert_eq!(tune["switches"]["stats_selftest_ships_on"]["value"], true);
+        assert!(tune["unknown"].is_array());
+    }
+
+    /// A reader that predates the pid suffix must still see an `OK`, and one that wants the pid
+    /// must cope with a reply that has none.
     #[test]
     fn the_ping_reply_is_prefix_stable() {
         assert!(is_ok_reply("OK"));
@@ -603,7 +835,7 @@ mod test {
                 Ok(n)
             }
         }
-        let text = "[display] at startup … ─── → done — ok\n".repeat(50);
+        let text = "[display] at startup … ─── → done - ok\n".repeat(50);
         let reply = read_reply(&mut Dribble(text.as_bytes()));
         assert!(
             !reply.contains('\u{FFFD}'),
@@ -612,15 +844,16 @@ mod test {
         assert_eq!(reply, text);
     }
 
-    /// `ScreenExtend logs` reads the backlog and goes away; it never listens to `LogLine`. It used
-    /// to read through the panel's command, which arms the event stream, so one `logs` against
-    /// the desktop app left every later log line serialised into an IPC event nobody read.
+    /// `ScreenExtend logs` never listens to `LogLine`, so it must not arm the event stream: every
+    /// later log line would be serialised into an IPC event nobody reads.
     #[test]
     fn the_logs_verb_does_not_arm_the_panel_stream() {
         crate::logbus::set_log_streaming(false);
-        crate::logbus::push_line("single-instance-logs-verb-probe".to_string());
         let mut reply = String::new();
         for _ in 0..200 {
+            // pushed on every turn: under a noisy parallel run one line can be dropped on overflow
+            // or pushed out of the backlog before it is read
+            crate::logbus::push_line("single-instance-logs-verb-probe".to_string());
             reply = logs_reply();
             if reply.contains("single-instance-logs-verb-probe") {
                 break;
@@ -645,8 +878,8 @@ mod test {
             .wire(),
             "SESSION MQZ8VLBXBZPH 418203"
         );
-        // The verbs that predate it are unchanged, which is what lets a new CLI drive an older
-        // host for everything but SESSION.
+        // older verbs are unchanged, so a new CLI can drive an older host for everything but
+        // SESSION
         assert_eq!(Command::Ping.wire(), "PING");
         assert_eq!(Command::Stats.wire(), "STATS");
     }
@@ -672,7 +905,7 @@ mod test {
             parse_request(&format!("{TOKEN} NOPE"), TOKEN),
             Some(Request::Unknown)
         );
-        // A wrong, short or absent token is indistinguishable from any other: nothing at all.
+        // a wrong, short or absent token is indistinguishable from any other: nothing at all
         assert_eq!(
             parse_request("wrong SESSION ABCDEFGHJKLM 123456", TOKEN),
             None
@@ -681,7 +914,7 @@ mod test {
         assert_eq!(parse_request("", TOKEN), None);
     }
 
-    /// A `SESSION` set with one argument is a set with an empty OTP, not a query — otherwise a
+    /// A `SESSION` set with one argument is a set with an empty OTP, not a query: otherwise a
     /// truncated request would read as "tell me the credentials" and answer with them.
     #[test]
     fn a_half_written_set_is_a_set_and_is_refused() {
@@ -711,7 +944,7 @@ mod test {
             cloud_detail: "Registered · https://session.screenextend.app/j/MQZ8VLBXBZPH".into(),
         };
         assert_eq!(SessionInfo::from_json(&info.to_json()), Some(info));
-        // What a host too old for the verb answers: it closes the connection saying nothing.
+        // what a host too old for the verb answers: it closes the connection saying nothing
         assert_eq!(
             serde_json::from_str::<serde_json::Value>("")
                 .ok()
@@ -727,9 +960,6 @@ mod test {
     /// The whole `SESSION` exchange over a real loopback socket, with a `Mutex<SessionInfo>`
     /// standing in for the host's `AppState`: the shipped ctrl file, the shipped client
     /// (`query_running_instance`), the shipped parser and the shipped reply shapes.
-    ///
-    /// This is the round trip the defect needed and did not have — `qr` and `session new` minted
-    /// an id per invocation because there was no verb to ask the running host for one.
     #[test]
     fn a_session_query_reads_back_what_a_session_set_wrote() {
         use std::sync::{Arc, Mutex};

@@ -58,8 +58,7 @@ pub struct AppState {
     pub server_ports: SharedServerPorts,
     pub disable_gpu_encode: Arc<std::sync::atomic::AtomicBool>,
     /// Which encoder the pipelines should ask for, from `serve --encoder`. A process-lifetime
-    /// CLI choice rather than a user setting, so it is not persisted and has no Tauri command;
-    /// the two places that build a streaming `Config` read it when they build one.
+    /// CLI choice, not a user setting: not persisted, no Tauri command.
     pub encoder_vendor: Arc<Mutex<crate::streamer::config::EncoderVendor>>,
     pub cloud: Mutex<Option<CloudClient>>,
     pub cloud_status: Arc<Mutex<(String, String)>>,
@@ -95,8 +94,8 @@ impl CloudStatusSink for TauriCloudStatusSink {
 
     fn session_rotated(&self, session_id: String) {
         use tauri_specta::Event;
-        // Only the id moved: the relay found this one taken and picked another. An empty `otp`
-        // says so, and the UI keeps the code it is already showing.
+        // only the id moved (the relay found it taken and picked another): an empty `otp` tells
+        // the UI to keep the code it is already showing
         let payload = crate::SessionIdChange {
             session_id,
             otp: String::new(),
@@ -139,9 +138,7 @@ pub async fn setup(app_handle: tauri::AppHandle) -> bool {
     audio::legacy::routing::recover_on_launch();
     let virtual_display = tauri::async_runtime::spawn_blocking(new_shared_controller).await;
 
-    // `setup` returns a bare bool, so the only place the reason can survive is the log backlog —
-    // and until now `Ok(None)` and a panicking `new_shared_controller` were indistinguishable, with
-    // the panic payload discarded.
+    // `setup` returns a bare bool, so the log backlog is the only place the reason survives
     let virtual_display = match virtual_display {
         Ok(Some(vd)) => vd,
         Ok(None) => {
@@ -188,9 +185,8 @@ pub async fn setup(app_handle: tauri::AppHandle) -> bool {
         cloud_status: Arc::new(Mutex::new(("connecting".to_string(), String::new()))),
         audio_hub: crate::streamer::audio::AudioHub::new(),
     };
-    // The saved STUN list, read from the same store the CLI writes, so `stun set`, `serve` and
-    // the desktop app all agree. Absent means "keep the built-in default"; an empty list is the
-    // deliberate "no STUN at all", which a LAN-only host has every reason to choose.
+    // saved STUN list, from the store the CLI writes. Absent keeps the built-in default; an
+    // empty list is a deliberate "no STUN at all" (a LAN-only host)
     if let Some(urls) = crate::cli::saved_stun_urls(&app_handle) {
         if urls.is_empty() {
             tprintln!("[ice] STUN disabled by configuration; host candidates only");
@@ -209,34 +205,21 @@ pub async fn setup(app_handle: tauri::AppHandle) -> bool {
 /// atomic read and the screen-recording read is the window-list probe, 0.6 ms warm.
 const WATCHDOG_TICK: Duration = Duration::from_secs(5);
 
-/// How often authorization is actually re-read while a session is streaming.
+/// How often authorization is re-read while a session is streaming.
 const TCC_REPROBE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Watch two things that can change under a live session and that nothing else notices.
 ///
-/// **Screen-recording consent.** macOS 15 re-asks roughly every 30 days and there is no
-/// supported way to suppress it. A host left running as a permanent second monitor -- the
-/// product's whole use case -- will meet that with a device connected, and if the user
-/// dismisses the dialog the capture APIs go on delivering frames: they just contain
-/// wallpaper. So the host reports a healthy stream while the client shows a blank desktop.
-/// `ensure_screen_recording_access` catches this at pipeline start, which is every join
-/// and every refresh, and nowhere in between -- this is the in-between. It acts only on
-/// `Some(false)` from `screen_recording_live`, which is `Silent::DefinitelyDenied`: live
-/// positive evidence (other apps' windows on screen, titles stripped) in a process that has
-/// never confirmed a grant. `None` is `Unknown` -- including the cached preflight negative
-/// of a host granted while running with nothing else on screen -- and never kicks.
+/// **Screen-recording consent.** macOS 15 re-asks roughly every 30 days, and if the user
+/// dismisses the dialog the capture APIs go on delivering frames of wallpaper, so the host
+/// reports a healthy stream. `ensure_screen_recording_access` only runs at pipeline start.
+/// This acts only on `Some(false)` from `screen_recording_live`, a definite denial: `None` is
+/// unknown and never kicks. It cannot see a grant withdrawn from a process that started
+/// authorized, because `CGPreflightScreenCaptureAccess == true` stays cached for its whole life.
 ///
-/// What that leaves it able to catch is a session that started on `Unknown` and turns out
-/// to be streaming wallpaper. It can no longer see a grant *withdrawn* from a process that
-/// had confirmed one, and in practice it never could for the common case: a process that
-/// started authorized gets `CGPreflightScreenCaptureAccess == true` cached for its whole
-/// life, which reads as granted whatever happens later. (It used to require a prior
-/// `Some(true)`, which now latches `CONFIRMED` and would make the edge unreachable.)
-///
-/// **AirPlay geometry.** On that display tier macOS owns the display and moves it under
-/// us; the sender re-sends codec data when it does, which `MirrorStats` latches. Bumping
-/// the reconfig epoch hands that to the client on its next `/reconfig` poll instead of
-/// waiting for a size poll to notice.
+/// **AirPlay geometry.** On that display tier macOS owns the display and can move it; the
+/// sender re-sends codec data when it does, which `MirrorStats` latches. Bumping the reconfig
+/// epoch hands that to the client on its next `/reconfig` poll.
 fn start_session_watchdog(app_handle: tauri::AppHandle) {
     std::thread::Builder::new()
         .name("se-session-watchdog".into())
@@ -270,14 +253,14 @@ fn start_session_watchdog(app_handle: tauri::AppHandle) {
                     sessions.values().any(|s| s.live_display.is_some())
                 };
                 if !streaming {
-                    // Nothing to protect, and the next join re-reads authorization anyway.
+                    // nothing to protect, and the next join re-reads authorization anyway
                     continue;
                 }
                 if last_probe.elapsed() < TCC_REPROBE_INTERVAL {
                     continue;
                 }
                 last_probe = Instant::now();
-                // `Some(false)` is a definite denial and nothing weaker (see above).
+                // `Some(false)` is a definite denial, nothing weaker
                 if permissions::screen_recording_live() == Some(false) {
                     teprintln!(
                         "[tcc] Screen Recording is definitely not authorized while streaming \
@@ -298,10 +281,8 @@ fn start_session_watchdog(app_handle: tauri::AppHandle) {
                         session::bump_kick_epoch(&state.sessions, &join);
                         session::signal_leave(&state.sessions, &join);
                     }
-                    // The log line above is the record; this is what puts it in front of
-                    // the person at the host, who is otherwise left to work out why a
-                    // device dropped. `App.tsx` answers it by re-opening the permission
-                    // gate over whatever route is mounted.
+                    // tell the person at the host why the device dropped: `App.tsx` answers
+                    // this by re-opening the permission gate over whatever route is mounted
                     use tauri_specta::Event as _;
                     if let Err(e) = (crate::ScreenRecordingRevoked {
                         key: permissions::KEY_SCREEN_RECORDING.to_string(),
@@ -343,12 +324,9 @@ pub fn set_device_override(
     } else {
         1.0
     };
-    // Both of the carried-over fields are read under **one** guard, before the struct literal.
-    // Two `lock_recover()` calls inside one struct literal are two guards alive at the same time
-    // on the same non-reentrant mutex — the temporaries live to the end of the statement, not to
-    // the end of their line — so the second one deadlocked the caller. `serve` calls this once
-    // per saved device at startup, which is why a host with any device in `config.json` hung
-    // before it ever printed a join URL.
+    // the carried-over fields are read under ONE guard, before the struct literal: two
+    // `lock_recover()` temporaries inside one literal both live to the end of the statement, and
+    // the second deadlocks on the non-reentrant mutex
     let Some(token) = resolve_device(&state, &device) else {
         return;
     };
@@ -379,27 +357,17 @@ pub fn set_device_override(
         control_enabled,
         dpr,
         audio_enabled,
-        // Neither of these is an argument here: `set_device_override` is already at specta's
-        // ten-argument ceiling, and unlike everything above them they need no rebuild verdict.
-        // `set_device_pointer_scope` and `set_device_auto_frame_rate` own them, and a device
-        // with no saved value keeps the default rather than being reset by an unrelated
-        // display change.
+        // not arguments here (specta's ceiling is ten): `set_device_pointer_scope` and
+        // `set_device_auto_frame_rate` own them, and a device with no saved value keeps the default
         pointer_scope: carried_scope,
         auto_frame_rate: carried_auto_frame_rate,
         adaptive_quality: carried_modes.0,
         native_dpr: carried_modes.1,
         auto_orientation: carried_modes.2,
     };
-    // What this edit costs the stream, decided by comparing the saved row against the one the
-    // sheet just submitted rather than by the fact that a save happened at all. The desktop UI
-    // writes every field on every save, so without the comparison renaming a device — or moving
-    // anything the pipeline never reads — bumped the epoch, and the client answers an epoch bump
-    // by rebuilding. `ReconfigAction` is the whole rule; `session.rs` holds it and the field
-    // table that tests it.
-    //
-    // A device with no saved row is the one case that cannot be compared, and the join path now
-    // seeds one, so in practice this is only ever a device that is not connected — where a bump
-    // reaches zero sessions anyway.
+    // the desktop UI writes every field on every save, so what the edit costs the stream comes
+    // from comparing the saved row with the submitted one (`ReconfigAction`, in `session.rs`).
+    // No saved row means a device that is not connected, where a bump reaches zero sessions
     let action = {
         let mut overrides = state.device_overrides.lock_recover();
         let action = match overrides.get(&token) {
@@ -409,11 +377,11 @@ pub fn set_device_override(
         overrides.insert(token.clone(), next);
         action
     };
-    // A save makes the refresh rate a setting rather than the join's detection.
+    // a save makes the refresh rate a setting, not the join's detection.
     // UNVERIFIED (not compiled): mirror of the Windows change.
     session::clear_join_seeded(&token);
-    // Class (b), whatever else this edit did: remote control is read per event, so it lands on
-    // the pointer that is moving now rather than on the next connection.
+    // remote control is read per event, so it lands on the pointer that is moving now, not on
+    // the next connection
     session::apply_live_input_for_device(
         &state.sessions,
         &token,
@@ -421,13 +389,12 @@ pub fn set_device_override(
         next.pointer_scope,
     );
     match action {
-        // Classes (a), (b) and (c). Nothing on the wire, nothing on the dashboard, nothing to
-        // the client: the name moved, or control did, or the audio sink, and the picture the
-        // user is looking at is already the right picture.
+        // the name moved, or control, or the audio sink: nothing the picture depends on, so
+        // nothing goes to the client
         ReconfigAction::Nothing => {
             tprintln!("device {token} settings saved; nothing the live stream reads has changed");
         }
-        // The extended desktop's DPI changes under a stream whose geometry is already correct.
+        // the extended desktop's DPI changes under a stream whose geometry is already correct
         ReconfigAction::ScaleLive => {
             let sessions = state.sessions.clone();
             let effective = ((next.dpr * next.scale as f64).round() as u32).clamp(
@@ -440,16 +407,15 @@ pub fn set_device_override(
                 )
                 .await;
                 if applied == 0 {
-                    // Nothing live to touch, so there is nothing to apply it to; the next join
-                    // reads it back out of the override map anyway.
+                    // no live display: the next join reads it back out of the override map
                     tprintln!(
                         "display scale for device {token} saved; no live display to apply it to"
                     );
                 }
             });
         }
-        // Every tab this device has open, because the settings are the device's. The client
-        // renegotiates on its own join id, so the display it is watching survives the change.
+        // every tab this device has open, because the settings are the device's. The client
+        // renegotiates on its own join id, so the display it is watching survives
         ReconfigAction::Rebuild => {
             let moved = session::bump_reconfig_epoch_for_device(&state.sessions, &token);
             tprintln!(
@@ -460,13 +426,12 @@ pub fn set_device_override(
     }
 }
 
-/// Resolve whatever the caller had — a device token, or an address it happens to know — to the
-/// one identity the host stores settings under.
+/// Resolve what the caller has (a device token, or an address) to the identity the host stores
+/// settings under.
 ///
-/// A token is passed straight through. An address is a convenience for the CLI and for a caller
-/// holding an old row: it resolves only while exactly one device is connected from it, because an
-/// address is a place and not a device. Anything else is refused with a line in the log rather
-/// than guessed at, since guessing is how one device ends up wearing another's settings.
+/// A token passes straight through. An address resolves only while exactly one device is
+/// connected from it: it is a place, not a device, and guessing is how one device ends up
+/// wearing another's settings.
 pub fn resolve_device(state: &AppState, key: &str) -> Option<String> {
     let key = key.trim();
     if key.is_empty() {
@@ -479,7 +444,7 @@ pub fn resolve_device(state: &AppState, key: &str) -> Option<String> {
         Some(token) => {
             tprintln!(
                 "[devices] {key} is an address, not a device; resolved to the device connected \
-                 from it — pass the token to be sure which device you mean"
+                 from it. Pass the token to be sure which device you mean"
             );
             Some(token)
         }
@@ -501,10 +466,10 @@ fn is_device_token(s: &str) -> bool {
 }
 
 /// Where a pointer-locked client may drive this host's cursor: `"all"` (every screen, including
-/// the host's real monitors — the default) or `"display"` (only the screen it is streaming).
+/// the host's real monitors, the default) or `"display"` (only the screen it is streaming).
 ///
 /// Its own command rather than another `set_device_override` argument: that one is at specta's
-/// ten-argument ceiling, and this needs none of its machinery — no clamp, no rebuild verdict,
+/// ten-argument ceiling, and this needs none of its machinery: no clamp, no rebuild verdict,
 /// no live display to touch. The injector reads the scope when the session is built, so a
 /// change applies to the next connection, exactly like remote control itself.
 #[tauri::command]
@@ -532,8 +497,8 @@ pub fn set_device_pointer_scope(state: State<'_, AppState>, device: String, scop
         .map(|o| o.control_enabled)
         .unwrap_or(true);
     drop(overrides);
-    // Class (b): straight into every live injector this device is driving. No epoch, because
-    // nothing the encoder or the client reads has moved.
+    // class (b): straight into every live injector this device drives, with no epoch
+    // (nothing the encoder or the client reads has moved)
     let reached =
         session::apply_live_input_for_device(&state.sessions, &token, control_enabled, parsed);
     tprintln!(
@@ -544,15 +509,15 @@ pub fn set_device_pointer_scope(state: State<'_, AppState>, device: String, scop
 
 /// Whether this device's stream may drop below its chosen refresh rate on its own.
 ///
-/// Off is the default and the owner's ruling: the rate the user picked is the rate the stream
+/// Off is the default: the rate the user picked is the rate the stream
 /// runs at, an unchanged frame is repeated rather than skipped, and no controller lowers it.
-/// A separate command for the same reason as `set_device_pointer_scope` — `set_device_override`
-/// is at specta's ten-argument ceiling — and read by the pipeline when the session is built, so
+/// A separate command for the same reason as `set_device_pointer_scope` (`set_device_override`
+/// is at specta's ten-argument ceiling) and read by the pipeline when the session is built, so
 /// a change applies to the next connection.
 ///
 /// **UNVERIFIED on macOS**: written to keep the command surface identical across the three
-/// `*_utils` modules and never compiled on a Mac in this workstream. The macOS pipeline's half
-/// of the ruling is not implemented at all.
+/// `*_utils` modules and never compiled on a Mac. The macOS pipeline does not read it yet:
+/// its half is not implemented at all.
 #[tauri::command]
 #[specta::specta]
 pub fn set_device_auto_frame_rate(state: State<'_, AppState>, device: String, enabled: bool) {
@@ -578,9 +543,8 @@ pub fn set_device_auto_frame_rate(state: State<'_, AppState>, device: String, en
         }
     };
     drop(overrides);
-    // Class (d): the pipeline copies this out of the override map when the session is built and
-    // the display's compose rate is chosen from it, so it takes a rebuild — but only when it
-    // actually moved. It used to take neither, which left the setting inert until the next join.
+    // class (d): read when the session is built (the display's compose rate is chosen from it),
+    // so it takes a rebuild, but only when it moved
     if changed {
         let moved = session::bump_reconfig_epoch_for_device(&state.sessions, &token);
         tprintln!(
@@ -600,10 +564,10 @@ pub fn set_device_auto_frame_rate(state: State<'_, AppState>, device: String, en
 /// quality (CBR with the slider as a QP floor, instead of constant QP at the slider), pixel
 /// ratio (the ratio the device reports at each join, instead of the slider) and orientation
 /// (whichever way the device is held, always, instead of the saved value). Off is the default
-/// for all three and means "fixed at what the sheet shows", the same ruling as
+/// for all three and means "fixed at what the sheet shows", the same rule as
 /// `set_device_auto_frame_rate`. Their own command for the same reason as that one:
 /// `set_device_override` is at specta's ten-argument ceiling. Each is read when the session is
-/// built, so a change takes a rebuild — only when something actually moved.
+/// built, so a change takes a rebuild (only when something actually moved).
 #[tauri::command]
 #[specta::specta]
 pub fn set_device_adaptive_modes(
@@ -644,7 +608,7 @@ pub fn set_device_adaptive_modes(
         }
     };
     drop(overrides);
-    // Class (d): all three are read when the session is built.
+    // class (d): all three are read when the session is built
     if changed {
         let moved = session::bump_reconfig_epoch_for_device(&state.sessions, &token);
         tprintln!(
@@ -664,8 +628,7 @@ pub fn refresh_device_stream(
     device: String,
     join_id: Option<String>,
 ) -> bool {
-    // A join id refreshes exactly that tab; without one, every tab the device has open, which is
-    // what "restart this device's stream" means when a device can hold several.
+    // a join id refreshes exactly that tab; without one, every tab the device has open
     let joins: Vec<String> = match join_id.filter(|j| !j.trim().is_empty()) {
         Some(join) => vec![join],
         None => match resolve_device(&state, &device) {
@@ -715,13 +678,11 @@ pub fn set_device_audio_output(state: State<'_, AppState>, device: String, devic
     } else {
         Some(device_id)
     };
-    // Per device: two tabs of one browser share one set of speakers, and the choice has to
-    // outlive every join so `serve` can replay it into a host with nothing connected yet.
-    //
-    // Class (c), so no epoch. `audioSink` rides in *every* `/reconfig` body and the client
-    // applies it on its next poll, about a second away; bumping as well meant that choosing an
-    // output device tore the session down — and it did so on every save of the device sheet,
-    // because the sheet pushes this command whether or not the sink moved.
+    // per device: two tabs of one browser share one set of speakers, and the choice outlives
+    // every join so `serve` can replay it into a host with nothing connected yet.
+    // No epoch: `audioSink` rides in every `/reconfig` body and the client applies it on its
+    // next poll (about a second), and the device sheet pushes this command whether or not the
+    // sink moved
     session::set_device_audio_sink(&state.audio_sinks, &token, sel);
 }
 
@@ -754,9 +715,8 @@ pub fn remove_device_override(state: State<'_, AppState>, device: String) {
 #[tauri::command]
 #[specta::specta]
 pub fn set_device_banned(state: State<'_, AppState>, token: String, ip: String, banned: bool) {
-    // By token, never by address: the address a banned phone had this morning is the address
-    // somebody's laptop gets this afternoon. `ip` is kept as a label for the log and as the
-    // last-resort lookup for a caller holding an old row.
+    // by token, never by address: a banned phone's address goes to the next device that asks.
+    // `ip` is only a label for the log and the last-resort lookup for an old row
     let Some(key) = resolve_device(&state, if token.trim().is_empty() { &ip } else { &token })
     else {
         teprintln!("[devices] cannot ban {ip}: it has never joined, so there is no device to ban");
@@ -811,8 +771,8 @@ pub fn get_disconnect_grace(state: State<'_, AppState>) -> u32 {
 #[tauri::command]
 #[specta::specta]
 pub fn get_display_capacity(state: State<'_, AppState>) -> DisplayCapacity {
-    // Through `shared_display_cap`, so `full` can only ever be true on the AirPlay tier, which
-    // macOS itself limits to one display.
+    // through `shared_display_cap`, so `full` can only be true on the AirPlay tier, which macOS
+    // limits to one display
     let max = session::shared_display_cap(&state.virtual_display);
     let in_use = session::live_display_count(&state.sessions);
     DisplayCapacity {
@@ -918,8 +878,7 @@ pub fn set_server_ports(
         "[streamer] server ports changed to HTTP :{http}, HTTPS :{https}; restarting streamers"
     );
 
-    // Tell the connected clients why their stream is about to end, rather than dropping the
-    // transport under them.
+    // tell connected clients why their stream is ending before the transport drops
     let connected: Vec<String> = state.sessions.lock().unwrap().keys().cloned().collect();
     for join in connected {
         session::send_bye(&state.sessions, &join, session::ByeReason::HostExit);
@@ -934,10 +893,8 @@ pub fn set_server_ports(
                 .graceful_shutdown(Some(Duration::from_millis(500)));
         }
     }
-    // Waiting for the old listeners to release their ports used to be a 300 ms
-    // `std::thread::sleep` inside a synchronous command, i.e. on the main thread, with
-    // `sync_streamers` and its per-adapter runtime spin-up behind it. The command now returns
-    // immediately and the restart finishes on its own thread.
+    // give the old listeners time to release their ports, on a thread of its own: this is a
+    // synchronous command, so sleeping here would block the main thread
     std::thread::spawn(move || {
         use tauri::Manager;
         std::thread::sleep(Duration::from_millis(300));
@@ -1011,8 +968,8 @@ pub fn install_audio_driver(app: tauri::AppHandle) -> String {
     match pkg {
         Ok(path) => {
             if !path.exists() {
-                // `resolve` only joins a path, so an app bundle built without the package
-                // staged reaches `install_pkg` and fails there with nothing naming the cause.
+                // `resolve` only joins a path: without this, a bundle built without the package
+                // fails inside `install_pkg` with nothing naming the cause
                 teprintln!(
                     "[audio] this build does not carry the audio driver package ({} is \
                      missing). Build it with macos/ScreenExtendAudio/scripts/release.sh \
@@ -1133,9 +1090,8 @@ fn display_slot_holder(state: &AppState) -> Option<String> {
 
 /// Whether an IPv6 address is one a client can reach by typing it into a browser.
 ///
-/// Link-local (`fe80::/10`) is not: it needs a zone index (`%en0`), and no URL carries one. The
-/// loopback and unspecified addresses are not either. Global unicast and unique-local are, and on
-/// an IPv6-only network they are the only way to host at all.
+/// Link-local (`fe80::/10`) is not: it needs a zone index (`%en0`), and no URL carries one. Nor
+/// are loopback and unspecified. Global unicast and unique-local are.
 fn servable_v6(ip: &std::net::Ipv6Addr) -> bool {
     !ip.is_loopback() && !ip.is_unspecified() && ip.segments()[0] & 0xffc0 != 0xfe80
 }
@@ -1149,9 +1105,7 @@ pub fn sync_streamers(state: &AppState) {
                 .flat_map(|adapter| adapter.ip_addresses.iter())
         };
 
-        // IPv4 first, then whatever IPv6 a browser can actually reach. An IPv6-only network used
-        // to produce no listener at all and no diagnostic, because every v6 address failed
-        // `parse::<Ipv4Addr>()` and was dropped with `.ok()`.
+        // IPv4 first, then whatever IPv6 a browser can reach
         let mut desired: Vec<(String, IpAddr)> = Vec::new();
         let mut unusable: Vec<String> = Vec::new();
         for ip in all() {
@@ -1252,10 +1206,8 @@ pub fn sync_streamers(state: &AppState) {
 
         let thread_handle = handle.clone();
         let ip_for_log = ip.clone();
-        // One thread per adapter, but they all drive the single shared transport runtime
-        // (`streamer::transport_runtime`) rather than each building one of their own.
-        // A discarded `JoinHandle` also discarded the spawn error, so a thread that never
-        // started left `streamers` claiming an adapter was served with nothing listening.
+        // one thread per adapter, all driving the shared `streamer::transport_runtime`. The spawn
+        // error is checked so `streamers` never claims an adapter with nothing listening
         let spawned = std::thread::Builder::new()
             .name(format!("se-adapter-{ip}"))
             .spawn(move || {
@@ -1280,14 +1232,13 @@ mod tests {
 
     #[test]
     fn only_reachable_ipv6_addresses_are_served() {
-        // The one this dev box reports, and the reason an IPv6-only network still cannot host
-        // from it: fe80::/10 needs a zone index no URL can carry.
+        // fe80::/10 needs a zone index no URL can carry
         assert!(!servable_v6(
             &"fe80::844:907:64ca:8224".parse::<Ipv6Addr>().unwrap()
         ));
         assert!(!servable_v6(&Ipv6Addr::LOCALHOST));
         assert!(!servable_v6(&Ipv6Addr::UNSPECIFIED));
-        // Global unicast and unique-local are what an IPv6-only network actually hands out.
+        // global unicast and unique-local are what an IPv6-only network hands out
         assert!(servable_v6(&"2001:db8::1".parse::<Ipv6Addr>().unwrap()));
         assert!(servable_v6(&"fd00::1".parse::<Ipv6Addr>().unwrap()));
     }

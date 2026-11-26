@@ -1,8 +1,4 @@
-//! `mach_absolute_time` → shared-host-clock conversion for capture timestamps.
-//!
-//! CGDisplayStream hands every frame a `displayTime` and ScreenCaptureKit a presentation
-//! timestamp; both were being discarded, so the pipeline could only ever measure from the moment
-//! its callback ran, hiding whatever the frame spent between the compositor and us.
+//! `mach_absolute_time` to shared-host-clock conversion for capture timestamps.
 //!
 //! The rest of the streamer measures against `streamer::audio::host_now_ns()`, whose epoch is an
 //! `Instant` taken at process start. On macOS `Instant` is `mach_absolute_time`-backed, so the two
@@ -24,9 +20,9 @@ fn mach_to_host_delta_ns() -> i128 {
 
 /// Convert a raw `mach_absolute_time` tick count to the shared host clock.
 ///
-/// Returns 0 — which is how [`crate::streamer::telemetry::FrameTiming`] spells "no OS
-/// timestamp" — for a missing stamp or one from before the host epoch, so such a sample is
-/// dropped rather than folded in as a negative duration.
+/// Returns 0 (how [`crate::streamer::telemetry::FrameTiming`] spells "no OS timestamp") for a
+/// missing stamp or one from before the host epoch, so such a sample is dropped rather than
+/// folded in as a negative duration.
 pub fn mach_ticks_to_host_ns(ticks: u64) -> u64 {
     if ticks == 0 {
         return 0;
@@ -34,23 +30,13 @@ pub fn mach_ticks_to_host_ns(ticks: u64) -> u64 {
     host_ns_to_shared_ns(mach_delta_ns(0, ticks))
 }
 
-/// Convert a mach-clock timestamp that is **already in nanoseconds** to the shared host clock.
-///
-/// ScreenCaptureKit stamps its samples from `CMClockGetHostTimeClock`, which is the same clock
-/// CGDisplayStream's `displayTime` comes from but expressed as a `CMTime` in seconds rather than
-/// as a raw tick count. Running such a value through the tick conversion would scale it by the
-/// timebase a second time and produce a plausible-looking, systematically wrong number — which is
-/// worse than the honest zero it replaces.
 /// The OS's frame time when it is usable as a capture instant, else the callback's arrival.
 ///
-/// Two ways an OS stamp is not a capture instant. It can be absent — CGDisplayStream delivers a
-/// `displayTime` of 0 on a handful of frames per session (measured: 2-3 in 200). And it can be in
-/// the *future*: `displayTime` is when WindowServer scheduled the frame to be shown, which on the
-/// 10.15.8 box is ahead of our callback on every single frame, by 15.5 ms at p50 with a 60 Hz
-/// display. Taking either at face value understates every latency measured from it by up to a
-/// frame period, and can produce a negative span.
-///
-/// Both callers pass the arrival stamp they just took, so the fallback costs nothing.
+/// An OS stamp can be absent: CGDisplayStream delivers a `displayTime` of 0 on a few frames per
+/// session (2-3 in 200). And it can be in the future: `displayTime` is when WindowServer
+/// scheduled the frame to be shown, ahead of our callback on every frame on 10.15.8 (15.5 ms at
+/// p50 on a 60 Hz display). Either one taken at face value understates latency by up to a frame
+/// period and can produce a negative span.
 pub fn os_frame_time_or(arrived_host_ns: u64, os_host_ns: u64) -> u64 {
     if os_host_ns == 0 || os_host_ns > arrived_host_ns {
         arrived_host_ns
@@ -59,6 +45,10 @@ pub fn os_frame_time_or(arrived_host_ns: u64, os_host_ns: u64) -> u64 {
     }
 }
 
+/// Convert a mach-clock timestamp that is already in nanoseconds to the shared host clock.
+///
+/// ScreenCaptureKit stamps its samples from `CMClockGetHostTimeClock` as a `CMTime` in seconds,
+/// not raw ticks: the tick conversion would scale such a value by the timebase a second time.
 pub fn host_ns_to_shared_ns(mach_ns: u64) -> u64 {
     if mach_ns == 0 {
         return 0;
@@ -100,9 +90,7 @@ mod tests {
 
     #[test]
     fn an_absent_or_future_os_stamp_falls_back_to_the_arrival() {
-        // 0 is CGDisplayStream delivering no `displayTime` at all, which it does a few times a
-        // session. The future case is `displayTime` on every frame of a 60 Hz display: it is when
-        // WindowServer scheduled the frame to be shown, ~15.5 ms after our callback runs.
+        // 0 is no `displayTime` at all; the second is one scheduled ~15.5 ms after the callback
         assert_eq!(os_frame_time_or(1_000_000, 0), 1_000_000);
         assert_eq!(os_frame_time_or(1_000_000, 1_015_500), 1_000_000);
     }

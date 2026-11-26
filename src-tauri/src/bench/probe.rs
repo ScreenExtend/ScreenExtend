@@ -1,9 +1,7 @@
 //! Probe stage: what each encoder session *is* and which properties it takes.
 //!
-//! One child process per row. A row creates a session for (codec, low-latency spec, hardware
-//! policy, size), reads its identity and its full supported-property dictionary (every key with
-//! its metadata), copies a list of read-only keys, then trial-sets every catalogue entry on a
-//! *fresh* session so an accepted or rejected property cannot contaminate the next.
+//! One child process per row. Every catalogue entry is trial-set on a *fresh* session, so an
+//! accepted or rejected property cannot contaminate the next.
 
 use std::ffi::c_void;
 use std::ptr;

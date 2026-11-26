@@ -2,12 +2,30 @@
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(windows)]
+use super::win::recipe::{Codec, Recipe, Val};
+#[cfg(target_os = "macos")]
 use crate::macos_utils::streamer::vt_recipe::{Codec, Recipe, Val};
 
 pub const QUICK: &str = include_str!("plans/quick.json");
 pub const DEFAULT: &str = include_str!("plans/default.json");
 pub const ANCHORS: &str = include_str!("plans/anchors.json");
 pub const FULL: &str = include_str!("plans/full.json");
+/// Windows: every vendor at 1080p60, production recipes (`lab`).
+#[cfg(windows)]
+pub const WIN_QUICK: &str = include_str!("plans/win-quick.json");
+/// Windows: the NVENC and Quick Sync settings sweep (`lab`).
+#[cfg(windows)]
+pub const WIN_ENCODERS: &str = include_str!("plans/win-encoders.json");
+/// Windows: NVENC and Quick Sync through the production encode loop (`pipe`).
+#[cfg(windows)]
+pub const WIN_PIPE_QUICK: &str = include_str!("plans/win-pipe-quick.json");
+/// Windows: several `pipe` sessions in one process.
+#[cfg(windows)]
+pub const WIN_PIPE_SESSIONS: &str = include_str!("plans/win-pipe-sessions.json");
+/// Windows: the capture handler's gates driven by a take's recorded flags (`pipe`).
+#[cfg(windows)]
+pub const WIN_PIPE_GATES: &str = include_str!("plans/win-pipe-gates.json");
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Plan {
@@ -33,7 +51,7 @@ pub struct Plan {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct Catalogue {
-    /// `[key, [value, value, …]]`: each (key, value) is set on a fresh session.
+    /// `[key, [value, value, ...]]`: each (key, value) is set on a fresh session.
     #[serde(default)]
     pub trials: Vec<(String, Vec<Val>)>,
     /// Read-only keys copied from a fresh session.
@@ -69,6 +87,7 @@ impl ProbeRow {
         )
     }
 
+    #[cfg(target_os = "macos")]
     pub fn default_rows() -> Vec<ProbeRow> {
         let mut rows = Vec::new();
         for codec in [Codec::H264, Codec::Hevc] {
@@ -92,6 +111,12 @@ impl ProbeRow {
             height: 2160,
         });
         rows
+    }
+
+    /// Windows: one row per encoder vendor (`hw` names the vendor), H.264 only.
+    #[cfg(windows)]
+    pub fn default_rows() -> Vec<ProbeRow> {
+        super::win::probe::default_rows()
     }
 }
 
@@ -152,7 +177,7 @@ pub struct Workload {
     pub transform: Option<String>,
     /// `pipe` stage: withhold a frame whose pixels equal the previous one's, the way a capture
     /// backend delivers nothing for an unchanged screen (so the encode loop sees only its own
-    /// keepalive). Off by default, so existing runs are unchanged.
+    /// keepalive). Off by default.
     #[serde(default)]
     pub skip_unchanged: bool,
 }
@@ -346,11 +371,12 @@ pub struct ChurnOpts {
     /// Wait this long before the first join: a host that has been up a while.
     #[serde(default)]
     pub first_wait_ms: Option<u64>,
-    /// Control: never run the main run loop (what `serve` did before MAC-DISPLAY-STALE).
+    /// Control: never run the main run loop.
     #[serde(default)]
     pub block_main: bool,
     /// What the main thread does while the joins run on another thread: `block` (as `serve`; the
-    /// default), `pump` (a CFRunLoop, as `serve` with `SE_MAIN_PUMP=1`), or `nsapp` (AppKit's event loop, as the desktop app).
+    /// default), `pump` (a CFRunLoop, as `serve` with `SE_MAIN_PUMP=1`), or `nsapp` (AppKit's
+    /// event loop, as the desktop app).
     #[serde(default)]
     pub main: Option<String>,
 }
@@ -444,7 +470,7 @@ impl LtrAck {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Churn {
-    /// Create → encode → destroy cycles.
+    /// Create, encode, destroy cycles.
     #[serde(default = "d_cycles")]
     pub cycles: u32,
     /// Frames encoded per cycle, at the workload's frame rate.
@@ -598,6 +624,16 @@ impl Plan {
             "default" => Some(DEFAULT),
             "anchors" => Some(ANCHORS),
             "full" => Some(FULL),
+            #[cfg(windows)]
+            "win-quick" => Some(WIN_QUICK),
+            #[cfg(windows)]
+            "win-encoders" => Some(WIN_ENCODERS),
+            #[cfg(windows)]
+            "win-pipe-quick" => Some(WIN_PIPE_QUICK),
+            #[cfg(windows)]
+            "win-pipe-sessions" => Some(WIN_PIPE_SESSIONS),
+            #[cfg(windows)]
+            "win-pipe-gates" => Some(WIN_PIPE_GATES),
             _ => None,
         }
     }
@@ -647,8 +683,11 @@ impl Plan {
                 l.ack.delay().map_err(|e| format!("group {gi}: {e}"))?;
             }
             if !g.deny.is_empty() {
+                #[cfg(target_os = "macos")]
                 crate::macos_utils::streamer::vt_recipe::Deny::parse(&g.deny.join(","))
                     .map_err(|e| format!("group {gi}: deny: {e}"))?;
+                #[cfg(windows)]
+                super::win::validate_deny(&g.deny).map_err(|e| format!("group {gi}: deny: {e}"))?;
             }
             let mut recipes: Vec<&RecipeEntry> = Vec::new();
             for pat in &g.recipes {
@@ -716,8 +755,8 @@ impl Plan {
             }
         }
 
-        // Workload-major blocks, in order of first appearance, with workloads that share one
-        // rendered clip (same pictures, different transform or speed) kept next to each other.
+        // workload-major blocks in order of first appearance; workloads that share one rendered
+        // clip (same pictures, different transform or speed) stay next to each other
         let mut order: Vec<String> = Vec::new();
         for r in &runs {
             if !order.contains(&r.workload.id) {
@@ -839,7 +878,7 @@ fn resolve_base(
     }
     obj.remove("base");
     obj.remove("remove");
-    // A production entry carries no recipe body of its own.
+    // a production entry carries no recipe body of its own
     if r.get("production").is_none() && base.get("production").is_some() {
         obj.remove("production");
     }
@@ -884,7 +923,7 @@ mod tests {
     fn repeats_are_interleaved() {
         let p = Plan::parse(QUICK).unwrap();
         let runs = p.expand().unwrap();
-        // Within a workload block, every repeat-0 run precedes every repeat-1 run.
+        // within a workload block, every repeat-0 run precedes every repeat-1 run
         let first = &runs[0].workload.id;
         let block: Vec<&RunSpec> = runs.iter().filter(|r| &r.workload.id == first).collect();
         let last_r0 = block.iter().rposition(|r| r.repeat == 0).unwrap();
@@ -990,7 +1029,7 @@ mod tests {
         assert!(env.contains(&("SE_SCK_PIXEL_FORMAT", "420v".into())));
         assert!(env.contains(&("SE_SCK_SHOWS_CURSOR", "0".into())));
         assert!(env.contains(&("SE_CGDS_MIN_FRAME_TIME", "0".into())));
-        // No `live` object: defaults.
+        // no `live` object: defaults
         let p = Plan::parse(&base.replace(
             "GROUP",
             r#"{"recipes":["p"],"workloads":["w"],"stage":"live"}"#,

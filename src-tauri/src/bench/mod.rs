@@ -1,17 +1,15 @@
 //! `ScreenExtend bench`: a self-contained encoder benchmark (built with `--features bench`).
 //!
 //! Intercepted in `cli::fast_path()` before the Tauri builder, so nothing here needs a Tauri
-//! runtime, a window or AppKit. Stages: `env` (machine facts), `probe` (what every encoder
-//! session is and which properties it takes), `lab` (the plan's runs, each a real-time replay of
-//! a clip through the production `Encoder`). Every unit of work runs in a child process of this
-//! same executable (`--child <kind> <spec.json>`) under a watchdog, so a crash or a hang is a
-//! recorded result and the suite carries on. One file comes back: `results-<host>.json`.
+//! runtime, a window or AppKit. Every unit of work runs in a child process of this same
+//! executable (`--child <kind> <spec.json>`) under a watchdog, so a crash or a hang is a recorded
+//! result and the suite carries on.
 
 #[cfg(target_os = "macos")]
 mod cf;
 #[cfg(target_os = "macos")]
 mod churn;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 mod clip;
 #[cfg(target_os = "macos")]
 mod env;
@@ -21,11 +19,11 @@ mod live;
 mod live_rx;
 #[cfg(target_os = "macos")]
 mod live_window;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 mod metrics;
 #[cfg(target_os = "macos")]
 mod pipe;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 mod plan;
 #[cfg(target_os = "macos")]
 mod probe;
@@ -33,26 +31,34 @@ mod probe;
 mod psnr;
 #[cfg(target_os = "macos")]
 mod replay;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 mod runner;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 mod series;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 mod summary;
 #[cfg(target_os = "macos")]
 pub(crate) mod synth_source;
+#[cfg(windows)]
+mod win;
+// per-OS stages under the names the shared runner and `child` already use
+#[cfg(windows)]
+use win::{churn, env, lab as replay, live, pipe, probe};
+// recipe hooks the Windows encoders call from their init paths (bench builds only)
+#[cfg(windows)]
+pub(crate) use win::hooks as win_hooks;
 
 /// Whether these `bench` arguments are a unit of work that must run inside the Tauri runtime
 /// (the `live` child, which needs `platform::setup` and the `AppState` it builds). `fast_path`
 /// lets those through to the builder instead of handling them before it.
 pub fn wants_tauri(args: &[String]) -> bool {
-    cfg!(target_os = "macos")
+    cfg!(any(target_os = "macos", windows))
         && args.first().map(String::as_str) == Some("--child")
         && args.get(1).map(String::as_str) == Some("live")
 }
 
 /// The `live` child, reached from `cli::dispatch` inside Tauri's `setup`.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub fn live_child(app: &tauri::AppHandle) -> ! {
     live::child_main(app)
 }
@@ -65,7 +71,7 @@ fn exit(code: i32) -> ! {
 }
 
 const HELP: &str = "\
-ScreenExtend bench — VideoToolbox encoder benchmark
+ScreenExtend bench: VideoToolbox encoder benchmark
 
 USAGE
   ScreenExtend bench [options]
@@ -78,7 +84,7 @@ USAGE
   --resume <dir>         continue a run directory, skipping what runs.jsonl already holds
   --stages env,probe,lab which stages to run (groups with \"stage\": \"pipe\" or \"live\" run in
                          the lab stage; a live run creates a virtual display and needs Screen
-                         Recording already granted — it is skipped, never prompted, otherwise)
+                         Recording already granted: it is skipped, never prompted, otherwise)
   --only <substring>     only runs whose id contains this
   --list                 print the expanded run list and the estimated duration; run nothing
   --per-frame            write a per-frame CSV for every run into <out>/logs/
@@ -88,19 +94,24 @@ The last line printed is the absolute path of the results file to send back.
 ";
 
 pub fn main(args: &[String]) -> ! {
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         let _ = args;
         eprintln!("error: the bench harness is only implemented for macOS");
         exit(2)
     }
-    #[cfg(target_os = "macos")]
+    // Windows: the console, the Windows help text and `bench record`, ahead of the shared parser
+    #[cfg(windows)]
+    if let Some(code) = win::main_prelude(args) {
+        exit(code)
+    }
+    #[cfg(any(target_os = "macos", windows))]
     {
         exit(mac_main(args))
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn mac_main(args: &[String]) -> i32 {
     use std::path::PathBuf;
 
@@ -171,7 +182,7 @@ fn mac_main(args: &[String]) -> i32 {
 
 /// One unit of work in a fresh process. The result goes to the spec's `result_path`; stdout and
 /// stderr are the runner's log file for this unit.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn child(args: &[String]) -> i32 {
     let (Some(kind), Some(arg)) = (args.first(), args.get(1)) else {
         eprintln!("error: --child <kind> <spec.json|inline json>");
@@ -188,7 +199,7 @@ fn child(args: &[String]) -> i32 {
             }
         }
     };
-    // The encoder's own log lines go to this child's log file.
+    // so the encoder's own log lines reach this child's log file
     crate::logbus::set_verbose(true);
     let parsed: serde_json::Value = match serde_json::from_str(&text) {
         Ok(v) => v,
@@ -226,7 +237,7 @@ fn child(args: &[String]) -> i32 {
             return 2;
         }
     };
-    // Let the log writer echo the last lines before the process goes.
+    // let the log writer echo the last lines before the process exits
     std::thread::sleep(std::time::Duration::from_millis(100));
     match result_path {
         Some(p) => {

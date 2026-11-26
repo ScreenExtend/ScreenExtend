@@ -130,6 +130,16 @@ impl<'a> Frame<'a> {
             .collect())
     }
 
+    /// Whether the compositor reported any dirty region for this frame.
+    ///
+    /// The same answer as `!dirty_regions()?.is_empty()` without building the `Vec`: one WinRT
+    /// call for the vector and one for its size, instead of one per region plus an allocation on
+    /// every changed frame. The per-frame unchanged-frame gate only ever needs this.
+    #[inline]
+    pub fn has_dirty_regions(&self) -> Result<bool, windows::core::Error> {
+        Ok(self.capture_frame.DirtyRegions()?.Size()? != 0)
+    }
+
     /// Gets the height of the frame.
     #[inline]
     #[must_use]

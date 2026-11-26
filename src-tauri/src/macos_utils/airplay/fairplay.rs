@@ -6,8 +6,7 @@
 //! `req[14]`, and message 2 (164 bytes) is answered with a fixed 12-byte header
 //! followed by an echo of `req[144..164]`. No key material, no session state, no
 //! randomness. The real FairPlay work only begins at `fairplay_decrypt`, which
-//! recovers the AES key for the video stream — and we never decode video, so we
-//! never go there.
+//! recovers the AES key for the video stream, and we never decode video.
 //!
 //! Reply tables and header transcribed from `lib/fairplay_playfair.c` of UxPlay
 //! (Copyright (C) 2018 Juho Vähä-Herttua, LGPL-2.1-or-later), used here under
@@ -17,9 +16,8 @@
 //!
 //! Dispatch is on body length, as in the reference. It deliberately does not
 //! also require the sequence byte: tolerating an unexpected one is what lets
-//! this answer sender variants nobody has seen, and refusing a message that is
-//! otherwise exactly right would be a disconnect for no gain. The sequence byte
-//! is still read, and reported when a message matches nothing at all.
+//! this answer sender variants nobody has seen. The sequence byte is still
+//! read, and reported when a message matches nothing at all.
 
 const REPLY_MESSAGES: [[u8; 142]; 4] = [
     [
@@ -84,8 +82,8 @@ const MODE_POS: usize = 14;
 
 const SETUP1_LEN: usize = 16;
 const SETUP2_LEN: usize = 164;
-/// The sequence byte message 2 carries. Read and reported, not required — see
-/// the module doc on why dispatch stays tolerant.
+/// The sequence byte message 2 carries. Read and reported, not required (see
+/// the module doc).
 const SETUP2_SEQ: u8 = 0x03;
 
 /// Trailing 20 bytes of message 2 that get echoed back.

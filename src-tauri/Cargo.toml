@@ -30,7 +30,7 @@ default = []
 probe = []
 # The self-contained encoder benchmark, `ScreenExtend bench` (src/bench/). Implies `probe`, so it
 # carries that feature's never-ship caveat too: build it for measurement, not for release.
-bench = ["probe"]
+bench = ["probe", "dep:lz4_flex", "dep:crc32fast"]
 
 [lints.rust]
 # Measured 2026-09: flipping this to `warn` lights 62 sites across 28 files, most of them in
@@ -43,6 +43,9 @@ dead_code = "allow"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+# `bench record` only: per-frame LZ4 and CRC-32 in raw takes.
+lz4_flex = { version = "0.11", optional = true, default-features = false, features = ["std", "safe-decode", "checked-decode"] }
+crc32fast = { version = "1.4", optional = true }
 # Tauri core + typed command/event gen bindings
 tauri = { version = "2", features = ["unstable", "specta"] }
 tauri-specta = { version = "=2.0.0-rc.21", features = ["derive", "typescript"] }

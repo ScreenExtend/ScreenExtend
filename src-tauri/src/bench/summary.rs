@@ -24,13 +24,28 @@ pub fn render(r: &Json) -> String {
     if env.is_null() {
         let _ = writeln!(
             s,
-            "ScreenExtend bench — {} — env stage not run in this directory",
+            "ScreenExtend bench - {} - env stage not run in this directory",
             r["host"].as_str().unwrap_or("?")
+        );
+    } else if cfg!(windows) {
+        let _ = writeln!(
+            s,
+            "ScreenExtend bench | {} | {} {} | {} {} (build {}.{}) | arch {}",
+            r["host"].as_str().unwrap_or("?"),
+            env["hw"]["model"].as_str().unwrap_or("?"),
+            env["hw"]["cpu_brand"].as_str().unwrap_or("?"),
+            env["os"]["product_name"].as_str().unwrap_or("Windows"),
+            env["os"]["display_version"].as_str().unwrap_or("?"),
+            env["os"]["build"]
+                .as_str()
+                .map_or_else(|| env["os"]["build"].to_string(), str::to_string),
+            env["os"]["ubr"],
+            env["process"]["arch"].as_str().unwrap_or("?"),
         );
     } else {
         let _ = writeln!(
             s,
-            "ScreenExtend bench — {} — {} {} — macOS {} ({}) — arch {} translated={}",
+            "ScreenExtend bench - {} - {} {} - macOS {} ({}) - arch {} translated={}",
             r["host"].as_str().unwrap_or("?"),
             env["hw"]["model"].as_str().unwrap_or("?"),
             env["hw"]["cpu_brand"].as_str().unwrap_or("?"),

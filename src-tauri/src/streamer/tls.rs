@@ -28,9 +28,7 @@ pub struct TlsMaterial {
     pub self_signed: bool,
 }
 
-/// Hand-written rather than derived: `key_pem` is a private key, and a derived `Debug` would put
-/// it in the log the first time anyone wrote `{material:?}` — including through an
-/// `expect`/`unwrap` message, which is how it would happen.
+/// Hand-written, not derived: `key_pem` is a private key and a derived `Debug` would log it.
 impl std::fmt::Debug for TlsMaterial {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TlsMaterial")
@@ -108,11 +106,9 @@ fn generate_or_load_dev_cert(extra_sans: &[String]) -> Result<TlsMaterial> {
     Ok(material)
 }
 
-/// The cached pair, or `None` when either half is missing or unreadable.
-///
-/// Both halves or neither: a certificate without its key is not usable, and a half-written
-/// cache (a crash mid-`cache_dev_cert`, a key the current user cannot read) has to fall through
-/// to a regeneration rather than fail the server start.
+/// The cached pair, or `None` when either half is missing or unreadable: a half-written cache
+/// (a crash mid-`cache_dev_cert`, a key the current user cannot read) must fall through to a
+/// regeneration rather than fail the server start.
 fn read_cached_cert(cert_file: &Path, key_file: &Path) -> Option<TlsMaterial> {
     if !cert_file.exists() || !key_file.exists() {
         return None;
@@ -208,8 +204,7 @@ fn subject_alt_names(extra_sans: &[String]) -> Vec<String> {
 mod tests {
     use super::*;
 
-    /// A scratch directory that removes itself, so the cache round trip runs against real files
-    /// without touching the app data dir the running host uses.
+    /// A self-removing scratch directory, so the cache tests never touch the real app data dir.
     struct TempDir(PathBuf);
 
     impl TempDir {
@@ -237,8 +232,7 @@ mod tests {
 
     #[test]
     fn localhost_and_the_loopback_address_are_always_offered() {
-        // The client reaches the host by IP on the LAN and by `localhost` on the same machine.
-        // Losing either name turns every join into a certificate warning.
+        // LAN clients join by IP, the same machine by localhost: losing either is a cert warning
         let sans = subject_alt_names(&[]);
         assert!(sans.contains(&"localhost".to_string()));
         assert!(sans.contains(&"127.0.0.1".to_string()));
@@ -246,9 +240,8 @@ mod tests {
 
     #[test]
     fn extra_sans_are_appended_once_and_blanks_are_dropped() {
-        // The extras are this host's adapter addresses, enumerated per interface, so a machine
-        // on two networks routinely offers the same address twice; an empty string comes from an
-        // adapter with no address at all and is not a name anything can match.
+        // extras are per-interface adapter addresses: duplicates are routine, and an empty
+        // string is an adapter with no address
         let sans = subject_alt_names(&[
             "192.168.1.10".into(),
             "192.168.1.10".into(),
@@ -280,16 +273,12 @@ mod tests {
         );
         assert!(key.contains("PRIVATE KEY-----"), "{key:.40}");
         assert!(a.self_signed);
-        // This is exactly why the cache exists: without it a client that trusted this host once
-        // is asked again on every launch.
         assert_ne!(a.key_pem, b.key_pem, "each generation is a new key pair");
     }
 
     #[tokio::test]
     async fn rustls_accepts_what_we_generate() {
-        // The one assertion that matters: the certificate this code produces is one the server
-        // will actually serve. A malformed PEM here fails at bind time on the user's machine
-        // with no test between here and there.
+        // a malformed PEM would otherwise first fail at bind time on a user's machine
         let material = generate_self_signed(&subject_alt_names(&[])).expect("generate");
         rustls_config(&material)
             .await
@@ -318,8 +307,7 @@ mod tests {
 
     #[test]
     fn half_a_cache_is_not_a_cache() {
-        // A crash between the two writes, or a key the current user cannot read, must fall
-        // through to a regeneration rather than handing rustls a certificate with no key.
+        // e.g. a crash between the two writes: must regenerate, not hand rustls a cert with no key
         let dir = TempDir::new("half");
         let cert_file = dir.join(DEV_CERT_FILE);
         let key_file = dir.join(DEV_KEY_FILE);
@@ -358,8 +346,7 @@ mod tests {
 
     #[test]
     fn an_operator_certificate_needs_both_halves() {
-        // Half a pair is a configuration mistake, not a reason to fall back to a self-signed
-        // certificate the operator did not ask for — that would look like it worked.
+        // half a pair is a config mistake: falling back to self-signed would look like it worked
         let err = load_or_generate(Some("cert.pem"), None, &[]).unwrap_err();
         assert!(err.to_string().contains("BOTH"), "{err}");
         let err = load_or_generate(None, Some("key.pem"), &[]).unwrap_err();
@@ -368,8 +355,7 @@ mod tests {
 
     #[test]
     fn an_operator_certificate_is_read_verbatim_and_is_not_self_signed() {
-        // `self_signed` drives the HTTPS upsell modal on the client page; reporting a real
-        // certificate as self-signed would show a warning nobody needs to see.
+        // self_signed drives the client page's HTTPS upsell modal
         let dir = TempDir::new("operator");
         let cert_file = dir.join("operator-cert.pem");
         let key_file = dir.join("operator-key.pem");

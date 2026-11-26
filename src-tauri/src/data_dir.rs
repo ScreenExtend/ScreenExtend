@@ -1,21 +1,16 @@
 //! Where the host keeps its per-user state, and the test-only switch that moves it.
 //!
-//! `SCREENEXTEND_DATA_DIR`, when set to a non-empty path, replaces the app-data, app-local-data
-//! and app-config directories with that one directory. Everything that makes a host a
-//! *singleton* lives there — `screenextend.lock`, the control socket's `screenextend.ctrl`,
-//! `config.json`, the exit breadcrumb and the dev TLS certificate — so two hosts started with
-//! two different values can run side by side, and every CLI verb run with the same value
-//! (`status`, `stop`, `devices set`, `logs`, `config …`) addresses that one host.
-//!
-//! It exists for `scripts/test-handler/`, which runs up to four hosts at once. Unset, every
-//! function here returns exactly what Tauri's path resolver returns, so a normal install never
-//! sees it. The desktop UI's own store calls (the JS side of `tauri-plugin-store`) are not
-//! redirected; the switch is for `serve` and the CLI.
+//! `SCREENEXTEND_DATA_DIR`, set to a non-empty path, replaces the app-data, app-local-data and
+//! app-config directories with that one directory (lock, control file, `config.json`, exit
+//! breadcrumb, dev TLS certificate), so hosts with different values run side by side (as
+//! `scripts/test-handler/` does) and a CLI verb run with the same value addresses that host.
+//! Unset, every function here returns Tauri's own path. The JS side of `tauri-plugin-store` is
+//! not redirected. A shipped build does not read it ([`crate::envcfg`]) and always uses Tauri's
+//! paths.
 //!
 //! Setting it also puts the Windows display backend into shared-driver mode
-//! (`windows_utils::virtual_display`): the driver keeps one monitor list for the whole machine
-//! and each commit replaces it, so a host that does not own the driver alone must merge its
-//! monitors into the live list instead of overwriting it.
+//! (`windows_utils::virtual_display`): the driver's monitor list is machine-wide and each commit
+//! replaces it, so an isolated host merges its monitors in instead of overwriting.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -30,7 +25,7 @@ const CONFIG_FILE: &str = "config.json";
 pub fn override_dir() -> Option<&'static Path> {
     static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
     DIR.get_or_init(|| {
-        let raw = std::env::var_os(DATA_DIR_ENV)?;
+        let raw = crate::envcfg::var_os(DATA_DIR_ENV)?;
         if raw.is_empty() {
             return None;
         }

@@ -9,18 +9,19 @@
 
   Four phases, each reported separately because the fixes are different:
 
-  1. hold      — inside the page: DOM event -> `RTCDataChannel.send`. Catches a send-side
+  1. hold      - inside the page: DOM event -> `RTCDataChannel.send`. Catches a send-side
                  coalescer holding a frame for a timer, a task or a byte threshold. Needs no host
                  instrumentation: it hooks `RTCDataChannel.prototype.send` and a capture-phase
                  pointer listener on `window`, which runs ahead of the page's own.
-  2. forward   — client send -> host `SendInput`, paired in order against the host's
+  2. forward   - client send -> host `SendInput`, paired in order against the host's
                  `input-trace` lines (`SE_INPUT_TRACE=1`). Both stamps are wall clock on one
-                 machine, so they are directly comparable.
-  3. frames    — the decisive one for "the client pointer feels laggy". Painted fps over three
+                 machine, so they are directly comparable. A shipped build does not read the
+                 variable: this phase needs a debug build or one with the `bench` feature.
+  3. frames    - the decisive one for "the client pointer feels laggy". Painted fps over three
                  windows on an otherwise static desktop: nothing moving, the *client's* pointer
                  sweeping, the *host's* pointer sweeping. A host that only produces a frame when
                  the desktop changes shows up here as a client sweep that paints nothing.
-  4. keys      — keystrokes into a focused field on the virtual display, same pairing as (2).
+  4. keys      - keystrokes into a focused field on the virtual display, same pairing as (2).
 
   The virtual display is left genuinely static for phase 3: no motion window, no animation. That
   is the scene the report is about.
@@ -53,13 +54,9 @@ $null = New-Item -ItemType Directory -Force -Path $runDir
 Start-Transcript -Path (Join-Path $runDir 'harness.log') -Force | Out-Null
 function Step($m) { Write-Host ("[{0:HH:mm:ss}] {1}" -f (Get-Date), $m) }
 
-# A JSON array from the page as a flat PowerShell array.
-#
-# PowerShell 5.1's `ConvertFrom-Json` emits a JSON array as a single `Object[]` rather than
-# unrolling it into the pipeline, so the obvious `@($json | ConvertFrom-Json)` produces a
-# one-element array *containing* the array — and `$a[0]` is then a whole column of values, which
-# fails on the first arithmetic with "[System.Object[]] does not contain a method named
-# 'op_Subtraction'". Piping through `ForEach-Object` is what unrolls it.
+# A JSON array from the page as a flat PowerShell array. PowerShell 5.1's `ConvertFrom-Json`
+# emits an array as one `Object[]` instead of unrolling it, so `@($json | ConvertFrom-Json)` is
+# a one-element array containing the array; piping through `ForEach-Object` unrolls it.
 function JsonArray($json) {
     if (-not $json) { return @() }
     $v = $json | ConvertFrom-Json
@@ -67,27 +64,18 @@ function JsonArray($json) {
     return @($v | ForEach-Object { $_ })
 }
 
-# Pair each client send with the injection it caused.
+# Pair each client send with the injection it caused: greedy forward matching, each send takes
+# the earliest injection at or after it that no earlier send has taken. Index pairing
+# (`trace[k] - send[k]`) shifts every later pair by one inter-event gap after a single extra or
+# missing row. An injection before the first send (the harness parks the host pointer) matches
+# nothing and is counted.
 #
-# Index pairing (`trace[k] - send[k]`) is wrong the moment either side has an extra or a missing
-# row: one unmatched injection shifts every later pair by a whole inter-event gap, and the run
-# reports a 250 ms "latency" that is really one dropped frame. Greedy forward matching instead —
-# each send takes the earliest injection at or after it that no earlier send has taken — so a drop
-# costs exactly one unmatched send and nothing downstream of it.
+# `$Tol` absorbs clock skew: the page stamps with `Date.now()`-anchored `performance.now()`, the
+# host with `SystemTime::now()`, and they disagree by a few ms, so a real injection can carry a
+# stamp slightly earlier than its send.
 #
-# A stray injection *before* the first send (the harness parks the host pointer) matches nothing
-# and is counted, not silently absorbed.
-#
-# `$Tol` absorbs the skew between the two clocks. The page's stamp is `Date.now() - performance.now()`
-# plus `performance.now()`, the host's is `SystemTime::now()`, and the two disagree by a few
-# milliseconds — so a genuine injection can carry a stamp slightly *earlier* than the send that
-# caused it. Without the tolerance that injection is skipped and the send matches the *next* one,
-# which at a 250 ms cadence reports a 250 ms latency that never happened.
-#
-# `$MaxMs` keeps a loss local. Without a ceiling, one missing injection makes that send adopt the
-# *next* send's injection and every later pair inherits the shift, so a single dropped frame at a
-# 250 ms cadence turns the whole run into a 250 ms "latency". An injection that far behind its send
-# is not that send's injection; the send is unmatched and the cursor stays put.
+# `$MaxMs` keeps a loss local: an injection that far behind its send is not that send's, so the
+# send stays unmatched instead of adopting the next one's and shifting every later pair.
 function Pair-Forward($sends, $trace, $Tol = 25, $MaxMs = 200) {
     $deltas = @()
     $unmatched = 0
@@ -106,8 +94,7 @@ function Pair-Forward($sends, $trace, $Tol = 25, $MaxMs = 200) {
     }
 }
 
-# Percentiles over a PowerShell array, reported to 0.1 ms. Returned as a hashtable so the caller
-# can drop it straight into the JSON.
+# percentiles as an ordered hashtable the caller can drop straight into the JSON
 function Pct($values, $scale = 1.0) {
     if (-not $values -or $values.Count -eq 0) { return $null }
     $s = @($values | Sort-Object)
@@ -122,11 +109,8 @@ function Pct($values, $scale = 1.0) {
     }
 }
 
-# --------------------------------------------------------------------------------------------
-# SendInput. The `INPUT` struct is 40 bytes on x64; a 48-byte one makes every call return 0 with
-# ERROR_INVALID_PARAMETER and the pointer never moves, which is a whole measurement of the wrong
-# thing that looks exactly like a real one. `SelfTest` refuses to let that happen quietly.
-# --------------------------------------------------------------------------------------------
+# SendInput. `INPUT` is 40 bytes on x64; with a 48-byte one every call returns 0
+# (ERROR_INVALID_PARAMETER) and the pointer never moves. `SelfTest` catches that.
 if (-not ('SEIn' -as [type])) {
     Add-Type @'
 using System;
@@ -209,9 +193,7 @@ public static class SEIn {
 
 [SEIn]::Init() | Out-Null
 
-# --------------------------------------------------------------------------------------------
-# CDP over a raw WebSocket, same shape as measure-stream.ps1.
-# --------------------------------------------------------------------------------------------
+# CDP over a raw WebSocket, same shape as measure-stream.ps1
 $script:cdpSocket = $null
 $script:cdpId = 0
 
@@ -263,19 +245,16 @@ function Invoke-Js {
     return $r.result.value
 }
 
-# --------------------------------------------------------------------------------------------
-# Host
-#
-# Only one ScreenExtend can hold the single-instance lock, and on this machine more than one agent
-# runs one. So the lock is taken by *identifying* the holder rather than by killing everything
-# named ScreenExtend: a host belonging to another agent's target directory is waited for, and the
-# owner's GUI is stopped and relaunched afterwards because the owner uses it between runs.
-# --------------------------------------------------------------------------------------------
-$OwnerGui = 'C:\Users\sarve\.cargo\shared_target\ScreenExtend\release\ScreenExtend.exe'
-# Target directories this run may stop a host in. Anything else is someone else's.
+# Only one ScreenExtend can hold the single-instance lock, and other hosts may be running on
+# this machine. The lock is taken by identifying the holder, not by killing everything named
+# ScreenExtend: a host from an unknown target directory is waited for, and the owner's GUI is
+# stopped and relaunched afterwards.
+$TargetRoot = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR.TrimEnd('\') } else { Join-Path $PSScriptRoot '..\src-tauri\target' }
+$OwnerGui = Join-Path $TargetRoot 'release\ScreenExtend.exe'
+# target directories this run may stop a host in; anything else is someone else's
 $MineRoots = @(
-    'C:\Users\sarve\.cargo\shared_target\ScreenExtend-w2\',
-    'C:\Users\sarve\.cargo\shared_target\ScreenExtend-base\'
+    ($TargetRoot + '-w2\'),
+    ($TargetRoot + '-base\')
 )
 
 function Se-Hosts {
@@ -300,19 +279,18 @@ function Claim-HostLock {
             $others += $h
         }
         if ($others.Count -eq 0) { Start-Sleep -Milliseconds 900; return }
-        Step ("waiting for another agent's host to finish: " + (($others | ForEach-Object { "pid $($_.Pid) $($_.Path)" }) -join '; '))
+        Step ("waiting for someone else's host to finish: " + (($others | ForEach-Object { "pid $($_.Pid) $($_.Path)" }) -join '; '))
         Start-Sleep -Seconds 30
     }
-    throw 'another agent has held the single-instance lock for an hour; not forcing it'
+    throw 'another host has held the single-instance lock for an hour; not forcing it'
 }
 
 function Start-OwnerGui {
     if (-not (Test-Path $OwnerGui)) { Write-Warning "the owner's GUI is not built at $OwnerGui"; return }
     if (Se-Hosts | Where-Object { "$($_.Path)" -eq $OwnerGui }) { return }
     $g = Start-Process -FilePath $OwnerGui -PassThru
-    # Launching it is not the same as it working: a `config.json` the bootstrap cannot replay stops
-    # it at a Setup Error dialog, and "relaunched, pid N" would be a true statement about a host
-    # that never came up. Listening on its ports is the cheapest proof it got past setup.
+    # a `config.json` the bootstrap cannot replay stops the GUI at a Setup Error dialog, so wait
+    # for it to listen on its ports: the cheapest proof it got past setup
     for ($i = 0; $i -lt 40; $i++) {
         Start-Sleep -Milliseconds 500
         if ($g.HasExited) { Write-Warning "the owner's GUI exited during startup"; return }
@@ -323,15 +301,10 @@ function Start-OwnerGui {
     Write-Warning "the owner's GUI (pid $($g.Id)) is running but never served 8080/8443 -- check it reached the dashboard"
 }
 
-# Put the owner's `config.json` back, and never put back something the bootstrap cannot read.
-#
-# Idempotent, and called from the trap as well as the normal exit, because the first version of
-# this harness cleared `devices` and then threw in phase 1 -- which left the file cleared and lost
-# a saved device row. `devices` and `knownDevices` must both come back as JSON *arrays*: an object
-# there ("devices": {"0": {...}}, the shape a dotted `config set` key produces) makes the
-# bootstrap's replay loop throw "object is not iterable" and the GUI stops at a Setup Error. If the
-# backup itself is malformed, the offending key is written as an empty array rather than restored,
-# because handing back a file that cannot be read is worse than handing back one that is empty.
+# Put the owner's `config.json` back. Idempotent: called from the trap as well as the normal
+# exit. `devices` and `knownDevices` must come back as JSON arrays: an object there
+# ("devices": {"0": {...}}) makes the bootstrap's replay loop throw "object is not iterable"
+# and the GUI stops at a Setup Error. A malformed key in the backup is written as [] instead.
 function Restore-Config {
     if (-not (Test-Path $storeBackup)) { return }
     try {
@@ -343,9 +316,8 @@ function Restore-Config {
                 $j.$k = @()
             }
         }
-        # No BOM: tauri-plugin-store cannot parse one, and a store it cannot parse is silently
-        # replaced by `defaultConfig` -- which throws away every device, every known device, the
-        # ports, TURN and STUN on the next launch.
+        # no BOM: tauri-plugin-store cannot parse one and silently replaces the store with
+        # `defaultConfig`, losing every saved device, the ports, TURN and STUN
         [IO.File]::WriteAllText($storeFile, ($j | ConvertTo-Json -Depth 12), (New-Object Text.UTF8Encoding $false))
         $back = Get-Content -Raw $storeFile | ConvertFrom-Json
         Step ("config restored: devices={0} knownDevices={1}" -f @($back.devices).Count, @($back.knownDevices).Count)
@@ -356,10 +328,9 @@ function Restore-Config {
 
 Claim-HostLock
 
-# A saved device row pins geometry and refresh rate for every later join from the same address, so
-# a run against one measures the row rather than the build. Cleared for the run and put back after.
-# No BOM: tauri-plugin-store cannot parse one and silently falls back to defaultConfig, which
-# throws away the whole saved configuration on the next launch.
+# A saved device row pins geometry and refresh rate for every later join from the same address,
+# so a run against one measures the row rather than the build. Cleared for the run and put back
+# after (written without a BOM, see Restore-Config).
 $storeFile = Join-Path $env:APPDATA 'app.screenextend.desktop\config.json'
 $storeBackup = Join-Path $runDir 'config.json.before'
 if (Test-Path $storeFile) {
@@ -374,9 +345,8 @@ if (Test-Path $storeFile) {
     } catch { Write-Warning "could not clear the saved device row: $_" }
 }
 
-# From here the owner's config is modified, so every exit path has to put it back. `trap` fires on
-# any terminating error, which is what the first version of this harness did not have: a throw in
-# phase 1 left `devices` cleared and a saved device row was lost.
+# the owner's config is modified from here on, so every exit path puts it back: `trap` fires
+# on any terminating error
 trap {
     Write-Warning "run failed: $_"
     Restore-Config
@@ -413,16 +383,11 @@ for ($i = 0; $i -lt 60; $i++) {
 if (-not $ready) { throw "host never served /health at $base (see $hostLog)" }
 Step "host up: $base session=$sessionId"
 
-# --------------------------------------------------------------------------------------------
-# Load, if asked. N-2 cores busy so the measurement is not competing with itself for every core.
-# --------------------------------------------------------------------------------------------
 $loadJobs = @()
 if ($Load) {
-    # Half the logical processors, not all-but-two. The harness drives the browser over CDP with a
-    # 20 s timeout, and a box with fourteen of sixteen cores spinning cannot answer `Runtime.evaluate`
-    # inside it -- the run then fails as a harness error rather than reporting a slow number, which
-    # measures nothing. Half is enough contention to move the percentiles and still leaves the host,
-    # the encoder and Chrome somewhere to run.
+    # half the logical processors, not all-but-two: with fourteen of sixteen cores spinning the
+    # browser cannot answer `Runtime.evaluate` inside the 20 s CDP timeout, and the run fails as
+    # a harness error instead of reporting a slow number
     $n = [Math]::Max(1, [int]([Environment]::ProcessorCount / 2))
     for ($i = 0; $i -lt $n; $i++) {
         $loadJobs += Start-Job -ScriptBlock {
@@ -433,9 +398,6 @@ if ($Load) {
     Step "CPU load: $n busy cores"
 }
 
-# --------------------------------------------------------------------------------------------
-# Client
-# --------------------------------------------------------------------------------------------
 $chrome = 'C:\Program Files\Google\Chrome\Application\chrome.exe'
 if (-not (Test-Path $chrome)) { $chrome = 'C:\Program Files (x86)\Google\Chrome\Application\chrome.exe' }
 $profileDir = Join-Path $runDir 'chrome-profile'
@@ -523,14 +485,9 @@ $p = $virtual.Split(',')
 $vb = [pscustomobject]@{ X = [int]$p[0]; Y = [int]$p[1]; Width = [int]$p[2]; Height = [int]$p[3] }
 Step "virtual display: $($vb.Width)x$($vb.Height) at $($vb.X),$($vb.Y)"
 
-# --------------------------------------------------------------------------------------------
-# In-page instrumentation.
-#
-# The pointer listener goes on `window` with `capture: true`, so it runs in the capture phase -
-# ahead of the page's own listener, which is registered on `#stage` in the bubble phase. A
-# listener on the same element would run *after* the page's, and the hold time would come out
-# negative or zero for the immediate path.
-# --------------------------------------------------------------------------------------------
+# In-page instrumentation. The pointer listener goes on `window` with `capture: true` so it
+# runs ahead of the page's own listener (on `#stage`, bubble phase); on the same element it
+# would run after the page's and the hold time would come out zero or negative.
 $install = Invoke-Js @'
 (function () {
   if (window.__ilat) return 'already';
@@ -610,13 +567,9 @@ $install = Invoke-Js @'
 Step "page hooks: $install"
 if ($install -notin @('installed', 'already')) { throw "could not install the page hooks: $install" }
 
-# One row per injected event, from whichever `input-trace` shape the binary under test emits.
-#
-# The shipped diagnostic writes `wall_ms=` through the log bus (stdout under `serve -v`). The
-# measurement patch carried in the baseline worktree writes `injected=` on stderr, because the
-# baseline has no host-clock stage histograms to hang the number off. Both name the same instant —
-# the wall clock immediately after `SendInput` returned — so both are read here and neither run
-# needs a binary rebuilt to match the other's log format.
+# One row per injected event. Two `input-trace` shapes are read: `wall_ms=` on stdout (the log
+# bus under `serve -v`) and `injected=` on stderr (a patched baseline build). Both are the wall
+# clock immediately after `SendInput` returned.
 function Read-Trace {
     $rows = @()
     foreach ($f in @($hostLog, $hostErr)) {
@@ -634,23 +587,19 @@ function Read-Trace {
             }
         }
     }
-    # Deliberately *not* returned as `, @(...)`: the caller always re-wraps with `@()`, and the
-    # extra wrapper made `@(Read-Trace)` a one-element array holding the array, so `[0].wall` was
-    # a whole column of stamps and the subtraction below failed on `System.Object[]`.
+    # not `, @(...)`: callers re-wrap with `@()`, and the extra wrapper would make that a
+    # one-element array holding the array
     return @($rows | Sort-Object wall)
 }
 
 $results = [ordered]@{}
 
-# --------------------------------------------------------------------------------------------
-# Phase 1 + 2: hold and forward, at three cadences.
-# --------------------------------------------------------------------------------------------
+# Phase 1 + 2: hold and forward, at three cadences
 foreach ($sweep in @(
         @{ name = 'isolated-4Hz'; count = 40; gap = 250; per = 1 },
         @{ name = 'sweep-125Hz'; count = 500; gap = 8; per = 1 },
         @{ name = 'sweep-1kHz'; count = 500; gap = 8; per = 8 })) {
 
-    # Trace rows are selected by wall-clock window below, so no prior count is needed.
     Invoke-Js 'window.__ilatReset(), true' | Out-Null
     $t0 = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
     $dispatched = Invoke-Js "window.__sweep($($sweep.count), $($sweep.gap), $($sweep.per))" -TimeoutMs 180000
@@ -659,9 +608,8 @@ foreach ($sweep in @(
 
     $h = (Invoke-Js 'JSON.stringify(window.__hold())') | ConvertFrom-Json
     $sendWall = JsonArray (Invoke-Js 'JSON.stringify(window.__sendWall())')
-    # Only the pointer kinds: a `Resize` or a focus change injected in the same window is a real
-    # event the host handled, but it is not the event this phase dispatched, and pairing it against
-    # a pointer send shifts every later pair.
+    # only the pointer kinds: a `Resize` or focus change injected in the same window would pair
+    # against a pointer send and shift every later pair
     $trace = @((Read-Trace) | Where-Object {
             $_.kind -match '^(pointer|batch|delta)' -and $_.wall -ge ($t0 - 50) -and $_.wall -le ($t1 + 50)
         })
@@ -691,13 +639,9 @@ foreach ($sweep in @(
     Start-Sleep -Milliseconds 600
 }
 
-# --------------------------------------------------------------------------------------------
-# Phase 3: frame production on a static desktop.
-#
-# Three windows, same length, nothing else running on the virtual display. The question is not
-# "how fast is the encoder" but "does a pointer moving over an unchanged desktop produce frames at
-# all" - and whether the answer differs for the client's pointer and the host's.
-# --------------------------------------------------------------------------------------------
+# Phase 3: frame production on a static desktop. Three windows of equal length: does a pointer
+# moving over an unchanged desktop produce frames at all, and does the answer differ between
+# the client's pointer and the host's?
 $fault = [SEIn]::SelfTest($vb.X + [int]($vb.Width / 2), $vb.Y + [int]($vb.Height / 2))
 if ($fault -and $fault.StartsWith('FATAL')) {
     throw "the host-sweep window would measure a still desktop: $fault"
@@ -737,12 +681,9 @@ function Window-Fps($name, $startAction, $stopAction) {
     }
 }
 
-# Does a single client pointer move, on a desktop where nothing else is changing, produce a frame?
-#
-# This is the structural question behind "the client pointer feels laggy": a host that only
-# encodes when the *desktop* changes has nothing to send for a cursor that moved, and the picture
-# then waits for whatever emits next. Counted rather than timed — one isolated move every `gapMs`,
-# and the painted count either tracks the moves or it tracks the keepalive.
+# Does one pointer move on an otherwise static desktop produce a frame? A host that only encodes
+# when the desktop changes has nothing to send for a cursor that moved. Counted, not timed: one
+# move every `gapMs`, and the painted count tracks either the moves or the keepalive.
 function Isolated-Moves($name, $moves, $gapMs, $mover) {
     Start-Sleep -Milliseconds 600
     $a = Painted
@@ -766,7 +707,7 @@ function Isolated-Moves($name, $moves, $gapMs, $mover) {
     }
 }
 
-# Park the host pointer off the virtual display for the two windows that must not have it moving.
+# park the host pointer off the virtual display for the two windows that must not have it moving
 $parkX = 10; $parkY = 10
 [SEIn]::MoveTo($parkX, $parkY)
 Start-Sleep -Milliseconds 400
@@ -778,7 +719,7 @@ $clientSweep = Window-Fps 'client-pointer' {
 } {
     Invoke-Js 'true' | Out-Null
 }
-# The sweep promise is still resolving; let it finish so it cannot bleed into the next window.
+# the sweep promise is still resolving; let it finish so it cannot bleed into the next window
 Start-Sleep -Milliseconds 1500
 Invoke-Js 'window.__ilatReset(), true' | Out-Null
 
@@ -822,9 +763,9 @@ public static class SEIn3 {
 [SEIn]::MoveTo($parkX, $parkY)
 Start-Sleep -Milliseconds 500
 
-# One move at a time, 300 ms apart: far enough that a frame produced *for* the move is
-# unambiguous, and 300 ms is longer than the 200 ms keepalive so the baseline of unrelated
-# emissions is known from the static window above.
+# one move at a time, 300 ms apart: far enough that a frame produced for the move is
+# unambiguous, and longer than the 200 ms keepalive, so the baseline of unrelated emissions
+# is known from the static window above
 $isoClient = Isolated-Moves 'client-pointer' 30 300 {
     param($i)
     Invoke-Js "(function(){var s=document.getElementById('stage'),r=s.getBoundingClientRect();
@@ -852,11 +793,8 @@ $results['frames'] = [ordered]@{
     isolatedHostMoves   = $isoHost
 }
 
-# --------------------------------------------------------------------------------------------
 # Phase 4: keystrokes. Dispatched into the page, so they take the same reliable-channel path a
 # real keypress does, and paired against the host's KEY injections.
-# --------------------------------------------------------------------------------------------
-# Trace rows are selected by wall-clock window below, so no prior count is needed.
 Invoke-Js 'window.__ilatReset(), true' | Out-Null
 $kt0 = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
 Invoke-Js @'
@@ -892,9 +830,6 @@ Step ("keys: {0} sends -> {1} injections; forward p50 {2} p99 {3}" -f $keyWall.C
     $(if ($results['keys'].forwardMs) { $results['keys'].forwardMs.p50 } else { 'n/a' }),
     $(if ($results['keys'].forwardMs) { $results['keys'].forwardMs.p99 } else { 'n/a' }))
 
-# --------------------------------------------------------------------------------------------
-# Wrap up
-# --------------------------------------------------------------------------------------------
 $final = $null
 try { $final = (Invoke-Js 'JSON.stringify(SEVideo.getStats())') | ConvertFrom-Json } catch { }
 

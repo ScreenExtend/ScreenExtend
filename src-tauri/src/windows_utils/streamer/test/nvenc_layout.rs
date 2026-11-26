@@ -1,14 +1,14 @@
-//! NVENC ABI assertions — generated, do not hand-edit the `abi_*` bodies.
+//! NVENC ABI assertions, generated: do not hand-edit the `abi_*` bodies.
 //!
 //! The previous version of this file asserted the Rust structs' `size_of` and `offset_of`
 //! against constants emitted by the same bindgen run that produced those structs. That is
 //! self-referential: it detects a hand edit to the Rust and nothing else. In particular it could
-//! not detect the thing it most needed to — bindings generated against one SDK header while
+//! not detect the thing it most needed to: bindings generated against one SDK header while
 //! `nvenc_sys/version.rs`, which is hand-written, encodes the struct revision words of another.
 //!
 //! A wrong revision word is not a compile error and not a crash. `nvEncInitializeEncoder`
 //! returns `NV_ENC_ERR_INVALID_VERSION`, `build_backend` catches it, and the whole NVIDIA path
-//! degrades to Quick Sync or x264 — on a machine with a working NVENC in it. The same is true of
+//! degrades to Quick Sync or x264, on a machine with a working NVENC in it. The same is true of
 //! a wrong GUID (the driver reports an unsupported parameter set, not a bad GUID) and of a wrong
 //! `NV_ENCODE_API_FUNCTION_LIST` offset, which is a call through the wrong function pointer.
 //!
@@ -16,16 +16,16 @@
 //!
 //! ## Provenance
 //!
-//! * Header: `src-tauri/resources/nvenc-headers/nvEncodeAPI.h` — FFmpeg/nv-codec-headers at tag
+//! * Header: `src-tauri/resources/nvenc-headers/nvEncodeAPI.h`, from FFmpeg/nv-codec-headers at tag
 //!   `n12.1.14.1` (commit `e1ff958747e9e08247cea31b6e629d61ece824c0`), which is NVENC API
 //!   **12.1**. MIT, redistributable; SHA-256 pinned in `src-tauri/resources/SHA256SUMS` and
 //!   recorded in `resources/PROVENANCE.md`.
 //! * The bindings in `nvenc_sys/` were audited against it rather than assumed: every struct
 //!   revision in the hand-written `version.rs` matches 12.1 exactly (CONFIG 8, INITIALIZE_PARAMS
 //!   6, RECONFIGURE_PARAMS 1, PRESET_CONFIG 4, PIC_PARAMS 6, LOCK_BITSTREAM 1,
-//!   REGISTER_RESOURCE 4, EVENT_PARAMS 1), and the members that looked like SDK-13 additions —
+//!   REGISTER_RESOURCE 4, EVENT_PARAMS 1), and the members that looked like SDK-13 additions (
 //!   `nvEncRestoreEncoderState`, `nvEncLookaheadPicture`, `numStateBuffers`, `outputStatsLevel`,
-//!   `splitEncodeMode`, `NV_ENC_CAPS_EXPOSED_COUNT = 55` — are all present at 12.1. 13.0 raises
+//!   `splitEncodeMode`, `NV_ENC_CAPS_EXPOSED_COUNT = 55`) are all present at 12.1. 13.0 raises
 //!   every one of those revisions by one, so the bindings are 12.1 throughout and internally
 //!   consistent.
 //! * Generator: `src-tauri/tools/nvenc_layout_gen.c`, compiled in C mode (`cl /TC`).
@@ -46,7 +46,7 @@
 //! `cl.exe`, and the generated Rust is the checked-in product. A diff in these numbers after a
 //! header bump is a required review item.
 //!
-//! What this file cannot check is whether the driver agrees — only running the encoder does
+//! What this file cannot check is whether the driver agrees: only running the encoder does
 //! that, which is `test/nvenc_encoder.rs`.
 
 use std::mem::{align_of, offset_of, size_of};
@@ -1275,7 +1275,7 @@ fn abi_status_codes_match_nvencodeapi_h() {
 #[test]
 fn abi_guids_match_nvencodeapi_h() {
     // bindgen mis-generates these (rust-bindgen#1888), so `nvenc_sys/guid.rs`
-    // transcribes them by hand — exactly the place a typo would survive review.
+    // transcribes them by hand, exactly the place a typo would survive review.
     assert_guid(
         NV_ENC_CODEC_H264_GUID,
         0x6BC82762,

@@ -19,11 +19,8 @@ unsafe impl Send for Shared {}
 unsafe impl Sync for Shared {}
 
 impl Shared {
-    /// The ring as a plain `*mut f32`.
-    ///
-    /// `UnsafeCell<T>` is `#[repr(transparent)]`, so the cell array and an `f32` array have the
-    /// same layout; going through the pointer is what lets `push`/`pop` copy spans instead of
-    /// storing one masked element at a time.
+    /// The ring as a plain `*mut f32`: `UnsafeCell<T>` is `#[repr(transparent)]`, so the layouts
+    /// match and `push`/`pop` can copy spans.
     #[inline]
     fn base_ptr(&self) -> *mut f32 {
         self.buf.as_ptr() as *mut f32
@@ -32,10 +29,9 @@ impl Shared {
 
 /// Host-clock time of one identified sample in the stream.
 ///
-/// Every capture callback is handed a hardware timestamp for the block it delivers. Publishing that
-/// alongside the absolute ring index the block starts at lets the encoder worker date its packets
-/// from when the samples were *captured* rather than from when it woke up to encode them. The pair
-/// is guarded by a seqlock, not a mutex, because the writer is a real-time audio callback.
+/// The capture callback publishes its hardware timestamp with the ring index the block starts at,
+/// so the encoder dates packets from capture, not from when it woke. A seqlock, not a mutex: the
+/// writer is a real-time audio callback.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Anchor {
     /// absolute index, in ring samples, of the sample this time refers to
@@ -79,18 +75,16 @@ pub fn ring(capacity: usize) -> (Producer, Consumer) {
 impl Producer {
     /// Write what fits and return how many samples had to be dropped.
     ///
-    /// Every operation here is wait-free: this runs on a CoreAudio IOProc or the SCK delivery
-    /// queue, where a blocking mutex acquisition against a lower-priority thread is a priority
-    /// inversion. In particular there is deliberately no consumer wakeup — the encoder worker
-    /// polls with a 125 us `park_timeout`, a quarter of one 5 ms Opus frame.
+    /// Wait-free: this runs on a CoreAudio IOProc or the SCK delivery queue, where blocking on a
+    /// lower-priority thread is a priority inversion. No consumer wakeup either: the encoder
+    /// worker polls with a 125 us `park_timeout`, a quarter of one 5 ms Opus frame.
     pub fn push(&self, data: &[f32]) -> usize {
         self.write(data)
     }
 
     /// Push a block whose first sample was captured at `host_ns`, publishing that as the anchor.
     ///
-    /// `host_ns == 0` means the backend had no usable hardware stamp for this block; the previous
-    /// anchor is then left in place rather than replaced with a guess.
+    /// `host_ns == 0` means no usable hardware stamp: the previous anchor stays in place.
     pub fn push_at(&self, data: &[f32], host_ns: u64) -> usize {
         if host_ns != 0 {
             let s = &*self.shared;
@@ -113,10 +107,8 @@ impl Producer {
         let free = s.buf.len() - head.wrapping_sub(tail);
         let n = data.len().min(free);
 
-        // Two copies around the wrap, not a masked store per sample. The backing store is
-        // `Box<[UnsafeCell<f32>]>`, which the compiler cannot see as contiguous `f32` through the
-        // per-element `get()`, so the scalar version never vectorises — and this runs on a
-        // CoreAudio IOProc, where cost is deadline-miss risk rather than throughput.
+        // two span copies around the wrap: a masked store per sample through `UnsafeCell::get()`
+        // never vectorises, and on a CoreAudio IOProc cost is deadline-miss risk
         let base = s.base_ptr();
         let start = head & s.mask;
         let first = n.min(s.buf.len() - start);
@@ -157,8 +149,8 @@ impl Consumer {
 
     /// The most recently published capture-time anchor.
     ///
-    /// `None` if the producer has never published one, or if the seqlock was caught mid-write on
-    /// every attempt — the caller falls back to its own clock for that frame.
+    /// `None` if none was ever published, or if the seqlock was mid-write on every attempt: the
+    /// caller falls back to its own clock for that frame.
     pub fn anchor(&self) -> Option<Anchor> {
         let s = &*self.shared;
         for _ in 0..4 {

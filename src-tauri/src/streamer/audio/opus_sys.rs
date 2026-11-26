@@ -44,13 +44,12 @@ pub const OPUS_RESET_STATE: c_int = 4028;
 pub const OPUS_GET_SAMPLE_RATE_REQUEST: c_int = 4029;
 pub const OPUS_SET_LSB_DEPTH_REQUEST: c_int = 4036;
 /// "If set to 1, disables almost all use of prediction, making frames almost completely
-/// independent" — the right dial for a zero-retransmit, unordered transport where any frame
-/// may have to stand alone. Costs bitrate at fixed quality.
+/// independent": for a zero-retransmit, unordered transport where any frame may have to
+/// stand alone. Costs bitrate at fixed quality.
 pub const OPUS_SET_PREDICTION_DISABLED_REQUEST: c_int = 4042;
 
-// The GET side. None of these existed, so the encoder's configuration was applied and never
-// confirmed: `ctl_set` does check its return, but nothing asked the encoder what state it was
-// actually in — and Windows and macOS load different libopus builds.
+// GET side, for reading back what the encoder applied: Windows and macOS load different
+// libopus builds
 pub const OPUS_GET_APPLICATION_REQUEST: c_int = 4001;
 pub const OPUS_GET_BITRATE_REQUEST: c_int = 4003;
 pub const OPUS_GET_VBR_REQUEST: c_int = 4007;
@@ -194,16 +193,9 @@ impl OpusApi {
         }
     }
 
-    /// What the loaded library says it is.
-    ///
-    /// This is the only identification the log carries for a `libloading`-resolved dependency
-    /// that ships in `resources/`, and Windows and macOS load different binaries behind the
-    /// same FFI. Measured on the bundled artifacts: the Windows DLL answers the literal
-    /// `"libopus unknown"` — upstream's own fallback when the build had no `package_version`,
-    /// which a shallow checkout does not generate — while the macOS dylib, built from the
-    /// official 1.6.1 release tarball, answers `"libopus 1.6.1"`. Both are the library
-    /// speaking. The null case below is the library declining to speak at all, which upstream
-    /// never does, so it must not be reported with a string the library itself can return.
+    /// What the loaded library says it is. The bundled Windows DLL answers `"libopus unknown"`
+    /// (upstream's fallback when the build had no `package_version`) and the macOS dylib
+    /// `"libopus 1.6.1"`, so the null case must not reuse a string the library can return.
     pub fn version(&self) -> String {
         unsafe {
             let ptr = (self.get_version)();

@@ -1,17 +1,11 @@
 //! TEST HOOK: a synthetic frame source in place of screen capture, for REAL sessions.
 //!
 //! Compiled only with `--features bench`, and active only with `SE_TEST_HOOKS=1` and
-//! `SE_TEST_SOURCE=<workload>[:<fps>]` (`stress` = the bench's window-drag stress clip, or any
-//! `streamer::synthetic` workload: `static`, `scroll`, `motion`, `drag`, `mixed`; the frame rate
-//! defaults to the session's). `macos_utils::streamer::start_capture` then returns this as the
-//! session's `CaptureBackend`: frames at the session's encode size, looped for the life of the
-//! session, delivered on their own schedule through the same `FrameSink` the real backends use,
-//! each stamped with the moment it is offered — so the encode loop, hold push, performance hold,
-//! RTP writer, pacer and congestion control all run the production path. A machine whose screen
-//! is locked (so real capture only ever sees a still picture) can be measured under motion.
-//!
-//! `static` delivers one frame and then nothing, the way a real backend delivers nothing for an
-//! unchanged screen. The virtual display is still created and the permission flow is untouched.
+//! `SE_TEST_SOURCE=<workload>[:<fps>]` (`stress` or a `streamer::synthetic` workload). Frames go
+//! through the `FrameSink` the real backends use, stamped when offered, so everything after
+//! capture is the production path and a locked-screen machine can be measured under motion.
+//! `static` delivers one frame and then nothing, as a real backend does for an unchanged screen.
+//! Only capture is replaced: the virtual display is still created, the permission flow untouched.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
@@ -117,7 +111,7 @@ fn render(spec: &Spec, w: usize, h: usize, fps: u32) -> Clip {
     }
     let wl = crate::streamer::synthetic::Workload::parse(&spec.workload)
         .unwrap_or(crate::streamer::synthetic::Workload::Static);
-    // Up to two seconds, within ~400 MB.
+    // up to two seconds, within ~400 MB
     let pic = w * h * 3 / 2;
     let n = if wl == crate::streamer::synthetic::Workload::Static {
         1
@@ -242,7 +236,7 @@ impl CaptureBackend for SynthSource {
                             &frame_buf
                         }
                         Clip::Frames(f) if f.len() == 1 && k > 0 => {
-                            // A still picture: nothing new to deliver.
+                            // a still picture: nothing new to deliver
                             k += 1;
                             continue;
                         }
@@ -339,7 +333,7 @@ mod tests {
             };
             let mut s = SynthSource::new(parse(spec).unwrap(), cfg, fps, sink);
             s.start().expect("starts");
-            // Let the first frame render (the stress clip renders its desktop first).
+            // let the first frame render (the stress clip renders its desktop first)
             std::thread::sleep(Duration::from_millis(300));
             let n0 = s.frames_captured();
             std::thread::sleep(Duration::from_millis(1000));

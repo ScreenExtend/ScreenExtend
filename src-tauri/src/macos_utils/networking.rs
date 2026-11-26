@@ -27,19 +27,14 @@ const fn iowr(num: u64, size: usize) -> u64 {
     0xc000_0000 | (((size as u64) & 0x1fff) << 16) | ((b'i' as u64) << 8) | num
 }
 
-/// `SIOCGIFMEDIA` — the ioctl `ifconfig` uses to print `media: autoselect`. Not in `libc`, so the
+/// `SIOCGIFMEDIA`: the ioctl `ifconfig` uses to print `media: autoselect`. Not in `libc`, so the
 /// `_IOWR('i', 56, struct ifmediareq)` of `<sys/sockio.h>` is recomputed here from the struct, and
 /// `an_ifmediareq_matches_the_kernels_64_bit_layout` pins the result to the header's number.
 ///
-/// The size in the request number is load-bearing, and 44 is the only value that is both correct
-/// and future-proof. `<net/if.h>` wraps `struct ifmediareq` in `#pragma pack(4)`, so the 64-bit
-/// `ifm_ulist` sits at offset 36 with no padding and the struct is 44 bytes, not the 48 an
-/// 8-aligned pointer would give. XNU also keeps a 32-bit compat form of the same call whose
-/// pointer is 4 bytes wide, encoding 40 — and because the two layouts agree over their first 36
-/// bytes, every field this module reads lands in the right place under either. Probed on 10.15.8
-/// (`docs/OPTIMIZATIONS.md`): 40 and 44 both return 0 on en0/en1/en3, 48 is `ENOTSUP` everywhere.
-/// Asking with 40 from a 64-bit process is nonetheless the wrong half of that pair, and would
-/// truncate `ifm_ulist` the moment anyone sets `ifm_count` to fetch the media list.
+/// The size in the request number must be 44: `<net/if.h>` wraps `struct ifmediareq` in
+/// `#pragma pack(4)`, so the 64-bit `ifm_ulist` sits at offset 36 with no padding. On 10.15.8,
+/// 44 and 40 (XNU's 32-bit compat form) both return 0 and 48 is `ENOTSUP`, but 40 from a 64-bit
+/// process would truncate `ifm_ulist` once `ifm_count` is set to fetch the media list.
 const SIOCGIFMEDIA: u64 = iowr(56, size_of::<ifmediareq>());
 const SIOCGIFFUNCTIONALTYPE: u64 = iowr(173, size_of::<ifreq>());
 
@@ -88,8 +83,7 @@ fn name_into(buf: &mut [libc::c_char], name: &str) {
     }
 }
 
-/// One `AF_INET` socket serves the whole enumeration; the previous code opened and closed two per
-/// interface per second.
+/// One `AF_INET` socket serves the whole enumeration.
 struct IoctlSocket(libc::c_int);
 
 impl IoctlSocket {
@@ -99,8 +93,8 @@ impl IoctlSocket {
     }
 
     /// The module's only `SIOCGIFMEDIA` call. `ifm_count` stays zero, so the kernel has no media
-    /// list to copy out and never dereferences `ifm_ulist`. `None` covers the interfaces that have
-    /// no medium at all — loopback and the `utun`s answer `ENOTSUP` here.
+    /// list to copy out and never dereferences `ifm_ulist`. `None` covers interfaces with no
+    /// medium at all: loopback and the `utun`s answer `ENOTSUP` here.
     fn media(&self, name: &str) -> Option<ifmediareq> {
         unsafe {
             let mut req: ifmediareq = std::mem::zeroed();
@@ -154,14 +148,12 @@ fn interface_index(name: &str) -> Option<u32> {
 /// `CWInterface.ssid` returns nil on macOS 10.15+ unless the process holds Location Services
 /// authorization.
 ///
-/// **ScreenExtend does not ask for Location, deliberately.** The SSID is a label on a dashboard
-/// row; a Location prompt is one of the heaviest consents macOS shows, and asking for it to
-/// decorate a row that already carries the adapter's addresses is not a trade worth making. So on
-/// a Mac that has never granted it the row reads "Wi-Fi", on purpose rather than by accident, and
-/// the reason is said once in the log instead of looking like a bug next to the Windows dashboard.
+/// **ScreenExtend does not ask for Location, deliberately.** The SSID is only a label on a
+/// dashboard row, and a Location prompt is one of the heaviest consents macOS shows. Without the
+/// grant the row reads "Wi-Fi", and the log says why once.
 ///
-/// The last name we *did* read is still remembered, so a machine that has the authorization does
-/// not flap to the placeholder on a single nil read.
+/// The last name read is remembered, so a machine that has the authorization does not flap to
+/// the placeholder on a single nil read.
 fn wifi_ssid(name: &str) -> Option<String> {
     static LAST: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
     let last = LAST.get_or_init(|| Mutex::new(HashMap::new()));
@@ -197,14 +189,12 @@ fn wifi_ssid(name: &str) -> Option<String> {
     }
 }
 
-/// Whether AWDL — Apple Wireless Direct Link, the radio AirDrop, Handoff and Sidecar run on — is
-/// up on this Mac, and which channel the Wi-Fi interface is associated to.
+/// Whether AWDL (Apple Wireless Direct Link, the radio AirDrop, Handoff and Sidecar run on) is up
+/// on this Mac.
 ///
-/// Both matter to latency and neither is something ScreenExtend can fix, so they are reported
-/// once rather than acted on. A single-radio Mac time-shares between the infrastructure link and
-/// AWDL's social channels (6, 44 and 149), which is measured elsewhere as periodic 50-200 ms
-/// stalls on a stream — a jitter source the *user* can act on by narrowing AirDrop's
-/// discoverability, and one that will otherwise be blamed on us.
+/// Reported once, not acted on: a single-radio Mac time-shares between the infrastructure link
+/// and AWDL's social channels (6, 44 and 149), which shows as periodic 50-200 ms stalls on a
+/// stream. The user can reduce it by narrowing AirDrop's discoverability.
 fn awdl_is_up() -> bool {
     unsafe {
         let mut ifap: *mut ifaddrs = std::ptr::null_mut();
@@ -262,10 +252,8 @@ fn report_radio_conditions() {
 
 /// The kernel's routing socket: how BSD announces interface and address changes.
 ///
-/// `PF_ROUTE` predates macOS, needs no framework, no run loop and no entitlement, and it carries
-/// exactly the events that change what the streamers bind — `RTM_NEWADDR`, `RTM_DELADDR`,
-/// `RTM_IFINFO`. The previous watcher re-ran the whole `getifaddrs` + `ioctl` + CoreWLAN
-/// enumeration once a second forever, whether or not anything had moved.
+/// `PF_ROUTE` needs no framework, no run loop and no entitlement, and it carries exactly the
+/// events that change what the streamers bind: `RTM_NEWADDR`, `RTM_DELADDR`, `RTM_IFINFO`.
 struct RouteSocket(libc::c_int);
 
 impl RouteSocket {
@@ -314,17 +302,17 @@ impl Drop for RouteSocket {
     }
 }
 
-/// A Wi-Fi switch produces a burst of routing messages — link down, address removed, link up,
-/// address added. One enumeration should cover the lot.
+/// A Wi-Fi switch produces a burst of routing messages (link down, address removed, link up,
+/// address added). One enumeration should cover the lot.
 const ROUTE_DEBOUNCE: Duration = Duration::from_millis(250);
-/// Re-enumerate this often even with a silent routing socket, so a message we somehow miss costs
-/// at most this much rather than the life of the process.
+/// Re-enumerate this often even with a silent routing socket, so a missed message costs at most
+/// this much.
 const ROUTE_BACKSTOP: Duration = Duration::from_secs(30);
 /// Only used when the routing socket cannot be opened at all.
 const FALLBACK_POLL: Duration = Duration::from_secs(1);
 
-/// How many full adapter enumerations the watcher has run. The whole point of the routing socket
-/// is that this stops growing when nothing changes, so it is worth being able to read.
+/// How many full adapter enumerations the watcher has run. With the routing socket this stops
+/// growing when nothing changes.
 static ENUMERATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub fn watch_enumerations() -> u64 {
@@ -376,8 +364,7 @@ fn hosted_network_name(app: &AppHandle) -> String {
 }
 
 /// The whole `getifaddrs` walk, once. `hosted_name` is `Some` only when the caller has already
-/// established that this host is running its own AP — the previous code asked CoreWLAN that
-/// question again for every Wi-Fi interface on every poll.
+/// established that this host is running its own AP, so CoreWLAN is not asked per interface.
 fn enumerate_adapters(hosted_name: Option<&str>) -> Vec<NetworkInfo> {
     let mut flags: BTreeMap<String, i32> = BTreeMap::new();
     let mut v4: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -479,8 +466,7 @@ pub fn cli_adapters() -> Vec<NetworkInfo> {
 #[tauri::command]
 #[specta::specta]
 pub fn watch_for_network_changes(app: AppHandle) {
-    // A Tauri command the frontend can call more than once. It used to start another identical
-    // thread every time, each one enumerating and each one able to call `sync_streamers`.
+    // the frontend can call this more than once: only the first call starts the watcher thread
     static WATCHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if WATCHING.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return;
@@ -510,7 +496,7 @@ pub fn watch_for_network_changes(app: AppHandle) {
             match &route {
                 Some(sock) => {
                     if sock.wait(ROUTE_BACKSTOP) {
-                        // Let the rest of a Wi-Fi switch's burst land before reading the world.
+                        // let the rest of a Wi-Fi switch's burst land before reading the adapters
                         std::thread::sleep(ROUTE_DEBOUNCE);
                         sock.drain();
                     }
@@ -547,9 +533,8 @@ const IFM_IEEE80211: u32 = 0x00000080;
 
 /// Which physical medium a local IP is reached over.
 ///
-/// `getifaddrs` gives the interface name for the address, and `SIOCGIFMEDIA` gives that
-/// interface's media type. USB tethering and RNDIS both report `IFM_ETHER`, which is the point:
-/// a phone on a cable is an ordinary Ethernet interface as far as the stack is concerned.
+/// USB tethering and RNDIS both report `IFM_ETHER`, which is the point: a phone on a cable is an
+/// ordinary Ethernet interface as far as the stack is concerned.
 pub fn link_medium_for_local_ip(ip: &str) -> Option<crate::streamer::platform::LinkMedium> {
     use crate::streamer::platform::LinkMedium;
 
@@ -594,7 +579,7 @@ pub fn link_medium_for_local_ip(ip: &str) -> Option<crate::streamer::platform::L
     let name = name?;
 
     let sock = IoctlSocket::open()?;
-    // A virtual or tunnel interface has no media type at all, which is not a failure.
+    // a virtual or tunnel interface has no media type at all, which is not a failure
     let Some(req) = sock.media(&name) else {
         return Some(LinkMedium::Other);
     };
@@ -646,11 +631,9 @@ mod tests {
         );
     }
 
-    /// What the watcher costs at idle, before and after.
-    ///
-    /// The old shape ran the full `getifaddrs` + `SIOCGIFMEDIA` + CoreWLAN enumeration once a
-    /// second forever. The new one blocks on the routing socket. Both halves are measured over the
-    /// same window on the same machine so the comparison is not against a remembered number.
+    /// What the watcher costs at idle: a once-a-second poll of the full `getifaddrs` +
+    /// `SIOCGIFMEDIA` + CoreWLAN enumeration against blocking on the routing socket, measured
+    /// over the same window on the same machine.
     ///
     /// ```text
     /// cargo test --lib macos_utils::networking::tests::measure_adapter_watch_cost -- --ignored --nocapture
@@ -759,10 +742,9 @@ mod tests {
         names
     }
 
-    /// Asks every interface the three request numbers `_IOWR('i', 56, …)` can produce, so the
-    /// choice of [`SIOCGIFMEDIA`] stays an observation rather than an argument: 40 is XNU's 32-bit
-    /// compat form, 44 is the header's, and 48 is what an unpacked 8-aligned `ifm_ulist` would
-    /// give. Needs a real kernel and real interfaces, hence ignored by default.
+    /// Asks every interface the three request numbers `_IOWR('i', 56, ...)` can produce: 40 is
+    /// XNU's 32-bit compat form, 44 is the header's, and 48 is what an unpacked 8-aligned
+    /// `ifm_ulist` would give. Needs a real kernel and real interfaces, hence ignored by default.
     ///
     /// ```text
     /// cargo test --lib macos_utils::networking::tests::probe_siocgifmedia_request_numbers -- --ignored --nocapture
@@ -798,8 +780,8 @@ mod tests {
             }
         }
 
-        // And the same constant through the two call sites that use it, so the numbers above are
-        // tied to what the app actually reports rather than to a bare ioctl.
+        // the same constant through the two call sites that use it, to tie the numbers above to
+        // what the app reports
         for adapter in enumerate_adapters(None) {
             for ip in &adapter.ip_addresses {
                 println!(

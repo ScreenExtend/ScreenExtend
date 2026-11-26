@@ -1,26 +1,20 @@
 //! Shared helpers for the test suite. Compiled only under `cfg(test)`.
 //!
-//! The one rule this module exists to enforce: **a test that verified nothing must say so.**
-//! An audit of the suite found six hardware-gated tests reporting `ok` after returning at the
-//! first line, and three more skipping with no message at all — on the machine that most needs
-//! the coverage, which is exactly where a green tick is most misleading. Every runtime-gated
-//! early return now goes through [`skip`], and every test that cannot run unattended carries
-//! `#[ignore = "<reason>"]` so the harness prints the reason instead of a bare `ignored`.
+//! The one rule this module enforces: **a test that verified nothing must say so.** A
+//! runtime-gated early return goes through [`skip`], and a test that cannot run unattended
+//! carries `#[ignore = "<reason>"]` so the harness prints the reason, not a bare `ignored`.
 
 /// Report a runtime-gated test as skipped instead of returning silently.
 ///
-/// Prints on plain stderr (not `teprintln!`, which only reaches the terminal when the logbus is
-/// in verbose mode — nothing under `cargo test` turns that on, which is how six skips became
-/// invisible). The harness captures stderr, so `--nocapture` is what shows the line live; the
-/// point is that it exists at all and shows up in a failure report.
+/// Prints on plain stderr, not `teprintln!`: nothing under `cargo test` puts the logbus in
+/// verbose mode. The harness captures stderr, so `--nocapture` shows the line live.
 ///
-/// Set `SE_REQUIRE_HW=1` on a machine that is supposed to have the capability and a skip becomes
-/// a failure, so a release box can be made strict without a second test suite.
+/// `SE_REQUIRE_HW=1` turns a skip into a panic, for a machine that should have the capability.
 #[track_caller]
 pub(crate) fn skip(what: &str, reason: impl std::fmt::Debug) {
     let msg = format!("SKIP {what}: {reason:?}");
     if std::env::var("SE_REQUIRE_HW").as_deref() == Ok("1") {
-        panic!("{msg} — SE_REQUIRE_HW=1 demands this path run");
+        panic!("{msg} (SE_REQUIRE_HW=1 demands this path run)");
     }
     eprintln!("{msg}");
 }
@@ -42,10 +36,9 @@ impl std::fmt::Debug for Reason<'_> {
 
 /// Route the log bus to stderr for the rest of the process.
 ///
-/// The encode tests report their measurements with `tprintln!`, which only reaches stderr when
-/// `logbus::VERBOSE` is set — and nothing under `cargo test` sets it, so the only per-frame
-/// encode latency numbers this repo produces went into a ring buffer and were discarded at exit.
-/// The harness still captures them; `--nocapture` is what shows them.
+/// The encode tests report measurements with `tprintln!`, which reaches stderr only when
+/// `logbus::VERBOSE` is set, and nothing under `cargo test` sets it. The harness still captures
+/// them, so pass `--nocapture`.
 pub(crate) fn show_measurements() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| crate::logbus::set_verbose(true));
@@ -53,8 +46,8 @@ pub(crate) fn show_measurements() {
 
 /// `p50 / p90 / p95 / p99 / max` of a sample set, in the sample's own unit.
 ///
-/// Nearest-rank on a sorted copy. Latency harnesses print these; `scripts/perf-gate.mjs` parses
-/// the line they end up on, so the shape of the numbers matters more than the exact estimator.
+/// Nearest-rank on a sorted copy. `scripts/perf-gate.mjs` parses the line the latency harnesses
+/// print these on.
 pub(crate) fn percentiles(samples: &[u128]) -> Percentiles {
     assert!(!samples.is_empty(), "percentiles of an empty sample set");
     let mut v = samples.to_vec();

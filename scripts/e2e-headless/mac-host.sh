@@ -35,6 +35,12 @@ start)
   done
   mkdir -p "$dir" && chmod 700 "$dir" || { echo "ERROR=cannot create $dir"; exit 2; }
   cd "$dir" || exit 2
+  # a shipped build reads none of the app's environment variables and would serve from the real
+  # data directory: refuse it
+  case "$(SCREENEXTEND_DATA_DIR="$dir" "$bin" config path 2>/dev/null < /dev/null)" in
+    *"$dir"*) ;;
+    *) echo "ERROR=this build ignores SCREENEXTEND_DATA_DIR (a shipped build); use a debug or bench build"; exit 2 ;;
+  esac
   echo "LOCKED_AT_START=$(locked)"
   SCREENEXTEND_DATA_DIR="$dir" nohup "$bin" serve --no-cloud --no-qr -v \
     --http-port "$http" --https-port "$https" > "$dir/serve.log" 2>&1 < /dev/null &
@@ -49,8 +55,8 @@ start)
     fi
     if grep -q "Host is running" "$dir/serve.log" 2>/dev/null && [ -n "$(listening "$https")" ]; then
       echo "READY=1"; echo "STARTUP_MS=$((i * 250))"
-      # Which SE_* variables the host process really carries (names and values of those
-      # only; nothing else from its environment is printed).
+      # the SE_* variables the host process really carries; nothing else from its environment
+      # is printed
       echo "HOST_ENV=$(ps -Eww -o command= -p "$pid" 2>/dev/null | tr ' ' '\n' | grep '^SE_' | tr '\n' ' ')"
       exit 0
     fi
@@ -67,7 +73,7 @@ stop)
   bin=$1 dir=$2 http=$3 https=$4
   pid=$(cat "$dir/serve.pid" 2>/dev/null)
   # 20 s for a clean stop, counting the `stop` command itself (which may hang with the host);
-  # then the host is killed, and STOPPED_BY says so.
+  # then the host is killed, and STOPPED_BY says so
   SCREENEXTEND_DATA_DIR="$dir" "$bin" stop > "$dir/stop.out" 2>&1 < /dev/null & sp=$!
   how=stop; i=0
   while [ $i -lt 80 ]; do
@@ -126,7 +132,7 @@ motionwin) # <helper> <display-id> <mode> <seconds> <out.json> <direct|open>
   helper=$1 id=$2 mode=$3 secs=$4 out=$5 how=${6:-direct}
   rm -f "$out"
   if [ "$how" = open ]; then
-    # Through LaunchServices, so the window belongs to the GUI session even from an SSH login.
+    # through LaunchServices, so the window belongs to the GUI session even from an SSH login
     app="$(dirname "$helper")/SEMotion.app"
     mkdir -p "$app/Contents/MacOS"
     cp -f "$helper" "$app/Contents/MacOS/motion-window"

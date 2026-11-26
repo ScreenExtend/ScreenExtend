@@ -15,8 +15,9 @@ use windows::Win32::Foundation::{LPARAM, WPARAM};
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_TEXTURE2D_DESC,
 };
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::System::WinRT::Direct3D11::IDirect3DDxgiInterfaceAccess;
-use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_QUIT};
+use windows::Win32::UI::WindowsAndMessaging::{PostQuitMessage, PostThreadMessageW, WM_QUIT};
 
 use super::capture::GraphicsCaptureApiHandler;
 use super::d3d11::{self, create_direct3d_device, SendDirectX};
@@ -62,9 +63,11 @@ pub enum Error {
 pub struct WgcFeatures {
     /// `IsCursorCaptureEnabled` — build 19041 (Windows 10 2004).
     pub cursor_toggle: bool,
-    /// `IsBorderRequired` — build 20348. Setting it to `false` additionally needs the user to
-    /// have granted `GraphicsCaptureAccess.RequestAccessAsync(Borderless)`; without that consent
-    /// the setter succeeds and the border stays.
+    /// `IsBorderRequired` — build 20348. Microsoft documents that turning the border off may need
+    /// `GraphicsCaptureAccess.RequestAccessAsync(Borderless)` consent first, and nothing here asks
+    /// for it; whether an unpackaged Win32 process needs it is not settled. The value is read back
+    /// after it is set and logged once per session (`wgc: session settings in effect`), which
+    /// shows what the session reports, not what the compositor draws.
     pub border_toggle: bool,
     /// `IncludeSecondaryWindows` — build 22000 (Windows 11 21H2).
     pub secondary_windows: bool,
@@ -115,8 +118,8 @@ impl WgcFeatures {
 /// is the contract check, because **the capture path uses no API newer than the contract-6 set**
 /// `IsSupported()` itself belongs to: `Direct3D11CaptureFramePool::Create`,
 /// `CreateCaptureSession`, `item.Closed`, `FrameArrived` and `item.Size`. Everything above that —
-/// `CreateFreeThreaded` (1809), `IsCursorCaptureEnabled` (1903), `IsBorderRequired` (2004),
-/// `IncludeSecondaryWindows` (20348), `MinUpdateInterval` and `DirtyRegionMode` (26100) — is
+/// `CreateFreeThreaded` (17763), `IsCursorCaptureEnabled` (19041), `IsBorderRequired` (20348),
+/// `IncludeSecondaryWindows` (22000), `MinUpdateInterval` and `DirtyRegionMode` (26100) — is
 /// probed individually by [`wgc_features`] and applied only where present, which is the
 /// probe-by-capability rule the contract number was standing in for.
 ///
@@ -199,10 +202,29 @@ pub struct GraphicsCaptureApi {
     halt: Arc<AtomicBool>,
     /// A flag indicating whether the capture session is currently active.
     active: bool,
-    /// The token for the `Closed` event handler.
-    capture_closed_event_token: i64,
-    /// The token for the `FrameArrived` event handler.
-    frame_arrived_event_token: i64,
+    /// The token for the `Closed` event handler, once it is registered.
+    capture_closed_event_token: Option<i64>,
+    /// The token for the `FrameArrived` event handler, once it is registered.
+    frame_arrived_event_token: Option<i64>,
+}
+
+/// Ends the capture thread's message loop from whichever thread a delegate runs on.
+///
+/// On the capture thread itself (a non-free-threaded pool dispatches `FrameArrived` there)
+/// `PostQuitMessage` cannot fail. Elsewhere (the item's `Closed` event, or a free-threaded pool)
+/// it is `PostThreadMessageW`, and a failure is logged rather than returned: a delegate's error
+/// goes to WinRT, which ignores it, so the halt flag would be set and the loop would never end,
+/// leaving the thread parked in `GetMessageW` for good.
+fn quit_capture_thread(thread_id: u32) {
+    if unsafe { GetCurrentThreadId() } == thread_id {
+        unsafe { PostQuitMessage(0) };
+        return;
+    }
+    if let Err(e) =
+        unsafe { PostThreadMessageW(thread_id, WM_QUIT, WPARAM::default(), LPARAM::default()) }
+    {
+        teprintln!("wgc: could not post WM_QUIT to the capture thread ({e}); it stays halted");
+    }
 }
 
 impl GraphicsCaptureApi {
@@ -227,6 +249,7 @@ impl GraphicsCaptureApi {
         dirty_region_settings: DirtyRegionSettings,
         color_format: ColorFormat,
         frame_pool_buffers: u32,
+        free_threaded: bool,
         stale_frames_dropped: Arc<AtomicU32>,
         thread_id: u32,
         result: Arc<Mutex<Option<E>>>,
@@ -239,6 +262,7 @@ impl GraphicsCaptureApi {
         let features = wgc_features();
 
         let GraphicsCaptureItemType::Monitor((item, _)) = &item_with_details;
+        let item = item.clone();
 
         // Create DirectX devices
         let direct3d_device = create_direct3d_device(&d3d_device)?;
@@ -246,22 +270,53 @@ impl GraphicsCaptureApi {
         let pixel_format = DirectXPixelFormat(color_format as i32);
 
         let buffers = frame_pool_buffers.clamp(1, 8) as i32;
-        let frame_pool = Direct3D11CaptureFramePool::Create(
-            &direct3d_device,
-            pixel_format,
-            buffers,
-            item.Size()?,
-        )?;
+        let initial_size = item.Size()?;
+        // `CreateFreeThreaded` is only asked for where it exists; a handler that wants it on a
+        // build without it gets the dispatcher-queue pool it always had.
+        let free_threaded = free_threaded && features.free_threaded_pool;
+        let frame_pool = if free_threaded {
+            Direct3D11CaptureFramePool::CreateFreeThreaded(
+                &direct3d_device,
+                pixel_format,
+                buffers,
+                initial_size,
+            )?
+        } else {
+            Direct3D11CaptureFramePool::Create(
+                &direct3d_device,
+                pixel_format,
+                buffers,
+                initial_size,
+            )?
+        };
         let frame_pool = Arc::new(frame_pool);
 
         // Create capture session
-        let session = frame_pool.CreateCaptureSession(item)?;
+        let session = frame_pool.CreateCaptureSession(&item)?;
 
         // Indicates if the capture is closed
         let halt = Arc::new(AtomicBool::new(false));
 
+        // `Self` exists before the first delegate is registered, so every `?` from here on drops
+        // it and `cleanup()` unregisters whatever was registered and closes the pool and the
+        // session. Before, a failure between the registrations and the final `Ok(Self{..})` (a
+        // setter refused below) skipped `cleanup` entirely and left the delegates, and the
+        // handler they hold, alive with nothing to stop them.
+        let mut api = Self {
+            item_with_details,
+            _d3d_device: d3d_device.clone(),
+            _direct3d_device: direct3d_device.clone(),
+            _d3d_device_context: d3d_device_context.clone(),
+            frame_pool: Some(frame_pool.clone()),
+            session: Some(session.clone()),
+            halt: halt.clone(),
+            active: false,
+            frame_arrived_event_token: None,
+            capture_closed_event_token: None,
+        };
+
         // Set capture session closed event
-        let capture_closed_event_token = item.Closed(&TypedEventHandler::<
+        api.capture_closed_event_token = Some(item.Closed(&TypedEventHandler::<
             GraphicsCaptureItem,
             IInspectable,
         >::new({
@@ -280,31 +335,32 @@ impl GraphicsCaptureApi {
                 }
 
                 // Stop the message loop to allow the thread to exit gracefully.
-                unsafe {
-                    PostThreadMessageW(thread_id, WM_QUIT, WPARAM::default(), LPARAM::default())?;
-                };
+                quit_capture_thread(thread_id);
 
                 Result::Ok(())
             }
-        }))?;
+        }))?);
 
         // Set frame pool frame arrived event
-        let frame_arrived_event_token = frame_pool.FrameArrived(&TypedEventHandler::<
+        api.frame_arrived_event_token = Some(frame_pool.FrameArrived(&TypedEventHandler::<
             Direct3D11CaptureFramePool,
             IInspectable,
         >::new({
-            // Init
-            let frame_pool_recreate = frame_pool.clone();
+            // Init. The pool is not captured here: it arrives as the event's sender, and a
+            // captured clone was a reference cycle (pool -> delegate -> pool) that only an
+            // explicit `RemoveFrameArrived` could break.
             let halt_frame_pool = halt.clone();
             let d3d_device_frame_pool = d3d_device.clone();
             let context = d3d_device_context.clone();
             let result_frame_pool = result;
 
-            let last_size = item.Size()?;
             let last_size = Arc::new((
-                AtomicI32::new(last_size.Width),
-                AtomicI32::new(last_size.Height),
+                AtomicI32::new(initial_size.Width),
+                AtomicI32::new(initial_size.Height),
             ));
+            // Failures since the last frame that reached the handler; see
+            // `GraphicsCaptureApiHandler::on_frame_pool_error`.
+            let pool_errors = AtomicU32::new(0);
             let callback_frame_pool = callback;
             let direct3d_device_recreate = SendDirectX::new(direct3d_device.clone());
 
@@ -336,43 +392,71 @@ impl GraphicsCaptureApi {
                     stale_frames_dropped.fetch_add(skipped, atomic::Ordering::Relaxed);
                 }
 
-                // Get frame content size
-                let frame_content_size = frame.ContentSize()?;
+                // Everything that can fail between the pool's signal and the handler. A failure
+                // is handed to the handler instead of being returned to WinRT, which ignores it.
+                let acquired = (|| -> windows::core::Result<_> {
+                    // Get frame content size
+                    let frame_content_size = frame.ContentSize()?;
 
-                // Get frame surface
-                let frame_surface = frame.Surface()?;
+                    // Get frame surface
+                    let frame_surface = frame.Surface()?;
 
-                // Convert surface to texture
-                let frame_dxgi_interface = frame_surface.cast::<IDirect3DDxgiInterfaceAccess>()?;
-                let frame_texture =
-                    unsafe { frame_dxgi_interface.GetInterface::<ID3D11Texture2D>()? };
+                    // Convert surface to texture
+                    let frame_dxgi_interface =
+                        frame_surface.cast::<IDirect3DDxgiInterfaceAccess>()?;
+                    let frame_texture =
+                        unsafe { frame_dxgi_interface.GetInterface::<ID3D11Texture2D>()? };
+
+                    // Check if the size has been changed
+                    if frame_content_size.Width != last_size.0.load(atomic::Ordering::Relaxed)
+                        || frame_content_size.Height != last_size.1.load(atomic::Ordering::Relaxed)
+                    {
+                        let direct3d_device_recreate = &direct3d_device_recreate;
+                        // Same buffer count as `Create`. Recreating with 1 quietly re-serializes
+                        // capture against encode for the rest of the session, and a content-size
+                        // change is exactly a resolution change on the client's virtual display.
+                        // The handler is not told: the next frame it receives is simply a
+                        // different size, which is what it has to check for.
+                        frame_pool.Recreate(
+                            &direct3d_device_recreate.0,
+                            pixel_format,
+                            buffers,
+                            frame_content_size,
+                        )?;
+
+                        last_size
+                            .0
+                            .store(frame_content_size.Width, atomic::Ordering::Relaxed);
+                        last_size
+                            .1
+                            .store(frame_content_size.Height, atomic::Ordering::Relaxed);
+                    }
+                    Ok((frame_surface, frame_texture))
+                })();
+                let (frame_surface, frame_texture) = match acquired {
+                    Ok(acquired) => {
+                        pool_errors.store(0, atomic::Ordering::Relaxed);
+                        acquired
+                    }
+                    Err(error) => {
+                        let consecutive = pool_errors
+                            .fetch_add(1, atomic::Ordering::Relaxed)
+                            .saturating_add(1);
+                        let verdict = callback_frame_pool
+                            .lock()
+                            .on_frame_pool_error(&error, consecutive);
+                        if let Err(e) = verdict {
+                            *result_frame_pool.lock() = Some(e);
+                            halt_frame_pool.store(true, atomic::Ordering::Relaxed);
+                            quit_capture_thread(thread_id);
+                        }
+                        return Ok(());
+                    }
+                };
 
                 // Get texture settings
                 let mut desc = D3D11_TEXTURE2D_DESC::default();
                 unsafe { frame_texture.GetDesc(&mut desc) }
-
-                // Check if the size has been changed
-                if frame_content_size.Width != last_size.0.load(atomic::Ordering::Relaxed)
-                    || frame_content_size.Height != last_size.1.load(atomic::Ordering::Relaxed)
-                {
-                    let direct3d_device_recreate = &direct3d_device_recreate;
-                    // Same buffer count as `Create`. Recreating with 1 quietly re-serializes
-                    // capture against encode for the rest of the session, and a content-size
-                    // change is exactly a resolution change on the client's virtual display.
-                    frame_pool_recreate.Recreate(
-                        &direct3d_device_recreate.0,
-                        pixel_format,
-                        buffers,
-                        frame_content_size,
-                    )?;
-
-                    last_size
-                        .0
-                        .store(frame_content_size.Width, atomic::Ordering::Relaxed);
-                    last_size
-                        .1
-                        .store(frame_content_size.Height, atomic::Ordering::Relaxed);
-                }
 
                 // Create a frame
                 let mut frame = Frame::new(
@@ -404,23 +488,17 @@ impl GraphicsCaptureApi {
                     halt_frame_pool.store(true, atomic::Ordering::Relaxed);
 
                     // Stop the message loop to allow the thread to exit gracefully.
-                    unsafe {
-                        PostThreadMessageW(
-                            thread_id,
-                            WM_QUIT,
-                            WPARAM::default(),
-                            LPARAM::default(),
-                        )?;
-                    };
+                    quit_capture_thread(thread_id);
                 }
 
                 Result::Ok(())
             }
-        }))?;
+        }))?);
 
         // Every setter below is optional on some supported Windows build. A property this host
         // does not have is skipped, never fatal: failing here is what routed every Windows 10 and
-        // pre-24H2 Windows 11 host onto the DXGI fallback.
+        // pre-24H2 Windows 11 host onto the DXGI fallback. A setter that exists and *fails*
+        // returns through `?`, which drops `api` and runs `cleanup()`.
         if features.cursor_toggle {
             match cursor_capture_settings {
                 CursorCaptureSettings::Default => (),
@@ -466,18 +544,51 @@ impl GraphicsCaptureApi {
             }
         }
 
-        Ok(Self {
-            item_with_details,
-            _d3d_device: d3d_device,
-            _direct3d_device: direct3d_device,
-            _d3d_device_context: d3d_device_context,
-            frame_pool: Some(frame_pool),
-            session: Some(session),
-            halt,
-            active: false,
-            frame_arrived_event_token,
-            capture_closed_event_token,
-        })
+        // What the session reports after the setters, once per session. `capture_features` says
+        // which properties exist; this says what they hold. A getter that fails reads `?`.
+        let read_back = |present: bool, value: Option<String>| -> String {
+            if present {
+                value.unwrap_or_else(|| "?".to_string())
+            } else {
+                "absent".to_string()
+            }
+        };
+        tprintln!(
+            "wgc: session settings in effect: pool={} buffers={buffers} cursor={} \
+             border_required={} min_update_interval={} dirty_region_mode={}",
+            if free_threaded {
+                "free-threaded"
+            } else {
+                "dispatcher-queue"
+            },
+            read_back(
+                features.cursor_toggle,
+                session.IsCursorCaptureEnabled().ok().map(|v| v.to_string())
+            ),
+            read_back(
+                features.border_toggle,
+                session.IsBorderRequired().ok().map(|v| v.to_string())
+            ),
+            read_back(
+                features.min_update_interval,
+                session
+                    .MinUpdateInterval()
+                    .ok()
+                    .map(|v| format!("{} us", v.Duration / 10))
+            ),
+            read_back(
+                features.dirty_region,
+                session.DirtyRegionMode().ok().map(|v| match v {
+                    GraphicsCaptureDirtyRegionMode::ReportOnly => "ReportOnly".to_string(),
+                    GraphicsCaptureDirtyRegionMode::ReportAndRender => {
+                        "ReportAndRender".to_string()
+                    }
+                    other => format!("{}", other.0),
+                })
+            ),
+        );
+
+        Ok(api)
     }
 
     /// Starts the capture.
@@ -529,7 +640,9 @@ impl GraphicsCaptureApi {
 
     fn cleanup(&mut self) {
         if let Some(frame_pool) = self.frame_pool.take() {
-            let _ = frame_pool.RemoveFrameArrived(self.frame_arrived_event_token);
+            if let Some(token) = self.frame_arrived_event_token.take() {
+                let _ = frame_pool.RemoveFrameArrived(token);
+            }
             let _ = frame_pool.Close();
         }
 
@@ -539,7 +652,9 @@ impl GraphicsCaptureApi {
 
         let GraphicsCaptureItemType::Monitor((item, _)) = &self.item_with_details;
 
-        let _ = item.RemoveClosed(self.capture_closed_event_token);
+        if let Some(token) = self.capture_closed_event_token.take() {
+            let _ = item.RemoveClosed(token);
+        }
         self.active = false;
     }
 }

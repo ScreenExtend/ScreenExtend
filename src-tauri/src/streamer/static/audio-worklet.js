@@ -64,15 +64,13 @@ class AudioJitterProcessor extends AudioWorkletProcessor {
         this.overruns = 0;
         this.stableBlocks = 0;
         this.blockCount = 0;
-        // Re-priming means outputting digital silence until the ring refills to the target,
-        // so doing it on a single missed quantum turned one lost 5 ms packet into 10-40 ms
-        // of silence — audibly worse than the gap it was covering. A real stall shows up as
-        // several starved blocks in a row; a jitter blip does not.
+        // re-priming outputs silence until the ring refills to the target, so on a single
+        // missed quantum one lost 5 ms packet becomes 10-40 ms of silence: a real stall is
+        // several starved blocks in a row
         this.starvedBlocks = 0;
         this.REPRIME_AFTER_STARVED = 4;
-        // The last quantum actually played, reused as concealment. Repeating it with a fade
-        // is what every codec's own PLC does in the absence of better information, and it is
-        // far less noticeable than a square-edged silence.
+        // the last quantum played, repeated with a fade as concealment: far less noticeable
+        // than a square-edged silence
         this.concealL = new Float32Array(128);
         this.concealR = new Float32Array(128);
         this.concealFrames = 0;
@@ -89,20 +87,19 @@ class AudioJitterProcessor extends AudioWorkletProcessor {
             const frames = Math.round((d.targetMs / 1000) * SR);
             this.commandedTargetFrames = Math.max(0, Math.min(this.capFrames - 1, frames));
         } else if (d.type === 'discontinuity') {
-            // The host told us the stream itself broke (a device change, a dropped
-            // broadcast slot). Nothing in the ring bridges that, so correct immediately
-            // rather than waiting for a silence boundary.
+            // the stream itself broke (a device change, a dropped broadcast slot): nothing
+            // in the ring bridges that, so correct now rather than at a silence boundary
             this.concealFrames = 0;
             this.priming = true;
             this.corrections++;
         } else if (d.type === 'mode') {
-            // The writer validated the same buffer on its own side. If it ended up in a
-            // different mode from this one, every packet goes somewhere nobody reads.
+            // the writer validated the same buffer on its own side: if it ended up in a
+            // different mode from this one, every packet goes somewhere nobody reads
             const writerShared = !!d.shared;
             if (writerShared === this.shared) return;
             if (this.shared) {
-                // It could not map the ring, so nothing will advance the write position we
-                // read. Fall back to the private ring it will postMessage into.
+                // the writer could not map the ring, so nothing advances the write position
+                // read here: fall back to the private ring it will postMessage into
                 this.shared = false;
                 this.ctrl = null;
                 this.ringL = new Float32Array(this.capFrames);
@@ -113,16 +110,15 @@ class AudioJitterProcessor extends AudioWorkletProcessor {
                 this.starvedBlocks = 0;
                 this.priming = true;
             } else {
-                // We could not map it and the writer did. Only the page can undo that.
+                // the writer mapped it and this side could not: only the page can undo that
                 this.port.postMessage({ type: 'mode-mismatch' });
             }
         } else if (d.type === 'ringport' && d.port) {
-            // The decode worker's end of a MessageChannel. Taking it removes the main thread
-            // from the sample path entirely on the private-ring transport, where every packet
-            // otherwise went worker -> page -> here, 200 times a second. Acknowledging is what
-            // releases the far end to the worker: on an engine that will not transfer a port
-            // into this scope nothing arrives here, no acknowledgement goes back, and the page
-            // relay carries on unchanged.
+            // The decode worker's end of a MessageChannel: taking it removes the main thread
+            // from the sample path on the private-ring transport (worker -> page -> here, 200
+            // times a second). The acknowledgement is what releases the far end to the worker:
+            // on an engine that will not transfer a port into this scope nothing arrives, no
+            // acknowledgement goes back, and the page relay carries on.
             this.samplePort = d.port;
             this.samplePort.onmessage = (e) => this.onMessage(e.data);
             this.port.postMessage({ type: 'ringport-ok' });
@@ -229,14 +225,11 @@ class AudioJitterProcessor extends AudioWorkletProcessor {
                 this.advanceRead(drop);
                 avail -= drop;
                 this.corrections++;
-            // `avail > 0` is what makes the concealment below reachable. This clause exists to
-            // *grow* the buffer at a silence boundary, and a commanded target is always at
-            // least MIN_TARGET_MS while the slack is 5 ms — so on a starved ring the test was
-            // unconditionally true and the block returned a square-edged silent quantum before
-            // conceal(), underruns++ and the re-prime hysteresis could run. The most common
-            // underrun of all, the ring at zero, took the one path that was written for
-            // everything else, and the adaptive safety margin could only ever decay because
-            // `underruns` never moved.
+            // `avail > 0` keeps a starved ring out of this branch, which exists to grow the
+            // buffer at a silence boundary. A commanded target is always at least
+            // MIN_TARGET_MS against 5 ms of slack, so without it an empty ring returns a
+            // silent quantum here and never reaches conceal(), underruns++ or the re-prime
+            // hysteresis below.
             } else if (err < -this.slackFrames && avail > 0 && this.peekPeak(need) < SILENCE_PEAK) {
                 outL.fill(0);
                 if (outR) outR.fill(0);
@@ -267,7 +260,7 @@ class AudioJitterProcessor extends AudioWorkletProcessor {
             if (!commanded && this.targetFrames < this.maxTarget) {
                 this.targetFrames = Math.min(this.maxTarget, this.targetFrames + Math.round(SR * 0.003));
             }
-            // Only a sustained stall is worth the silence a re-prime costs.
+            // only a sustained stall is worth the silence a re-prime costs
             if (this.starvedBlocks >= this.REPRIME_AFTER_STARVED) this.priming = true;
         }
 
@@ -285,9 +278,8 @@ class AudioJitterProcessor extends AudioWorkletProcessor {
         this.concealGain = 1;
     }
 
-    // Fill [from, need) with a fading repeat of the last audio we played. Beyond a couple of
-    // quanta the gain has decayed to nothing, so a genuine stall still ends in silence — it
-    // just gets there without a click.
+    // fill [from, need) with a fading repeat of the last audio played: the gain decays to
+    // nothing, so a real stall still ends in silence, just without a click
     conceal(outL, outR, from, need) {
         if (this.concealFrames <= 0) {
             outL.fill(0, from);

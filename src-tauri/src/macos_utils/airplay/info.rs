@@ -1,13 +1,13 @@
-//! The `GET /info` response — where the geometry we want is advertised.
+//! The `GET /info` response, where the geometry we want is advertised.
 //!
 //! The sender fetches this twice. The first time it carries a binary-plist
 //! qualifier asking only for the Bonjour TXT blob; the second is bare and must
 //! return the full device description, including a one-element `displays` array
 //! that is the receiver's entire say in what the resulting display looks like.
 //!
-//! Note `refreshRate` is a frame *interval* in seconds, not a rate in Hz —
-//! 1/60 = 0.01666… That inversion is not a mistake, it is what the protocol
-//! wants, and getting it backwards asks for a 0.016 Hz display.
+//! `refreshRate` is a frame *interval* in seconds (1/60 = 0.01666), not a rate
+//! in Hz. That is what the protocol wants: getting it backwards asks for a
+//! 0.016 Hz display.
 
 use plist::{Dictionary, Value};
 
@@ -20,8 +20,8 @@ pub struct Geometry {
     pub height: u32,
     pub refresh_hz: u32,
     /// Cap on the frame rate the sender will push at us. We discard every frame,
-    /// so we ask for as few as the protocol allows — this is pure saved CPU and
-    /// bandwidth on the host, and it is what UxPlay does when it renders nothing.
+    /// so we ask for as few as the protocol allows, which saves host CPU and
+    /// bandwidth (UxPlay does the same when it renders nothing).
     pub max_fps: u32,
 }
 
@@ -44,15 +44,15 @@ const DISCARD_FPS: u32 = 1;
 ///
 /// `SE_AIRPLAY_MAX_FPS` raises it, which is only useful alongside
 /// `SE_AIRPLAY_TIMING`: the mirror header's capture timestamps
-/// ([`super::mirror`]) are the one instrument in the tree for macOS's own
-/// compositor-to-consumer latency, and at one frame a second there is nothing
-/// to build a distribution out of. It costs real host CPU — macOS encodes the
-/// whole desktop for us to throw away — so it is never on by default.
+/// ([`super::mirror`]) measure macOS's own compositor-to-consumer latency, and
+/// at one frame a second there is nothing to build a distribution out of. It
+/// costs real host CPU (macOS encodes the whole desktop for us to throw away),
+/// so it is never on by default.
 ///
 /// Whether macOS honours the value at all is what the drain loop's packets/s
 /// line reports.
 fn advertised_max_fps() -> u32 {
-    std::env::var("SE_AIRPLAY_MAX_FPS")
+    crate::envcfg::var("SE_AIRPLAY_MAX_FPS")
         .ok()
         .and_then(|v| v.trim().parse::<u32>().ok())
         .filter(|v| (1..=240).contains(v))
@@ -60,7 +60,7 @@ fn advertised_max_fps() -> u32 {
 }
 
 /// `displays[0].features`. Bits 1|2|3 in the same namespace as the TXT feature
-/// word; not a display-mode selector — there is no such thing on the wire.
+/// word; not a display-mode selector (there is no such thing on the wire).
 const DISPLAY_FEATURES: u64 = 14;
 
 /// `statusFlags` bits 2 and 6: audio cable attached, supports AirPlay from cloud.
@@ -114,11 +114,9 @@ pub fn full(name: &str, id: &Identity, geom: Geometry) -> Vec<u8> {
         Value::Integer(super::dnssd::features_word(false).into()),
     );
 
-    // We decline audio: no formats, no latencies. The mirroring session sets up
-    // a type-96 audio stream alongside the video one, and accepting it makes
-    // macOS route system audio at us — which would silence the host and defeat
-    // ScreenExtend's own audio capture. Advertising no formats is the polite way
-    // to say no.
+    // decline audio by advertising no formats: accepting the type-96 stream the
+    // session sets up alongside video makes macOS route system audio at us,
+    // which would silence the host and defeat ScreenExtend's own audio capture
     root.insert("audioFormats".into(), Value::Array(vec![]));
     root.insert("audioLatencies".into(), Value::Array(vec![]));
 
@@ -189,8 +187,8 @@ pub const STREAM_AUDIO: u16 = 96;
 
 fn encode(v: Value) -> Vec<u8> {
     let mut out = Vec::new();
-    // The only failure mode is an unrepresentable value, and every value here is
-    // a literal we constructed.
+    // can only fail on an unrepresentable value, and every value here is built
+    // in this file
     if let Err(e) = v.to_writer_binary(&mut out) {
         teprintln!("[airplay] failed to encode a binary plist: {e}");
     }

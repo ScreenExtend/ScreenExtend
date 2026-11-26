@@ -1,9 +1,10 @@
 //! The orchestrator: output directory, stages, one child process per unit of work with a
-//! watchdog, the JSONL ledger, resume, and the single results file.
+//! watchdog, the JSONL run log, resume, and the single results file.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -11,11 +12,17 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value as Json};
 
+#[cfg(target_os = "macos")]
 use super::cf;
 use super::clip;
 use super::env::CLEARED_VARS;
 use super::plan::{Plan, ProbeRow, RunSpec};
 use super::probe::ProbeSpec;
+#[cfg(windows)]
+use super::win::sys as cf;
+// `signal()` on an `ExitStatus`: an NTSTATUS crash code on Windows
+#[cfg(windows)]
+use super::win::ExitStatusSignal as _;
 
 pub struct Opts {
     pub plan: Option<String>,
@@ -77,17 +84,16 @@ fn default_catalogue() -> super::plan::Catalogue {
 fn estimate_s(r: &RunSpec, rec: Option<&clip::ClipInfo>) -> f64 {
     let w = &r.workload;
     if let Some(c) = r.live.as_ref().and_then(|l| l.churn.as_ref()) {
-        // Each join: the POST and first media (up to ~10 s on a bad one), the hold, the leave
-        // (up to ~6 s), the gap; plus setup.
+        // per join: POST and first media (up to ~10 s), hold, leave (up to ~6 s), gap; plus setup
         let per = c.hold_s.unwrap_or(3.0) + c.gap_ms.unwrap_or(750) as f64 / 1e3 + 4.0;
         return c.joins as f64 * (per + 4.0) + c.first_wait_ms.unwrap_or(0) as f64 / 1e3 + 20.0;
     }
     if let Some(l) = &r.live {
-        // Setup + join (~3 s), the warm-up, the measured span, drain and teardown (~6 s).
+        // setup + join (~3 s), the warm-up, the measured span, drain and teardown (~6 s)
         return l.warmup_s() + l.seconds() + 10.0;
     }
     if let Some(c) = &r.churn {
-        // Each cycle: the frames at the workload's rate plus a create and a teardown.
+        // per cycle: the frames at the workload's rate plus a create and a teardown
         return c.cycles as f64 * (c.frames as f64 / w.fps.max(1) as f64 + 0.5) + 6.0;
     }
     let (clip_s, frames) = if w.kind == "recording" {
@@ -110,7 +116,9 @@ fn estimate_s(r: &RunSpec, rec: Option<&clip::ClipInfo>) -> f64 {
     } else {
         0.0
     };
-    // Every extra session is another create and another collector, not more wall time.
+    #[cfg(windows)]
+    let timed = timed + super::win::cache::estimate_s(r, rec);
+    // every extra session is another create and another collector, not more wall time
     timed + psnr + 6.0 + 0.5 * r.sessions.saturating_sub(1) as f64
 }
 
@@ -120,7 +128,6 @@ fn watchdog(estimate_s: f64, slack: Duration) -> Duration {
     Duration::from_secs_f64(estimate_s * 1.1) + slack
 }
 
-/// The child kind for a run.
 fn child_kind(r: &RunSpec) -> &'static str {
     if r.churn.is_some() {
         "churn"
@@ -146,7 +153,7 @@ fn child_env(r: &RunSpec) -> Vec<(&'static str, String)> {
     }
     if !r.tune_on.is_empty() {
         env.push(("SE_TUNE_ON", r.tune_on.join(",")));
-        // A test-hook candidate is honoured only with the gate (pipeline.rs).
+        // a test-hook candidate is honoured only with the gate (pipeline.rs)
         if r.tune_on.iter().any(|t| t == "hold_push_start_immediate")
             && !env.iter().any(|(k, _)| *k == "SE_TEST_HOOKS")
         {
@@ -312,6 +319,7 @@ fn read_lines(path: &Path) -> Vec<Json> {
         .collect()
 }
 
+#[cfg(target_os = "macos")]
 fn write_json(path: &Path, v: &Json, pretty: bool) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
     let text = if pretty {
@@ -322,6 +330,24 @@ fn write_json(path: &Path, v: &Json, pretty: bool) -> std::io::Result<()> {
     .unwrap_or_default();
     fs::write(&tmp, text)?;
     File::open(&tmp)?.sync_all()?;
+    fs::rename(&tmp, path)
+}
+
+/// Windows: `FlushFileBuffers` needs a handle with write access, so sync through the handle
+/// that wrote the file.
+#[cfg(windows)]
+fn write_json(path: &Path, v: &Json, pretty: bool) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    let text = if pretty {
+        serde_json::to_string_pretty(v)
+    } else {
+        serde_json::to_string(v)
+    }
+    .unwrap_or_default();
+    let mut f = File::create(&tmp)?;
+    f.write_all(text.as_bytes())?;
+    f.sync_all()?;
+    drop(f);
     fs::rename(&tmp, path)
 }
 
@@ -435,7 +461,6 @@ pub fn run(o: Opts) -> i32 {
         .filter_map(|v| std::env::var(v).ok().map(|val| (v.to_string(), json!(val))))
         .collect();
 
-    // ---- env ------------------------------------------------------------------------------
     let env_path = out.join("env.json");
     if stages.iter().any(|s| s == "env") && !(o.resume.is_some() && env_path.exists()) {
         let spec = json!({ "result_path": out.join("work/env.result.json"), "out_dir": out, "parent_env": parent_env });
@@ -463,7 +488,6 @@ pub fn run(o: Opts) -> i32 {
         );
     }
 
-    // ---- probe ----------------------------------------------------------------------------
     if stages.iter().any(|s| s == "probe") {
         let done: HashSet<String> = read_lines(&probe_path)
             .iter()
@@ -514,14 +538,13 @@ pub fn run(o: Opts) -> i32 {
         }
     }
 
-    // ---- lab ------------------------------------------------------------------------------
     if stages.iter().any(|s| s == "lab") {
         let done: HashSet<String> = read_lines(&runs_path)
             .iter()
             .filter(|v| v["outcome"].as_str() != Some("skipped"))
             .filter_map(|v| v["id"].as_str().map(str::to_string))
             .collect();
-        // Last run (by position) that needs each rendered clip, so it can be deleted after.
+        // last run (by position) that needs each rendered clip, so it can be deleted after
         let mut last_use: HashMap<String, usize> = HashMap::new();
         for (i, r) in runs.iter().enumerate() {
             if r.workload.kind == "synthetic" && r.churn.is_none() && !done.contains(&r.id) {
@@ -559,9 +582,12 @@ pub fn run(o: Opts) -> i32 {
                 );
             };
             let clip_path: PathBuf = match r.workload.kind.as_str() {
-                // A churn run paints its own frames; so does a live run's window.
+                // a churn run paints its own frames; so does a live run's window
                 _ if r.churn.is_some() => PathBuf::new(),
                 "synthetic" if r.live.is_some() => PathBuf::new(),
+                // Windows: the feeder renders `streamer::synthetic` patterns itself, at any size
+                #[cfg(windows)]
+                "synthetic" if super::win::feed::renders_live(&r.workload) => PathBuf::new(),
                 "recording" => match &o.recording {
                     Some(p) => p.clone(),
                     None => {
@@ -578,7 +604,7 @@ pub fn run(o: Opts) -> i32 {
                             skip(format!("clip would be {need} bytes, over the {} byte budget; lower seconds or size", clip::CLIP_BUDGET_BYTES));
                             continue;
                         }
-                        // One clip on disk at a time keeps the cache inside the budget.
+                        // one clip on disk at a time keeps the cache inside the budget
                         if let Ok(rd) = fs::read_dir(out.join("cache")) {
                             for e in rd.flatten() {
                                 let _ = fs::remove_file(e.path());
@@ -641,7 +667,7 @@ pub fn run(o: Opts) -> i32 {
             );
             let mut v = c.result.clone().unwrap_or_else(|| json!({ "id": r.id }));
             v["outcome"] = json!(c.outcome);
-            // A live precondition that did not hold is a recorded skip, retried on --resume.
+            // a live precondition that did not hold is a recorded skip, retried on --resume
             if c.outcome == "ok" && v["result"] == "skipped" {
                 v["outcome"] = json!("skipped");
                 v["reason"] = v["skip_reason"].clone();
@@ -720,12 +746,11 @@ pub fn run(o: Opts) -> i32 {
         }
     }
 
-    // ---- results --------------------------------------------------------------------------
     let env = fs::read_to_string(&env_path)
         .ok()
         .and_then(|t| serde_json::from_str::<Json>(&t).ok());
     let probe = read_lines(&probe_path);
-    // A resumed run that was first skipped appears twice; the last line is the truth.
+    // a resumed run that was first skipped appears twice; the last line is the truth
     let mut all_runs: Vec<Json> = Vec::new();
     for v in read_lines(&runs_path) {
         let id = v["id"].clone();

@@ -1,10 +1,8 @@
-//use rand::Rng;
 use serde::{Deserialize, Serialize};
 use specta::Type;
 #[cfg(debug_assertions)]
 use specta_typescript::Typescript;
 use tauri::path::BaseDirectory;
-//use tauri::Emitter;
 use tauri::Manager;
 use tauri_plugin_cli::CliExt;
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
@@ -17,6 +15,7 @@ mod logbus;
 mod bench;
 mod cli;
 mod data_dir;
+mod envcfg;
 mod exit_reason;
 mod single_instance;
 mod streamer;
@@ -54,7 +53,7 @@ pub struct DeviceAudioOutputs {
     /// What the host last asked this device to play on.
     pub selected: String,
     /// What the device says it is actually playing on right now. `None` when it never said,
-    /// which is not the same as `Some("")` — the device's default output.
+    /// which is not the same as `Some("")` (the device's default output).
     pub current: Option<String>,
     /// `Some(false)` when the labels beside the ids are the client page's own numbering rather
     /// than the operating system's names; `None` when the client never said.
@@ -91,14 +90,14 @@ pub struct ScreenRecordingRevoked {
 /// Everything the UI can say about the hosted network without opening the log terminal.
 ///
 /// `state` is the tri-state both platforms already collect and neither could report:
-/// - `notStarted` — nothing is being advertised.
-/// - `advertised` — the platform accepted the start, and that is all that is known. An AP
+/// - `notStarted`: nothing is being advertised.
+/// - `advertised`: the platform accepted the start, and that is all that is known. An AP
 ///   in this state is visible to a phone and may still be unjoinable, because nothing is
 ///   serving DHCP.
-/// - `verified` — the AP interface holds a routable IPv4, i.e. something is serving
+/// - `verified`: the AP interface holds a routable IPv4, i.e. something is serving
 ///   addresses, so a client that associates can actually get on.
 ///
-/// `secured` is what item 6 of the UI recommendations needs: on macOS the HostAP SPI can
+/// `secured` is there because on macOS the HostAP SPI can
 /// refuse every secured `securityType` and the fallback brings up an *unencrypted* AP,
 /// which stays up for the session while the join URL, session id and OTP are readable by
 /// anyone in range who associates. A toast cannot carry that; a badge on the card can.
@@ -109,7 +108,7 @@ pub struct HostedNetworkReport {
     pub ssid: String,
     pub channel: Option<i32>,
     pub band: Option<String>,
-    /// The security type as it was logged, e.g. `WPA2` or `securityType 2 (open — no
+    /// The security type as it was logged, e.g. `WPA2` or `securityType 2 (open, no
     /// encryption)`. `None` when nothing is up.
     pub security: Option<String>,
     /// False means the network carries no encryption at all.
@@ -152,7 +151,7 @@ pub struct PermissionStatus {
 ///
 /// Two things emit it: the cloud relay rotating an id it found taken, and `ScreenExtend session
 /// new` replacing the pair through the single-instance control socket. An **empty `otp` means
-/// the OTP did not change** — the rotation case — and the frontend must leave its copy alone
+/// the OTP did not change** (the rotation case) and the frontend must leave its copy alone
 /// rather than clearing it. Without the field the UI would show the new id beside the old code
 /// and then push that stale pair back through `set_session_credentials`, undoing the half of the
 /// change it could not see.
@@ -172,11 +171,10 @@ pub struct JoinAttemptsPaused {
 /// The severities a capability note can carry.
 ///
 /// `blocking` is the only one that takes "Continue anyway" off the startup gate, so it is
-/// reserved for the **bare minimum**: a host that cannot create a virtual display, cannot
-/// capture, or cannot encode at all. Everything a user could plausibly live without — the
-/// hosted network, any audio tier, remote input, a hardware GPU, the preferred one of two
-/// working capture backends — is `optional`. `installable` is a row the app can fix by itself;
-/// the bootstrap remediates it and re-probes before deciding anything.
+/// reserved for the **bare minimum**: a host that cannot create a virtual display, capture, or
+/// encode. Anything a user could live without (the hosted network, audio, remote input, a
+/// hardware GPU, the preferred capture backend) is `optional`. `installable` is a row the app
+/// can fix by itself: the bootstrap remediates it and re-probes before deciding anything.
 pub const SEVERITY_BLOCKING: &str = "blocking";
 pub const SEVERITY_INSTALLABLE: &str = "installable";
 pub const SEVERITY_OPTIONAL: &str = "optional";
@@ -190,16 +188,15 @@ pub mod api_key {
     pub const CAPTURE_PREFERRED: &str = "capture-preferred";
     /// No way to create a display for a joining device.
     pub const DISPLAY: &str = "display";
-    /// No encoder at all — not even the software one.
+    /// No encoder at all, not even the software one.
     pub const ENCODER: &str = "encoder";
     /// The virtual display driver is not installed. Installable.
     pub const DISPLAY_DRIVER: &str = "display-driver";
     /// The virtual display driver is installed but not answering. Installable (reinstall).
     pub const DISPLAY_DRIVER_UNRESPONSIVE: &str = "display-driver-unresponsive";
     /// The virtual display driver is installed and healthy, and another process of ours is
-    /// already using it. Deliberately **not** installable: there is nothing to install, and
-    /// reinstalling a driver whose pipe is merely occupied is what produced the loop of
-    /// elevation prompts this key exists to end.
+    /// already using it. Deliberately **not** installable: reinstalling a driver whose pipe is
+    /// merely occupied only loops elevation prompts.
     pub const DISPLAY_DRIVER_BUSY: &str = "display-driver-busy";
     /// Displays work, but this backend can only drive one at a time.
     pub const DISPLAY_CAPPED: &str = "display-capped";
@@ -211,9 +208,8 @@ pub mod api_key {
     pub const INPUT_ACCESSIBILITY: &str = "input-accessibility";
 }
 
-/// The three capabilities that make a host usable at all: it must be able to create a display,
-/// capture it, and encode the result. Missing any one of them means there is nothing to offer a
-/// device that joins, and only those three may produce a `blocking` row.
+/// The three capabilities a host cannot do without: create a display, capture it, and encode
+/// the result. Only these may produce a `blocking` row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BareMinimum {
     Display,
@@ -242,8 +238,8 @@ pub struct UnsupportedApi {
 }
 
 impl UnsupportedApi {
-    /// A row that stops startup. Taking [`BareMinimum`] rather than a string is the audit: a
-    /// capability that is not one of the three cannot be given this severity by accident.
+    /// A row that stops startup. Takes [`BareMinimum`], not a string, so only one of the three
+    /// capabilities can be given this severity.
     pub fn blocking(
         what: BareMinimum,
         name: impl Into<String>,
@@ -322,16 +318,15 @@ pub struct CompatibilityReport {
     /// It is here rather than behind a command of its own because the one thing that needs it
     /// asks for this report at exactly the same moment: the startup gate's repair budget is
     /// "one driver install, one reinstall and one relaunch per boot", and a restart is the
-    /// advice it gives when that budget runs out — so the restart has to clear it.
+    /// advice it gives when that budget runs out, so the restart has to clear it.
     pub boot_id: String,
 }
 
 impl CompatibilityReport {
     /// Whether this host is missing something it cannot stream without.
     ///
-    /// This is the one question the startup gate asks: a `true` here is the only reason the
-    /// user is not offered "Continue anyway". `installable` rows are deliberately not counted —
-    /// they are remediated and re-probed first, and only what survives that can be missing.
+    /// A `true` here is the only reason the startup gate withholds "Continue anyway".
+    /// `installable` rows are not counted: they are remediated and re-probed first.
     pub fn bare_minimum_missing(&self) -> bool {
         !self.os_supported
             || self
@@ -348,10 +343,10 @@ impl CompatibilityReport {
 
 /// What the virtual display driver's host process has built up, read without elevation.
 ///
-/// The bundled IddCx driver leaks ~47–124 MB of commit, ~37 handles and ~5 threads per display
+/// The bundled IddCx driver leaks ~47-124 MB of commit, ~37 handles and ~5 threads per display
 /// creation or mode change and never gives it back; at ~36 GB / ~3,200 threads it stops attaching
 /// displays at all. Only a device restart (elevated) or a reboot frees it, so the startup gate
-/// reads this before `setup` and offers the restart (`docs/OPTIMIZATIONS.md` UX-DRVRESTART).
+/// reads this before `setup` and offers the restart.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, Type)]
 pub struct DisplayDriverHealth {
     /// `false` where there is no such driver (macOS, Linux). Nothing else here means anything then.
@@ -361,7 +356,7 @@ pub struct DisplayDriverHealth {
     pub needs_restart: bool,
     /// The driver host's pid, when one was found.
     pub pid: Option<u32>,
-    /// How that pid was chosen: `pipeServer` (the process serving the driver's own named pipe —
+    /// How that pid was chosen: `pipeServer` (the process serving the driver's own named pipe,
     /// exact), `largestWudfHost` (a guess, used only when the pipe could not name its server),
     /// `none` (no driver host found) or `unsupported`.
     pub identified_by: String,
@@ -400,7 +395,7 @@ pub struct DisplayCapacity {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
 pub struct Device {
-    /// The live session this row is — one browser tab. A device with two tabs open produces two
+    /// The live session this row is: one browser tab. A device with two tabs open produces two
     /// rows with one `token` between them. Empty on a row that describes only a device.
     #[serde(rename = "joinId")]
     pub join_id: String,
@@ -420,7 +415,7 @@ pub struct Device {
     pub video_quality: u32,
     #[serde(rename = "remoteControl")]
     pub control_enabled: bool,
-    /// `"display"` or `"all"` — how far a pointer-locked client may drive this host's cursor.
+    /// `"display"` or `"all"`: how far a pointer-locked client may drive this host's cursor.
     /// See `streamer::input::PointerScope`.
     #[serde(rename = "pointerScope")]
     pub pointer_scope: String,
@@ -449,11 +444,7 @@ pub struct Device {
 
 impl Device {
     pub fn defaults(info: crate::streamer::session::DeviceInfo) -> Self {
-        // The *saved* rate is capped the same way the join path caps the reported one, and for
-        // the same reason: a device row written from a 360 Hz browser pinned the host to a 360 Hz
-        // virtual display for every later join, long after the session that measured it. The
-        // slider still goes to `MAX_REFRESH_RATE`; this is only what a device is given without
-        // anyone choosing it.
+        // the saved default gets the same clamp the join path applies to the reported rate
         let refresh_rate = if info.refresh_rate == 0 {
             60
         } else {
@@ -509,15 +500,54 @@ fn exit_app(app: tauri::AppHandle) {
         );
         remove_all_displays(&state.virtual_display);
     }
+    #[cfg(windows)]
+    HOST_TORN_DOWN.store(true, std::sync::atomic::Ordering::SeqCst);
     app.exit(0);
+}
+
+/// Set once the host's teardown has run, so the run loop's `Exit` does not repeat it.
+#[cfg(windows)]
+static HOST_TORN_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The desktop host's teardown, from the run loop's `Exit` (Windows).
+///
+/// The webview's `onCloseRequested` path (stop the hosted network, then [`exit_app`]) does not
+/// run when the renderer crashed or hung, or on a logoff or shutdown (tao turns `WM_ENDSESSION`
+/// into `Exit`), and attached virtual displays and a Mobile Hotspot are OS state that outlives
+/// the process. Idempotent, and a no-op when the JavaScript path already ran or `setup` never
+/// built an `AppState`.
+#[cfg(windows)]
+fn windows_exit_teardown(app: &tauri::AppHandle) {
+    use streamer::lock::LockExt;
+    if HOST_TORN_DOWN.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    exit_reason::record("the run loop exited before the desktop UI's own shutdown had run");
+    streamer::session::broadcast_bye(
+        &state.sessions,
+        streamer::session::ByeReason::HostExit,
+        BYE_FLUSH_TIMEOUT,
+    );
+    remove_all_displays(&state.virtual_display);
+    // only a network this process started: the stopper is registered by a successful start
+    let started_here = state.stop_hosted_network.lock_recover().is_some();
+    if started_here {
+        let stopped = windows_utils::hosted_network::stop_hosted_network_blocking(app, &state);
+        tprintln!("[exit] hosted network stopped on exit: {stopped}");
+    }
 }
 
 /// An id that changes when this machine reboots.
 ///
-/// Derived rather than read from anywhere authoritative: wall clock now, minus the monotonic
-/// uptime, bucketed to ten seconds so the tick granularity and a small clock correction do not
-/// change it inside one boot. A large clock step would, and what that costs is one extra driver
-/// repair attempt — which is why nothing but the repair budget may key on this.
+/// The kernel's own per-boot counter when it can be read ([`windows_boot_counter`]). Otherwise
+/// derived: wall clock minus monotonic uptime, bucketed to ten seconds. The derived value can
+/// flip inside one boot (time sync slews the wall clock but not the tick count, and a reading
+/// can land on either side of a bucket edge). That costs one extra driver repair attempt, so
+/// nothing but the repair budget may key on this. The two forms carry different prefixes, so
+/// neither can equal the other.
 #[cfg(windows)]
 pub fn boot_id() -> String {
     let uptime_ms = unsafe { windows::Win32::System::SystemInformation::GetTickCount64() };
@@ -525,7 +555,67 @@ pub fn boot_id() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or_default();
-    format!("b{}", now_ms.saturating_sub(uptime_ms) / 10_000)
+    boot_id_from(windows_boot_counter(), now_ms, uptime_ms)
+}
+
+/// `BootId` under the prefetcher's parameters: a counter the kernel advances once per boot (a
+/// Fast Startup resume is not a boot, and does not advance it, which matches the driver host's
+/// lifetime: it is hibernated with the kernel session). Readable unelevated.
+#[cfg(windows)]
+fn windows_boot_counter() -> Option<u32> {
+    use winreg::enums::HKEY_LOCAL_MACHINE;
+    winreg::RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey(
+            r"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters",
+        )
+        .ok()?
+        .get_value::<u32, _>("BootId")
+        .ok()
+}
+
+#[cfg(windows)]
+fn boot_id_from(counter: Option<u32>, now_ms: u64, uptime_ms: u64) -> String {
+    match counter {
+        Some(id) => format!("k{id}"),
+        None => format!("b{}", now_ms.saturating_sub(uptime_ms) / 10_000),
+    }
+}
+
+#[cfg(all(windows, test))]
+mod boot_id_tests {
+    use super::*;
+
+    /// The driver-repair budget keys on this, so it must not move inside one boot. With the
+    /// counter readable it cannot; the derived fallback can.
+    #[test]
+    fn the_boot_id_does_not_follow_the_wall_clock() {
+        // two readings 2 ms apart in uptime, the second after a 2-minute clock correction;
+        // then two that straddle a ten-second bucket edge
+        let uptime: u64 = 3 * 24 * 3600 * 1000;
+        let a = boot_id_from(Some(13), 1_700_000_009_999, uptime);
+        let b = boot_id_from(Some(13), 1_700_000_010_001 + 120_000, uptime + 2);
+        assert_eq!(a, b);
+        assert_ne!(
+            boot_id_from(None, 1_700_000_009_999, uptime),
+            boot_id_from(None, 1_700_000_010_001, uptime),
+            "the fallback is the old derivation, edge flip and all"
+        );
+        assert_ne!(boot_id_from(Some(14), 0, 0), a, "a new boot is a new id");
+    }
+
+    #[test]
+    fn this_machine_answers_with_its_boot_counter() {
+        if windows_boot_counter().is_none() {
+            crate::test_support::skip_because(
+                "this_machine_answers_with_its_boot_counter",
+                "the BootId registry value is not readable here",
+            );
+            return;
+        }
+        let id = boot_id();
+        assert!(id.starts_with('k'), "{id}");
+        assert_eq!(id, boot_id());
+    }
 }
 
 /// Empty off Windows: the repair budget exists for the bundled display driver, and no other
@@ -537,8 +627,8 @@ pub fn boot_id() -> String {
 
 /// Ask the other ScreenExtend instance that is holding the display driver's pipe to quit.
 ///
-/// Only ever reaches an instance answering on the single-instance control socket — a desktop
-/// host or a `serve` — and never this process, whose own control server may well be the one
+/// Only ever reaches an instance answering on the single-instance control socket (a desktop
+/// host or a `serve`) and never this process, whose own control server may well be the one
 /// that file names by the time the desktop UI asks. A `probe --live` run, or an instance that
 /// is already on its way out, has no socket to ask: the answer there is `false` and the user is
 /// told to close it themselves rather than being handed a button that silently does nothing.
@@ -620,12 +710,8 @@ fn read_avatar(app: &tauri::AppHandle) -> Option<Vec<u8>> {
     }
 }
 
-// Base64 rather than `Vec<u8>`, which tauri-specta maps to `number[]`: a 256x256 PNG then
-// crossed the bridge as a JSON array of decimal integers -- three to four bytes of JSON
-// per image byte -- to be parsed into an array of tens of thousands of boxed numbers, walked
-// into a `Uint8Array`, wrapped in a `Blob` and run through a `FileReader` to become the
-// base64 data URL the `<img>` wanted in the first place. This is the same payload the
-// webview needs, one third the size of the array encoding, with no conversion at all.
+// base64, not `Vec<u8>`: tauri-specta maps that to `number[]`, three to four bytes of JSON per
+// image byte, and the `<img>` wants a base64 data URL anyway
 #[tauri::command]
 #[specta::specta]
 fn set_avatar(app: tauri::AppHandle, bytes: String) -> bool {
@@ -692,20 +778,16 @@ fn build_menu(handle: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<taur
     tauri::menu::MenuBuilder::new(handle).build()
 }
 
-// The legacy `installdrivers` / `removedrivers` / `hostednetwork` subcommands.
-//
-// They stay because installers from earlier releases invoke them by these exact names
-// (`windows/hooks.nsh`, `windows/fragment.wxs`), so an old uninstaller must keep working.
-// `drivers install|remove` and `network start` are the modern equivalents.
-//
-// Every path resolution and every shell call here used to be an `.unwrap()`. A missing
-// `nefconc`, a shell-ACL mismatch against `capabilities/default.json` or an unresolvable
-// resource directory therefore crashed the process — during an uninstall, where the caller
-// wants a non-zero exit code and a reason, not a crash dialog.
+// The legacy `installdrivers` / `removedrivers` / `hostednetwork` subcommands. Installers already
+// shipped invoke them by these exact names (`windows/hooks.nsh`, `windows/fragment.wxs`), so
+// they must keep working; `drivers install|remove` and `network start` are the modern forms.
+// Nothing here may panic: a missing `nefconc`, a shell-ACL mismatch against
+// `capabilities/default.json` or an unresolvable resource directory has to reach the caller as
+// a non-zero exit code and a reason, not a crash dialog in the middle of an uninstall.
 
-/// Spawn one legacy external command. A non-zero exit is reported but not fatal: `certutil
-/// -delstore` for a certificate that is already gone is the normal uninstall case, and the
-/// previous code ignored the status entirely. Only a failure to run at all is an error.
+/// Spawn one legacy external command. A non-zero exit is logged but not fatal (`certutil
+/// -delstore` for a certificate that is already gone is the normal uninstall case), except for
+/// the steps `legacy_step_is_required` names on Windows. A failure to run at all is an error.
 async fn legacy_shell(
     app: &tauri::AppHandle,
     program: &str,
@@ -728,10 +810,75 @@ async fn legacy_shell(
                     out.status.code(),
                     String::from_utf8_lossy(&out.stderr).trim()
                 );
+                #[cfg(windows)]
+                if legacy_step_is_required(program, args, out.status.code()) {
+                    return Err(format!(
+                        "{program} {} failed (exit {:?}); the driver is not installed",
+                        args.first().copied().unwrap_or_default(),
+                        out.status.code()
+                    ));
+                }
             }
             Ok(())
         }
         Err(e) => Err(format!("could not run {program}: {e}")),
+    }
+}
+
+/// Windows: whether a non-zero exit from this legacy step means there is no driver.
+///
+/// Only creating the device node and installing the driver package are fatal: without them
+/// `installdrivers` must not exit 0 (a refused signature, a missing devnode). Removing a node,
+/// a package or a certificate that is already gone is the ordinary uninstall case. 3010 and
+/// 1641 are the installer convention for "succeeded, a reboot is required / was started".
+#[cfg(windows)]
+fn legacy_step_is_required(program: &str, args: &[&str], code: Option<i32>) -> bool {
+    if matches!(code, Some(3010) | Some(1641)) {
+        return false;
+    }
+    program == "nefconc"
+        && args
+            .first()
+            .is_some_and(|a| *a == "--create-device-node" || *a == "--install-driver")
+}
+
+#[cfg(all(windows, test))]
+mod legacy_step_tests {
+    use super::legacy_step_is_required;
+
+    #[test]
+    fn only_the_two_install_steps_are_fatal() {
+        assert!(legacy_step_is_required(
+            "nefconc",
+            &["--create-device-node", "--class-name", "Display"],
+            Some(1)
+        ));
+        assert!(legacy_step_is_required(
+            "nefconc",
+            &["--install-driver", "--inf-path", "x.inf"],
+            Some(-1)
+        ));
+        assert!(!legacy_step_is_required(
+            "nefconc",
+            &["--install-driver", "--inf-path", "x.inf"],
+            Some(3010)
+        ));
+        for args in [
+            &["--remove-device-node", "--hardware-id", "x"][..],
+            &["--uninstall-driver", "--inf-path", "x.inf"][..],
+        ] {
+            assert!(!legacy_step_is_required("nefconc", args, Some(1)));
+        }
+        assert!(!legacy_step_is_required(
+            "certutil",
+            &["-delstore", "root", "ScreenExtend"],
+            Some(1)
+        ));
+        assert!(!legacy_step_is_required(
+            "netsh",
+            &["wlan", "start", "hostednetwork"],
+            Some(1)
+        ));
     }
 }
 
@@ -867,6 +1014,39 @@ async fn legacy_hosted_network(
     legacy_shell(app, "netsh", &["wlan", "start", "hostednetwork"], &cwd).await
 }
 
+/// The elevated half of the legacy hosted network when the passphrase came in a file: it is on
+/// no command line, this process's or netsh's, because the key goes through the WLAN service.
+#[cfg(windows)]
+async fn legacy_hosted_network_from_file(
+    app: &tauri::AppHandle,
+    ssid: &str,
+    password_file: &std::path::Path,
+) -> Result<(), String> {
+    let password = crate::windows_utils::hosted_network::take_passphrase_file(password_file)?;
+    if ssid.is_empty() {
+        return Err("hostednetwork needs an SSID".to_string());
+    }
+    // validate before anything changes: a passphrase the WLAN service would refuse must not
+    // leave the SSID rewritten and no network started
+    crate::windows_utils::hosted_network::validate_passphrase(&password)?;
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    legacy_shell(
+        app,
+        "netsh",
+        &[
+            "wlan",
+            "set",
+            "hostednetwork",
+            "mode=allow",
+            &format!("ssid={ssid}"),
+        ],
+        &cwd,
+    )
+    .await?;
+    crate::windows_utils::hosted_network::set_legacy_passphrase(&password)?;
+    legacy_shell(app, "netsh", &["wlan", "start", "hostednetwork"], &cwd).await
+}
+
 /// Run one legacy branch and turn its result into the process exit code the installer reads.
 fn finish_legacy(app: &tauri::AppHandle, result: Result<(), String>) {
     match result {
@@ -958,14 +1138,10 @@ pub fn run() {
             logbus::LogLine
         ]);
 
-    // Debug build, no CLI arguments: that is `pnpm tauri dev`, and `cargo run -- serve` is
-    // deliberately excluded. The path is resolved from the crate directory rather than from
-    // `..`, so it lands on the right file whatever the working directory is -- a relative
-    // path here wrote somewhere else, or panicked, depending on where the binary started.
-    //
-    // "no arguments" is still only a proxy for "this is the current build", so a stale debug
-    // binary can revert the whole surface. `scripts/check-bindings.mjs` is what catches that:
-    // a static cross-check against the macro lists above, run in CI.
+    // Debug build, no CLI arguments: that is `pnpm tauri dev`; `cargo run -- serve` is
+    // deliberately excluded. The path comes from the crate directory, not the working directory.
+    // "No arguments" is only a proxy for "this is the current build": a stale debug binary can
+    // revert the whole surface, which `scripts/check-bindings.mjs` catches.
     #[cfg(debug_assertions)]
     if std::env::args_os().nth(1).is_none() {
         let bindings_path =
@@ -1011,16 +1187,35 @@ pub fn run() {
                 Some(command) if command.name == "hostednetwork" => {
                     let mut ssid = String::new();
                     let mut password = String::new();
+                    #[cfg(windows)]
+                    let mut password_file = String::new();
                     for (key, arg_data) in &command.matches.args {
                         match key.as_str() {
                             "ssid" => ssid = arg_data.value.as_str().unwrap_or("").to_string(),
                             "password" => {
                                 password = arg_data.value.as_str().unwrap_or("").to_string()
                             }
+                            #[cfg(windows)]
+                            "password-file" => {
+                                password_file = arg_data.value.as_str().unwrap_or("").to_string()
+                            }
                             _ => {}
                         }
                     }
                     let handle = app.handle().clone();
+                    #[cfg(windows)]
+                    let result = if password_file.is_empty() {
+                        tauri::async_runtime::block_on(legacy_hosted_network(
+                            &handle, &ssid, &password,
+                        ))
+                    } else {
+                        tauri::async_runtime::block_on(legacy_hosted_network_from_file(
+                            &handle,
+                            &ssid,
+                            std::path::Path::new(&password_file),
+                        ))
+                    };
+                    #[cfg(not(windows))]
                     let result = tauri::async_runtime::block_on(legacy_hosted_network(
                         &handle, &ssid, &password,
                     ));
@@ -1037,9 +1232,7 @@ pub fn run() {
                     finish_legacy(&handle, result);
                 }
                 _ => {
-                    // This runs before the window exists, so a failure here has no UI to report
-                    // itself in other than a dialog. It used to be an `.unwrap()` on the normal
-                    // startup path of every user.
+                    // runs before the window exists: a dialog is the only way to report a failure
                     let lock_dir = match crate::data_dir::local_data_dir(app) {
                         Ok(dir) => dir,
                         Err(e) => {
@@ -1054,8 +1247,8 @@ pub fn run() {
                         }
                     };
                     let _ = std::fs::create_dir_all(&lock_dir);
-                    // Before anything can exit: every deliberate exit route writes its reason
-                    // here, and this is what reads the previous instance's back into the log.
+                    // before anything can exit: every deliberate exit route writes its reason
+                    // here, and this reads the previous instance's back into the log
                     exit_reason::set_dir(lock_dir.clone());
                     exit_reason::report_previous(&lock_dir);
                     let lock_path = lock_dir.join(single_instance::LOCK_FILE);
@@ -1063,9 +1256,8 @@ pub fn run() {
 
                     let mut lock = single_instance::acquire_lock(&lock_path);
 
-                    // An unwritable or unopenable lock file is not another instance. Offering
-                    // "Show running instance" for one that does not exist is how that used to
-                    // present.
+                    // an unwritable or unopenable lock file is not another instance: do not
+                    // offer "Show running instance" for it
                     if let single_instance::LockOutcome::Unavailable(e) = &lock {
                         app.dialog()
                             .message(format!(
@@ -1146,12 +1338,10 @@ pub fn run() {
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        // The run loop is where an exit nobody asked for becomes visible. Tauri's default is to
-        // end the process once the last window is gone, so a `WM_CLOSE` from anywhere — a
-        // restart manager replacing the binary, a session logoff, a stray Alt+F4 — produced a
-        // clean exit(0) with no crash dump, no Application-log event and no line anywhere saying
-        // what happened. The window's own close request and the run loop's `ExitRequested` are
-        // recorded here, so the reason survives the process that had it.
+        // Tauri ends the process once the last window is gone, so a `WM_CLOSE` from anywhere (a
+        // restart manager replacing the binary, a session logoff, a stray Alt+F4) is a clean
+        // exit(0) with no crash dump and no Application-log event. Record the window's close
+        // request and the run loop's `ExitRequested` so the reason survives the process.
         .run(|_app, event| match &event {
             tauri::RunEvent::WindowEvent {
                 label,
@@ -1169,6 +1359,8 @@ pub fn run() {
                      route of ours having named a reason"
                 ));
             }
+            #[cfg(windows)]
+            tauri::RunEvent::Exit => windows_exit_teardown(_app),
             _ => {}
         });
 }

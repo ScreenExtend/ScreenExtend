@@ -1,0 +1,52 @@
+{
+ "version": 1,
+ "name": "win-pipe-quick",
+ "workloads": [
+  {
+   "id": "take-fps60",
+   "kind": "recording",
+   "fps": 60,
+   "transform": "fps:60",
+   "max_frames": 2900
+  },
+  {
+   "id": "take-native",
+   "kind": "recording",
+   "max_frames": 2900
+  }
+ ],
+ "recipes": [
+  {
+   "name": "nvenc-prod",
+   "vendor": "nvenc",
+   "production": {
+    "qp": 15
+   }
+  },
+  {
+   "name": "qsv-prod",
+   "vendor": "qsv",
+   "production": {
+    "qp": 15
+   }
+  }
+ ],
+ "groups": [
+  {
+   "name": "production encode loop, 1080p",
+   "stage": "pipe",
+   "recipes": [
+    "nvenc-prod",
+    "qsv-prod"
+   ],
+   "workloads": [
+    "take-fps60",
+    "take-native"
+   ],
+   "per_frame": true
+  }
+ ],
+ "order": {
+  "cooldown_ms": 1000
+ }
+}

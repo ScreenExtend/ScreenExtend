@@ -25,9 +25,8 @@ pub fn apply(our_device: AudioObjectID, real_device: AudioObjectID, gain: &Monit
     gain.set(compute_gain(scalar, muted));
 
     if real_device != 0 {
-        // A device that rejects volume or mute control is why the volume keys can look dead with
-        // nothing in the log to say so. Report each refusal once per device rather than on every
-        // property notification, which arrives per keystroke.
+        // A device that rejects volume or mute control makes the volume keys look dead: report
+        // each refusal once per device, not per property notification (one per keystroke).
         let vol = hal::set_output_volume_scalar(real_device, scalar);
         let mute = hal::set_output_mute(real_device, muted);
         if vol != 0 || mute != 0 {

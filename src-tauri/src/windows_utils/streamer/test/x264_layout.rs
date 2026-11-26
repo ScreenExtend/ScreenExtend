@@ -1,29 +1,10 @@
 //! libx264 ABI, measured against the library that is actually loaded.
 //!
-//! `nvenc_layout.rs` and `amd_layout.rs` prove their bindings against a **vendored header**
-//! compiled by `cl`. That is the right method there — NVENC and AMF ship no artifact this repo
-//! can question at runtime, and a wrong struct revision degrades silently to another encoder.
-//! It is the wrong method for libx264, and deliberately not what this file does:
-//!
-//! * `x264.h` is GPL-2.0-or-later. `resources/nvenc-headers/` and `resources/amf-headers/` are
-//!   both MIT, which is what made vendoring them into an AGPL tree a licence question with an
-//!   easy answer. Vendoring a GPL header to run a generator over is a different question and
-//!   not one a test needs to ask.
-//! * The header would describe *a* libx264. The one that matters is `libx264-164.dll` in
-//!   `resources/`, or whatever a user's `PATH` puts in front of it — and a header cannot speak
-//!   for that.
-//!
-//! So every assertion here is made by the loaded library. `X264Api::load` already refuses a
-//! build that does not export `x264_encoder_open_164`, which is a strong ABI gate; what it
-//! cannot catch is the vendored `x264_param_t` being the wrong *size* or having a field at the
-//! wrong offset within a build that is otherwise correct. Those are what the two tests below
-//! measure: a guard canary behind the struct catches a short binding, and a round trip through
-//! `x264_encoder_parameters` catches a displaced field.
-//!
-//! The failure they exist for is not a crash. `x264_param_default_preset` memsets and fills a
-//! struct whose size it knows and we do not; a binding one field short means libx264 writes
-//! past our allocation, and a binding with a field at the wrong offset means we configure a
-//! resolution or a bitrate the encoder never sees.
+//! No vendored header here, unlike `nvenc_layout.rs` and `amd_layout.rs`: `x264.h` is
+//! GPL-2.0-or-later, and a header cannot speak for the `libx264-164.dll` that really loads.
+//! `X264Api::load` already refuses a build without `x264_encoder_open_164`; these tests catch
+//! an `x264_param_t` binding that is short (libx264 writes past the allocation) or has a
+//! displaced field (a resolution or bitrate the encoder never sees).
 
 use std::mem::size_of;
 
@@ -33,8 +14,8 @@ use crate::windows_utils::streamer::x264::x264_sys::{
 
 use super::skip;
 
-/// Bytes of sacrificial padding placed immediately after the struct. A binding that is short by
-/// one `c_int` field is the realistic mistake, so a whole cache line is generous.
+/// Guard bytes right after the struct. A binding one `c_int` short is the realistic mistake,
+/// so a whole cache line is generous.
 const GUARD_BYTES: usize = 64;
 const GUARD_PATTERN: u8 = 0xA5;
 
@@ -51,8 +32,7 @@ fn api() -> Option<X264Api> {
 #[test]
 fn the_loaded_library_is_the_build_the_bindings_describe() {
     let Some(api) = api() else { return };
-    // `load()` refuses a mismatch outright, so reaching here means the two agree — assert it
-    // anyway, because that guarantee lives in one `if` a refactor could drop.
+    // `load()` already refuses a mismatch, but that guarantee is one `if` a refactor could drop
     assert_eq!(
         api.build,
         X264_BUILD,
@@ -64,14 +44,11 @@ fn the_loaded_library_is_the_build_the_bindings_describe() {
 
 #[test]
 fn param_default_preset_stays_inside_the_struct_we_gave_it() {
-    // The one thing a header-derived layout test would have caught and nothing else does:
     // if `x264_param_t` here is smaller than libx264's, `x264_param_default_preset` writes past
-    // the end of it. On the stack that is a corrupted local; in `X264Encoder::new` it is a
-    // corrupted neighbour, which is a crash somewhere else entirely.
+    // the end of it: in `X264Encoder::new` a corrupted neighbour, and a crash somewhere else
     let Some(api) = api() else { return };
 
-    // One allocation: the struct, then the guard, so anything written past the struct lands in
-    // bytes we can check rather than in whatever the allocator put next.
+    // one allocation, struct then guard, so an overrun lands in bytes the test can check
     let mut buf = vec![GUARD_PATTERN; size_of::<x264_param_t>() + GUARD_BYTES];
     let param = buf.as_mut_ptr() as *mut x264_param_t;
 
@@ -89,7 +66,7 @@ fn param_default_preset_stays_inside_the_struct_we_gave_it() {
         size_of::<x264_param_t>()
     );
 
-    // And the same for `x264_param_apply_profile`, which the encoder calls next.
+    // same check for `x264_param_apply_profile`, which the encoder calls next
     unsafe {
         let rc = (api.param_apply_profile)(param, c"baseline".as_ptr());
         assert_eq!(rc, 0, "x264_param_apply_profile(baseline)");
@@ -103,11 +80,9 @@ fn param_default_preset_stays_inside_the_struct_we_gave_it() {
 
 #[test]
 fn the_encoder_reads_the_fields_back_from_where_we_wrote_them() {
-    // A displaced field is silent: we set `i_bitrate` at the wrong offset, libx264 encodes at
-    // its default, and the only symptom is a stream that ignores the bitrate controller.
-    // `x264_encoder_parameters` returns the *effective* configuration, so writing a distinctive
-    // value and reading it back proves the offset — and it proves it against the loaded library
-    // rather than against a header.
+    // a displaced field is silent: `i_bitrate` lands at the wrong offset, libx264 encodes at
+    // its default, and the stream just ignores the bitrate controller. `x264_encoder_parameters`
+    // returns the effective configuration, so a distinctive value read back proves the offset
     let Some(api) = api() else { return };
 
     let mut param: x264_param_t = unsafe { std::mem::zeroed() };
@@ -118,12 +93,11 @@ fn the_encoder_reads_the_fields_back_from_where_we_wrote_them() {
         );
     }
 
-    // Values chosen to be unlike any default, so a field read from the wrong offset cannot
-    // coincidentally match.
+    // unlike any default, so a field read from the wrong offset cannot match by chance
     param.i_width = 642;
     param.i_height = 362;
     // I420, like the real encoder: libx264 maps anything at or above I444 to 4:4:4, which
-    // `param_apply_profile("baseline")` then rejects outright.
+    // `param_apply_profile("baseline")` then rejects outright
     param.i_csp = X264_CSP_I420;
     param.i_fps_num = 37;
     param.i_fps_den = 1;
@@ -171,9 +145,8 @@ fn the_encoder_reads_the_fields_back_from_where_we_wrote_them() {
     assert_eq!(effective.rc.i_bitrate, 1234, "rc.i_bitrate");
     assert_eq!(effective.b_annexb, 1, "b_annexb");
     assert_eq!(effective.b_repeat_headers, 1, "b_repeat_headers");
-    // `i_keyint_max` is the one libx264 is allowed to reinterpret (zerolatency and the profile
-    // both have opinions), so require only that it is a sane positive number rather than the
-    // literal — a garbage value here still means a displaced field.
+    // libx264 may reinterpret `i_keyint_max` (zerolatency and the profile both have opinions),
+    // so only a sane positive number is required: garbage still means a displaced field
     assert!(
         effective.i_keyint_max > 0 && effective.i_keyint_max < 100_000,
         "i_keyint_max came back as {}",

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build, sign, package, notarize and stage the ScreenExtend Audio driver — one command.
+# Build, sign, package, notarize and stage the ScreenExtend Audio driver in one command.
 #
 #   ./scripts/release.sh
 #
@@ -37,9 +37,8 @@ STAGED="${SRC_TAURI}/resources/ScreenExtendAudio.pkg"
 die() { echo "error: $*" >&2; exit 1; }
 step() { echo; echo "==> $*"; }
 
-# ---------------------------------------------------------------- preflight
-# Everything is checked here, before any work, so a missing tool or a typo in an identity fails in
-# seconds rather than after a full compile and a notarization round trip.
+# everything is checked before any work, so a missing tool or a typo in an identity fails in
+# seconds, not after a full compile and a notarization round trip
 step "Preflight"
 
 [ "$(uname -s)" = "Darwin" ] || die "the driver can only be built on macOS"
@@ -47,7 +46,7 @@ for tool in git xcrun codesign pkgbuild productbuild; do
   command -v "${tool}" >/dev/null 2>&1 || die "${tool} is not on PATH"
 done
 [ -x /usr/libexec/PlistBuddy ] || die "/usr/libexec/PlistBuddy is missing"
-xcrun --show-sdk-path >/dev/null 2>&1 || die "no macOS SDK selected — install the Command Line Tools"
+xcrun --show-sdk-path >/dev/null 2>&1 || die "no macOS SDK selected: install the Command Line Tools"
 
 SIGN_IDENTITY="${SE_SIGN_IDENTITY:-}"
 INSTALLER_IDENTITY="${SE_INSTALLER_IDENTITY:-}"
@@ -67,7 +66,7 @@ if [ -n "${NOTARY_PROFILE}" ]; then
   xcrun notarytool --help >/dev/null 2>&1 \
     || die "notarytool is unavailable (needs Xcode 13+); unset SE_NOTARY_PROFILE to skip it"
   [ -n "${INSTALLER_IDENTITY}" ] \
-    || die "SE_NOTARY_PROFILE is set but SE_INSTALLER_IDENTITY is not — Apple will not notarize
+    || die "SE_NOTARY_PROFILE is set but SE_INSTALLER_IDENTITY is not: Apple will not notarize
        an unsigned package"
 fi
 
@@ -75,7 +74,6 @@ echo "  driver signing:  ${SIGN_IDENTITY:-SKIPPED (no SE_SIGN_IDENTITY)}"
 echo "  package signing: ${INSTALLER_IDENTITY:-SKIPPED (no SE_INSTALLER_IDENTITY)}"
 echo "  notarization:    ${NOTARY_PROFILE:-SKIPPED (no SE_NOTARY_PROFILE)}"
 
-# ---------------------------------------------------------------- libASPL
 step "libASPL"
 if [ -n "${SE_LIBASPL_DIR:-}" ]; then
   [ -d "${SE_LIBASPL_DIR}/include/aspl" ] || die "SE_LIBASPL_DIR has no include/aspl"
@@ -84,11 +82,9 @@ else
   "${HERE}/scripts/fetch-libaspl.sh"
 fi
 
-# ---------------------------------------------------------------- build + sign
 step "Building the driver bundle"
 SE_SIGN_IDENTITY="${SIGN_IDENTITY}" "${HERE}/scripts/build.sh"
 
-# ---------------------------------------------------------------- package
 step "Building the installer package"
 if [ -n "${INSTALLER_IDENTITY}" ]; then
   SE_INSTALLER_IDENTITY="${INSTALLER_IDENTITY}" "${HERE}/scripts/package.sh"
@@ -100,7 +96,6 @@ VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "${HER
 PKG="${BUILD}/ScreenExtendAudio-${VERSION}.pkg"
 [ -f "${PKG}" ] || die "package.sh did not produce ${PKG}"
 
-# ---------------------------------------------------------------- notarize
 if [ -n "${NOTARY_PROFILE}" ]; then
   step "Notarizing (this takes minutes)"
   xcrun notarytool submit "${PKG}" --keychain-profile "${NOTARY_PROFILE}" --wait
@@ -110,10 +105,9 @@ if [ -n "${NOTARY_PROFILE}" ]; then
 else
   step "Notarization skipped"
   echo "  The package is not notarized. coreaudiod will only load the plug-in on a Mac with SIP"
-  echo "  disabled. See docs/manual-tests/macos-audio-driver-signing.md."
+  echo "  disabled."
 fi
 
-# ---------------------------------------------------------------- stage
 if [ -z "${SE_SKIP_COPY:-}" ]; then
   step "Staging for the app bundle"
   mkdir -p "$(dirname "${STAGED}")"

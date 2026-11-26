@@ -44,14 +44,9 @@ jobs:
       - name: install frontend dependencies
         run: pnpm install
 
-      # The 10.15-12.x system-audio tier ships as a signed, notarized AudioServerPlugIn
-      # package that `install_audio_driver` resolves out of the app bundle. It is gitignored,
-      # so it has to be built here; without it the bundler copies nothing and the shipped app
-      # offers an Install button that can only fail.
-      #
-      # Each credentialed step inside release.sh skips itself, loudly, when its identity is
-      # absent -- so a fork without these secrets still produces an app, just one whose audio
-      # package is unsigned and therefore refused by Gatekeeper on the user's machine.
+      # the audio driver .pkg (10.15-12.x system-audio tier) is gitignored, so build it here;
+      # without it the app's Install button can only fail. release.sh skips signing and notarizing
+      # when the secrets are absent: the .pkg is then unsigned and Gatekeeper refuses it
       - name: build the macOS audio driver package
         if: matrix.platform == 'macos-latest'
         env:
@@ -68,11 +63,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # src-tauri/.cargo/config.toml already sets this for every cargo invocation; it is
-          # repeated here so the value is visible to anyone reading the release job, and so a
-          # C or Objective-C dependency compiled by a build script inherits it too. Without
-          # it rustc's default for x86_64-apple-darwin is 10.12 and the shipped binary
-          # contradicts minimumSystemVersion 10.15.
+          # also in src-tauri/.cargo/config.toml; repeated so C/ObjC built by build scripts inherit it.
+          # rustc's default for x86_64-apple-darwin is 10.12, below minimumSystemVersion 10.15
           MACOSX_DEPLOYMENT_TARGET: '10.15'
         with:
           tagName: app-v__VERSION__
@@ -82,17 +74,12 @@ jobs:
           prerelease: false
           args: ${{ matrix.args }}
 
-      # Everything below runs before `finalize-release`, which is what publishes the draft, so
-      # a failure here leaves the release unpublished rather than shipping a broken bundle.
+      # the checks below gate finalize-release: a failure leaves the draft unpublished
 
-      # `src-tauri/Info.plist` reaches the bundle by a Tauri convention (a file of that exact
-      # name beside the config is merged into the generated Contents/Info.plist) and, since
-      # this change, by an explicit `bundle.macOS.infoPlist` too. Nothing asserted either, and
-      # the failure mode is silent until it is fatal: a missing NSAudioCaptureUsageDescription
-      # is a hard process kill the first time a user enables System Audio.
-      #
-      # NSSupportsAutomaticGraphicsSwitching is the same file's other load-bearing key: without
-      # it a dual-GPU Mac pins the discrete GPU on for the app's whole lifetime (QA1734).
+      # the keys come from src-tauri/Info.plist, merged into the bundle by Tauri, and a miss is
+      # silent until fatal: no NSAudioCaptureUsageDescription is a hard process kill the first time
+      # System Audio is enabled, and without NSSupportsAutomaticGraphicsSwitching a dual-GPU Mac
+      # keeps the discrete GPU on for the app's whole lifetime (QA1734)
       - name: bundled Info.plist carries the keys the app cannot run without
         if: matrix.platform == 'macos-latest'
         run: |
@@ -114,17 +101,11 @@ jobs:
             exit 1
           fi
 
-      # 0.7.0 shipped with no bundle signature: only the arm64 slice carried the linker's
-      # ad-hoc signature (identifier `ScreenExtend-<hash>`, Info.plist not bound, nothing
-      # sealed), the x86_64 slice was unsigned, and the bundle had no designated requirement.
-      # TCC then stored every grant against a csreq the running app could never satisfy, so
-      # the permission gate could not be passed on Apple silicon. `bundle.macOS.signingIdentity`
-      # is now "-" in tauri.macos.conf.json, so the bundler signs the universal executable
-      # (both slices) and then the bundle, before the DMG and the updater .app.tar.gz are made
-      # from it. This step fails the release unless that signature is whole: verifies with
-      # --deep --strict, identifier == bundle id, Info.plist bound, resources sealed, and each
-      # slice's CDHash in the designated requirement (or, with a Developer ID, the requirement
-      # satisfied by every slice).
+      # with only the linker's ad-hoc signature (arm64 slice, Info.plist unbound, nothing sealed)
+      # TCC stores grants against a csreq the app can never satisfy; signingIdentity "-" in
+      # tauri.macos.conf.json makes the bundler sign both slices and the bundle. Require it whole:
+      # --deep --strict, identifier == bundle id, Info.plist bound, resources sealed, and every
+      # slice satisfying the designated requirement
       - name: macOS bundle signature is whole (every slice, Info.plist, resources)
         if: matrix.platform == 'macos-latest'
         run: |
@@ -136,8 +117,7 @@ jobs:
             echo "::error::the macOS bundle signature is incomplete; TCC grants could never match this build"
             exit 1
           fi
-          # The updater archive is what an existing install receives; check the copy inside it
-          # too, so a signature lost between bundling and archiving cannot ship.
+          # existing installs receive the updater archive, so check the copy inside it too
           tarball=$(find src-tauri/target/universal-apple-darwin/release/bundle/macos \
                          -maxdepth 1 -name '*.app.tar.gz' | head -1)
           if [ -n "$tarball" ]; then
@@ -151,18 +131,11 @@ jobs:
             echo "::warning::no .app.tar.gz updater archive was found to check"
           fi
 
-      # TCC keys a grant on (service, bundle id) plus a `csreq` blob captured at grant time, so
-      # an identity that drifts between releases shows the user a ticked Screen Recording box
-      # over a grant that no longer applies. An ad-hoc identity's designated requirement is its
-      # cdhashes, which change with every build: a grant made to an ad-hoc build works for that
-      # build and is lost on every update. Whether macOS 15 specifically treats an ad-hoc
-      # identity any worse than that is unverified on this project. The expected requirement is
-      # checked in beside the resource provenance; see docs/manual-tests/macos-app-signing.md
-      # for how to re-seed it.
-      #
-      # Nothing in this workflow signs with a Developer ID until an APPLE_CERTIFICATE secret
-      # exists, so without one the build is ad-hoc by construction: say so loudly and let the
-      # release through rather than fail a gate no build can pass.
+      # TCC keys a grant on (service, bundle id) plus a csreq captured at grant time: if the
+      # identity drifts between releases, Screen Recording shows ticked over a grant that no
+      # longer applies. An ad-hoc requirement is the cdhashes, so its grants are lost on every
+      # update, and without an APPLE_CERTIFICATE secret the build is ad-hoc by construction:
+      # warn and pass
       - name: macOS code identity is stable and Developer ID
         if: matrix.platform == 'macos-latest'
         env:
@@ -173,7 +146,7 @@ jobs:
           codesign -dv --verbose=4 "$app" 2>&1 | tee /tmp/codesign.txt
           if [ "$HAVE_DEVELOPER_ID" != "true" ]; then
             echo "::warning::no APPLE_CERTIFICATE secret; this release is ad-hoc signed and \
-                  TCC grants will not survive an update (docs/manual-tests/macos-app-signing.md)"
+                  TCC grants will not survive an update"
             exit 0
           fi
           if grep -qi 'Signature=adhoc' /tmp/codesign.txt; then
@@ -195,18 +168,13 @@ jobs:
               exit 1
             fi
           else
-            echo "::warning::$expected is absent; seed it with the requirement printed                   above (docs/manual-tests/macos-app-signing.md) so the next release is gated"
+            echo "::warning::$expected is absent; seed it with the requirement printed                   above so the next release is gated"
           fi
 
-      # The release is a draft until `finalize-release` publishes it, and that job needs this
-      # one, so failing here leaves the draft unpublished. One link-time reference to an API
-      # newer than 10.15 is bound by dyld before main(), which means the app does not launch
-      # on Catalina at all while launching fine on this runner and on every modern dev Mac.
-      #
-      # The 10.15 SDK is not on any hosted runner: the .tbd stub half of the check therefore
-      # weakens (a newer SDK's stubs are a superset), while the header-availability half
-      # still fails anything annotated as introduced after the floor. The strong verdict is
-      # the dev box run in docs/dev-workflow.md.
+      # one link-time reference to an API newer than 10.15 is bound by dyld before main(): the app
+      # then fails to launch on Catalina while running fine here. No hosted runner has the 10.15
+      # SDK, so the .tbd half of the check is weak (newer stubs are a superset); the
+      # header-availability half still catches anything introduced after the floor
       - name: macOS dyld floor check (universal binary)
         if: matrix.platform == 'macos-latest'
         run: |
@@ -217,7 +185,7 @@ jobs:
             echo "::error::the shipped binary links a framework that is absent on macOS 10.15"
             exit 1
           fi
-          # nm -m -arch all covers both slices in one pass, so the arm64 half is audited too.
+          # nm -m -arch all covers both slices, so arm64 is checked too
           bash scripts/check-macos-dyld.sh "$bin" "$(xcrun --sdk macosx --show-sdk-path)" --floor 10.15
 
   finalize-release:

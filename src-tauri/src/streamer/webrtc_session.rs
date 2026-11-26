@@ -37,7 +37,10 @@ use super::bitrate::{
 use super::config::H264Profile;
 use super::congestion::{self, DelayBasedEstimate, NetworkState, SendHistory, SharedFeedback};
 use super::input;
-use super::keyframe::{pli_backoff_cap_healthy_ms, KeyframeGate, PliBackoff, PLI_BACKOFF_CAP_MS};
+use super::keyframe::{
+    payload_carries_idr, pli_backoff_cap_healthy_ms, DistanceAsk, KeyframeGate, PacketDistance,
+    PliBackoff, PLI_BACKOFF_CAP_MS,
+};
 use super::lock::LockExt;
 use super::negotiate;
 use super::pacer::{Pacer, PacingMode};
@@ -51,36 +54,25 @@ const BWE_POLL_INTERVAL: Duration = Duration::from_millis(120);
 /// Floor on how often a client's out-of-band keyframe request may force an IDR.
 const MIN_IDR_REQUEST_GAP: Duration = Duration::from_millis(200);
 
-/// No `useinbandfec=1`: it used to be advertised and it was never true. libopus documents
-/// in-band FEC as an LPC-layer (SILK) feature, and this encoder runs
-/// `OPUS_APPLICATION_RESTRICTED_LOWDELAY` at 5 ms frames — both force CELT-only — so no FEC
-/// can be produced on either transport path. Telling the client to expect it was a lie that
-/// could only make its concealment worse.
+/// No `useinbandfec=1`: libopus documents in-band FEC as an LPC-layer (SILK) feature, and this
+/// encoder runs `OPUS_APPLICATION_RESTRICTED_LOWDELAY` at 5 ms frames, both of which force
+/// CELT-only, so no FEC can be produced on either transport path.
 const OPUS_FALLBACK_FMTP: &str = "minptime=5;stereo=1;sprop-stereo=1";
 
-/// How much audio may sit unsent in the DataChannel before the forwarder starts dropping.
-///
-/// Expressed in milliseconds, not bytes. The old threshold was a flat 16 KiB, which at the
-/// measured ~93-byte message is about **a second** of audio queued before the drop policy
-/// engaged — by which point the listener is a second behind and every packet in the queue is
-/// worthless. 40 ms is two Opus frames more than the client's own maximum jitter target.
+/// How much audio may sit unsent in the DataChannel before the forwarder starts dropping. In
+/// milliseconds, not bytes: a flat 16 KiB is about a second of ~93-byte messages. 40 ms is two
+/// Opus frames more than the client's own maximum jitter target.
 const AUDIO_BACKPRESSURE_MS: usize = 40;
 
-/// What `buffered_amount` counts on top of the queue: bytes already *sent* but not yet
-/// acknowledged.
+/// Allowance for what `buffered_amount` counts beyond the queue: bytes sent but not yet SACKed.
 ///
-/// webrtc-sctp 0.17.1 adds a message to `buffered_amount` when it is queued and releases it only
-/// in `handle_sack` (`stream::on_buffer_released`), so a datagram that is on the wire, or already
-/// delivered, still counts until the peer's SACK for it arrives — and an SCTP receiver may hold
-/// that SACK for up to 200 ms (RFC 9260 §6.2; webrtc-sctp's own `ACK_INTERVAL` is 200 ms). With
-/// the bare 40 ms threshold, one delayed SACK was a full queue: the forwarder dropped every packet
-/// until the SACK landed, in bursts of 41–43 packets (~205–215 ms of audio, G06's measurement),
-/// each an audible hole, on an idle loopback link. Allowing one SACK interval of in-flight data
-/// keeps the drop for a channel that is genuinely backed up.
+/// webrtc-sctp 0.17.1 releases a message only in `handle_sack`, and a receiver may hold a SACK
+/// for up to 200 ms (RFC 9260 section 6.2). Without this one delayed SACK reads as a full queue
+/// and the forwarder drops 41-43 packets (~210 ms of audio) on an idle link.
 const AUDIO_SACK_ALLOWANCE_MS: usize = 220;
 
-/// The byte figure that `AUDIO_BACKPRESSURE_MS` works out to for the message size actually
-/// being sent, so the policy tracks the bitrate instead of assuming one.
+/// The drop threshold in bytes for the message size actually being sent, so the policy tracks
+/// the bitrate instead of assuming one.
 fn backpressure_limit_bytes(msg_len: usize) -> usize {
     let frames = (AUDIO_BACKPRESSURE_MS + AUDIO_SACK_ALLOWANCE_MS)
         / crate::streamer::audio::encoder::FRAME_MS as usize;
@@ -90,12 +82,9 @@ fn backpressure_limit_bytes(msg_len: usize) -> usize {
 /// RTP payload MTU on a same-subnet path: 1200 bytes of datagram minus the 12-byte RTP header.
 pub(crate) const RTP_PAYLOAD_MTU_LAN: usize = 1200 - 12;
 
-/// RTP payload MTU once the path goes through a relay. The datagram then carries TURN
-/// ChannelData or Send-indication encapsulation on top of RTP, SRTP auth and the outer IP/UDP
-/// headers, which can push it past a tunnelled path MTU (1400/1420 are common) or the 1280-byte
-/// IPv6 minimum. Fragmentation turns graceful loss into catastrophic loss — one lost fragment
-/// destroys the whole datagram — and a PMTU black hole loses everything. Moonlight caps remote
-/// streams at 1024 for exactly this reason and Sunshine defaults to it.
+/// RTP payload MTU on a relayed path. TURN encapsulation on top of SRTP and IP/UDP can push a
+/// datagram past a tunnelled path MTU (1400/1420 are common) or the 1280-byte IPv6 minimum, and
+/// one lost fragment loses the whole datagram. Moonlight caps remote streams at 1024 too.
 const RTP_PAYLOAD_MTU_RELAY: usize = 1024 - 12;
 
 /// How long to wait for ICE gathering before returning the answer anyway.
@@ -109,8 +98,8 @@ const GATHER_MAX_WAIT_LAN_MS: u64 = 200;
 /// de-jitter buffer turns ordinary jitter into stutter.
 const PLAYOUT_DELAY_MAX_RELAY: u16 = 20;
 
-/// Live sessions, for the leak check. A session that ends must give its peer connection, its ICE
-/// sockets and its injector thread back; before the explicit close these only ever went up.
+/// Live sessions, for the leak check: a session that ends must give back its peer connection,
+/// its ICE sockets and its injector thread.
 static LIVE_SESSIONS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
 pub fn live_sessions() -> i64 {
@@ -139,13 +128,8 @@ impl EncoderControl for Pipeline {
 }
 
 /// What a session's tasks and handlers keep of the pipeline: its controls and shared state, never
-/// the frame channel's sender.
-///
-/// They used to keep whole `Pipeline` clones, and a `Pipeline` carries `tx`. The RTP writer held
-/// one through its `KeyframeRequester`, so the channel it was reading from could not close while
-/// the writer was alive and the writer could not leave until the channel closed. It stayed parked
-/// in `recv()` for the life of the host with an `Arc` of the peer connection: one ICE socket,
-/// and everything hanging off the connection, per join.
+/// the frame channel's sender. A `Pipeline` clone carries `tx`, and one held by the RTP writer
+/// keeps the channel it reads from open, so the writer and its peer connection never go away.
 #[derive(Clone)]
 pub(crate) struct SessionPipeline {
     control: Arc<dyn EncoderControl>,
@@ -153,9 +137,28 @@ pub(crate) struct SessionPipeline {
     repair: Arc<crate::streamer::repair::RepairState>,
     max_bitrate_bps: u32,
     frame_duration: Duration,
+    #[cfg(test)]
+    packet_distance_limit: u32,
 }
 
 impl SessionPipeline {
+    #[cfg(not(test))]
+    fn packet_distance_limit(&self) -> u32 {
+        super::keyframe::PACKET_DISTANCE_LIMIT
+    }
+
+    #[cfg(test)]
+    fn packet_distance_limit(&self) -> u32 {
+        self.packet_distance_limit
+    }
+
+    /// The same session with the packet distance measured against `limit` instead of 2^15.
+    #[cfg(test)]
+    pub(crate) fn with_packet_distance_limit(mut self, limit: u32) -> Self {
+        self.packet_distance_limit = limit;
+        self
+    }
+
     fn of(pipeline: &Pipeline) -> Self {
         let mut control = pipeline.clone();
         control.tx = tokio::sync::broadcast::channel(1).0;
@@ -165,19 +168,36 @@ impl SessionPipeline {
             max_bitrate_bps: pipeline.max_bitrate_bps,
             frame_duration: pipeline.frame_duration,
             control: Arc::new(control),
+            #[cfg(test)]
+            packet_distance_limit: super::keyframe::PACKET_DISTANCE_LIMIT,
         }
     }
 
     /// A session with no encoder behind it, for the transport tests.
     #[cfg(test)]
     pub(crate) fn without_encoder(control: Arc<dyn EncoderControl>) -> Self {
+        Self::without_encoder_at(control, 8_000_000)
+    }
+
+    /// The same, paced to `max_bitrate_bps`.
+    #[cfg(test)]
+    pub(crate) fn without_encoder_at(
+        control: Arc<dyn EncoderControl>,
+        max_bitrate_bps: u32,
+    ) -> Self {
         Self {
             control,
             telemetry: crate::streamer::telemetry::SessionTelemetry::new_shared(),
             repair: Arc::new(crate::streamer::repair::RepairState::new()),
-            max_bitrate_bps: 8_000_000,
+            max_bitrate_bps,
             frame_duration: Duration::from_millis(16),
+            packet_distance_limit: super::keyframe::PACKET_DISTANCE_LIMIT,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn telemetry(&self) -> crate::streamer::telemetry::SharedTelemetry {
+        Arc::clone(&self.telemetry)
     }
 
     fn request_idr(&self) {
@@ -193,12 +213,9 @@ impl SessionPipeline {
     }
 }
 
-/// The one path every keyframe request in a session takes.
-///
-/// There are five callers — an RTCP PLI, an RTCP FIR, this client opcode, a payloader failure
-/// and a lagging viewer — and on an infinite-GOP encoder each one produces the largest frame the
-/// session will ever emit. Funnelling them through a single rate-limited requester is what stops
-/// a decoder's backlog from being answered five times over.
+/// The one rate-limited path every keyframe request in a session takes (RTCP PLI, RTCP FIR, the
+/// client opcode, a payloader failure, a lagging viewer). On an infinite-GOP encoder each one
+/// produces the largest frame of the session, and one backlog must not be answered five times.
 #[derive(Clone)]
 pub struct KeyframeRequester {
     pipeline: SessionPipeline,
@@ -208,17 +225,12 @@ pub struct KeyframeRequester {
 impl KeyframeRequester {
     /// Recover the picture, by the cheapest means the encoder and the client can agree on.
     ///
-    /// An IDR is the largest frame the session will ever emit, sent on a link that has just
-    /// demonstrated it could not carry the previous burst — which is how one lost packet becomes a
-    /// keyframe storm. When the encoder has long-term reference slots *and* transport-wide
-    /// feedback says the client holds one, the repair is a P frame predicted from that picture
-    /// instead: measured at 23698 B against a 28423 B IDR on a synthetic worst case where every
-    /// pixel changes every frame, and far better than that on real screen content, which is mostly
-    /// static. Neither half is optional — repairing against a reference the client never received
-    /// produces a picture it cannot decode, which is worse than the keyframe it replaced.
+    /// When the encoder has long-term reference slots *and* transport-wide feedback says the
+    /// client holds one, the repair is a P frame predicted from it, not an IDR (23698 B against
+    /// 28423 B with every pixel changing). A reference the client never received cannot be
+    /// decoded, so both halves are required.
     ///
-    /// Returns whether anything was requested; a suppressed one means a recovery is already in
-    /// flight for the same event.
+    /// Returns whether anything was requested; `false` means a recovery is already in flight.
     pub fn request(&self, reason: &str) -> bool {
         if !self.gate.allow(audio::host_now_ns()) {
             return false;
@@ -246,23 +258,12 @@ impl KeyframeRequester {
 
     /// A keyframe, and nothing cleverer, because the **client** asked for one.
     ///
-    /// A PLI, a FIR or the client's out-of-band opcode all mean the same thing: *this decoder
-    /// cannot continue from what it has*. A long-term-reference repair is the wrong answer to
-    /// that by construction — it predicts from a picture the decoder is being told it does not
-    /// have — and the `can_repair` guard does not catch it, because "the client holds this
-    /// reference" is inferred from transport-wide feedback, i.e. from the *packets* arriving,
-    /// not from anything having decoded them.
-    ///
-    /// The two come apart on every single join. The session's opening IDR goes out while the
-    /// track is binding, its packets are acknowledged, and the page then installs its transform
-    /// and creates a decoder that has never seen a keyframe. From that point every request it
-    /// makes was answered with a repair frame it could not use: measured on the Windows dev box,
-    /// 35 admitted requests produced one IDR, the page logged `no WebCodecs frame within 5s`,
-    /// and it demoted itself to a `<video>` element for the rest of the session.
-    ///
-    /// libwebrtc's rule is the same one: a PLI is answered with a keyframe, full stop. The
-    /// repair path keeps the losses the *transport* detected, which do imply a decoder that is
-    /// running.
+    /// A PLI, a FIR or the client's opcode means *this decoder cannot continue from what it has*.
+    /// A long-term-reference repair is the wrong answer: "the client holds this reference" is
+    /// inferred from packets arriving, not from anything decoding them, and on every join the
+    /// opening IDR is acknowledged before the page creates its decoder. Repairs there gave 35
+    /// requests one IDR, and the page demoted itself to a `<video>` element. Losses the
+    /// transport detects keep the repair path (`request`): those imply a running decoder.
     pub fn request_keyframe_for_client(&self, reason: &str) -> bool {
         if !self.gate.allow(audio::host_now_ns()) {
             return false;
@@ -270,6 +271,32 @@ impl KeyframeRequester {
         tprintln!("keyframe requested: {reason}");
         self.pipeline.request_idr();
         true
+    }
+
+    /// An IDR because a delta is getting too far from its keyframe for some receivers. The gate
+    /// is asked first; a refusal is not counted as a suppressed request (it is retried until it
+    /// gets through), and only when the request may force is the window taken anyway.
+    pub fn request_keyframe_for_distance(
+        &self,
+        request: super::keyframe::DistanceRequest,
+    ) -> DistanceAsk {
+        let asked = self
+            .gate
+            .ask_for_distance(audio::host_now_ns(), request.may_force);
+        match asked {
+            DistanceAsk::Admitted => tprintln!(
+                "keyframe requested: a delta is near the packet distance older receivers allow"
+            ),
+            DistanceAsk::Forced if request.first_force => tprintln!(
+                "keyframe requested: a delta is near the packet distance older receivers allow \
+                 (past the gate)"
+            ),
+            _ => {}
+        }
+        if matches!(asked, DistanceAsk::Admitted | DistanceAsk::Forced) {
+            self.pipeline.request_idr();
+        }
+        asked
     }
 
     /// The same, without the log line, for the paths a stalled decoder repeats.
@@ -282,8 +309,39 @@ impl KeyframeRequester {
     }
 }
 
+/// The `transport_tier` a client reports when it reads frames through `RTCRtpScriptTransform`
+/// (`telemetry::transport_tier_name`).
+const SCRIPT_TRANSFORM_TIER: u8 = 1;
+
+/// The `video_path` a client reports when the browser's own decoder paints into a `<video>`
+/// (`telemetry::video_path_name`): a page demoted off WebCodecs, or one that never had it.
+const VIDEO_ELEMENT_PATH: u8 = 3;
+
+/// Whether a viewer painting through the browser's own decoder is kept under the packet distance.
+/// Unmeasured: an old Chrome there probably has the same limit, a current browser probably not.
+const PACKET_DISTANCE_FOR_OWN_DECODER: bool = true;
+
+/// Whether a viewer is kept under the packet distance, from the last STATS it sent. Only a page
+/// that has said it reads frames through the script transform is exempt; one that has sent
+/// nothing (not yet, never, or an older page such as the relay's copy) might be on the transport
+/// with the limit.
+fn packet_distance_applies(stats: Option<&crate::streamer::telemetry::ClientStats>) -> bool {
+    match stats {
+        None => true,
+        // checked before the video path: a page demoted to its own decoder that still reports the
+        // script-transform tier is exempt whatever `PACKET_DISTANCE_FOR_OWN_DECODER` says
+        Some(s) if s.transport_tier == SCRIPT_TRANSFORM_TIER => false,
+        Some(s) if s.video_path == VIDEO_ELEMENT_PATH => PACKET_DISTANCE_FOR_OWN_DECODER,
+        Some(_) => true,
+    }
+}
+
 pub struct InputParams {
     pub device: Option<String>,
+    /// The display's stable device-interface path, so the injector follows the monitor rather
+    /// than a `\\.\DISPLAYn` slot Windows can hand to another one.
+    #[cfg(windows)]
+    pub device_path: Option<String>,
     /// The `os` string the client reported at join, which decides the modifier layout on a
     /// macOS host. Empty when the client did not say.
     pub client_os: String,
@@ -297,10 +355,9 @@ pub struct InputParams {
 #[derive(Clone)]
 pub struct AudioParams {
     pub fast: bool,
-    /// Put a standard Opus track in the answer even on the fast path, so a decoder that
-    /// answered "supported" and then failed on real packets has somewhere to go. Requested by
-    /// the client, because only the client knows whether it can switch to it — see
-    /// `AudioCapabilities::wants_fallback_track`.
+    /// Put a standard Opus track in the answer even on the fast path, so a decoder that answered
+    /// "supported" and then failed on real packets has somewhere to go. The client asks for it
+    /// (`AudioCapabilities::wants_fallback_track`): only it knows whether it can switch.
     pub fallback_track: bool,
     /// The client said it can parse [`audio::FLAG_REDUNDANT`] messages. Old clients cannot, so
     /// this is off unless the join request opted in.
@@ -308,40 +365,27 @@ pub struct AudioParams {
     /// Link loss as measured by the video BWE, in hundredths of a percent. Wired in by
     /// `start_session`; `None` outside a live session.
     pub link_loss: Option<Arc<std::sync::atomic::AtomicU32>>,
-    /// Where this client is, decided from its IP before the handshake rather than measured
-    /// 500 ms into the session. A relayed session is *known* to be relayed before a single
-    /// packet is sent, which is the one thing the loss-driven redundancy policy cannot learn
-    /// in time.
+    /// Where this client is, decided from its IP before the handshake. A relayed session is
+    /// known to be relayed before a single packet is sent, which the loss-driven redundancy
+    /// policy cannot learn in time.
     pub locality: SessionLocality,
     pub hub: SharedAudioHub,
     pub overrides: SharedDeviceOverrides,
-    /// The device this session belongs to. `overrides` is keyed by token, so this is the token —
-    /// two tabs of one browser share it, and therefore share the audio toggle.
+    /// The device this session belongs to. `overrides` is keyed by token, so two tabs of one
+    /// browser share the audio toggle.
     pub device_token: String,
 }
 
-/// Loss at which duplicating the previous frame starts paying for itself.
-///
-/// Below this, redundancy is pure overhead: every packet doubles in payload to protect against
-/// a loss that is not happening. Above it, a single lost packet is an audible 5 ms hole with
-/// no codec-level concealment available (in-band FEC cannot exist in this configuration), so
-/// the trade inverts. 0.5 % — the same order as the point at which the video BWE starts to
-/// react.
+/// Loss at which duplicating the previous frame starts paying for itself: below it redundancy
+/// doubles every payload for nothing, above it a lost packet is an audible 5 ms hole with no
+/// codec-level concealment. 0.5 %, about where the video BWE starts to react.
 const AUDIO_REDUNDANCY_LOSS_THRESHOLD: u32 = 50; // hundredths of a percent
 
 impl AudioParams {
     /// Should this packet carry the previous frame alongside it?
     ///
-    /// The client saying it can parse the format is absolute: one that cannot must never be
-    /// sent it. Past that, the question is whether the link is losing packets — and the
-    /// measured answer lags the loss it describes, because `link_loss` can only move after
-    /// loss has already been observed and reported by the video BWE.
-    ///
-    /// A `CrossNetwork` session does not have to wait for that. It is relayed through a TURN
-    /// server by construction, so it starts defensive and the loss-driven policy takes over
-    /// from there; it never turns redundancy *off*, it only removes the opening window in
-    /// which a relayed client's first packets are unprotected. `SameNetwork` and `Unknown`
-    /// keep the old purely-reactive behaviour: a clean LAN should not pay for this.
+    /// Never for a client that cannot parse the format. Otherwise on measured loss, which lags,
+    /// so a `CrossNetwork` session has it on from the first packet. A clean LAN does not pay.
     fn redundancy_now(&self) -> bool {
         if !self.redundancy {
             return false;
@@ -370,9 +414,9 @@ fn h264_fmtp(profile_level_id: &str) -> String {
 
 /// The `profile-level-id` this profile is registered and bound under.
 ///
-/// The level byte is decorative here: webrtc-rs's fmtp matcher compares only the first two bytes
-/// (`profile_level_id_matches`, `rtp_transceiver/fmtp/h264/mod.rs`), and the answer echoes the
-/// offer's line anyway. The real level goes on with `negotiate::apply_level_to_answer`.
+/// The level byte is decorative: webrtc-rs's fmtp matcher compares only the first two bytes
+/// (`profile_level_id_matches`), and the answer echoes the offer's line anyway. The real level
+/// goes on with `negotiate::apply_level_to_answer`.
 fn profile_plid(profile: H264Profile) -> &'static str {
     match profile {
         H264Profile::Baseline => "42e01f",
@@ -381,11 +425,9 @@ fn profile_plid(profile: H264Profile) -> &'static str {
     }
 }
 
-/// Every H.264 payload type to register, chosen profile first.
-///
-/// The chosen one leads so the track binds to it; Baseline follows as a floor whenever it is not
-/// already the choice, because a client that turns out to offer nothing else must still get a
-/// picture rather than a silent codec mismatch.
+/// Every H.264 payload type to register, chosen profile first so the track binds to it.
+/// Baseline follows as a floor: a client that offers nothing else must still get a picture
+/// rather than a silent codec mismatch.
 fn h264_codecs(profile: H264Profile) -> Vec<(PayloadType, PayloadType, &'static str)> {
     let mut out = vec![(102, 103, profile_plid(profile))];
     match profile {
@@ -404,10 +446,36 @@ type RawSocket = usize;
 #[cfg(not(windows))]
 type RawSocket = i32;
 
-/// The media socket a session muxes ICE over, when it is on the LAN tier.
-///
-/// Kept whole so the session can close it: `UDPMuxDefault` spawns a read worker that lives until
-/// `close()`, and the raw handle is what qWAVE needs once the candidate pair is nominated.
+/// The media socket's mux before a transport owns it: closed if dropped while still held.
+/// `UDPMuxDefault` spawns a read worker that lives until `close()`.
+struct MuxGuard(Option<Arc<webrtc::ice::udp_mux::UDPMuxDefault>>);
+
+impl Drop for MuxGuard {
+    fn drop(&mut self) {
+        let Some(mux) = self.0.take() else {
+            return;
+        };
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(async move {
+                use webrtc::ice::udp_mux::UDPMux;
+                if let Err(e) = mux.close().await {
+                    teprintln!("closing media socket: {e}");
+                }
+            });
+        }
+    }
+}
+
+/// Builds the media socket on `bind` and lets go of it before any transport has taken it, the
+/// way an error or a dropped negotiation would. Whether a socket was made.
+#[cfg(test)]
+pub(crate) fn drop_unowned_media_socket(bind: std::net::IpAddr) -> bool {
+    let guard = MuxGuard(lan_media_socket(bind).map(|m| m.mux));
+    guard.0.is_some()
+}
+
+/// The media socket a session muxes ICE over, when it is on the LAN tier. The raw handle is
+/// what qWAVE needs once the candidate pair is nominated.
 struct MediaSocket {
     mux: Arc<webrtc::ice::udp_mux::UDPMuxDefault>,
     raw: RawSocket,
@@ -415,34 +483,68 @@ struct MediaSocket {
     local: std::net::SocketAddr,
 }
 
-/// Bind and configure the LAN-tier media socket, or return `None` and let the session use the
-/// stock ephemeral sockets.
-/// Whether the tuned media socket is enabled for this process.
-///
-/// **Off by default, and this is a measured decision, not caution.** Bound to `0.0.0.0` it made
-/// the join flaky: `UDPMuxDefault` has one socket, but the muxed gather still emits a host
-/// candidate for *every* local address — 24 of them on the Windows dev box, which carries several
-/// virtual adapters — and a pair whose local candidate is not the address the OS route actually
-/// sends from can pass inbound connectivity checks and fail outbound. Measured with the WHEP
-/// self-test on that box: **3 of 5 joins connected**. Binding one named address fixes the cause
-/// (see below), but that path cannot be exercised by the self-test, whose config leaves `bind_ip`
-/// unspecified — so it ships behind a switch until somebody can measure it on a real AP, which is
-/// also the only place its benefit exists. `docs/manual-tests/transport.md` §2 is that measurement.
-fn media_socket_enabled() -> bool {
-    matches!(
-        std::env::var("SCREENEXTEND_MEDIA_SOCKET").as_deref(),
-        Ok("1") | Ok("true")
-    )
+#[cfg(test)]
+tokio::task_local! {
+    // puts one test's negotiations on the tuned media socket without the process-wide variable,
+    // which every test running beside it would see
+    pub(crate) static FORCE_MEDIA_SOCKET: bool;
 }
 
-/// Bind the tuned media socket to one named local address.
+/// Whether the tuned media socket is enabled for this process.
 ///
-/// The address is the adapter this streamer serves (`Config::bind_ip`). Binding it, rather than
-/// `0.0.0.0`, is what makes the muxed candidate honest: one local address, one host candidate,
-/// and every packet leaving from the address the candidate names.
+/// Off by default. Bound to `0.0.0.0`, the muxed gather emits a host candidate for *every* local
+/// address (24 on a box with several virtual adapters), and a pair whose local address is not
+/// the one the OS routes from can pass inbound checks and fail outbound: 3 of 5 joins
+/// connected. Binding one named address fixes that but is unmeasured on a real AP, so it stays
+/// behind `SCREENEXTEND_MEDIA_SOCKET`.
+fn media_socket_enabled() -> bool {
+    #[cfg(test)]
+    if FORCE_MEDIA_SOCKET.try_with(|on| *on).unwrap_or(false) {
+        return true;
+    }
+    matches!(
+        crate::envcfg::var("SCREENEXTEND_MEDIA_SOCKET").as_deref(),
+        Ok("1") | Ok("true")
+    ) || media_socket_by_default()
+}
+
+/// Windows candidate `media_socket_default`: the LAN tier takes the tuned socket without the
+/// variable, which is also the only way its ICE sockets get `SIO_UDP_CONNRESET` turned off.
+#[cfg(windows)]
+fn media_socket_by_default() -> bool {
+    crate::windows_utils::streamer::tune::candidate("media_socket_default")
+}
+
+#[cfg(not(windows))]
+fn media_socket_by_default() -> bool {
+    false
+}
+
+/// Below this a pacer wait is slept precisely (`pacer_precise_wait`); the async timer rounds
+/// every deadline up to the next whole millisecond, which here is most of the wait.
+#[cfg(windows)]
+const PRECISE_WAIT_BELOW: Duration = Duration::from_millis(2);
+
+/// A short pacer wait slept on a blocking thread: `std::thread::sleep` uses a high-resolution
+/// waitable timer on Windows, and the wait holds no runtime worker. A spin on the writer's task
+/// would hold one, and the workers are also what notice arriving datagrams and input.
+#[cfg(windows)]
+async fn pace_sleep_precise(wait: Duration) {
+    if wait >= PRECISE_WAIT_BELOW
+        || tokio::task::spawn_blocking(move || std::thread::sleep(wait))
+            .await
+            .is_err()
+    {
+        tokio::time::sleep(wait).await;
+    }
+}
+
+/// Bind the tuned media socket to the adapter this streamer serves (`Config::bind_ip`), or
+/// return `None` for the stock ephemeral sockets. One named address, not `0.0.0.0`: one host
+/// candidate, and every packet leaves from the address it names.
 fn lan_media_socket(bind: std::net::IpAddr) -> Option<MediaSocket> {
     if bind.is_unspecified() {
-        // Nothing to bind to means the 24-candidate shape above, so do not.
+        // no named address: `0.0.0.0` would mean a host candidate per local address
         return None;
     }
     let (sock, tuning) = match sockets::bind_tuned(std::net::SocketAddr::new(bind, 0)) {
@@ -607,31 +709,23 @@ fn udp_only_setting_engine(
     se.set_srflx_acceptance_min_wait(Some(std::time::Duration::from_millis(50)));
     se.set_prflx_acceptance_min_wait(Some(std::time::Duration::from_millis(50)));
     se.set_relay_acceptance_min_wait(Some(std::time::Duration::from_millis(0)));
-    // `enable_sender_rtx(true)` is deliberately NOT set, and this comment is here because it looks
-    // like an oversight twice a year. webrtc-rs 0.17.1's NACK responder binds a stream only when
-    // `stream_support_nack(info)` — `rtcp_feedback` containing `nack` with an empty parameter —
-    // and the RTX codec is registered with `rtcp_feedback: vec![]`, so the responder never binds
-    // it; `resend_packets` then looks the stream up by `nack.media_ssrc` and writes to the
-    // *primary* SSRC's writer. Enabling it would add an `a=ssrc-group:FID` telling Chrome to
-    // expect retransmissions on a stream that would always be silent. Repairs already reach the
-    // client on the primary SSRC. See `docs/OPTIMIZATIONS.md` row 62.
-    // The transport tests run on loopback, which ICE leaves out of its gathering. Tests only: a
-    // streamer bound to loopback (the bench) keeps the candidates it always offered, because
-    // loopback ones would measure a different path and could not pair with a browser's LAN ones.
+    // `enable_sender_rtx(true)` is deliberately NOT set: webrtc-rs 0.17.1's NACK responder never
+    // binds the RTX stream (its codec has no `nack` feedback) and resends on the primary SSRC, so
+    // an `a=ssrc-group:FID` would promise Chrome retransmissions on a stream that stays silent.
+
+    // The transport tests run on loopback, which ICE leaves out of its gathering. Tests only: on
+    // the bench, loopback candidates would measure a different path and could not pair with a
+    // browser's LAN ones.
     if cfg!(test) && bind_ip.is_loopback() {
         se.set_include_loopback_candidate(true);
         se.set_ip_filter(Box::new(move |ip: std::net::IpAddr| ip == bind_ip));
     }
     if let Some(mux) = mux {
-        // One socket means one address that can actually send, so offer exactly that one. Without
-        // this the muxed gather advertises a host candidate per local address on the machine —
-        // every Hyper-V, VirtualBox and VPN adapter included — and every one of those pairs points
-        // at a socket that will not send from it.
+        // one socket sends from one address, so offer only that one, not a host candidate per
+        // local adapter (Hyper-V, VirtualBox, VPN)
         se.set_ip_filter(Box::new(move |ip: std::net::IpAddr| ip == bind_ip));
-        // Only ever on the LAN tier: muxed mode skips server-reflexive gathering outright
-        // (`agent_gather.rs`, `UDPNetwork::Muxed(_) => continue`), and a same-subnet peer is
-        // already offered no STUN server. Relay gathering builds its own sockets and is
-        // unaffected, so a misclassified peer with TURN configured still connects.
+        // muxed mode skips server-reflexive gathering (`agent_gather.rs`), hence LAN tier only.
+        // Relay gathering builds its own sockets, so a misclassified peer with TURN still connects.
         se.set_udp_network(UDPNetwork::Muxed(mux as Arc<dyn UDPMux + Send + Sync>));
     }
     se
@@ -682,15 +776,11 @@ async fn detect_session_locality(
     };
     let remote_addr = cand_addr.get(&rid).copied();
 
-    // What the local end of the nominated pair is physically riding. A USB-tethered phone is an
-    // ordinary Ethernet interface, so this is the only way the host can tell the wired path from
-    // Wi-Fi — and the wired path is what every competitor in the category treats as its
-    // low-latency tier. Reported through the log bus, because the desktop UI's appearance is
-    // fixed.
+    // the medium under the nominated pair, for the log: a USB-tethered phone is an ordinary
+    // Ethernet interface, so this is the only way to tell the wired path from Wi-Fi
     if let Some(lip) = cand_ip.get(&lid).cloned() {
-        // `spawn_blocking`, not an inline call: on Windows this is two WMI round trips, and on
-        // macOS a `getifaddrs` walk plus an ioctl. Once per session, never on a hot path — but
-        // never on a tokio worker either.
+        // `spawn_blocking`: two WMI round trips on Windows, a `getifaddrs` walk plus an ioctl on
+        // macOS, and neither belongs on a tokio worker
         let probe = lip.clone();
         let medium = tokio::task::spawn_blocking(move || {
             crate::streamer::platform::link_medium_for_local_ip(&probe)
@@ -724,7 +814,7 @@ async fn detect_session_locality(
     if lt.contains("relay") || rt.contains("relay") {
         if is_private_ip(&lip) && is_private_ip(&rip) && same_subnet_24(&lip, &rip) {
             teprintln!(
-                "WARNING: same-subnet peers ({lip} <-> {rip}) are routing via relay/router — \
+                "WARNING: same-subnet peers ({lip} <-> {rip}) are routing via relay/router: \
                  check AP client isolation (and AP-side WMM). Disabling client isolation lets \
                  the host<->client pair take a direct Wi-Fi path and removes 10-40ms of latency."
             );
@@ -846,9 +936,8 @@ fn still_gathering(pc: &webrtc::peer_connection::RTCPeerConnection) -> bool {
 /// Close `pc`, once it has stopped gathering candidates.
 ///
 /// webrtc-ice 0.17.1 does not cancel a gathering round when its agent closes. A candidate that
-/// turns up afterwards (a STUN server that took its time) is added to the closed agent and given a
-/// receive loop nothing will ever stop, and that loop holds the agent: the new socket, and through
-/// the agent's check list every socket it had before.
+/// turns up afterwards (a slow STUN server) is added to the closed agent and given a receive
+/// loop nothing will ever stop, and that loop holds the agent and every socket it had.
 async fn close_connection(pc: &webrtc::peer_connection::RTCPeerConnection) {
     let deadline = Instant::now() + GATHER_SETTLE;
     while still_gathering(pc) && Instant::now() < deadline {
@@ -859,14 +948,10 @@ async fn close_connection(pc: &webrtc::peer_connection::RTCPeerConnection) {
     }
 }
 
-/// A session's peer connection and the media socket under it, closed exactly once whichever way
-/// the session ends.
-///
-/// Dropping an `RTCPeerConnection` closes nothing: its own tasks hold the ICE agent, and the agent
-/// holds its sockets. So a connection that is merely dropped — a `/whep` request the client
-/// aborted takes the whole `start_session` future with it, between any two `.await`s — stayed up
-/// for the life of the host. Closing runs in a task of its own for the same reason: a `close` the
-/// caller stopped polling halfway would leave a connection that says it is closed and is not.
+/// A session's peer connection and the media socket under it, closed exactly once however the
+/// session ends. Dropping an `RTCPeerConnection` closes nothing, and an aborted `/whep` request
+/// drops `start_session` between any two `.await`s, so `Drop` closes too, in a task of its own
+/// (a `close` the caller stopped polling halfway leaves a connection half closed).
 struct Transport {
     pc: Arc<webrtc::peer_connection::RTCPeerConnection>,
     /// `UDPMuxDefault` runs a read worker that only stops on `close()`.
@@ -929,14 +1014,8 @@ impl Drop for Transport {
     }
 }
 
-/// What the caller must hold to end a session.
-///
-/// Nothing used to close the host's peer connection — `grep close() ` over the transport found
-/// only the self-test — and the connection could not have been dropped anyway, because its own
-/// state-change handler held an `Arc` back to it. So every join leaked a peer connection, its ICE
-/// agent, that agent's UDP sockets, and one `injector` OS thread whose only exit condition is both
-/// of its channel senders being dropped. Not once per device: once per *join*, and the client
-/// rebuilds the whole session on any settings change.
+/// What the caller must hold to end a session. Nothing else closes the peer connection, and an
+/// unclosed one leaks its ICE agent and sockets and one `injector` OS thread, once per join.
 pub struct SessionHandle {
     transport: Option<Transport>,
     /// Dropped to send the RTP writer home. It is the one task with no other way to learn the
@@ -967,30 +1046,23 @@ impl SessionHandle {
     /// Close the peer connection and wait for the injector thread to release its input state.
     pub async fn close(mut self) {
         drop(self.writer_stop.take());
-        // The connection's own handlers each hold a clone of the injector's sender — the input
-        // data channel's `on_message`, and the state-change handler that releases held keys —
-        // so the channel cannot disconnect while the connection is alive, whatever this handle
-        // does with its own copy. Letting the connection go is what actually abandons it.
-        //
-        // Without this the join below waited on a thread that had no way to leave, and it waited
-        // inside the task that removes the display: every clean leave left its virtual display
-        // standing and its transport counted as live. It went unseen because the only other
-        // caller was a session being superseded, which kept its display on purpose.
+        // the connection's own handlers hold clones of the injector's sender (the input channel's
+        // `on_message`, the state-change handler), so close it first: otherwise the join below
+        // waits on a thread that cannot leave, inside the task that removes the display
         if let Some(transport) = self.transport.take() {
             transport.close().await;
         }
         self.stop_injector();
         if let Some(join) = self.input_join.take() {
-            // The proof that the thread went away rather than the hope that it did — but
-            // bounded, because a session that cannot produce that proof must still give its
-            // display back. A thread that outlives this is parked on a channel nothing can feed;
-            // it costs one idle OS thread, not a screen the user is looking at.
+            // bounded: a session that cannot prove the thread left must still give its display
+            // back, and the cost is one idle OS thread parked on a channel nothing can feed
             let left = tokio::task::spawn_blocking(move || join_injector(join))
                 .await
                 .unwrap_or(false);
             if !left {
                 teprintln!(
-                    "injector thread did not leave within {INJECTOR_JOIN_DEADLINE:?};                      continuing so the display is released anyway"
+                    "injector thread did not leave within {INJECTOR_JOIN_DEADLINE:?}; \
+                     continuing so the display is released anyway"
                 );
             }
         }
@@ -1030,12 +1102,9 @@ type NegotiatedMedia = (
     String,
 );
 
-/// A negotiated WHEP session whose pipeline does not exist yet.
-///
-/// Everything up to and including the answer depends only on the offer, the codec choice and the
-/// ICE server list — not on the encoder, the capture session or the virtual display. Splitting
-/// here is what lets `start_session` run the handshake and the display/pipeline work as two
-/// concurrent futures instead of one serial chain.
+/// A negotiated WHEP session whose pipeline does not exist yet. The answer depends only on the
+/// offer, the codec choice and the ICE server list, so `start_session` runs the handshake and
+/// the display/pipeline work concurrently.
 pub struct PendingWhep {
     transport: Transport,
     media_raw: Option<RawSocket>,
@@ -1060,11 +1129,8 @@ impl PendingWhep {
         &self.transport.resource_id
     }
 
-    /// Give everything back when the other half of the join failed.
-    ///
-    /// Without this a display or pipeline failure would leak exactly what the peer connection used
-    /// to leak on every join: the connection, its ICE agent, that agent's sockets, and the mux
-    /// read worker.
+    /// Give everything back when the other half of the join failed: the connection, its ICE
+    /// agent, that agent's sockets, and the mux read worker.
     pub async fn abandon(self) {
         self.transport.close().await;
     }
@@ -1093,11 +1159,9 @@ pub async fn prepare_whep(
     bind_ip: std::net::IpAddr,
 ) -> Result<PendingWhep> {
     let profile = video.profile;
-    // The LAN tier: our own socket, with the send/receive buffers and the Windows CONNRESET fix
-    // webrtc-rs never applies, muxed so one port carries the host candidate. Never on a relayed or
-    // unclassified path, because muxed mode gives up server-reflexive gathering; never without an
-    // explicit opt-in, because it made the join flaky on a multi-adapter host — see
-    // `media_socket_enabled`.
+    // LAN tier only: a socket the host binds itself, with the buffers and the Windows CONNRESET
+    // fix webrtc-rs never applies. Muxed mode gives up server-reflexive gathering, so never on a
+    // relayed or unclassified path, and never without the opt-in (`media_socket_enabled`).
     let media_socket = if locality == SessionLocality::SameNetwork && media_socket_enabled() {
         lan_media_socket(bind_ip)
     } else {
@@ -1111,8 +1175,10 @@ pub async fn prepare_whep(
         );
     }
     let media_raw = media_socket.as_ref().map(|m| m.raw);
-    let mux = media_socket.map(|m| m.mux);
-    let api = build_api(profile, mux.clone(), bind_ip)?;
+    // the mux's read worker runs from here: until the transport owns the mux, the guard closes
+    // it on any way out (an error below, or the caller ceasing to poll)
+    let mut mux = MuxGuard(media_socket.map(|m| m.mux));
+    let api = build_api(profile, mux.0.clone(), bind_ip)?;
 
     let rtc_config = RTCConfiguration {
         ice_servers,
@@ -1124,12 +1190,11 @@ pub async fn prepare_whep(
             .await
             .context("new_peer_connection")?,
     );
-    // From here on every way out closes the connection, the caller ceasing to poll included.
-    let mut transport = Transport::new(Arc::clone(&pc), mux);
+    // from here on every way out closes the connection, the caller ceasing to poll included
+    let mut transport = Transport::new(Arc::clone(&pc), mux.0.take());
 
-    // Every transport constant that should differ between a 1 ms same-subnet hop and a relayed
-    // path, decided once, up front. The post-hoc detector still runs and complains if this
-    // guess was wrong — but the first frames go out with the right sizes either way.
+    // transport constants that differ between a same-subnet hop and a relayed path, decided up
+    // front so the first frames go out right. The post-hoc detector logs a wrong guess.
     let mtu = match locality {
         SessionLocality::CrossNetwork => RTP_PAYLOAD_MTU_RELAY,
         _ => RTP_PAYLOAD_MTU_LAN,
@@ -1149,14 +1214,11 @@ pub async fn prepare_whep(
         playout_delay_max * 10
     );
 
-    // Whether this client can carry a transport-wide sequence number at all. Read from the
-    // offer, because an extension the peer did not offer cannot be negotiated into the answer.
+    // from the offer: an extension the peer did not offer cannot be negotiated into the answer
     let twcc_offered = offer_sdp.contains("transport-wide-cc-extensions-01");
 
-    // Everything from here to the answer can fail — `set_remote_description` on a malformed
-    // offer most realistically — and each failure used to return with the peer connection, its
-    // ICE agent, that agent's sockets and the mux read worker still alive, and `LIVE_SESSIONS`
-    // still counting them. A client retrying a bad SDP leaked one of each per attempt.
+    // everything from here to the answer can fail (`set_remote_description` on a malformed offer,
+    // most realistically), so it runs as one block and any error closes the transport below
     let prepared: Result<NegotiatedMedia> = async {
         let track = Arc::new(TrackLocalStaticRTP::new(
             RTCRtpCodecCapability {
@@ -1189,8 +1251,8 @@ pub async fn prepare_whep(
             .await
             .context("set_remote_description(offer)")?;
 
-        // No IDR here. The track has no binding until the connection comes up, and a write to an
-        // unbound track is silently discarded — see the `Connected` arm above.
+        // no IDR here: the track has no binding until the connection comes up, and a write to an
+        // unbound track is silently discarded
 
         let answer = pc.create_answer(None).await.context("create_answer")?;
 
@@ -1198,9 +1260,8 @@ pub async fn prepare_whep(
         pc.set_local_description(answer)
             .await
             .context("set_local_description(answer)")?;
-        // A same-subnet peer needs nothing but host candidates, and host gathering finishes in
-        // single-digit milliseconds. Waiting the WAN-shaped 1.5 s for a reflexive candidate nobody
-        // will use is pure time-to-first-frame, paid on every LAN join.
+        // a same-subnet peer needs only host candidates, which gather in single-digit milliseconds:
+        // the 1.5 s wait for a reflexive candidate would be pure time-to-first-frame
         let gather_max_wait = match locality {
             SessionLocality::SameNetwork => Duration::from_millis(GATHER_MAX_WAIT_LAN_MS),
             _ => Duration::from_millis(GATHER_MAX_WAIT_MS),
@@ -1223,8 +1284,7 @@ pub async fn prepare_whep(
         );
 
         // webrtc-rs answers with the offer's own codec parameters, so without this the answer keeps
-        // whatever level the browser named — Chrome always says 3.1, i.e. 1280x720@30 — no matter what
-        // resolution the session actually negotiated.
+        // the level the browser named (Chrome always says 3.1, i.e. 1280x720@30)
         let answer_sdp = if video.may_raise_level {
             tprintln!(
                 "answering H.264 {profile:?} at level 0x{:02x} (client allowed level asymmetry)",
@@ -1247,8 +1307,8 @@ pub async fn prepare_whep(
         }
     };
 
-    // Registered only once the answer exists: the client cannot PATCH a resource whose id it has
-    // not been given, and a failed negotiation must not leave an entry behind.
+    // registered only once the answer exists: the client cannot PATCH a resource whose id it has
+    // not been given, and a failed negotiation must not leave an entry behind
     transport.resource_id = join_id.to_string();
     let superseded = register_trickle(join_id, join_id, device_token, &pc);
 
@@ -1280,9 +1340,13 @@ pub async fn activate_whep(
     input: InputParams,
     audio: Option<AudioParams>,
 ) -> Result<(String, SessionHandle)> {
+    #[cfg(windows)]
+    let frames = pipeline.subscribe();
+    #[cfg(not(windows))]
+    let frames = pipeline.tx.subscribe();
     activate_session(
         pending,
-        pipeline.tx.subscribe(),
+        frames,
         SessionPipeline::of(pipeline),
         closed_tx,
         input,
@@ -1325,18 +1389,22 @@ pub(crate) async fn activate_session(
     let feedback = Arc::new(SharedFeedback::default());
     let clock_epoch = Instant::now();
     *feedback.history.lock_recover() = Some(SendHistory::new(clock_epoch));
-    // The pacer refills from the same target the encoder is given, so the two never disagree
-    // about how much this session is allowed to send.
+    // the pacer refills from the same target the encoder is given, so the two never disagree
+    // about how much this session may send
     let pacing_target_bps = Arc::new(std::sync::atomic::AtomicU32::new(pipeline.max_bitrate_bps));
 
     let InputParams {
         device: input_device,
+        #[cfg(windows)]
+            device_path: input_device_path,
         client_os,
         live: live_input,
         control_rx,
     } = input;
     let client = input::ClientProfile {
         device_name: input_device,
+        #[cfg(windows)]
+        device_path: input_device_path,
         platform: input::ClientPlatform::from_reported(&client_os),
         live: std::sync::Arc::clone(&live_input),
     };
@@ -1379,31 +1447,34 @@ pub(crate) async fn activate_session(
                     });
                 }
                 // `Weak`: the channel owns `on_message`, which owns the sender this task reads, so
-                // an `Arc` here is a cycle neither the task nor the channel could ever leave.
+                // an `Arc` here is a cycle neither the task nor the channel could ever leave
                 let dc_for_pong = is_reliable.then(|| Arc::downgrade(&dc));
                 let idr_keyframes = keyframes_dc.clone();
-                // The client rate-limits itself to one request per 200 ms, but that limit is
-                // advisory: a hostile or looping client must not be able to pin the encoder at
-                // one IDR per frame. `Instant` rather than the host clock because this is a
-                // local interval, not a stamp anything else compares against.
+                // the client's own 200 ms limit is advisory: a hostile or looping client must not
+                // pin the encoder at one IDR per frame. `Instant`, not the host clock: a local
+                // interval nothing else compares against
                 let mut last_idr_request: Option<std::time::Instant> = None;
                 let telemetry_for_stats = Arc::clone(&session_telemetry);
-                // One log line per distinct rejection per channel, so a client whose page has
-                // drifted from this host build is diagnosable without a flood. A drifted client
-                // repeats the same malformed frame thousands of times a second.
+                // one log line per distinct rejection per channel: a page that has drifted from
+                // this host build repeats the same malformed frame thousands of times a second
                 let mut reported_errors: std::collections::HashSet<input::protocol::ParseError> =
                     std::collections::HashSet::new();
-                // The Pong reply used to be written from inside the receive handler, which
-                // head-of-line blocked every later message on this channel behind an SCTP send.
-                // It goes to a task that owns the channel instead, so the handler only ever
-                // parses and enqueues.
+                // the Pong is sent from its own task: an SCTP send inside the receive handler
+                // head-of-line blocks every later message on this channel
                 let pong_tx = dc_for_pong.map(|dc_pong| {
                     let (pong_tx, mut pong_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+                    let pong_telemetry = Arc::clone(&session_telemetry);
                     tokio::spawn(async move {
                         while let Some(t_ns) = pong_rx.recv().await {
+                            let state = if pong_telemetry.picture_pending_now() {
+                                input::protocol::hoststate::PICTURE_PENDING
+                            } else {
+                                0
+                            };
                             let pong = input::protocol::build_pong(
                                 t_ns,
                                 crate::streamer::audio::host_now_ns(),
+                                state,
                             );
                             let Some(dc) = dc_pong.upgrade() else { break };
                             if dc.send(&Bytes::copy_from_slice(&pong)).await.is_err() {
@@ -1414,8 +1485,8 @@ pub(crate) async fn activate_session(
                     pong_tx
                 });
                 dc.on_message(Box::new(move |msg: DataChannelMessage| {
-                    // Read per message, never captured: turning remote control off is a
-                    // class-(b) edit and must not cost the session a renegotiation.
+                    // remote control is read per message, never captured: turning it off must not
+                    // cost the session a renegotiation
                     let parsed = match input::protocol::parse(&msg.data) {
                         Ok(parsed) => parsed,
                         Err(e) => {
@@ -1433,9 +1504,8 @@ pub(crate) async fn activate_session(
                             return Box::pin(async {});
                         }
                     };
-                    // Both of these are transport business and are answered before the
-                    // remote-control gate: a device with control disabled still needs its
-                    // clock synced and still reports what its own pipeline is doing.
+                    // stats and ping are answered before the remote-control gate: a device with
+                    // control disabled still reports its pipeline and still needs its clock synced
                     match parsed.ev {
                         input::protocol::InputEvent::ClientStats(stats) => {
                             telemetry_for_stats.set_client_stats(*stats);
@@ -1445,16 +1515,13 @@ pub(crate) async fn activate_session(
                                 let _ = pong_tx.send(t_ns);
                             }
                         }
-                        // The receiver has no other way to ask: a client on the legacy encoded
-                        // transform runs instead of libwebrtc's reference finder, so no PLI is
-                        // ever emitted for it and a single lost keyframe would otherwise freeze
-                        // the picture until its own watchdog gave up on the WebCodecs path.
+                        // the legacy encoded transform runs instead of libwebrtc's reference
+                        // finder, so no PLI is ever emitted: this is its only way to ask
                         input::protocol::InputEvent::KeyframeRequest { .. } => {
                             let now = std::time::Instant::now();
                             let allowed = last_idr_request
                                 .is_none_or(|t| now.duration_since(t) >= MIN_IDR_REQUEST_GAP);
-                            // The request is counted whether or not it is acted on: it is a real
-                            // observation about the client either way.
+                            // counted whether or not it is acted on
                             telemetry_for_stats
                                 .degradation
                                 .keyframe_requests
@@ -1465,12 +1532,18 @@ pub(crate) async fn activate_session(
                                 .fetch_add(1, Ordering::Relaxed);
                             if allowed {
                                 last_idr_request = Some(now);
-                                // Through the session's one rate-limited requester, not
-                                // `pipeline.request_idr()` directly: this floor guards against a
-                                // looping client, the gate guards against answering a decoder's
-                                // whole backlog with the largest frame the encoder emits.
+                                // via the requester: this floor stops a looping client, the gate
+                                // stops a decoder's backlog from being answered with IDRs
                                 idr_keyframes.request_keyframe_for_client_quietly();
                             }
+                        }
+                        // letting go is not control: a page that loses focus or is hidden releases
+                        // what it held even while remote control is off
+                        ev @ input::protocol::InputEvent::Lifecycle(
+                            input::protocol::Lifecycle::Focus(false)
+                            | input::protocol::Lifecycle::Visibility(false),
+                        ) if cfg!(windows) => {
+                            tx.route(ev, parsed.fast, parsed.client_ns, parsed.seq)
                         }
                         ev if live_for_dc.control_enabled() => {
                             tx.route(ev, parsed.fast, parsed.client_ns, parsed.seq)
@@ -1494,8 +1567,8 @@ pub(crate) async fn activate_session(
             use webrtc::rtcp::transport_feedbacks::transport_layer_cc::TransportLayerCc;
             use webrtc::rtcp::transport_feedbacks::transport_layer_nack::TransportLayerNack;
             let telemetry = Arc::clone(&pipeline.telemetry);
-            // See `PliBackoff`: an encoded-transform receiver asks every 200 ms for as long as
-            // the session lives, and the gate alone answered nearly every one with an IDR.
+            // an encoded-transform receiver sends a PLI every 200 ms for the life of the session,
+            // and the gate alone would answer nearly every one with an IDR
             let mut pli_backoff = PliBackoff::new();
             let mut client_key_requests: u32 = 0;
             let mut client_frames_painted: u32 = 0;
@@ -1509,17 +1582,14 @@ pub(crate) async fn activate_session(
                     if any.downcast_ref::<PictureLossIndication>().is_some()
                         || any.downcast_ref::<FullIntraRequest>().is_some()
                     {
-                        // The client's request is always counted — it is a real observation
-                        // about the client. Whether we act on it is the gate's decision: a
-                        // decoder that has just lost its reference chain emits a PLI for every
-                        // frame in its backlog, and answering each one with the largest frame
-                        // the encoder can produce is what turns a stumble into a storm.
+                        // Always counted. Acting on it is the backoff's decision: a decoder that
+                        // has just lost its reference chain emits a PLI per frame in its backlog.
                         telemetry
                             .degradation
                             .keyframe_requests
                             .fetch_add(1, Ordering::Relaxed);
-                        // The client counts the requests its own page makes; a moved counter is
-                        // the page saying this one is genuine.
+                        // the client counts the requests its own page makes: a moved counter is the
+                        // page saying this one is genuine
                         let now_ns = audio::host_now_ns();
                         let mut cap_ms = PLI_BACKOFF_CAP_MS;
                         if let Some(stats) = telemetry.client.get() {
@@ -1527,11 +1597,11 @@ pub(crate) async fn activate_session(
                                 client_key_requests = stats.keyframe_requests;
                                 pli_backoff.note_evidence();
                             }
-                            // Painting through WebCodecs, and said so within the last 3 s: the
-                            // PLI is libwebrtc's own idle decoder, not the page.
+                            // painting through WebCodecs, and said so within the last 3 s: the
+                            // PLI is libwebrtc's own idle decoder, not the page
                             let fresh =
                                 now_ns.saturating_sub(stats.received_host_ns) < 3_000_000_000;
-                            // Judged per STATS frame (about 1 Hz), not per PLI (5 Hz).
+                            // judged per STATS frame (about 1 Hz), not per PLI (5 Hz)
                             if stats.received_host_ns != client_stats_at {
                                 client_stats_at = stats.received_host_ns;
                                 client_painting = stats.frames_painted != client_frames_painted;
@@ -1547,8 +1617,8 @@ pub(crate) async fn activate_session(
                             keyframes.gate.note_suppressed();
                         }
                     } else if let Some(nack) = any.downcast_ref::<TransportLayerNack>() {
-                        // Counted, never logged: a lossy link produces these continuously and
-                        // every logbus line is a JSON IPC event to the UI.
+                        // counted, never logged: a lossy link produces these continuously and every
+                        // logbus line is a JSON IPC event to the UI
                         let lost: u64 = nack
                             .nacks
                             .iter()
@@ -1569,15 +1639,16 @@ pub(crate) async fn activate_session(
                         };
                         if summary.reported > 0 {
                             feedback.record_report(&summary);
+                            #[cfg(windows)]
+                            telemetry
+                                .link
+                                .on_feedback(&summary.path, audio::host_now_ns());
                         }
                         if summary.lost > 0 {
                             pli_backoff.note_evidence();
                         }
-                        // The receipts, straight through to the encode thread. This is the whole
-                        // point of stamping the transport-wide sequence numbers ourselves: the
-                        // host can name the frames the client holds and the frames it does not,
-                        // which is exactly what a long-term-reference encoder needs and what no
-                        // RTCP receiver report can say.
+                        // per-frame receipts for the encode thread: what the client holds and
+                        // what it lost, which a long-term-reference repair needs
                         if let Some(ns) = summary.acked_capture_ns {
                             pipeline.repair.acknowledge(ns);
                         }
@@ -1592,8 +1663,8 @@ pub(crate) async fn activate_session(
                         }
                     } else if let Some(remb) = any.downcast_ref::<ReceiverEstimatedMaximumBitrate>()
                     {
-                        // A client that did not negotiate the transport-wide sequence number
-                        // makes Chrome run its own receive-side estimator and report it here.
+                        // without the transport-wide sequence number Chrome runs its own
+                        // receive-side estimator and reports it here
                         feedback.record_remb(remb.bitrate as u32);
                     }
                 }
@@ -1601,9 +1672,8 @@ pub(crate) async fn activate_session(
         });
     }
 
-    // One loss estimate, shared: the video BWE already polls `getStats` every 120 ms and the
-    // audio DataChannel rides the same link, so audio does not need its own measurement — and
-    // could not get a better one, since SCTP does not report loss the way RTCP does.
+    // one loss estimate, shared with audio: its DataChannel rides the same link, and SCTP does
+    // not report loss the way RTCP does
     let link_loss = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
     spawn_bitrate_driver(
@@ -1637,28 +1707,30 @@ pub(crate) async fn activate_session(
         tokio::spawn(async move {
             let telemetry = Arc::clone(&pipeline.telemetry);
             let mut packetizer = H264Packetizer::new();
-            // A per-session access-unit ordinal, so transport-wide feedback can say which *frame*
-            // the client received whole rather than only which packets it did. See
-            // `SharedFeedback::acked_frame_capture_ns`.
+            #[cfg(feature = "bench")]
+            let mut au_dump = AuDump::from_env();
+            // per-session access-unit ordinal, so transport-wide feedback can say which *frame* the
+            // client received whole (`SharedFeedback::acked_frame_capture_ns`)
             let mut frame_ordinal: u32 = 0;
-            // Reused across frames: the payload list is the one per-frame allocation the writer
-            // still owns, and it only ever has to grow to the largest access unit of the session.
+            // reused across frames: it only ever grows to the largest access unit of the session
             let mut payloads: Vec<Bytes> = Vec::with_capacity(64);
             let sequencer = new_random_sequencer();
+            let mut distance = PacketDistance::with_limit(pipeline.packet_distance_limit());
             let mut pacer = Pacer::new(
                 pacing_mode,
                 pipeline.max_bitrate_bps,
                 mtu,
                 pipeline.frame_duration,
             );
+            #[cfg(windows)]
+            let precise_wait =
+                crate::windows_utils::streamer::tune::candidate("pacer_precise_wait");
             let mut warned_unbound = false;
             let mut last_rtp_ts: Option<u32> = None;
             let mut first_frame_written = false;
             let mut warned_dropped_params = false;
-            // Two extensions when the client offered transport-wide-cc, one when it did not.
-            // Stamping an extension the peer never negotiated costs a marshal and a `BytesMut`
-            // per packet and reaches nobody, and the send history it feeds would only ever be
-            // written and never read.
+            // transport-cc only when the client offered it: an unnegotiated extension costs a
+            // marshal and a `BytesMut` per packet and reaches nobody
             let mut extensions = Vec::with_capacity(2);
             extensions.push(webrtc::rtp::extension::HeaderExtension::PlayoutDelay(
                 webrtc::rtp::extension::playout_delay_extension::PlayoutDelayExtension::new(
@@ -1684,29 +1756,26 @@ pub(crate) async fn activate_session(
                         let mut timing = frame.timing;
                         let capture_ns = audio::host_instant_to_ns(frame.capture);
                         frame_ordinal = frame_ordinal.wrapping_add(1);
+                        #[cfg(feature = "bench")]
+                        au_dump.write(&frame.data);
                         packetizer.packetize(mtu, &frame.data, &mut payloads);
+
                         if payloads.is_empty() {
-                            // Nothing packetizable in this access unit at all — an encoder that
-                            // emitted only an AUD, or a degenerate buffer. Asking for another IDR
-                            // is the only recovery, and the gate is what stops that spinning.
+                            // nothing packetizable (an AUD-only access unit, a degenerate buffer):
+                            // another IDR is the only recovery, and the gate stops that spinning
                             keyframes.request_quietly();
                             continue;
                         }
-                        // Strictly increasing per session: a frame captured just before a repeat
-                        // was submitted, but taken by the encode loop just after it, would
-                        // otherwise go backwards, and a receiver drops a frame older than the
-                        // last one it decoded.
+                        // strictly increasing: a frame captured just before a repeat was submitted
+                        // but encoded after it would go backwards, and receivers drop those
                         let (rtp_ts, clamped) =
                             next_video_rtp_ts(last_rtp_ts, audio::host_ns_to_rtp90k(capture_ns));
                         last_rtp_ts = Some(rtp_ts);
                         if clamped {
                             telemetry.rtp_ts_clamped.fetch_add(1, Ordering::Relaxed);
                         }
-                        // The local packetizer sends parameter sets separately, and fragments
-                        // either one, rather than dropping an oversized STAP-A the way the stock
-                        // payloader did. That failure mode was a permanent black screen with RTP
-                        // flowing and every host-side signal reporting success, so the assertion
-                        // stays even though the path that produced it is gone.
+                        // lost parameter sets are a permanent black screen with RTP flowing and
+                        // every host-side signal reporting success, so check and say so
                         if access_unit_has_sps(&frame.data)
                             && !payloads_carry_parameter_sets(&payloads)
                             && !warned_dropped_params
@@ -1729,26 +1798,38 @@ pub(crate) async fn activate_session(
                                 .any(|w| w[0] == 0 && w[1] == 0 && w[2] == 1 && (w[3] & 0x1F) == 5);
                         }
                         let last = payloads.len().saturating_sub(1);
+                        let frame_packets = payloads.len() as u32;
+                        let frame_idr = payloads.iter().any(|p| payload_carries_idr(p));
                         let mut stop = false;
                         let mut written = 0usize;
                         let waited_before = pacer.total_wait_ns();
                         let missed_before = pacer.deadline_misses();
+                        // what the waits really took: the async timer makes them longer than the
+                        // pacer asked for (`pacer_precise_wait` records this instead)
+                        #[cfg(windows)]
+                        let mut slept_ns = 0u64;
                         for (i, payload) in payloads.drain(..).enumerate() {
                             let wire_len = payload.len() + 12;
-                            // `PacingMode::Off` is the same code path the writer had before the
-                            // pacer existed: no clock read, no bucket, no sleep.
+                            // `PacingMode::Off`: no clock read, no bucket, no sleep
                             if pacer.mode() != PacingMode::Off {
                                 let wait = pacer.schedule(wire_len, Instant::now());
+                                #[cfg(windows)]
+                                let wait = if !wait.is_zero() && precise_wait {
+                                    let started = Instant::now();
+                                    pace_sleep_precise(wait).await;
+                                    slept_ns += started.elapsed().as_nanos() as u64;
+                                    Duration::ZERO
+                                } else {
+                                    wait
+                                };
                                 if !wait.is_zero() {
                                     tokio::time::sleep(wait).await;
                                 }
                             }
                             if twcc_offered {
-                                // Stamp the transport-wide sequence number ourselves. The stock
-                                // `twcc::sender::Sender` interceptor would do the stamping but
-                                // keeps its counter private, and without the packet-to-sequence
-                                // mapping the feedback that comes back cannot be turned into a
-                                // delay gradient.
+                                // stamped here: the stock `twcc::sender::Sender` interceptor keeps
+                                // its counter private, and the feedback is useless without the
+                                // packet-to-sequence mapping
                                 let now = Instant::now();
                                 let transport_seq = {
                                     let mut guard = feedback.history.lock_recover();
@@ -1789,11 +1870,29 @@ pub(crate) async fn activate_session(
                         if stop {
                             break;
                         }
+                        let asked = distance.on_frame(
+                            frame_packets,
+                            frame_idr,
+                            audio::host_now_ns(),
+                            keyframes.gate.interval_ms(),
+                            || packet_distance_applies(telemetry.client.get().as_ref()),
+                            |request| keyframes.request_keyframe_for_distance(request),
+                        );
+                        let counter = match asked {
+                            DistanceAsk::Admitted | DistanceAsk::Forced => {
+                                Some(&telemetry.degradation.keyframes_for_packet_distance)
+                            }
+                            DistanceAsk::Refused => {
+                                Some(&telemetry.degradation.packet_distance_asks_refused)
+                            }
+                            DistanceAsk::None => None,
+                        };
+                        if let Some(c) = counter {
+                            c.fetch_add(1, Ordering::Relaxed);
+                        }
                         if written == 0 {
-                            // `TrackLocalStaticRTP` returns `Ok(0)` when the track has no
-                            // binding yet or the sender is paused: the frame is dropped with no
-                            // error anywhere. That is exactly how the handshake-time IDR used to
-                            // vanish, so say it out loud once rather than let it be silent again.
+                            // `Ok(0)` means no binding yet or a paused sender: the frame is
+                            // dropped with no error anywhere, so say it once
                             if !warned_unbound {
                                 warned_unbound = true;
                                 tprintln!(
@@ -1802,32 +1901,22 @@ pub(crate) async fn activate_session(
                             }
                             continue;
                         }
-                        // The first frame this viewer *actually* received. If the session's
-                        // opening IDR went out before the binding existed — which is the normal
-                        // case, the track binds during ICE — then everything since has been a P
-                        // frame predicting from a picture this decoder has never seen, and it
-                        // will sit black until something produces another keyframe. Nothing did:
-                        // the encoders run an infinite GOP, and on a still desktop the keepalive
-                        // only ever repeats. Ask once, through the gate, at the first byte that
-                        // reached the wire.
-                        //
-                        // Measured on the Windows dev box against a Chrome client: without this
-                        // the page logged `no WebCodecs frame within 5s` and demoted itself to a
-                        // `<video>` element on every join where the client's own PLI did not
-                        // happen to arrive first.
+                        // The first frame this viewer actually received. The track binds during
+                        // ICE, so the opening IDR normally went out unbound, and with an infinite
+                        // GOP nothing else produces a keyframe: ask once. Without it the page logs
+                        // `no WebCodecs frame within 5s` and demotes itself to a `<video>` element.
                         if warned_unbound || !first_frame_written {
                             first_frame_written = true;
                             keyframes.request_keyframe_for_client("first RTP reached the wire");
                         }
                         warned_unbound = false;
                         timing.mark_socket_write_done();
-                        // Only the sleeping, not the writes it is interleaved with: the cost of
-                        // pacing has to be separable from the cost of sending, or "the pacer is
-                        // free on this path" and "the socket is slow" look the same.
-                        telemetry
-                            .stages
-                            .pace_wait
-                            .record(pacer.total_wait_ns().saturating_sub(waited_before));
+                        // only the sleeping, not the writes interleaved with it: the cost of pacing
+                        // has to be separable from the cost of sending
+                        let pace_wait = pacer.total_wait_ns().saturating_sub(waited_before);
+                        #[cfg(windows)]
+                        let pace_wait = if precise_wait { slept_ns } else { pace_wait };
+                        telemetry.stages.pace_wait.record(pace_wait);
                         let missed = pacer.deadline_misses().saturating_sub(missed_before);
                         if missed > 0 {
                             telemetry
@@ -1841,11 +1930,8 @@ pub(crate) async fn activate_session(
                         telemetry.record_frame(&timing);
                     }
                     Err(RecvError::Lagged(skipped)) => {
-                        // Our own broadcast dropped frames on this viewer, which means the link
-                        // is oversubscribed. A keyframe is the biggest frame the encoder can
-                        // produce, so answering with one unconditionally is how a stumble
-                        // becomes a storm: gate it, and tell the controller to take the rate
-                        // down so the keyframe that does go out is smaller.
+                        // the local broadcast dropped frames on this viewer: the link is
+                        // oversubscribed, so gate the keyframe and cut the rate to keep it small
                         telemetry
                             .degradation
                             .frames_dropped_broadcast
@@ -1863,9 +1949,8 @@ pub(crate) async fn activate_session(
         });
     }
 
-    // A `Weak`, not an `Arc`: webrtc-rs stores this closure inside the peer connection, so an
-    // owning handle here is a reference cycle the connection can never escape — `close()` does
-    // not clear the handler either, so even closing it would not have been enough.
+    // `Weak`, not `Arc`: webrtc-rs stores this closure inside the peer connection, so an owning
+    // handle is a reference cycle, and `close()` does not clear the handler
     let pc_state = Arc::downgrade(&pc);
     let qos_flow: Arc<Mutex<Option<sockets::QosFlow>>> = Arc::new(Mutex::new(None));
     let qos_flow_state = Arc::clone(&qos_flow);
@@ -1878,14 +1963,27 @@ pub(crate) async fn activate_session(
     let grace_cancel_rx_closure = grace_cancel_rx.clone();
     let expected_locality = locality;
     let superseded = Mutex::new(superseded);
+    // a new candidate pair is a new path: the Windows QP governor forgets the old one's delay
+    #[cfg(windows)]
+    {
+        let path_telemetry = Arc::clone(&pipeline.telemetry);
+        pc.sctp()
+            .transport()
+            .ice_transport()
+            .on_selected_candidate_pair_change(Box::new(move |_| {
+                path_telemetry.link.path_changed();
+                Box::pin(async {})
+            }));
+    }
+    let connected_state = Arc::clone(&pipeline.telemetry);
     pc.on_peer_connection_state_change(Box::new(move |state: RTCPeerConnectionState| {
         if state == RTCPeerConnectionState::Connected {
-            // A renegotiation in place leaves the transport it replaces running on the host —
-            // its ICE agent, its RTP writer, its RTCP reader and its 8 Hz stats poll — until ICE
-            // gives up on it 15-30 s later (BASELINE D-05). The client abandoned it when it
-            // offered again, and this one now carries the picture, so close it. Closing it fires
-            // its own `Closed` state, which runs the superseded session's ordinary teardown;
-            // that teardown already keeps the display, because its sequence is no longer current.
+            connected_state
+                .transport_connected
+                .store(true, Ordering::Relaxed);
+            // A renegotiation in place leaves the transport it replaces running until ICE gives
+            // up on it 15-30 s later, so close it. Its `Closed` state runs the superseded
+            // session's ordinary teardown, which keeps the display (its sequence is not current).
             if let Some(old) = superseded.lock_recover().take().and_then(|w| w.upgrade()) {
                 tokio::spawn(async move {
                     tprintln!("closing the transport this renegotiation replaced");
@@ -1904,11 +2002,8 @@ pub(crate) async fn activate_session(
         }
         if state == RTCPeerConnectionState::Connected {
             let _ = grace_cancel_tx.send(true);
-            // The IDR the handshake used to request went nowhere: `write_rtp` on a track with no
-            // binding returns `Ok(0)`, so those frames were discarded without an error, and with
-            // an infinite GOP nothing else would ever produce a keyframe. The client rescued
-            // itself with a PLI, one browser PLI interval plus a round trip late. This is the
-            // first moment the track can actually carry it.
+            // the first moment the track can carry an IDR: before the binding `write_rtp` returns
+            // `Ok(0)`, and with an infinite GOP nothing else would produce a keyframe
             keyframes_state.request("connection is up and the track is bound");
             if !locality_logged.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 let pc = pc_state.clone();
@@ -1917,12 +2012,17 @@ pub(crate) async fn activate_session(
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     let Some(pc) = pc.upgrade() else { return };
                     let (observed, remote) = detect_session_locality(&pc).await;
-                    // Windows marks DSCP through qWAVE and nowhere else, and qWAVE needs the
-                    // destination — which does not exist until a pair is nominated. This is that
-                    // moment. A failure means qWAVE is off or the platform lacks it; carry on
-                    // unmarked and say so once.
+                    // Windows marks DSCP only through qWAVE, which needs a destination, and none
+                    // exists until a pair is nominated. On failure (qWAVE off or absent) the
+                    // traffic stays unmarked.
                     if let (Some(raw), Some(dest)) = (media_raw, remote) {
-                        match sockets::mark_video_flow(raw, dest) {
+                        // qWAVE answers through a service: keep it off the runtime's workers
+                        let flow =
+                            tokio::task::spawn_blocking(move || sockets::mark_video_flow(raw, dest))
+                                .await
+                                .ok()
+                                .flatten();
+                        match flow {
                             Some(flow) => {
                                 tprintln!("media socket: marked as interactive video for {dest}");
                                 *qos_slot.lock_recover() = Some(flow);
@@ -1952,7 +2052,7 @@ pub(crate) async fn activate_session(
             let pc = pc_state.clone();
             tokio::spawn(async move {
                 let Some(pc) = pc.upgrade() else { return };
-                teprintln!("peer connection {state:?} — dumping ICE candidate pairs:");
+                teprintln!("peer connection {state:?}, dumping ICE candidate pairs:");
                 log_ice_diagnostics(&pc).await;
             });
         }
@@ -1968,17 +2068,17 @@ pub(crate) async fn activate_session(
             let mut cancel_rx = grace_cancel_rx_closure.clone();
             let _ = grace_cancel_tx.send(false);
             tokio::spawn(async move {
-                tprintln!("peer connection Disconnected — waiting 8s for recovery before closing");
+                tprintln!("peer connection Disconnected, waiting 8s for recovery before closing");
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(8)) => {
-                        tprintln!("peer connection Disconnected grace period expired — closing session");
+                        tprintln!("peer connection Disconnected grace period expired, closing session");
                         if let Some(tx) = closed_tx.lock_recover().take() {
                             let _ = tx.send(());
                         }
                     }
                     _ = cancel_rx.changed() => {
                         if *cancel_rx.borrow() {
-                            tprintln!("peer connection recovered before grace period expired — keeping session");
+                            tprintln!("peer connection recovered before grace period expired, keeping session");
                         }
                     }
                 }
@@ -2030,11 +2130,9 @@ pub async fn handle_whep_offer(
     activate_whep(pending, pipeline, closed_tx, input, audio).await
 }
 
-/// Add the audio media the answer must carry, before `create_answer`.
-///
-/// Both halves have to exist in the first answer: WHEP has no renegotiation verb, so a track or a
-/// data channel that is not in it can never be added later. What feeds them is a separate
-/// question, answered by [`start_audio_forwarders`] once the pipeline exists.
+/// Add the audio media the answer must carry, before `create_answer`: WHEP has no renegotiation
+/// verb, so a track or data channel missing from the first answer can never be added later.
+/// [`start_audio_forwarders`] feeds them once the pipeline exists.
 async fn add_audio_tracks(
     pc: &Arc<webrtc::peer_connection::RTCPeerConnection>,
     fast: bool,
@@ -2043,9 +2141,8 @@ async fn add_audio_tracks(
     Option<Arc<TrackLocalStaticSample>>,
     Option<Arc<RTCDataChannel>>,
 )> {
-    // On the fast path the Opus track is added but never fed: its whole job is to exist in the
-    // answer so the client has an `m=audio` section to fall back onto if its WebCodecs decoder
-    // dies mid-session.
+    // on the fast path the Opus track is the spare: it has to exist in the answer so the client
+    // has an `m=audio` section to fall back onto if its WebCodecs decoder dies mid-session
     let track = if !fast || fallback_track {
         let track = Arc::new(TrackLocalStaticSample::new(
             RTCRtpCodecCapability {
@@ -2101,10 +2198,8 @@ fn start_audio_forwarders(
     audio: AudioParams,
     telemetry: crate::streamer::telemetry::SharedTelemetry,
 ) {
-    // On the fast path the track is the client's spare, and it used to be added and never fed:
-    // a client whose decoder or worklet failed mid-session switched to it and played silence
-    // for the rest of the session. It is fed in standby — nothing until the client reports
-    // that it is playing the track (`audioPath` 3 in its stats frame).
+    // on the fast path the track is the client's spare, fed in standby: nothing until the client
+    // reports that it is playing the track (`audioPath` 3 in its stats frame)
     if let Some(track) = track {
         tokio::spawn(forward_track(
             Arc::clone(pc),
@@ -2116,10 +2211,8 @@ fn start_audio_forwarders(
     }
 
     if let Some(dc) = dc {
-        // Weak for the same reason as the connection-state handler: the data channel this
-        // closure is attached to is owned by the peer connection, so an `Arc` of either here is a
-        // cycle — and one a session that never connects never breaks, because the closure is only
-        // consumed by the channel opening.
+        // `Weak`: the peer connection owns the channel this closure hangs on, so an `Arc` of
+        // either is a cycle that a session which never connects never breaks
         let dc_for_open = Arc::downgrade(&dc);
         let pc_for_open = Arc::downgrade(pc);
         dc.on_open(Box::new(move || {
@@ -2170,15 +2263,13 @@ async fn forward_datachannel(
     telemetry: crate::streamer::telemetry::SharedTelemetry,
 ) {
     let mut sub: Option<audio::AudioSubscription> = None;
-    // Sticky across iterations: any producer-side skip — a broadcast lag or a backpressure
-    // drop — leaves a hole the client must be told about, and it is told on the next packet
-    // that actually goes out. Without this the client sees a `seq` jump with `flags == 0`,
-    // which is indistinguishable from ordinary network loss, so it splices the new audio onto
-    // the old with no resync and keeps the offset for good.
+    // sticky until a packet goes out: a producer-side skip (broadcast lag, backpressure drop)
+    // must be flagged, or the client reads the `seq` jump as network loss, splices across it
+    // with no resync and keeps the offset for good
     let mut pending_discontinuity = false;
     let mut prev_payload: Option<Bytes> = None;
-    // A client that stepped down to the spare track has detached this channel's handler; the
-    // track forwarder feeds it from then on, and feeding both would be the audio twice.
+    // a client that stepped down to the spare track has detached this channel's handler: the
+    // track forwarder feeds it from then on, and feeding both would be the audio twice
     let mut stepped_down = false;
     let mut last_path_check = Instant::now();
     loop {
@@ -2213,10 +2304,8 @@ async fn forward_datachannel(
 
         match tokio::time::timeout(Duration::from_millis(250), s.rx.recv()).await {
             Ok(Ok(pkt)) => {
-                // Checked every packet, not one in four. The old sampling detected a backed-up
-                // channel up to 20 ms late and — worse — kept discarding for up to 20 ms after
-                // it had drained. `buffered_amount` is a read behind a lock in webrtc-rs, not a
-                // syscall.
+                // checked every packet (sampling reacts up to 20 ms late in both directions):
+                // `buffered_amount` is a read behind a lock in webrtc-rs, not a syscall
                 let msg_len = protocol::HEADER_LEN + pkt.data.len();
                 if dc.buffered_amount().await > backpressure_limit_bytes(msg_len) {
                     s.diagnostics
@@ -2248,8 +2337,8 @@ async fn forward_datachannel(
                 pending_discontinuity = false;
                 prev_payload = Some(pkt.data);
             }
-            // The subscriber fell behind the host-wide capture and the broadcast dropped
-            // packets on its behalf: a real audio gap, previously invisible.
+            // the subscriber fell behind the host-wide capture and the broadcast dropped
+            // packets on its behalf: a real audio gap
             Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped))) => {
                 telemetry
                     .degradation
@@ -2302,10 +2391,8 @@ async fn forward_track(
     mut standby: bool,
 ) {
     let frame_duration = Duration::from_millis(crate::streamer::audio::encoder::FRAME_MS as u64);
-    // A gap longer than this is a device change or a stall, not a scheduling wobble; advancing
-    // the track's clock by the true elapsed time is right up to that point, and beyond it the
-    // sane thing is to treat the timeline as restarted rather than to jump the RTP clock by
-    // minutes.
+    // a longer gap is a device change or a stall, not a scheduling wobble: treat the timeline as
+    // restarted instead of jumping the RTP clock by minutes
     const MAX_CATCHUP: Duration = Duration::from_millis(500);
     let mut last_capture_ns: Option<u64> = None;
     let mut sub: Option<audio::AudioSubscription> = None;
@@ -2313,8 +2400,7 @@ async fn forward_track(
         if !pc_alive(&pc) {
             break;
         }
-        // The client latches its step-down (it never returns to the fast path in a session),
-        // so once it is seen this stops being a question.
+        // the client latches its step-down: it never returns to the fast path in a session
         if standby && client_playing_track(&telemetry) {
             standby = false;
             tprintln!("audio: the client stepped down to the standard Opus track; feeding it");
@@ -2336,22 +2422,11 @@ async fn forward_track(
 
         match tokio::time::timeout(Duration::from_millis(250), s.rx.recv()).await {
             Ok(Ok(pkt)) => {
-                // `TrackLocalStaticSample` derives each RTP timestamp by *accumulating*
-                // `duration`, so a fixed 5 ms advanced the audio timeline by 5 ms per packet
-                // no matter what actually happened at capture. Every real gap — a device
-                // change, a broadcast lag, a backpressure drop — therefore left audio
-                // permanently 5 ms per lost packet behind the video, which rides the true host
-                // clock in its RTP timestamps, and nothing ever corrected it. Spacing samples
-                // by the real elapsed `capture_ns` puts both media back on one timeline.
-                //
-                // In whole frames, though. Every packet carries exactly one frame of samples,
-                // and `capture_ns` is re-anchored on each engine wake from `now − read`, so the
-                // raw spacing wobbles by the capture thread's scheduling (4.3 ms, 5.6 ms, …).
-                // Passed through as-is, each packet's RTP timestamp disagreed with the 240
-                // samples it carries, and NetEQ answered every disagreement with concealment:
-                // 627,600 concealed samples in a 22 s window (13 s of it synthesised) and a
-                // 350-600 ms buffer. Rounding to frames keeps the timestamps exact and still
-                // advances by a real gap when one happens.
+                // `TrackLocalStaticSample` accumulates `duration` into the RTP timestamp, so a
+                // fixed 5 ms leaves audio 5 ms behind the video per lost packet: use the real
+                // elapsed `capture_ns`. Rounded to whole frames: the raw spacing wobbles with
+                // capture scheduling (4.3 ms, 5.6 ms), and NetEQ conceals every timestamp that
+                // disagrees with a packet's 240 samples (627,600 concealed samples in 22 s).
                 let duration = match last_capture_ns {
                     Some(prev) if pkt.capture_ns > prev => {
                         whole_frames(Duration::from_nanos(pkt.capture_ns - prev), frame_duration)
@@ -2372,8 +2447,8 @@ async fn forward_track(
                     break;
                 }
             }
-            // The subscriber fell behind the host-wide capture and the broadcast dropped
-            // packets on its behalf: a real audio gap, previously invisible.
+            // the subscriber fell behind the host-wide capture and the broadcast dropped
+            // packets on its behalf: a real audio gap
             Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped))) => {
                 telemetry
                     .degradation
@@ -2412,21 +2487,16 @@ fn spawn_bitrate_driver(
     let min_bps = DEFAULT_MIN_BITRATE_BPS.min(max_bps);
     let mut controller = BitrateController::new(min_bps, max_bps);
     let mut current_target = max_bps;
-    // The estimator runs on its own running value rather than on the emitted target. That is
-    // what lets a small per-interval cut compound: fed back the *emitted* target, a 5% loss
-    // producing a sub-deadband cut would be suppressed by the controller, recomputed from the
-    // unchanged target, and suppressed again — the dead band by another route.
+    // the estimator keeps its own value: fed back the emitted target, a sub-deadband cut is
+    // suppressed, recomputed from the same target and suppressed again
     let mut estimate_bps = max_bps;
     let mut delay_estimate = DelayBasedEstimate::new(max_bps, min_bps, max_bps);
     let mut last_bytes_sent: Option<(u64, Instant)> = None;
     let mut rtt_monitor = RttCongestionMonitor::new();
     let mut signal_logged = false;
-    // `fraction_lost` and `round_trip_time` come from the remote's RTCP receiver reports, which
-    // browsers emit about once a second, and this loop runs every 120 ms. Seven polls in eight
-    // therefore re-read the same two numbers — and feeding an unchanged reading back into the
-    // controller is not a no-op: it lets one loss event be acted on up to eight times, which is
-    // the mechanism behind the ratcheting the cut rate-limit was added to stop. Remember them and
-    // only drive the loss and RTT arms when they actually moved.
+    // `fraction_lost` and `round_trip_time` come from RTCP receiver reports, about one a second,
+    // and this loop polls every 120 ms: re-feeding an unchanged reading acts on one loss event
+    // up to eight times, so the loss and RTT arms run only when the pair moved
     let mut last_receiver_report: Option<(u64, u64)> = None;
     let mut stale_report_run: u32 = 0;
     let mut stale_run_logged = false;
@@ -2456,11 +2526,9 @@ fn spawn_bitrate_driver(
                     }
                     StatsReportType::RemoteInboundRTP(s) => {
                         fraction_lost = fraction_lost.max(s.fraction_lost);
-                        // webrtc-rs does NOT use the W3C unit here. `round_trip_time` is
-                        // already milliseconds: interceptor-0.17.1/src/stats/interceptor.rs
-                        // `calculate_rtt_ms` returns `rtt_seconds * 1000.0 + …` and it is
-                        // copied verbatim into this field. Scaling it again pinned every
-                        // session at the bitrate floor.
+                        // NOT the W3C unit: webrtc-rs's `round_trip_time` is already milliseconds
+                        // (interceptor 0.17.1, `calculate_rtt_ms`). Scaled again it pins every
+                        // session at the bitrate floor
                         if let Some(rtt_ms) = s.round_trip_time {
                             max_rtt_ms = max_rtt_ms.max(rtt_ms);
                         }
@@ -2473,8 +2541,7 @@ fn spawn_bitrate_driver(
                 continue;
             }
 
-            // Publish for the audio forwarder, in hundredths of a percent so it fits an
-            // integer without losing the range that matters (0.5 % to 10 %).
+            // for the audio forwarder, in hundredths of a percent
             link_loss.store(
                 (fraction_lost.clamp(0.0, 1.0) * 10_000.0) as u32,
                 Ordering::Relaxed,
@@ -2498,8 +2565,7 @@ fn spawn_bitrate_driver(
             };
             last_bytes_sent = Some((bytes_sent, now));
 
-            // Bit-exact comparison of the raw doubles: any real receiver report moves at least one
-            // of them, and a repeat is a repeat.
+            // bit-exact on the raw doubles: any real receiver report moves at least one of them
             let report_key = (fraction_lost.to_bits(), max_rtt_ms.to_bits());
             let report_fresh = last_receiver_report != Some(report_key);
             if report_fresh {
@@ -2526,10 +2592,8 @@ fn spawn_bitrate_driver(
                 .keyframe_requests_suppressed
                 .store(keyframe_gate.suppressed(), Ordering::Relaxed);
 
-            // Transport-wide feedback, when the client negotiated the extension, supersedes the
-            // receiver report on both counts: it names every lost sequence number at the
-            // browser's own feedback cadence rather than once a second, and it carries the
-            // arrival times that make a delay gradient possible at all.
+            // transport-wide feedback, when negotiated, supersedes the receiver report: every
+            // lost sequence number at the browser's own cadence, plus arrival times
             let twcc_loss = feedback.take_loss();
             let delivered_bps = feedback.received_bps();
             // Transport-wide feedback is consumed on read, so a `Some` here is always a new
@@ -2552,8 +2616,8 @@ fn spawn_bitrate_driver(
 
             let mut estimate = match loss_signal {
                 Some(l) => estimate_from_loss(estimate_bps, measured_send_bps, l),
-                // Nothing new to react to. Holding the previous estimate is the point: re-running
-                // the controller on a stale reading is how one loss event became eight cuts.
+                // nothing new: hold the estimate, since re-running the controller on a stale
+                // reading turns one loss event into several cuts
                 None => estimate_bps,
             };
 
@@ -2566,12 +2630,12 @@ fn spawn_bitrate_driver(
                         .delay_overuse_events
                         .fetch_add(1, Ordering::Relaxed);
                 }
-                // The delay signal fires before loss does, so it may only ever lower the
-                // estimate — never raise it above what the loss controller allows.
+                // the delay signal fires before loss does, so it may only lower the estimate,
+                // never raise it above what the loss controller allows
                 estimate = estimate.min(delay_bps.max(min_bps));
             } else if report_fresh && rtt_monitor.observe(max_rtt_ms) {
-                // No transport-wide feedback: fall back to the round-trip excursion detector,
-                // which is coarse but is all a client without the extension gives us.
+                // no transport-wide feedback: the round-trip excursion detector is coarse, but
+                // it is all a client without the extension gives
                 let rtt_estimate = (estimate_bps as f64 * 0.85) as u32;
                 if rtt_estimate < estimate {
                     let baseline = rtt_monitor.baseline_ms().unwrap_or(0.0);
@@ -2587,8 +2651,8 @@ fn spawn_bitrate_driver(
                 estimate = estimate.min(remb.max(min_bps));
             }
 
-            // A viewer the local broadcast dropped frames on is a viewer whose link is
-            // oversubscribed. Cutting here is what keeps the keyframe that follows small.
+            // a viewer the local broadcast dropped frames on has an oversubscribed link:
+            // cutting here keeps the keyframe that follows small
             let lags = feedback.take_lag_events();
             if lags > 0 {
                 let base = if measured_send_bps > 0 {
@@ -2636,26 +2700,106 @@ fn spawn_bitrate_driver(
 /// The video RTP timestamp actually written: `candidate` (the host clock at 90 kHz), unless it is
 /// not strictly ahead of the previous one (wrapping comparison), in which case one tick after the
 /// previous one. Returns whether it had to clamp.
-fn next_video_rtp_ts(last: Option<u32>, candidate: u32) -> (u32, bool) {
+pub(crate) fn next_video_rtp_ts(last: Option<u32>, candidate: u32) -> (u32, bool) {
     match last {
         Some(l) if (candidate.wrapping_sub(l) as i32) <= 0 => (l.wrapping_add(1), true),
         _ => (candidate, false),
     }
 }
 
+/// Test hook: with `SE_TEST_HOOKS=1` and `SE_DUMP_AU=<path>`, the first access units the writer
+/// packetizes, exactly as it receives them, appended to one Annex-B file.
+#[cfg(feature = "bench")]
+struct AuDump {
+    file: Option<std::fs::File>,
+    left: u32,
+}
+
+#[cfg(feature = "bench")]
+impl AuDump {
+    const FRAMES: u32 = 600;
+
+    fn from_env() -> Self {
+        let hooks = crate::envcfg::var("SE_TEST_HOOKS").as_deref() == Ok("1");
+        let file = crate::envcfg::var("SE_DUMP_AU")
+            .ok()
+            .filter(|_| hooks)
+            .and_then(|p| std::fs::File::create(p).ok());
+        Self {
+            file,
+            left: Self::FRAMES,
+        }
+    }
+
+    fn write(&mut self, au: &[u8]) {
+        use std::io::Write as _;
+        let Some(f) = self.file.as_mut() else { return };
+        let _ = f.write_all(au);
+        self.left -= 1;
+        if self.left == 0 {
+            self.file = None;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
+    fn the_tuned_media_socket_stays_opt_in() {
+        if crate::envcfg::var_os("SCREENEXTEND_MEDIA_SOCKET").is_some()
+            || crate::envcfg::var_os("SE_TUNE_ON").is_some()
+        {
+            crate::test_support::skip_because(
+                "the_tuned_media_socket_stays_opt_in",
+                "the environment opts in",
+            );
+            return;
+        }
+        assert!(!super::media_socket_enabled());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_precise_pacer_wait_sleeps_its_time_and_leaves_the_runtime_free() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let spins = Arc::new(AtomicU64::new(0));
+            let counter = Arc::clone(&spins);
+            let other = tokio::spawn(async move {
+                loop {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    tokio::task::yield_now().await;
+                }
+            });
+            let wait = Duration::from_micros(800);
+            let started = Instant::now();
+            super::pace_sleep_precise(wait).await;
+            assert!(started.elapsed() >= wait);
+            other.abort();
+            assert!(
+                spins.load(Ordering::Relaxed) > 0,
+                "another task ran on the only worker while the pacer waited"
+            );
+        });
+    }
+
+    #[test]
     fn the_video_rtp_timestamp_never_goes_backwards() {
         use super::next_video_rtp_ts as next;
-        // The first frame and a normal increase are untouched.
+        // the first frame and a normal increase are untouched
         assert_eq!(next(None, 12_345), (12_345, false));
         assert_eq!(next(Some(1_000), 2_500), (2_500, false));
-        // Equal: one tick on.
+        // equal: one tick on
         assert_eq!(next(Some(1_000), 1_000), (1_001, true));
-        // Slightly behind (a real frame captured just before a repeat's submit).
+        // slightly behind (a real frame captured just before a repeat's submit)
         assert_eq!(next(Some(1_000), 990), (1_001, true));
-        // Across the 32-bit wrap: ahead stays ahead, behind is clamped, the +1 wraps too.
+        // across the 32-bit wrap: ahead stays ahead, behind is clamped, the +1 wraps too
         assert_eq!(next(Some(u32::MAX - 10), 5), (5, false));
         assert_eq!(next(Some(5), u32::MAX - 10), (6, true));
         assert_eq!(next(Some(u32::MAX), u32::MAX), (0, true));
@@ -2672,9 +2816,8 @@ mod tests {
 
     #[test]
     fn the_chosen_profile_leads_the_registered_codec_list() {
-        // The track binds to the first codec whose fmtp matches, so a High session must register
-        // High first — and must still register Baseline, so a client that turns out to offer only
-        // Baseline gets a picture instead of a silent codec mismatch.
+        // the track binds to the first codec whose fmtp matches, so High must be registered
+        // first, and Baseline still registered for a client that turns out to offer nothing else
         let high = h264_codecs(H264Profile::High);
         assert_eq!(high[0].2, "640c1f");
         assert!(high.iter().any(|c| c.2 == "42e01f"));
@@ -2831,10 +2974,9 @@ mod tests {
 
     #[test]
     fn a_resource_answers_only_to_the_device_that_opened_it_and_only_while_it_lives() {
-        // The registry is the whole of the authority check, so it is asserted without a peer
-        // connection: `trickle_owner` is what `DELETE` resolves through, and `PATCH` applies the
-        // same two tests before it touches ICE. The second factor is the device token, not the
-        // peer address: an address moves under a live session and is recycled between devices.
+        // the registry is the whole authority check, so no peer connection is needed: `DELETE`
+        // resolves through `trickle_owner`, and `PATCH` applies the same two tests before it
+        // touches ICE
         let id = "0123456789abcdef0123456789abcdef";
         let mine = "aaaaaaaabbbbbbbbccccccccdddddddd";
         let theirs = "11111111222222223333333344444444";
@@ -2844,7 +2986,7 @@ mod tests {
             map.insert(
                 id.to_string(),
                 TrickleEntry {
-                    // A dangling `Weak` is exactly the state a finished session leaves behind.
+                    // a dangling `Weak` is the state a finished session leaves behind
                     pc: std::sync::Weak::new(),
                     join_id: id.to_string(),
                     device_token: mine.to_string(),
@@ -2883,9 +3025,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_renegotiation_hands_back_the_transport_it_replaces_and_teardown_keeps_the_new_one() {
-        // BASELINE D-05: the superseded peer connection ran on for 15-30 s after every in-place
-        // renegotiation, and its teardown then removed the *new* session's registry entry,
-        // because both are registered under the one join id.
+        // both transports register under the one join id: the superseded one is handed back to
+        // be closed, and its teardown must not remove the new session's entry
         let api = APIBuilder::new().build();
         let old = Arc::new(api.new_peer_connection(Default::default()).await.unwrap());
         let new = Arc::new(api.new_peer_connection(Default::default()).await.unwrap());
@@ -2915,12 +3056,9 @@ mod tests {
         let _ = new.close().await;
     }
 
-    /// The body `trickleFragment()` in `static/index.html` actually writes, byte for byte.
-    ///
-    /// Not a copy of it: `scripts/test-client-ice.mjs` lifts the shipped function out of the page
-    /// and emits its output to this fixture, and fails if the file no longer matches, so a change
-    /// to the client body either updates these bytes — and this test then parses the new ones —
-    /// or is caught there. A literal here could do neither.
+    /// The body `trickleFragment()` in `static/index.html` actually writes, byte for byte:
+    /// `scripts/test-client-ice.mjs` runs the shipped function, writes this fixture and fails
+    /// if the file no longer matches.
     #[test]
     fn the_client_fragment_shape_parses_whole() {
         let body = include_str!("test/trickle-fragment.sdpfrag");
@@ -2936,10 +3074,8 @@ mod tests {
             f.candidates.iter().any(|c| c.0.contains("typ relay")),
             "the fixture must carry the relay candidate, which is the one trickle exists for"
         );
-        // SDP is CRLF (RFC 4566 §5) and the client writes it that way. The parser tolerates bare
-        // LF, so a checkout that rewrote the endings would still pass every assertion above while
-        // no longer being the bytes that go on the wire — which is the one thing a golden vector
-        // exists to pin.
+        // SDP is CRLF (RFC 4566 section 5). The parser tolerates bare LF, so a checkout that
+        // rewrote the endings would still pass everything above.
         assert_eq!(
             body.matches('\n').count(),
             body.matches("\r\n").count(),
@@ -2961,13 +3097,8 @@ mod tests {
         }
     }
 
-    // ---- SDP negotiation, with no display, no encoder and no network ---------------------
-    //
-    // `whep_selftest.rs` already checks these attributes against a captured answer. What it
-    // could not check is that *this* MediaEngine still produces them: the codec registration,
-    // the fmtp string, the five feedback entries and the RTX codec are all in `build_api`, and
-    // a change there is invisible until a real browser fails to decode. Two in-process peer
-    // connections negotiate for real; nothing here needs a virtual display.
+    // two in-process peer connections negotiate, with no display, encoder or network: checks
+    // that the MediaEngine `build_api` registers still produces what `whep_selftest.rs` expects
 
     async fn negotiate_answer(profile: H264Profile) -> Option<String> {
         use webrtc::rtp_transceiver::rtp_transceiver_direction::RTCRtpTransceiverDirection;
@@ -2975,8 +3106,8 @@ mod tests {
 
         let api =
             build_api(profile, None, std::net::Ipv4Addr::UNSPECIFIED.into()).expect("build_api");
-        // A peer connection binds UDP sockets for its ICE agent, which a locked-down box may
-        // refuse; that is a skip, not a failure of the SDP under test.
+        // a peer connection binds UDP sockets for its ICE agent, which a locked-down box may
+        // refuse: a skip, not a failure of the SDP under test
         let client = match api.new_peer_connection(RTCConfiguration::default()).await {
             Ok(pc) => Arc::new(pc),
             Err(e) => {
@@ -3001,7 +3132,7 @@ mod tests {
             .await
             .expect("recvonly video transceiver");
 
-        // The same raw RTP track the live session adds, so the answer describes the real thing.
+        // the same raw RTP track the live session adds, so the answer describes the real thing
         let track = Arc::new(TrackLocalStaticRTP::new(
             RTCRtpCodecCapability {
                 mime_type: MIME_TYPE_H264.to_owned(),
@@ -3041,8 +3172,7 @@ mod tests {
 
     #[tokio::test]
     async fn each_h264_profile_negotiates_its_own_level_id() {
-        // The profile is a per-session setting, and picking the wrong level-id gives a client
-        // that either refuses the stream or decodes it in software.
+        // a wrong level-id gives a client that refuses the stream or decodes it in software
         for (profile, plid) in [
             (H264Profile::Baseline, "42e01f"),
             (H264Profile::Main, "4d001f"),
@@ -3060,9 +3190,9 @@ mod tests {
 
     #[test]
     fn the_fmtp_line_says_packetization_mode_1_and_allows_level_asymmetry() {
-        // Without `packetization-mode=1` a browser will not accept the fragmented NAL units the
+        // without `packetization-mode=1` a browser will not accept the fragmented NAL units the
         // payloader emits; without level asymmetry a phone that decodes less than it encodes
-        // refuses the whole m-line.
+        // refuses the whole m-line
         let line = h264_fmtp("42e01f");
         assert!(line.contains("packetization-mode=1"), "{line}");
         assert!(line.contains("level-asymmetry-allowed=1"), "{line}");
@@ -3071,8 +3201,8 @@ mod tests {
 
     #[test]
     fn every_codec_gets_its_own_rtx_payload_type() {
-        // RTX carries the retransmissions NACK asks for. Two codecs sharing an apt, or a codec
-        // whose rtx pt collides with another codec's, silently disables loss recovery.
+        // two codecs sharing an apt, or an rtx pt colliding with another codec's, silently
+        // disables loss recovery
         for profile in [H264Profile::Baseline, H264Profile::Main, H264Profile::High] {
             let codecs = h264_codecs(profile);
             assert!(!codecs.is_empty(), "{profile:?} registers no codec");
@@ -3097,8 +3227,6 @@ mod tests {
             }
         }
     }
-
-    // ---- locality, which decides whether a session waits for a relay ----------------------
 
     #[test]
     fn private_and_link_local_addresses_are_recognised_in_both_families() {
@@ -3128,17 +3256,14 @@ mod tests {
 
     #[test]
     fn the_same_subnet_check_is_ipv4_only_and_compares_three_octets() {
-        // It exists to spot AP client isolation: two devices on one /24 that still had to go
-        // through a relay. A false positive there prints advice about a router that is not the
-        // problem.
+        // it exists to spot AP client isolation (two devices on one /24 that still went through
+        // a relay), and a false positive prints advice about a router that is not the problem
         assert!(same_subnet_24("192.168.1.10", "192.168.1.200"));
         assert!(!same_subnet_24("192.168.1.10", "192.168.2.10"));
         assert!(!same_subnet_24("192.168.1.10", "10.0.0.10"));
         assert!(!same_subnet_24("fe80::1", "fe80::2"), "IPv6 has no /24");
         assert!(!same_subnet_24("192.168.1.10", "garbage"));
     }
-
-    // ---- the SDP candidate summary, which is the only ICE diagnostic in the log ----------
 
     #[test]
     fn the_candidate_summary_counts_types_and_names_the_routable_ones() {
@@ -3153,8 +3278,7 @@ a=candidate:4 1 udp 16777215 198.51.100.9 50003 typ relay raddr 203.0.113.7 rpor
         assert!(s.contains("host=2"), "{s}");
         assert!(s.contains("srflx=1"), "{s}");
         assert!(s.contains("relay=1"), "{s}");
-        // The routable ones are named with their transport and address, because "we gathered a
-        // relay candidate" and "we gathered the *right* relay candidate" are different facts.
+        // the routable ones are named with their transport and address
         assert!(s.contains("relay/udp 198.51.100.9:50003"), "{s}");
         assert!(s.contains("srflx/udp 203.0.113.7:50002"), "{s}");
     }
@@ -3178,8 +3302,8 @@ a=candidate:4 1 udp 16777215 198.51.100.9 50003 typ relay raddr 203.0.113.7 rpor
 
     #[test]
     fn a_trickled_candidate_line_is_summarised_the_same_way() {
-        // A candidate arriving over the data channel has no `a=` prefix; the summary is used on
-        // both, so both spellings have to be accepted.
+        // a candidate arriving over the data channel has no `a=` prefix, and the summary is used
+        // on both spellings
         let s = summarize_sdp_candidates("candidate:1 1 udp 2130706431 10.0.0.5 4000 typ host\r\n");
         assert!(s.contains("host=1"), "{s}");
     }
@@ -3194,7 +3318,7 @@ a=candidate:4 1 udp 16777215 198.51.100.9 50003 typ relay raddr 203.0.113.7 rpor
     }
 }
 
-/// The most candidate lines one fragment may carry. Our own client batches 24; a body at the
+/// The most candidate lines one fragment may carry. The shipped client batches 24; a body at the
 /// 64 KiB `MAX_SDP_LEN` could otherwise hold several hundred, each awaited individually.
 const MAX_TRICKLE_CANDIDATES: usize = 64;
 /// The most fragments one session may ever be sent. Gathering on any real client is over inside a
@@ -3203,18 +3327,15 @@ const MAX_TRICKLE_CANDIDATES: usize = 64;
 const MAX_TRICKLE_FRAGMENTS: u32 = 128;
 
 struct TrickleEntry {
-    /// `Weak`, so a session that ends drops out of here without anything having to remember to
-    /// remove it — and so this map can never be the thing that keeps a peer connection alive.
+    /// `Weak`, so a session that ends drops out of here without anyone removing it, and this
+    /// map can never be what keeps a peer connection alive.
     pc: std::sync::Weak<webrtc::peer_connection::RTCPeerConnection>,
     /// The session this resource is. Identical to the resource id today; kept as its own field
     /// so a caller reads a name rather than an assumption.
     join_id: String,
-    /// The device that opened the join. The resource id is a 128-bit capability, but it is
-    /// handed out in a `Location` header that travels in cleartext on the HTTP listener, which is
-    /// the listener most LAN joins use — so the id alone is not the authority. The second factor
-    /// is the device token rather than the peer's address: an address moves under a live session
-    /// and is recycled between devices, so it identified nothing and broke trickle for a peer
-    /// that had merely roamed.
+    /// The device that opened the join. The id travels in a cleartext `Location` header on the
+    /// HTTP listener, so it alone is not the authority, and the second factor is the token, not
+    /// the peer's address: an address moves under a live session and is recycled between devices.
     device_token: String,
     /// Fragments accepted so far, against `MAX_TRICKLE_FRAGMENTS`.
     fragments: u32,
@@ -3239,8 +3360,8 @@ pub enum TrickleLookup {
 /// Register `pc` as the live transport of `id`, and hand back the one it replaces, if any.
 ///
 /// The resource id *is* the join id, so a renegotiation in place registers a second peer
-/// connection under the same id. The one it replaces is the transport the client has just
-/// abandoned: returned so the new session can close it once it is itself connected.
+/// connection under it. The replaced one is returned so the new session can close it once it
+/// is itself connected.
 fn register_trickle(
     id: &str,
     join_id: &str,
@@ -3263,10 +3384,8 @@ fn register_trickle(
     .filter(|old| old.strong_count() > 0 && !std::ptr::eq(old.as_ptr(), Arc::as_ptr(pc)))
 }
 
-/// Forget `id`, but only while it still names `pc`.
-///
-/// A superseded session's teardown runs after its replacement registered under the same id;
-/// removing by id alone took the *live* session's trickle entry with it.
+/// Forget `id`, but only while it still names `pc`: a superseded session's teardown runs after
+/// its replacement registered under the same id.
 fn unregister_trickle(id: &str, pc: &Arc<webrtc::peer_connection::RTCPeerConnection>) {
     if let Some(map) = TRICKLE_SESSIONS.lock_recover().as_mut() {
         if map
@@ -3288,8 +3407,8 @@ pub(crate) fn trickle_entries() -> usize {
 
 /// The join a live resource names, when it belongs to `device_token`.
 ///
-/// `DELETE` needs this so the id — the whole point of RFC 9725 §4.4 — carries authority: the
-/// resource must be live and the caller must present the device token that opened it.
+/// `DELETE` (RFC 9725 section 4.4) resolves through this, so the id carries authority only
+/// while the resource is live and the caller presents the device token that opened it.
 pub fn trickle_owner(id: &str, device_token: &str) -> Option<String> {
     let guard = TRICKLE_SESSIONS.lock_recover();
     let e = guard.as_ref()?.get(id)?;
@@ -3308,13 +3427,9 @@ pub struct TrickleFragment {
     pub end_of_candidates: bool,
 }
 
-/// Parse an `application/trickle-ice-sdpfrag` body.
-///
-/// A fragment is a partial SDP: zero or more `m=` sections, each with an optional `a=mid:` and
-/// some `a=candidate:` lines, plus `a=ice-ufrag:` for the generation the candidates belong to. The
-/// mid and the m-line index are what tell the agent which media section a candidate is for; with
-/// BUNDLE there is only one, but carrying them through is what makes this work with a client that
-/// does not bundle.
+/// Parse an `application/trickle-ice-sdpfrag` body: a partial SDP of zero or more `m=`
+/// sections, each with an optional `a=mid:` and some `a=candidate:` lines, plus `a=ice-ufrag:`.
+/// The mid and the m-line index are carried through for a client that does not bundle.
 pub fn parse_trickle_fragment(body: &str) -> TrickleFragment {
     let mut out = TrickleFragment::default();
     let mut mid: Option<String> = None;
@@ -3342,17 +3457,14 @@ pub fn parse_trickle_fragment(body: &str) -> TrickleFragment {
     out
 }
 
-/// Feed trickled candidates to a live session.
-///
-/// The resource must be live *and* belong to `device_token`, and the session's fragment budget
-/// must not be spent — the id is a capability, but it rides a cleartext header on the HTTP
-/// listener, so it is not the only thing standing between an observer and a media-redirection
-/// primitive.
+/// Feed trickled candidates to a live session. The resource must be live *and* belong to
+/// `device_token`, with fragment budget left: the id rides a cleartext header on the HTTP
+/// listener, so it alone must not let an observer redirect media.
 pub async fn add_trickled_candidates(id: &str, device_token: &str, body: &str) -> TrickleLookup {
     use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 
-    // The budget is charged under the same lock that resolves the session, so concurrent
-    // fragments cannot both read the last one.
+    // the budget is charged under the same lock that resolves the session, so concurrent
+    // fragments cannot both read the last one
     let pc = {
         let mut guard = TRICKLE_SESSIONS.lock_recover();
         let Some(entry) = guard.as_mut().and_then(|m| m.get_mut(id)) else {
@@ -3393,10 +3505,8 @@ pub async fn add_trickled_candidates(id: &str, device_token: &str, body: &str) -
         }
     }
     if frag.end_of_candidates {
-        // An empty candidate string is how webrtc-rs spells `add_remote_candidate(None)`, which
-        // is what tells the ICE agent remote gathering is over so it can fail the checklist
-        // early instead of waiting out its own timers. Parsing the attribute and only logging it
-        // left the agent none the wiser.
+        // an empty candidate is how webrtc-rs spells `add_remote_candidate(None)`: remote
+        // gathering is over, so the agent can fail the checklist without waiting out its timers
         if let Err(e) = pc
             .add_ice_candidate(RTCIceCandidateInit {
                 candidate: String::new(),

@@ -1,30 +1,11 @@
-//! The performance hold: keep this process's threads on fast performance cores while streaming.
+//! The performance hold: one `QOS_CLASS_USER_INTERACTIVE` thread of this process busy-spins so
+//! the encode runs on a woken performance cluster. M1: ~6.5 ms a frame with it, ~8.1 ms without
+//! (the fallback `ave.avc` encoder: 7.4 vs 10.5 ms). An external low-priority spinner does not
+//! help, and on the 2012 Intel MacBook Pro nothing changes, so there it would be pure cost.
 //!
-//! Measured on an M1 (macOS 26.7.1, pipe stage, `production {qp:15}`): the same clip encodes in
-//! ~6.5 ms when a thread of the streaming process keeps a performance cluster awake and ~8.1 ms on
-//! an otherwise idle machine (the fallback `ave.avc` encoder: 7.4 vs 10.5 ms); an external
-//! low-priority spinner does not help. On the 2012 Intel MacBook Pro nothing changes, so there the
-//! hold would be pure cost.
-//!
-//! Variants, both one `QOS_CLASS_USER_INTERACTIVE` thread busy-spinning on the CPU's relax hint:
-//! * **linger** (the default where eligible; `perf_hold_inflight` in a plan) — spins from each
-//!   *captured* frame's submit until [`LINGER`] after the newest one, then parks. Only real frames
-//!   start or extend it: a still screen (the 5 fps keepalive) and hold pushes cost nothing, while
-//!   sparse-but-active content (typing, a cursor at ~10 fps) stays warm.
-//! * **spin** (`perf_hold_spin`, `SE_PERF_HOLD=spin`) — spins for as long as any session is live.
-//!
-//! **Default policy** ([`decide`]): the linger variant is on only when the machine has more than
-//! one performance level (`hw.nperflevels >= 2`: performance + efficiency cores; an absent sysctl
-//! is not eligible), the power source is AC, and Low Power Mode is off (unreadable counts as off)
-//! — the counterpart of the Windows GPU clock hold, which is AC-only. It is decided when the first
-//! session starts and re-decided about once a second on this module's own thread (never on the
-//! encode thread), so it follows a power-source change mid-session. `SE_PERF_HOLD=0` forces it
-//! off, `=1` forces the linger variant on whatever the power source or core layout, `=spin` forces
-//! the always-spin variant. In a bench plan, `tune_off: ["perf_hold"]` disables the default and
-//! `tune_on: ["perf_hold_spin"]` / `["perf_hold_inflight"]` force a variant.
-//!
-//! Parking: `std::thread::park_timeout`, woken by `Thread::unpark` from the encode loop's
-//! real-frame submit (measured mean ~11 µs, max ~25 µs to running).
+//! [`decide`] is the policy; it runs on this module's own thread, never on the encode thread.
+//! The parked thread is woken by `Thread::unpark` from the encode loop's real-frame submit
+//! (~11 us mean, ~25 us max to running).
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Mutex, OnceLock};
@@ -35,7 +16,8 @@ use serde_json::json;
 
 use crate::streamer::lock::LockExt;
 
-/// Default linger after the newest captured frame.
+/// Default linger after the newest captured frame: long enough that sparse but active content
+/// (typing, a cursor at ~10 fps) stays warm.
 pub const LINGER: Duration = Duration::from_millis(200);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -242,7 +224,9 @@ pub fn read_inputs() -> Inputs {
         power: PowerSource::from_name(tune::power_source()),
         low_power_mode: tune::low_power_mode(),
         thermal: tune::thermal_state(),
-        env: std::env::var("SE_PERF_HOLD").ok().filter(|v| !v.is_empty()),
+        env: crate::envcfg::var("SE_PERF_HOLD")
+            .ok()
+            .filter(|v| !v.is_empty()),
         tune_off: !tune::enabled("perf_hold"),
         tune_spin: tune::enabled("perf_hold_spin"),
         tune_linger: tune::enabled("perf_hold_inflight"),
@@ -278,7 +262,7 @@ pub fn begin() -> Session {
                 Err(e) => teprintln!("[tune] perf_hold: could not start its thread: {e}"),
             }
         }
-        // The decision reads IOKit and ObjC: it is the hold's own thread that makes it, at once.
+        // the decision reads IOKit and ObjC, so the hold's own thread makes it
         DECIDE_NOW.store(true, Relaxed);
         if let Some(t) = t.get() {
             t.unpark();
@@ -304,7 +288,7 @@ impl Drop for Session {
         let last = l.last.take();
         let changes = l.changes;
         drop(l);
-        // Let the thread book its last spin interval.
+        // let the thread book its last spin interval
         std::thread::sleep(Duration::from_millis(2));
         if was != 0 {
             tprintln!("[tune] performance hold off: the last session ended");
@@ -427,7 +411,7 @@ fn run() {
             }
             continue;
         }
-        // Spin in short slices so the session, the decision and the linger are re-read often.
+        // short slices, so the session, the decision and the linger are re-read often
         let t0 = Instant::now();
         for _ in 0..256 {
             std::hint::spin_loop();
@@ -478,21 +462,21 @@ mod tests {
     fn the_default_policy_wants_efficiency_cores_ac_power_and_no_low_power_mode() {
         use PowerSource::*;
         let on = Some(Variant::Linger);
-        // M1 on the charger.
+        // M1 on the charger
         assert_eq!(decide(&inputs(Some(2), Ac, Some(false))).variant, on);
         assert_eq!(
             decide(&inputs(Some(2), Ac, Some(false))).why,
             "2 perf levels, AC power"
         );
-        // Low Power Mode unreadable (before macOS 12) counts as off.
+        // Low Power Mode unreadable (before macOS 12) counts as off
         assert_eq!(decide(&inputs(Some(2), Ac, None)).variant, on);
-        // Each condition alone turns it off.
+        // each condition alone turns it off
         assert_eq!(decide(&inputs(Some(2), Battery, Some(false))).variant, None);
         assert_eq!(decide(&inputs(Some(2), Ups, Some(false))).variant, None);
         assert_eq!(decide(&inputs(Some(2), Unknown, Some(false))).variant, None);
         assert_eq!(decide(&inputs(Some(2), Ac, Some(true))).variant, None);
         assert_eq!(decide(&inputs(Some(1), Ac, Some(false))).variant, None);
-        // The 2012 Intel MacBook Pro: no hw.nperflevels at all.
+        // Intel: no hw.nperflevels at all
         assert_eq!(decide(&inputs(None, Ac, None)).variant, None);
         assert!(decide(&inputs(Some(2), Battery, None))
             .why
@@ -511,7 +495,7 @@ mod tests {
         };
         let eligible = inputs(Some(2), Ac, Some(false));
         let ineligible = inputs(None, Battery, Some(true));
-        // SE_PERF_HOLD wins over everything.
+        // SE_PERF_HOLD wins over everything
         assert_eq!(
             decide(&with(Some("0"), false, true, true, eligible.clone())).variant,
             None
@@ -524,12 +508,12 @@ mod tests {
             decide(&with(Some("spin"), true, false, false, ineligible.clone())).variant,
             Some(Variant::Spin)
         );
-        // An unknown value is ignored.
+        // an unknown value is ignored
         assert_eq!(
             decide(&with(Some("yes"), false, false, false, eligible.clone())).variant,
             Some(Variant::Linger)
         );
-        // Then the plan switches: a forced variant runs even where the default would not...
+        // then the plan switches: a forced variant runs even where the default would not...
         assert_eq!(
             decide(&with(None, false, true, false, ineligible.clone())).variant,
             Some(Variant::Spin)
@@ -538,7 +522,7 @@ mod tests {
             decide(&with(None, false, false, true, ineligible.clone())).variant,
             Some(Variant::Linger)
         );
-        // ...and `perf_hold` in the off list disables the default.
+        // ...and `perf_hold` in the off list disables the default
         assert_eq!(
             decide(&with(None, true, false, false, eligible)).variant,
             None
@@ -550,23 +534,23 @@ mod tests {
         const MS: u64 = 1_000_000;
         let linger = 200 * MS;
         let mut l = Linger::default();
-        // Nothing captured yet (a still screen from the start, keepalive only): never spins.
+        // nothing captured yet (a still screen from the start, keepalive only): never spins
         for t in [0, 100, 1_000, 5_000] {
             assert!(!l.should_spin(t * MS, linger));
         }
-        // A captured frame starts it.
+        // a captured frame starts it
         l.real(1_000 * MS);
         assert!(l.should_spin(1_000 * MS, linger));
         assert!(l.should_spin(1_199 * MS, linger));
-        // Repeats and pushes do not call `real`: it parks 200 ms after the last captured frame.
+        // repeats and pushes do not call `real`: it parks 200 ms after the last captured frame
         assert!(!l.should_spin(1_200 * MS, linger));
-        // Sparse but active content (10 fps) keeps it warm throughout.
+        // sparse but active content (10 fps) keeps it warm throughout
         for k in 0..20u64 {
             let t = 2_000 * MS + k * 100 * MS;
             l.real(t);
             assert!(l.should_spin(t + 99 * MS, linger));
         }
-        // An out-of-order (older) stamp does not shorten it.
+        // an out-of-order (older) stamp does not shorten it
         l.real(2_500 * MS);
         assert!(l.should_spin(4_000 * MS, linger));
         assert!(!l.should_spin(4_100 * MS, linger));

@@ -61,12 +61,9 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
 
 const DOWNLOAD_URL = "https://screenextend.app";
-// The gate is open while the user is in System Settings, which is minutes, not seconds.
-// 200 ms was five IPC round-trips a second into TCC for the whole of it. The `focus`
-// listener below is what actually makes the dialog feel instant -- returning to the app
-// re-checks immediately -- so the interval only has to cover the case where the app never
-// loses focus. First two seconds at 200 ms, then 1 s, then 3 s: about 26 calls in the
-// first minute against roughly 300.
+// the gate stays open for minutes while the user is in System Settings, so the poll backs
+// off (about 26 TCC reads in the first minute against 300 at a flat 200 ms). The `focus`
+// listener re-checks at once on return; the interval covers an app that never lost focus.
 const PERMISSION_POLL_STEPS = [
   { until: 2000, every: 200 },
   { until: 10000, every: 1000 },
@@ -74,10 +71,9 @@ const PERMISSION_POLL_STEPS = [
 ];
 const UPDATE_CHECK_DEADLINE_MS = 2000;
 
-// `request_permission` takes a key; this prefix marks an explicit, user-pressed Retry. It is a
-// key prefix rather than a new argument so the generated bindings stay as they are. The host
-// enforces the rule this pairs with: the first request for a permission may raise the macOS
-// prompt, every later automatic one is a silent read, and only a Retry asks macOS again.
+// marks a user-pressed Retry on the key `request_permission` takes. The host lets the first
+// request for a permission raise the macOS prompt, makes every later automatic one a silent
+// read, and asks macOS again only for a Retry.
 // Keep in step with `RETRY_PREFIX` in `src-tauri/src/macos_utils/permissions.rs`.
 const PERMISSION_RETRY_PREFIX = "retry:";
 
@@ -96,10 +92,8 @@ function blocks(p: PermissionStatus): boolean {
   return p.required && p.state === "denied";
 }
 
-// A repair that does not fix the driver would be tried again on the next launch, forever, and
-// two of the three ask for elevation. `driverRepair` in the config store is the record that
-// stops that; this is a second, cheaper belt across one launch, because the store is written
-// asynchronously and a relaunch can beat the write to disk.
+// second guard against a relaunch loop, beside `driverRepair` in the config store: the store
+// is written asynchronously and a relaunch can beat the write to disk
 const RELAUNCH_MEMO_KEY = "se.driverRelaunchAt";
 const RELAUNCH_WINDOW_MS = 10 * 60 * 1000;
 
@@ -108,8 +102,7 @@ function relaunchAlreadyTried(): boolean {
     const at = Number(window.localStorage.getItem(RELAUNCH_MEMO_KEY) ?? "");
     return Number.isFinite(at) && Date.now() - at < RELAUNCH_WINDOW_MS;
   } catch {
-    // Storage can be unavailable. Treat that as "already tried": a relaunch loop is worse than
-    // a relaunch that never happens, and every other route out of this state still works.
+    // storage unavailable reads as "already tried": a relaunch loop is worse than no relaunch
     return true;
   }
 }
@@ -118,13 +111,12 @@ function rememberRelaunch(): void {
   try {
     window.localStorage.setItem(RELAUNCH_MEMO_KEY, String(Date.now()));
   } catch {
-    /* see relaunchAlreadyTried */
+    // see relaunchAlreadyTried
   }
 }
 
-// How long to wait after asking another instance to quit before probing again. It closes its
-// window, broadcasts BYE to every connected device and removes their virtual displays on the
-// way out, which is what has to finish before the driver is ours to open.
+// wait after asking another instance to quit: it broadcasts BYE and removes its virtual
+// displays on the way out, and the driver is ours to open only after that
 const HOLDER_QUIT_SETTLE_MS = 2500;
 
 function needsRelaunch(perms: PermissionStatus[] | null): boolean {
@@ -161,21 +153,16 @@ export default function Bootstrap() {
   const loaded = useLoaded();
   const { setLoaded, setOtp, setHostedNetworkOn, setSessionId, setQrValues, setPublicSessionsEnabled } = useGlobalSetters();
 
-  // Why startup stopped, or null while it has not. It was a bare boolean, and the dialog it
-  // opened said "core drivers or libraries" whatever had gone wrong -- including a `TypeError`
-  // out of the saved-settings replay reading a malformed `config.json`.
+  // why startup stopped, or null while it has not
   const [failure, setFailure] = useState<SetupFailure | null>(null);
   const [loading, setLoading] = useState(false);
   const [compatReport, setCompatReport] = useState<CompatibilityReport | null>(null);
   const [compatBlocking, setCompatBlocking] = useState(false);
-  // The last report the probe produced, kept so the setup-error dialog can ask it whether this
-  // host has a driver to install instead of guessing from the platform name.
+  // last probe report, so the setup-error dialog can ask whether this host has a driver to install
   const [lastReport, setLastReport] = useState<CompatibilityReport | null>(null);
   const [remediating, setRemediating] = useState(false);
-  // The display driver is held by another ScreenExtend process. Its own dialog, because the
-  // only two useful actions -- quit that process, try again -- are neither "continue" nor
-  // "exit", and because nothing here may install anything. The pid is the whole payload: the
-  // host's row says the same thing in prose, and one number is easier to translate around.
+  // another ScreenExtend process holds the display driver: its pid (null when unknown), or
+  // undefined while the dialog is closed
   const [busyHolder, setBusyHolder] = useState<number | null | undefined>(undefined);
   const [compatDontShowAgain, setCompatDontShowAgain] = useState(true);
   const [permReport, setPermReport] = useState<PermissionStatus[] | null>(null);
@@ -185,28 +172,24 @@ export default function Bootstrap() {
   const [downloaded, setDownloaded] = useState(0);
   const [total, setTotal] = useState(0);
   const running = useRef(false);
-  // The driver-memory gate (`classifyDriverHealth`). Null while it has nothing to say; otherwise
-  // the modal is open, in one of its three phases. `outcome` is the last failed attempt's answer.
+  // the driver-memory gate (`classifyDriverHealth`): null while closed, otherwise the modal's
+  // phase. `outcome` is the last failed attempt's answer.
   const [driverRestart, setDriverRestart] = useState<{
     phase: "prompt" | "restarting" | "failed";
     commitMb: number;
     outcome: DriverRestartOutcome | null;
   } | null>(null);
-  // Set once the gate has passed (or a restart has been verified), so a retry of `setup()` does
-  // not ask again. And what `runSetup` was called with when the gate stopped it, to resume with.
+  // set once the gate has passed or a restart is verified, so a retry of `setup()` does not
+  // ask again; and the argument `runSetup` had when the gate stopped it, to resume with
   const driverHealthCleared = useRef(false);
   const pendingTryInstall = useRef(true);
-  // Set by anything in the saved-settings phase that did not work. It does not open a dialog on
-  // its own -- a setting the host would not take is not a reason to refuse to start -- but it is
-  // what lets the dialog name the right cause if startup then fails for another reason.
+  // set when anything in the saved-settings phase fails. Opens no dialog on its own (a
+  // rejected setting is no reason to refuse to start) but lets a later failure name the cause.
   const settingsFailed = useRef(false);
 
-  // Read the saved configuration, creating one on the first run.
-  //
-  // Never throws. A configuration that cannot be read is not one of the three things allowed to
-  // stop the app (`startup-gate.ts`): the host can still create a display, capture and encode,
-  // so it starts on the defaults and says in the log that it did. The old version threw
-  // `config store unreadable after setup` into the catch that opened the driver dialog.
+  // Reads the saved configuration, creating one on the first run. Never throws: an unreadable
+  // config is not allowed to stop the app (`startup-gate.ts`), so it starts on the defaults
+  // and logs that it did.
   const loadSavedSettings = async (): Promise<Config> => {
     try {
       let existing = await getConfig();
@@ -220,13 +203,12 @@ export default function Bootstrap() {
       console.error("[bootstrap] the saved configuration could not be read; using the defaults", e);
     }
     settingsFailed.current = true;
-    // A copy: `defaultConfig` is module-level and shared with every other reader of it.
+    // a copy: `defaultConfig` is module-level and shared
     return { ...defaultConfig };
   };
 
-  // Push the saved configuration into the host. Every step is individually survivable: one
-  // setting the host rejects must not cost the user the other settings, and it must never cost
-  // them the dashboard. What it costs is a line in the log and the toast below.
+  // Pushes the saved configuration into the host. Each step may fail alone: one rejected
+  // setting must not cost the user the others, or the dashboard.
   const replaySavedSettings = async (existing: Config): Promise<void> => {
     const replay: Promise<unknown>[] = [];
     const step = (what: string, run: () => Promise<unknown>) => {
@@ -234,8 +216,7 @@ export default function Bootstrap() {
       try {
         started = run();
       } catch (e) {
-        // A synchronous throw out of a call site, e.g. reading a field off a value the store
-        // held in some shape nothing here anticipated.
+        // a synchronous throw, e.g. reading a field off a stored value of an unexpected shape
         settingsFailed.current = true;
         console.error(`[bootstrap] applying ${what} failed`, e);
         return;
@@ -257,12 +238,11 @@ export default function Bootstrap() {
     if (existing.legacyVolumeKeyProxy) {
       step("legacyVolumeKeyProxy", () => commands.setLegacyVolumeKeyProxy(true));
     }
-    // Independent per device, so replay them together rather than one IPC round-trip
-    // at a time: with a dozen saved devices the serial version was the longest single
-    // stretch between setup() returning and the dashboard appearing.
+    // independent per device, so replayed together: with a dozen saved devices, one IPC
+    // round-trip at a time is the longest stretch between setup() and the dashboard
     for (const device of existing.devices) {
-      // Keyed by the device token. A row with none names only an address, which is
-      // recycled between machines, so it waits for that device to join again.
+      // keyed by the device token: a row with none names only an address, which is
+      // recycled between machines, so it waits for that device to join again
       if (!device.token) {
         console.log(`[migrate] saved device ${device.ip} has no token; its settings wait for it to join once more`);
         continue;
@@ -308,13 +288,13 @@ export default function Bootstrap() {
     await Promise.all(replay);
   };
 
-  // The catch-all classifier. `setup()` has its own answer above; everything reaching here is
-  // either a settings phase that already recorded itself or the bootstrap failing on its own.
+  // catch-all: `setup()` classifies its own failure, so what reaches here is the settings
+  // phase (which recorded itself) or the bootstrap itself
   const failStartup = () =>
     setFailure(classifySetupFailure({ setupFailed: false, settingsFailed: settingsFailed.current }));
 
-  // Read the driver host's memory. A read that fails says nothing about the machine, so it lets
-  // startup through -- `setup()` is still the real test.
+  // a failed read says nothing about the machine, so it lets startup through: `setup()` is
+  // the real test
   const readDriverHealth = async (): Promise<DisplayDriverHealth | null> => {
     try {
       return await commands.displayDriverHealth();
@@ -324,8 +304,8 @@ export default function Bootstrap() {
     }
   };
 
-  // The one place the driver-memory gate sits: after the compatibility gate has installed a
-  // missing driver, before `setup()` creates anything a restart would take away.
+  // the driver-memory gate: after the compatibility gate has installed a missing driver,
+  // before `setup()` creates anything a restart would take away
   const driverHealthBlocks = async (tryInstall: boolean): Promise<boolean> => {
     if (loaded || driverHealthCleared.current) return false;
     const gate = classifyDriverHealth(await readDriverHealth());
@@ -338,9 +318,8 @@ export default function Bootstrap() {
     return false;
   };
 
-  // "Restart Driver": one UAC prompt, the elevated `drivers restart`, and on a verified restart
-  // straight on with the setup the gate interrupted. A failure keeps the modal and its two
-  // actions, with the reason.
+  // "Restart Driver": one UAC prompt, then on a verified restart the setup the gate
+  // interrupted resumes. A failure keeps the modal open, with the reason.
   const restartDriver = async () => {
     setDriverRestart(prev => prev && { ...prev, phase: "restarting", outcome: null });
     let outcome: DriverRestartOutcome | null = null;
@@ -366,8 +345,8 @@ export default function Bootstrap() {
 
   const runSetup = async (tryInstall: boolean) => {
     if (await driverHealthBlocks(tryInstall)) return;
-    // Whether `setup()` got as far as answering. Everything after it is the app's own work, and
-    // a failure there is not a verdict on the machine's drivers.
+    // whether `setup()` answered: a failure after that is the app's own, not a verdict on
+    // the machine's drivers
     let setupAnswered = false;
     try {
       let success;
@@ -379,7 +358,7 @@ export default function Bootstrap() {
       }
       setupAnswered = true;
       if (success) {
-        // A retry must not inherit the previous attempt's verdict about the settings.
+        // a retry must not inherit the previous attempt's verdict about the settings
         settingsFailed.current = false;
         const existing = await loadSavedSettings();
         const savedPorts = existing.serverPorts;
@@ -412,9 +391,8 @@ export default function Bootstrap() {
         } else {
           commands.unregisterCloudSession().catch((e: unknown) => { console.error("unregisterCloudSession failed", e); });
         }
-        // An empty QR list reads on the dashboard as "no networks were found". When the adapter
-        // read is what failed, that is the wrong thing to tell someone whose host is serving
-        // fine -- so the reason is named here rather than being rendered as an absence.
+        // an empty QR list reads as "no networks were found", which is wrong when the adapter
+        // read is what failed: say so
         const qr = await readQrValues(newSessionId, savedPorts?.http);
         if (qr.adaptersUnavailable) {
           toast({
@@ -430,19 +408,13 @@ export default function Bootstrap() {
           await installUpdate(update);
           return;
         }
-        // Was `document.getElementById("dashlink")!.click()`. When the element was not
-        // in the document at that moment the TypeError landed in the catch below and the
-        // user got the driver-install dialog for what was a routing failure -- and its
-        // only action retried the same thing.
         void navigate("/dashboard");
         scheduleConfigEditorPreload();
         void loadDevices();
         void loadSettings();
       } else {
-        // `setup()` failing is the last place an install can still help, and the only one where
-        // the budget is consulted rather than the gate's own classification -- there is no
-        // report here to say what went wrong. Without the budget this was a second elevation
-        // prompt on top of whatever the gate had already spent.
+        // the last place an install can still help. No report says what went wrong here, so
+        // the repair budget decides: without it this is a second elevation prompt.
         if (tryInstall && (await spendRepair("install"))) {
           await commands.installDrivers();
           await new Promise(resolve => setTimeout(resolve, 5000));
@@ -452,11 +424,8 @@ export default function Bootstrap() {
         }
       }
     } catch (e) {
-      // `setup()` itself is awaited above and its own failure is `setup`; anything else in here
-      // is either the settings replay (which records itself and does not throw) or the bootstrap
-      // going wrong on its own. The dialog now says which, instead of naming drivers for all
-      // three -- the throw the owner hit was `object is not iterable` out of a malformed
-      // `config.json`, on a machine whose drivers were fine.
+      // a throw before `setup()` answered is `setup`; anything later is the settings replay
+      // or the bootstrap itself, and the dialog must say which
       console.error("setup failed", e);
       setFailure(classifySetupFailure({
         setupFailed: !setupAnswered,
@@ -465,13 +434,9 @@ export default function Bootstrap() {
     }
   };
 
-  // `check()` is an HTTP round-trip to the release endpoint, and on an offline or
-  // captive-portal network it takes the full timeout. It used to gate everything: no
-  // permission probe, no compatibility report, no `setup()` and so no virtual display
-  // until it settled. It is kicked off here instead and only awaited at the one point
-  // where an update would take the screen over, so it overlaps the whole startup path.
-  // The deadline bounds the pathological case; a check that misses it is picked up on
-  // the next launch.
+  // `check()` is an HTTP round-trip that takes its full timeout on an offline or
+  // captive-portal network, so it runs alongside startup and is awaited only where an update
+  // would take the screen over. A check that misses the deadline is picked up next launch.
   const updateCheck = useRef<Promise<Update | null> | null>(null);
 
   const pendingUpdate = async (): Promise<Update | null> => {
@@ -513,10 +478,8 @@ export default function Bootstrap() {
     }
   };
 
-  // A check that *failed* is not the same as "nothing was missing". Both used to return the
-  // same `false`, so an unreadable probe was reported to the user as all-granted. Startup still
-  // proceeds on `unreadable` -- refusing to start over a probe we could not run would be worse,
-  // and capture reports its own failure -- but the user is told which of the two happened.
+  // a check that failed is `unreadable`, not `ok`. Startup still proceeds on it (capture
+  // reports its own failure) but the user is told the probe could not run.
   const ensurePermissions = async (): Promise<"ok" | "blocked" | "unreadable"> => {
     let perms: PermissionStatus[];
     try {
@@ -532,9 +495,9 @@ export default function Bootstrap() {
     }
     const missing = perms.filter(blocks);
     if (missing.length === 0) return "ok";
-    // The automatic request. The host lets it reach the macOS prompt only the very first time
-    // this permission is ever requested (persisted across relaunches); after that it is a
-    // silent read and nothing appears on screen. Only the Retry button asks macOS again.
+    // the automatic request: the host lets it reach the macOS prompt only the first time a
+    // permission is ever requested (persisted across relaunches). After that it is a silent
+    // read, and only Retry asks macOS again.
     for (const p of missing) {
       try {
         await commands.requestPermission(p.key);
@@ -542,7 +505,7 @@ export default function Bootstrap() {
         console.error(`requesting the ${p.key} permission failed`, e);
       }
     }
-    // The gate is (re)opening: the next way out of it may start `proceed()` once more.
+    // the gate is (re)opening: the next way out may start `proceed()` once more
     gateLeft.current = false;
     try {
       setPermReport(await commands.checkPermissions());
@@ -552,9 +515,8 @@ export default function Bootstrap() {
     return "blocked";
   };
 
-  // Three things can close the permission gate -- the poll, Re-check, and a Retry that ends in
-  // a grant -- and each used to call `proceed()` itself, so two of them landing together ran
-  // setup twice. Leaving the gate is now one function that starts `proceed()` once per opening.
+  // the poll, Re-check and a granted Retry can all close the permission gate, and two landing
+  // together must not run setup twice: `proceed()` starts once per opening
   const gateLeft = useRef(false);
   const leavePermissionGate = () => {
     if (gateLeft.current) return;
@@ -563,11 +525,11 @@ export default function Bootstrap() {
     proceed().catch(() => failStartup());
   };
 
-  // The only path that may re-raise a macOS permission prompt after the first. When the host's
-  // silent read is a *definite* denial (never just "could not confirm"), it also clears the TCC
-  // entry first -- macOS will not ask over an existing one -- and says so in the row's detail.
+  // the only path that may re-raise a macOS permission prompt. On a definite denial the host
+  // clears the TCC entry first (macOS will not ask over an existing one) and says so in the
+  // row's detail.
   const [retrying, setRetrying] = useState<string | null>(null);
-  // State disables the button on the next render; the ref closes the gap before it.
+  // state disables the button on the next render; the ref covers the gap before it
   const retryInFlight = useRef(false);
   const retryPermission = async (key: string) => {
     if (retryInFlight.current) return;
@@ -608,20 +570,19 @@ export default function Bootstrap() {
     if (!perms.some(blocks)) leavePermissionGate();
   };
 
-  // The boot the repair budget is scoped to, from the last report. Empty until one arrives, and
-  // empty on the platforms that do not report one -- `repairForBoot` treats both as "this boot".
+  // the boot the repair budget is scoped to, from the last report. Empty until one arrives or
+  // where the platform reports none: `repairForBoot` treats both as "this boot".
   const bootId = useRef("");
 
-  // Take one attempt out of the budget, or refuse. Persisted before the attempt runs, not
-  // after: a relaunch never comes back to write it down, and an install the user cancels at the
-  // UAC prompt has still been offered once.
+  // Takes one attempt out of the budget, or refuses. Persisted before the attempt runs: a
+  // relaunch never comes back to write it down, and an install cancelled at the UAC prompt
+  // has still been offered once.
   const spendRepair = async (what: RepairAttempt): Promise<boolean> => {
     let repair: DriverRepair;
     try {
       repair = repairForBoot((await getConfig())?.driverRepair, bootId.current);
     } catch (e) {
-      // The store is unreadable. Refuse: an unbounded loop of elevation prompts is the failure
-      // this budget exists to prevent, and every route out of the modal still works.
+      // store unreadable: refuse, since a loop of elevation prompts is what the budget prevents
       console.error("[bootstrap] the driver repair record is unreadable; not repairing", e);
       return false;
     }
@@ -638,36 +599,30 @@ export default function Bootstrap() {
     return true;
   };
 
-  // Install what can be installed, then say whether the caller should carry on deciding.
-  // `false` means this launch is over -- the only route to it is a relaunch that has already
-  // been started, which is why the caller must not fall through to the dashboard behind it.
+  // Installs what can be installed. `false` means a relaunch has been started and this launch
+  // is over: the caller must not fall through to the dashboard behind it.
   const remediate = async (rows: UnsupportedApi[]): Promise<boolean> => {
     const action = driverRemediation(rows);
-    // An installable row nothing here knows how to install. Carry on and decide: it survives
-    // the pass, so the user is shown it rather than left on a spinner forever.
+    // an installable row nothing here can install: carry on, so the user is shown it instead
+    // of a spinner
     if (!action) return true;
-    // One per boot, and the modal that follows says to restart. Without this the same pass ran
-    // again on the next launch, and again after the relaunch it started, each time asking for
-    // elevation twice -- against a driver that was never the problem.
+    // one per boot: without the budget every launch and relaunch asks for elevation again
     if (!(await spendRepair(action))) return true;
     setRemediating(true);
     try {
       if (action === "reinstall") {
-        // Installed but not answering. Installing over it changes nothing -- the driver is
-        // already there -- so it comes out first. A removal that fails is not fatal: the
-        // install below is still the flow that used to run on its own.
+        // installed but not answering: installing over it changes nothing, so remove it first.
+        // A failed removal is not fatal.
         if (!(await commands.removeDrivers())) {
           console.log("[bootstrap] removing the unresponsive display driver did not complete");
         }
       }
       const installed = await commands.installDrivers();
-      // The driver enumerates asynchronously; the probe below reads the same thing the
-      // installer just changed, so it has to be given the moment the old flow gave it.
+      // the driver enumerates asynchronously: give it time before the next probe reads it
       await new Promise(resolve => setTimeout(resolve, 5000));
       if (!installed && action === "reinstall" && !relaunchAlreadyTried() && (await spendRepair("relaunch"))) {
-        // A driver that is present but silent is often one this process opened before the
-        // reinstall. A fresh process is the cheapest thing left to try, and it is bounded
-        // twice over so it cannot become a relaunch loop.
+        // a present but silent driver is often one this process opened before the reinstall,
+        // so try a fresh process. Bounded twice over, so it cannot become a relaunch loop.
         rememberRelaunch();
         console.log("[bootstrap] relaunching so the reinstalled display driver is opened fresh");
         await commands.relaunchApp();
@@ -687,8 +642,8 @@ export default function Bootstrap() {
     }
   };
 
-  // Ask the instance holding the driver to quit, then probe again. `quitDriverHolder` only ever
-  // reaches one that answers on the control socket, so a `false` means "close it yourself".
+  // `quitDriverHolder` only reaches an instance that answers on the control socket, so a
+  // `false` means "close it yourself"
   const quitHolderAndRetry = async () => {
     let quit = false;
     try {
@@ -716,8 +671,7 @@ export default function Bootstrap() {
       try {
         report = await commands.checkSystemRequirements();
       } catch (e) {
-        // The probe itself failed, which says nothing about the machine. Start; `setup()` is
-        // the real test and reports its own failure.
+        // a failed probe says nothing about the machine: start, `setup()` is the real test
         console.error("the compatibility probe failed; starting anyway", e);
         await runSetup(true);
         return;
@@ -752,13 +706,11 @@ export default function Bootstrap() {
 
   const start = async () => {
     updateCheck.current = check().catch(e => {
-      // An updater failure -- network, signature, malformed latest.json -- used to be
-      // indistinguishable from "no update available".
+      // log it: an updater failure (network, signature, malformed latest.json) is not "no update"
       console.error("the update check failed", e);
       return null;
     });
-    // The dashboard is the next screen either way; fetching its chunk alongside the Rust
-    // setup keeps it off the entry chunk without making the navigation wait for it.
+    // the dashboard is the next screen either way: fetch its chunk alongside the Rust setup
     void loadDashboard();
     await proceed();
   };
@@ -907,9 +859,7 @@ export default function Bootstrap() {
             ? t("bootstrap.driverRestart.restarting")
             : t("bootstrap.starting")}
       </p>
-      {/* The driver has leaked past its threshold. Same dialog as the busy-driver one, and only
-          the two actions the owner asked for: no "continue anyway", because what it heads off
-          is every join timing out. */}
+      {/* the driver leaked past its threshold. No "continue anyway": every join would time out */}
       <AlertDialog open={driverRestart !== null}>
         <AlertDialogContent className="max-w-2xl">
           <AlertDialogHeader>
@@ -970,9 +920,7 @@ export default function Bootstrap() {
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>{t("bootstrap.setupError.title")}</AlertDialogTitle>
-            {/* Same dialog, same layout, same two buttons -- only the sentence that names the
-                cause moves. Blaming the display driver for a malformed `config.json` is what
-                sent the owner reinstalling a driver that was working. */}
+            {/* only the sentence naming the cause varies: a bad config.json must not blame the driver */}
             <AlertDialogDescription>
               {t(setupErrorBodyKey(failure ?? "setup"))}
               {offersDriverInstallFor(failure ?? "setup", lastReport) && <b>{t("bootstrap.setupError.installPrompt")}</b>}
@@ -994,9 +942,8 @@ export default function Bootstrap() {
             >
               {t("common.quit")}
             </AlertDialogAction>
-            {/* Shown only where there is a driver to install. It used to be shown on macOS
-                too, where `install_drivers` returns `true` without doing anything, so the
-                copy told the user to press a button that could not help. */}
+            {/* installs only where there is a driver to install (on macOS `install_drivers` does
+                nothing); otherwise a plain retry */}
             <AlertDialogAction
               className="bg-blue-600 hover:bg-blue-700 text-white disabled:cursor-not-allowed disabled:select-none disabled:opacity-50"
               onClick={async () => {
@@ -1029,8 +976,7 @@ export default function Bootstrap() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
-      {/* Another ScreenExtend has the display driver. Nothing is broken, so there is no install
-          button and no "Can't Start on This Computer" -- just the two things that help. */}
+      {/* another ScreenExtend holds the display driver: nothing is broken, so no install button */}
       <AlertDialog open={busyHolder !== undefined}>
         <AlertDialogContent className="max-w-2xl">
           <AlertDialogHeader>
@@ -1086,9 +1032,8 @@ export default function Bootstrap() {
       <AlertDialog open={compatReport !== null}>
         <AlertDialogContent className="max-w-2xl">
           <AlertDialogHeader>
-            {/* Blocking no longer only means "this OS is too old". It also means the app tried
-                to install what was missing and the machine still cannot create a display or
-                send video, which is not a verdict on the operating system. */}
+            {/* blocking is not only "this OS is too old": also a machine that still cannot create a
+                display or send video after the install was tried */}
             <AlertDialogTitle>
               {!compatBlocking
                 ? t("bootstrap.compatibility.limitedTitle")
@@ -1113,16 +1058,14 @@ export default function Bootstrap() {
                     <ul className="list-disc pl-5 mt-2 space-y-1">
                       {compatReport.unsupported_apis.map(api => (
                         <li key={api.name}>
-                          <b>{api.name}</b> — {api.description} {t("bootstrap.compatibility.apiRequires", { version: api.required_version })}
+                          <b>{api.name}</b> - {api.description} {t("bootstrap.compatibility.apiRequires", { version: api.required_version })}
                         </li>
                       ))}
                     </ul>
                   </div>
                 )}
-                {/* A driver row that survived its own repair. The app has spent its one
-                    install and its one relaunch for this boot and will not ask for elevation
-                    again, so the two things left are Try Again and a restart -- and the user
-                    has to be told that, or the modal reads as a dead end. */}
+                {/* a driver row that survived its repair: the budget for this boot is spent, so
+                    say that Try Again and a restart are what is left */}
                 {compatBlocking && offersDriverInstall(compatReport) && (
                   <div>{t("bootstrap.compatibility.driverRestartHint")}</div>
                 )}
@@ -1151,9 +1094,7 @@ export default function Bootstrap() {
             </div>
           )}
           <AlertDialogFooter>
-            {/* The one action a blocked driver row still has. It re-probes, and the repair
-                budget guarantees it cannot turn into another elevation prompt -- so it is safe
-                to offer, which the old modal's single Exit button was not. */}
+            {/* re-probes only: the repair budget rules out another elevation prompt */}
             {compatBlocking && offersDriverInstall(compatReport) && (
               <button
                 className="inline-flex h-10 items-center justify-center rounded-md bg-secondary px-4 py-2 text-sm font-medium text-secondary-foreground hover:bg-secondary/80"
@@ -1262,8 +1203,8 @@ export default function Bootstrap() {
                               ? <Loader2 className="animate-spin" size={14} />
                               : t("bootstrap.permissions.retry")}
                           </button>
-                          {/* Opens the pane only. It never requests: a request from here would
-                              raise the macOS dialog over the very pane it just opened. */}
+                          {/* opens the pane only: a request from here would raise the macOS dialog
+                              over the pane it just opened */}
                           <button
                             className="rounded-md bg-secondary px-3 py-1.5 text-sm hover:bg-secondary/80"
                             onClick={() => {
@@ -1310,8 +1251,8 @@ export default function Bootstrap() {
             <AlertDialogAction
               className="bg-blue-600 hover:bg-blue-700 text-white"
               onClick={() => {
-                // Goes through LaunchServices on macOS so the new process is its
-                // own TCC subject rather than an heir of this dying one.
+                // through LaunchServices on macOS, so the new process is its own TCC subject,
+                // not an heir of this dying one
                 commands.relaunchApp().catch(() => {
                   toast({
                     variant: "destructive",

@@ -2,16 +2,15 @@
 #
 # WASAPI shared mode on the default render endpoint, in the engine's mix format. Each click is
 # written at a known stream frame, and `IAudioClock::GetPosition` reports, with a QPC stamp, which
-# frame the device is playing. The host time of a click is therefore the moment the endpoint's
-# play position reaches the click's first frame — the instant the host's own speaker plays it —
-# converted to Unix milliseconds through one paired QPC/precise-system-time sample. Unlike the
-# winmm train (clicks.ps1), nothing between this process and the engine is in the number: no
-# winmm queue, no sleep-driven position polling.
+# frame the device is playing. The host time of a click is the moment the endpoint's play position
+# reaches the click's first frame, converted to Unix milliseconds through one paired
+# QPC/precise-system-time sample. Unlike the winmm train (clicks.ps1) there is no winmm queue and
+# no sleep-driven position polling in the number.
 #
-# The loopback capture sees the mix a little *before* the play cursor reaches it (on this machine
-# about 15 ms: see f36f2ec), so "client render − this time" is the client's lag behind the host's
-# own speaker, which can be smaller than the host's capture → client render span. Prints one JSON
-# document: {"clicks":[ms,...], ...} — the same shape as clicks.ps1.
+# The loopback capture sees the mix a little before the play cursor reaches it (about 15 ms,
+# measured), so "client render - this time" is the client's lag behind the host's own speaker,
+# which can be smaller than the host's capture -> client render span. Prints one JSON document,
+# {"clicks":[ms,...], ...}, the same shape as clicks.ps1.
 param([int]$Seconds = 12, [int]$IntervalMs = 700, [double]$Amplitude = 0.25, [int]$BurstMs = 4, [int]$FreqHz = 2000)
 $ErrorActionPreference = 'Stop'
 Add-Type -TypeDefinition @'

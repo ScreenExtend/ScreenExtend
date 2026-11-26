@@ -1,19 +1,12 @@
 //! The `live` stage: the whole host workflow on a real virtual display.
 //!
 //! One run is one child process (`bench --child live <spec>`) that, unlike every other bench
-//! child, runs inside the Tauri runtime: `cli::fast_path` lets it through and `cli::dispatch`
-//! hands it here from `setup`, because a virtual display needs `platform::setup` and the
-//! `AppState` it builds. The runner points `SCREENEXTEND_DATA_DIR` at a private directory, so the
-//! child never touches the user's config, lock file, control socket or a running host, and the
-//! listeners are on loopback on non-default ports.
-//!
-//! Flow: silent preconditions (Screen Recording already granted, a display backend that can create
-//! a display, free ports) → the production server → a WHEP join from an in-process webrtc-rs
-//! client asking for the run's display (so the production join path creates the display, starts
-//! production capture and the production pipeline) → a borderless window on that display showing
-//! the workload, one IOSurface per frame, each stamped with a barcode of its index → the client
-//! reassembles and decodes every frame with VideoToolbox and reads the stamp back → leave,
-//! teardown, one result object.
+//! child, runs inside the Tauri runtime, because a virtual display needs `platform::setup` and
+//! the `AppState` it builds. `SCREENEXTEND_DATA_DIR` points at a private directory and the
+//! listeners are on loopback on non-default ports, so the child never touches the user's config,
+//! lock file, control socket or a running host. An in-process webrtc-rs client makes a real WHEP
+//! join, a window on the new display shows the workload with a barcode stamp per frame, and the
+//! client decodes every frame and reads the stamp back.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -152,9 +145,9 @@ pub fn child_main(app: &tauri::AppHandle) -> ! {
 }
 
 /// `bench --child live attach:<blocked|pump|pumpreg>:<wait ms>:<displays>`: create and remove
-/// displays on a thread without a run loop, as `serve` does, while the main thread blocks (what
-/// `serve` does), pumps its run loop, or pumps it with the reconfiguration callback registered
-/// there. One `ATTACH` line per display.
+/// displays on a thread without a run loop while the main thread blocks (both as `serve` does),
+/// pumps its run loop, or pumps it with the reconfiguration callback registered there. One
+/// `ATTACH` line per display.
 fn attach_child(app: &tauri::AppHandle, spec: &str) -> ! {
     let p: Vec<&str> = spec.split(':').collect();
     let mode = p[0].to_string();
@@ -171,7 +164,7 @@ fn attach_child(app: &tauri::AppHandle, spec: &str) -> ! {
     };
     let m = mode.clone();
     let worker = std::thread::spawn(move || {
-        // The process has looked at the displays before, as a host that has been up a while.
+        // the process has looked at the displays before, like a host that has been up a while
         let before = display::active_displays().len();
         std::thread::sleep(Duration::from_millis(wait));
         for k in 0..count {
@@ -199,7 +192,7 @@ fn attach_child(app: &tauri::AppHandle, spec: &str) -> ! {
         }
     });
     if mode == "nsapp" {
-        // The desktop app's situation: a real NSApplication run on the main thread.
+        // the desktop app's situation: a real NSApplication run on the main thread
         std::thread::spawn(move || {
             let _ = worker.join();
             super::exit(0)
@@ -653,7 +646,7 @@ fn run_inner(app: &tauri::AppHandle, spec: &RunSpec, ctx: &mut Ctx) -> Result<Js
     let fps = spec.workload.fps.clamp(1, 240);
     let production = spec.recipe.production.clone();
 
-    // ---- what the plan asked for, and whether it reached the child ---------------------------
+    // what the plan asked for, and whether it reached the child
     let env = |k: &str| std::env::var(k).ok();
     ctx.applied.insert(
         "recipe".into(),
@@ -699,9 +692,8 @@ fn run_inner(app: &tauri::AppHandle, spec: &RunSpec, ctx: &mut Ctx) -> Result<Js
         json!(crate::data_dir::override_dir().map(|p| p.display().to_string())),
     );
 
-    // ---- preconditions, all silent ---------------------------------------------------------
-    // A locked screen composites nothing new: both Macs sat locked overnight and produced 30 runs
-    // that only the frame-count check caught.
+    // preconditions, all silent
+    // a locked screen composites nothing new, so the run would measure nothing
     let locked = screen_locked();
     ctx.pre.insert("screen_locked".into(), json!(locked));
     if locked == Some(true) {
@@ -794,7 +786,6 @@ fn run_inner(app: &tauri::AppHandle, spec: &RunSpec, ctx: &mut Ctx) -> Result<Js
         },
     };
 
-    // ---- the host -------------------------------------------------------------------------
     crate::streamer::platform::set_dpi_awareness();
     crate::streamer::platform::apply_process_tuning();
     let t_setup = Instant::now();
@@ -819,8 +810,8 @@ fn run_inner(app: &tauri::AppHandle, spec: &RunSpec, ctx: &mut Ctx) -> Result<Js
         .otp
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = OTP.into();
-    // A device with saved settings, the way a real one has after its first join: the quality
-    // slider is constant QP (the shipped default is 15), the refresh rate is the one asked for.
+    // a device with saved settings, the way a real one has after its first join: the quality
+    // slider is constant QP (the shipped default is 15), the refresh rate is the one asked for
     let qp = production.as_ref().and_then(|p| p.qp);
     let min_qp = production.as_ref().and_then(|p| p.min_qp);
     let seeded = production.is_none() || qp.is_some() || min_qp.is_some();
@@ -901,8 +892,8 @@ fn run_inner(app: &tauri::AppHandle, spec: &RunSpec, ctx: &mut Ctx) -> Result<Js
     let client_rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .thread_name("bench-live-client")
-        // A receiver that reads at background priority overruns webrtc-rs's 1 MB SRTP stream buffer
-        // (dropped silently) on a 1.3 MB keyframe, whatever the socket buffer holds.
+        // a receiver that reads at background priority overruns webrtc-rs's 1 MB SRTP stream
+        // buffer (dropped silently) on a 1.3 MB keyframe, whatever the socket buffer holds
         .on_thread_start(|| {
             qos::pin_current_thread_user_interactive();
         })
@@ -917,7 +908,7 @@ fn run_inner(app: &tauri::AppHandle, spec: &RunSpec, ctx: &mut Ctx) -> Result<Js
             _ => "block",
         }
         .to_string();
-        // The joins' own waits never run a run loop: they are not the main thread.
+        // the joins' own waits never run a run loop: they are not on the main thread
         BLOCK_MAIN.store(true, Ordering::Relaxed);
         let app_state: &platform::AppState = &state;
         let out = std::thread::scope(|sc| {
@@ -951,17 +942,16 @@ fn run_inner(app: &tauri::AppHandle, spec: &RunSpec, ctx: &mut Ctx) -> Result<Js
         return Ok(out);
     }
 
-    // However it goes wrong before the teardown's own guard: not past the run's expected length.
+    // whatever goes wrong before the teardown's own guard: never past the run's expected length
     guard_exit(
         "the join started",
         Duration::from_secs_f64(opts.warmup_s.unwrap_or(1.5) + opts.seconds.unwrap_or(12.0) + 40.0),
     );
 
-    // ---- the join -------------------------------------------------------------------------
     let (au_tx, au_rx) = unbounded();
     let assembler = Arc::new(Mutex::new(Assembler::new(au_tx)));
-    // The receive task only timestamps and hands on; reassembly has a thread of its own, so nothing
-    // it does can leave datagrams waiting in the socket.
+    // the receive task only timestamps and hands on; reassembly has a thread of its own, so
+    // nothing it does can leave datagrams waiting in the socket
     let (pkt_tx, pkt_rx) = unbounded::<(u16, u32, bool, bytes::Bytes, u64)>();
     {
         let assembler = Arc::clone(&assembler);
@@ -980,7 +970,7 @@ fn run_inner(app: &tauri::AppHandle, spec: &RunSpec, ctx: &mut Ctx) -> Result<Js
     let rcvbuf: Arc<Mutex<Vec<i32>>> = Arc::default();
     let rtp_packets = Arc::new(AtomicU64::new(0));
     let first_rtp_ns = Arc::new(AtomicU64::new(0));
-    // The client's own connection story, so a join that never carries media says where it stopped.
+    // the client's own connection states, so a join that never carries media says where it stopped
     let pc_states: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let offer_candidates: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let ssrc = Arc::new(AtomicU32::new(0));
@@ -1011,7 +1001,7 @@ fn run_inner(app: &tauri::AppHandle, spec: &RunSpec, ctx: &mut Ctx) -> Result<Js
             }),
         )
         .await?;
-        // The page's control channel: STATS ride on it, as `input.js` sends them.
+        // the page's control channel: STATS ride on it, as `input.js` sends them
         let stats_dc = if want_stats {
             Some(
                 pc.create_data_channel(
@@ -1087,7 +1077,7 @@ fn run_inner(app: &tauri::AppHandle, spec: &RunSpec, ctx: &mut Ctx) -> Result<Js
         let mut gather = pc.gathering_complete_promise().await;
         pc.set_local_description(offer).await?;
         let _ = gather.recv().await;
-        // The sockets this gather opened are the client's (the host has opened none yet).
+        // the sockets this gather opened are the client's (the host has opened none yet)
         let want = opts.rcvbuf_bytes.unwrap_or(8 << 20);
         if let Ok(mut v) = rcvbuf.lock() {
             *v = udp_fds()
@@ -1165,7 +1155,6 @@ fn run_inner(app: &tauri::AppHandle, spec: &RunSpec, ctx: &mut Ctx) -> Result<Js
         .map(|l| l.trim().to_string())
         .collect();
 
-    // First media, then the display the join created.
     let wait_start = Instant::now();
     while rtp_packets.load(Ordering::Relaxed) == 0 && wait_start.elapsed() < Duration::from_secs(20)
     {
@@ -1221,9 +1210,8 @@ fn run_inner(app: &tauri::AppHandle, spec: &RunSpec, ctx: &mut Ctx) -> Result<Js
             display::display_bounds(display_id)
         );
     }
-    // The display must be the size the client asked for: a run whose display stayed at another
-    // mode (macOS restoring the size it remembers for that display identity) measured the wrong
-    // thing. Checked at DPR 1, where a backing pixel is a point; a HiDPI request is recorded only.
+    // the display must be the size the client asked for (macOS can restore the size it remembers
+    // for that display identity); checked at DPR 1 only, where a backing pixel is a point
     let size_mismatch = (dpr < 1.5 && (px_w, px_h) != (req_w, req_h)).then(|| {
         format!(
             "the display is {px_w}x{px_h}, not the requested {req_w}x{req_h} (the run measured \
@@ -1258,7 +1246,6 @@ fn run_inner(app: &tauri::AppHandle, spec: &RunSpec, ctx: &mut Ctx) -> Result<Js
         })),
     });
 
-    // ---- the receiver ---------------------------------------------------------------------
     let decoded = Arc::new(AtomicU64::new(0));
     let rx_stop = Arc::new(AtomicBool::new(false));
     let client_window = live_rx::ClientWindow::new();
@@ -1289,7 +1276,6 @@ fn run_inner(app: &tauri::AppHandle, spec: &RunSpec, ctx: &mut Ctx) -> Result<Js
         request_pli,
         Some(Arc::clone(&client_window)),
     );
-    // Once a second, the page's STATS frame on the reliable channel.
     let stats_sent = Arc::new(AtomicU64::new(0));
     let stats_task = stats_dc.map(|dc| {
         let (cw, sent) = (Arc::clone(&client_window), Arc::clone(&stats_sent));
@@ -1308,7 +1294,6 @@ fn run_inner(app: &tauri::AppHandle, spec: &RunSpec, ctx: &mut Ctx) -> Result<Js
         })
     });
 
-    // ---- the workload ---------------------------------------------------------------------
     let (w, h) = (px_w as usize & !1, px_h as usize & !1);
     let period_ns = 1_000_000_000 / fps as u64;
     let run_ns = ((warmup + seconds + 0.5) * 1e9) as u64;
@@ -1417,7 +1402,7 @@ fn run_inner(app: &tauri::AppHandle, spec: &RunSpec, ctx: &mut Ctx) -> Result<Js
         cursor = Some(CursorWorkload::start(display_id, bounds.2, bounds.3));
     }
 
-    // Warm-up, with a check that the window's frames actually reach capture.
+    // warm-up, with a check that the window's frames actually reach capture
     let sleep_until = |t: Instant| {
         let now = Instant::now();
         if t > now {
@@ -1460,7 +1445,7 @@ fn run_inner(app: &tauri::AppHandle, spec: &RunSpec, ctx: &mut Ctx) -> Result<Js
         }
     }
 
-    // ---- the measured window ----------------------------------------------------------------
+    // the measured window
     let s0 = snap(&telemetry);
     let t0_ns = s0.t_ns;
     let t1 = t0 + Duration::from_secs_f64(seconds);
@@ -1472,7 +1457,6 @@ fn run_inner(app: &tauri::AppHandle, spec: &RunSpec, ctx: &mut Ctx) -> Result<Js
     let encoder_backend = telemetry.encoder.get();
     let capture_features = telemetry.capture_features.get();
 
-    // ---- teardown -------------------------------------------------------------------------
     let (late, underruns, render_err) = win_work.as_mut().map(|w| w.finish()).unwrap_or_default();
     let present_ns: Vec<u64> = win_work
         .as_ref()
@@ -1486,13 +1470,13 @@ fn run_inner(app: &tauri::AppHandle, spec: &RunSpec, ctx: &mut Ctx) -> Result<Js
     if let Some(c) = cursor.as_mut() {
         c.finish();
     }
-    // Frames in flight when the workload stopped: let them arrive and decode.
+    // frames in flight when the workload stopped: let them arrive and decode
     std::thread::sleep(Duration::from_millis(400));
     let window_server_bounds_end = window.as_ref().and_then(|w| w.server_bounds());
     if let Some(win) = window.take() {
         win.close();
     }
-    // Nothing of this process may stay on the user's screen: from here the child has this long.
+    // nothing of this process may stay on the user's screen: from here the child has this long
     guard_exit("teardown", Duration::from_secs(8));
     let t_leave = Instant::now();
     teardown_host(Some(&join_id));
@@ -1531,8 +1515,8 @@ fn run_inner(app: &tauri::AppHandle, spec: &RunSpec, ctx: &mut Ctx) -> Result<Js
             )
         })
         .unwrap_or((0, 0, 0, 0, 0, 0, 0));
-    // The production leave path removes the display on its own (after `LEAVE_SETTLE`); give it
-    // the chance, and time it, before the forced cleanup.
+    // the production leave path removes the display on its own (after `LEAVE_SETTLE`): give it
+    // the chance, and time it, before the forced cleanup
     let gone_within = |limit: Duration| -> Option<f64> {
         let t = Instant::now();
         while t.elapsed() < limit {
@@ -1554,15 +1538,14 @@ fn run_inner(app: &tauri::AppHandle, spec: &RunSpec, ctx: &mut Ctx) -> Result<Js
     let display_left = displays_before_cleanup && gone_within(Duration::from_secs(3)).is_none();
     client_rt.shutdown_timeout(Duration::from_secs(2));
 
-    // ---- results --------------------------------------------------------------------------
     let Some(rx) = rx else {
         return Ok(json!({ "result": "receiver_panicked", "valid": false,
                           "invalid_reasons": ["the decode thread gave no result in 3 s"], "host_log": host_log() }));
     };
     let in_window = |r: &FrameRec| r.capture_ns >= t0_ns && r.capture_ns <= t1_ns;
     let frames: Vec<&FrameRec> = rx.frames.iter().filter(|r| in_window(r)).collect();
-    // Freshness by stamp: a frame showing the same presented index as the decoded frame before
-    // it is a repeat (the encode loop's idle repeater, or capture redelivering a still picture).
+    // freshness by stamp: a frame showing the same presented index as the decoded frame before
+    // it is a repeat (the encode loop's idle repeater, or capture redelivering a still picture)
     let mut fresh_flag: HashMap<usize, bool> = HashMap::new();
     let mut prev: Option<u32> = None;
     for r in &rx.frames {
@@ -1677,8 +1660,7 @@ fn run_inner(app: &tauri::AppHandle, spec: &RunSpec, ctx: &mut Ctx) -> Result<Js
     if frames.is_empty() {
         reasons.push("no frames received in the measured window".into());
     }
-    // Every animated workload, the cursor fallback included, must actually be captured: one Intel
-    // cursor-fallback run presented nothing, captured 1 fresh frame and was marked valid.
+    // every animated workload, the cursor fallback included, must actually be captured
     let window_s = t1_ns.saturating_sub(t0_ns) as f64 / 1e9;
     let min_fresh_fps = (MIN_FRESH_SHARE * mode_hz as f64).max(MIN_FRESH_FPS);
     if !is_static && window_s > 0.0 && (captured_fresh as f64 / window_s) < min_fresh_fps {
@@ -1698,9 +1680,7 @@ fn run_inner(app: &tauri::AppHandle, spec: &RunSpec, ctx: &mut Ctx) -> Result<Js
     if decode_fail > 0 {
         reasons.push(format!("{decode_fail} frames failed to decode"));
     }
-    // Why the first keyframe was or was not usable: its packets, the ones still missing when it
-    // was emitted, the ones that completed it out of order (NACK repair), and how long it took
-    // from its first packet to its last.
+    // why the first keyframe was or was not usable
     let first_keyframe = rx
         .frames
         .iter()
@@ -1720,9 +1700,7 @@ fn run_inner(app: &tauri::AppHandle, spec: &RunSpec, ctx: &mut Ctx) -> Result<Js
         .filter(|r| r.recovered > 0 && r.complete)
         .count();
     let frames_given_up = rx.frames.iter().filter(|r| r.gave_up).count();
-    // A run that decoded nothing (or little) measured nothing, however clean its transport looks:
-    // r6 `live-hold-forced` lost its first keyframe, received 718 complete frames, decoded 0 and
-    // was marked valid.
+    // a run that decoded nothing (or little) measured nothing, however clean its transport looks
     if !frames.is_empty() && (decode_ok as f64) < 0.8 * frames.len() as f64 {
         reasons.push(format!(
             "decoded {decode_ok} of {} frames received in the window (< 80%); {skipped} skipped \
@@ -1754,9 +1732,8 @@ fn run_inner(app: &tauri::AppHandle, spec: &RunSpec, ctx: &mut Ctx) -> Result<Js
     let frames_json = json!({
         "presented_total": present_ns.iter().filter(|&&p| p != 0).count(),
         "presented_in_window": presented_in_window,
-        // Host side: frames the encode loop submitted that were not its own idle repeats, i.e.
-        // capture deliveries. Capture may redeliver an unchanged picture; the stamp counts
-        // below are what the client actually saw change.
+        // host side: submitted frames that were not the encode loop's idle repeats; capture may
+        // redeliver an unchanged picture, so the stamp counts below are what the client saw change
         "captured_fresh_in_window": captured_fresh,
         "host_encoded_in_window": s1.encoded.saturating_sub(s0.encoded),
         "received": frames.len(),
@@ -1874,7 +1851,7 @@ fn run_inner(app: &tauri::AppHandle, spec: &RunSpec, ctx: &mut Ctx) -> Result<Js
 
 /// Display churn: `joins` short real joins back to back on this one host process, one device
 /// identity, cycling sizes. Per join: requested vs actual size, origin, overlap, attach time
-/// (POST → first RTP, and POST → the session's display recorded), outcome. Overall: failures,
+/// (POST -> first RTP, and POST -> the session's display recorded), outcome. Overall: failures,
 /// wrong sizes, overlaps, attach percentiles, and displays / fds / threads before and after.
 #[allow(clippy::too_many_arguments)]
 fn churn(
@@ -1906,7 +1883,7 @@ fn churn(
         crate::bench::cf::thread_count(),
     );
     let files0 = open_file_kinds();
-    // The ports the client's own gathers opened, so a leftover socket can be told client or host.
+    // the ports the client's own gathers opened, so a leftover socket can be told client or host
     let client_ports: Arc<Mutex<HashSet<u16>>> = Arc::default();
     let mut rows = Vec::new();
     let (mut failures, mut wrong, mut overl) = (0u32, 0u32, 0u32);
@@ -2049,7 +2026,7 @@ fn churn(
         });
         let _ = client_rt
             .block_on(async { tokio::time::timeout(Duration::from_secs(3), pc.close()).await });
-        // The display goes after LEAVE_SETTLE; wait for it so the next join is a fresh create.
+        // the display goes after LEAVE_SETTLE: wait for it so the next join is a fresh create
         let t_leave = Instant::now();
         while t_leave.elapsed() < Duration::from_secs(6) {
             let alive = id.is_some_and(|i| {
@@ -2181,12 +2158,11 @@ fn udp_port(fd: i32) -> u16 {
         if libc::getsockname(fd, (&raw mut sa).cast(), &mut sl) != 0 {
             return 0;
         }
-        // `sin_port` and `sin6_port` are at the same offset.
+        // `sin_port` and `sin6_port` are at the same offset
         u16::from_be((*(&raw const sa).cast::<libc::sockaddr_in>()).sin_port)
     }
 }
 
-/// Every UDP descriptor of this process.
 fn udp_fds() -> Vec<i32> {
     (0..4096)
         .filter(|&fd| unsafe {
@@ -2235,8 +2211,8 @@ fn raise_rcvbuf(fd: i32, want: u32) -> i32 {
     }
 }
 
-/// If this process is still alive after `after`, sample it (the stacks go beside the result) and leave
-/// at once, which takes its window and its displays with it.
+/// If this process is still alive after `after`, sample it (the stacks go to
+/// `/tmp/se-live-hang-<pid>.txt`) and leave at once, which takes its window and displays with it.
 fn guard_exit(what: &'static str, after: Duration) {
     std::thread::spawn(move || {
         std::thread::sleep(after);
@@ -2259,7 +2235,7 @@ fn guard_exit(what: &'static str, after: Duration) {
 /// The churn control: main-thread waits block instead of pumping.
 static BLOCK_MAIN: AtomicBool = AtomicBool::new(false);
 
-/// Sleep on the main thread with its run loop running (see `pump_main_run_loop`): what the desktop app
+/// Sleep on the main thread with its run loop running (`pump_main_run_loop`), as the desktop app
 /// and `serve` do all the time.
 fn pause(d: Duration) {
     if BLOCK_MAIN.load(Ordering::Relaxed) {

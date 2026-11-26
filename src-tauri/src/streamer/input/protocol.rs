@@ -2,7 +2,6 @@
 
 use smol_str::SmolStr;
 
-// opcodes
 pub mod op {
     pub const POINTER_DOWN: u8 = 0x01;
     pub const POINTER_UP: u8 = 0x02;
@@ -28,9 +27,8 @@ pub mod op {
     pub const MOUSE_DELTA: u8 = 0x54;
     pub const PING: u8 = 0x60;
     pub const PONG: u8 = 0x61;
-    /// Client -> host only. The host-to-client twin this opcode once had was never sent; the
-    /// injector's own counters go to `SessionTelemetry` instead, where `status --json` reads
-    /// them alongside every other counter. See `docs/INPUT-PROTOCOL.md`.
+    /// Client -> host only. The injector's own counters go to `SessionTelemetry` instead, where
+    /// `status --json` reads them.
     pub const STATS: u8 = 0x62;
     pub const BYE: u8 = 0x63;
     /// Client -> host, reliable channel, 2 bytes: opcode then a reason byte.
@@ -52,12 +50,10 @@ pub mod bye {
     pub const HOST_EXIT: u8 = 0x02;
 }
 
-// source codes
 pub const SRC_MOUSE: u8 = 0x00;
 pub const SRC_TOUCH: u8 = 0x01;
 pub const SRC_PEN: u8 = 0x02;
 
-// modifier bitmask
 pub mod modmask {
     pub const SHIFT: u16 = 1 << 0;
     pub const CONTROL: u16 = 1 << 1;
@@ -68,7 +64,6 @@ pub mod modmask {
     pub const NUMLOCK: u16 = 1 << 6;
 }
 
-// buttons bitmask
 pub mod btn {
     pub const PRIMARY: u16 = 1 << 0; // left
     pub const SECONDARY: u16 = 1 << 1; // right
@@ -91,7 +86,7 @@ pub const POINTER_LEN: usize = 40;
 pub const WHEEL_LEN: usize = 15;
 pub const MOUSE_DELTA_LEN: usize = 8;
 /// Bytes of tail: a `u64` client stamp, and for a batch two more bytes of flags + predicted
-/// count. Both tails are optional; see `docs/INPUT-PROTOCOL.md`.
+/// count. Both tails are optional.
 pub const STAMP_LEN: usize = 8;
 pub const BATCH_TAIL_LEN: usize = STAMP_LEN + 2;
 /// A `u16` sequence number, appended past the stamp tail on the fast-channel frames.
@@ -101,16 +96,14 @@ pub const SEQ_LEN: usize = 2;
 ///
 /// Every tail is appended past the v1 length, so a v1 client reads as 0 and a client newer
 /// than this build can append further fields without breaking the parse. The declared length
-/// is a floor, never an equality — the same rule the client stats frame already follows.
+/// is a floor, never an equality.
 #[inline]
 fn rd_stamp(b: &[u8], at: usize) -> u64 {
     rd_u64(b, at).unwrap_or(0)
 }
 
-/// Read the fast-channel sequence number a frame may carry at `at`.
-///
-/// Optional for the same reason the stamp is: a client that does not send it reads as `None`
-/// and the injector simply does not reorder-gate that session.
+/// Read the fast-channel sequence number a frame may carry at `at`. A client that does not
+/// send it reads as `None` and that session is not reorder-gated.
 #[inline]
 fn rd_seq(b: &[u8], at: usize) -> Option<u16> {
     rd_u16(b, at)
@@ -119,8 +112,7 @@ fn rd_seq(b: &[u8], at: usize) -> Option<u16> {
 /// Whether `seq` is newer than `last` in a wrapping `u16` space.
 ///
 /// The comparison is the signed difference, so it stays correct across the wrap at 65535 as
-/// long as the two are less than half a space apart — which at one event per pointer sample is
-/// several minutes of continuous motion.
+/// long as the two are less than half a space apart.
 #[inline]
 pub fn seq_is_newer(seq: u16, last: u16) -> bool {
     (seq.wrapping_sub(last) as i16) > 0
@@ -139,10 +131,8 @@ pub enum Phase {
 }
 
 impl Phase {
-    /// `None` for anything that is not one of the eight pointer opcodes.
-    ///
-    /// This used to fall through to `Phase::Move`, which turned a future protocol mistake into a
-    /// silently injected cursor move rather than a rejected frame.
+    /// `None` for anything that is not one of the eight pointer opcodes: falling through to
+    /// `Phase::Move` would turn a protocol mistake into an injected cursor move.
     #[inline]
     pub fn from_opcode(op: u8) -> Option<Phase> {
         Some(match op {
@@ -161,9 +151,8 @@ impl Phase {
 
 /// Why a frame did not decode.
 ///
-/// Every one of these used to be `None`, so a client whose protocol had drifted from the host's
-/// produced a session where input silently did nothing. The opcode is carried on every variant
-/// because that is what the log line has to name to be actionable.
+/// The opcode is carried wherever there is one, because that is what the log line has to name
+/// when a client's protocol has drifted from the host's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ParseError {
     /// A zero-length message.
@@ -313,7 +302,7 @@ pub enum InputEvent {
     Pong {
         t_ns: u64,
     },
-    /// The client's own view of its half of the path. See `docs/TELEMETRY.md` for the layout.
+    /// The client's own view of its half of the path.
     ClientStats(Box<crate::streamer::telemetry::ClientStats>),
     /// The client is asking for an IDR out of band. Handled by the transport; it injects
     /// nothing, so it must never reach a backend's `dispatch`.
@@ -324,13 +313,12 @@ pub enum InputEvent {
 
 /// Whether a pointer frame's coordinates should move the cursor before its buttons are applied.
 ///
-/// They should, for every phase that carries them — `Down` and `Up` included, which is the
-/// whole point: a browser fires `pointerdown` with no preceding `pointermove` on touch, so a
-/// backend that positions only on move-ish phases clicks wherever the host cursor already was.
+/// `Down` and `Up` included: a browser fires `pointerdown` with no preceding `pointermove` on
+/// touch, so a backend that positions only on moves clicks wherever the host cursor already was.
 ///
 /// The one exception is pointer lock. While the client holds it the browser freezes
 /// `clientX`/`clientY` at the lock point, so the coordinates a locked `POINTER_DOWN` carries are
-/// stale by construction and only `MOUSE_DELTA` may move the cursor.
+/// stale and only `MOUSE_DELTA` may move the cursor.
 #[inline]
 pub fn positions_cursor(pointer_locked: bool, phase: Phase) -> bool {
     !pointer_locked && !matches!(phase, Phase::Leave | Phase::Out | Phase::Cancel)
@@ -352,7 +340,7 @@ pub fn is_fast(op: u8) -> bool {
     )
 }
 
-// ─── Little-endian fixed-offset readers ─────────────────────────────────────
+// every multi-byte field on the wire is little-endian, at a fixed offset
 #[inline]
 fn rd_u16(b: &[u8], o: usize) -> Option<u16> {
     Some(u16::from_le_bytes(b.get(o..o + 2)?.try_into().ok()?))
@@ -388,7 +376,7 @@ pub struct Parsed {
     ///
     /// The fast channel is unordered and zero-retransmit, so two moves can be delivered out of
     /// order and the older one would walk the cursor backwards for a frame. `None` means the
-    /// client is older than the field and this session simply is not reorder-gated.
+    /// client is older than the field and this session is not reorder-gated.
     pub seq: Option<u16>,
 }
 
@@ -549,8 +537,8 @@ fn parse_pointer_batch(
     let predicted = if b.len() >= need + BATCH_TAIL_LEN {
         *client_ns = rd_stamp(b, need);
         *seq = rd_seq(b, need + BATCH_TAIL_LEN);
-        // A client that claims more predictions than it sent samples is malformed; clamping
-        // rather than rejecting keeps the real samples, which are still good.
+        // more predictions than samples is malformed: clamp rather than reject, the real
+        // samples are still good
         b[need + STAMP_LEN + 1].min(count as u8)
     } else {
         0
@@ -587,8 +575,8 @@ fn parse_mouse_delta(b: &[u8], client_ns: &mut u64) -> Option<InputEvent> {
     if b.len() < MOUSE_DELTA_LEN {
         return None;
     }
-    // Byte 8 was a zero pad every client already sent, which is why it can become the flags
-    // byte without a version bump: an old client reads as "no flags set".
+    // byte 8 is the flags byte: older clients send a zero pad there, which reads as "no flags
+    // set"
     let flags = b.get(MOUSE_DELTA_LEN).copied().unwrap_or(0);
     *client_ns = rd_stamp(b, MOUSE_DELTA_LEN + 1);
     Some(InputEvent::MouseDelta {
@@ -677,9 +665,8 @@ fn parse_drop(b: &[u8]) -> Result<InputEvent, ParseError> {
     let x = rd_f32(b, 2).ok_or_else(bad)?;
     let y = rd_f32(b, 6).ok_or_else(bad)?;
     let count = rd_u16(b, 10).ok_or_else(bad)? as usize;
-    // The count sizes a `Vec<DropItem>` (~72 B each), so it has to be bounded by what the
-    // message could actually contain before it is believed: a bare 12-byte header claiming
-    // 65535 items would otherwise allocate ~4.7 MB and then fail on the first read.
+    // the count sizes a `Vec<DropItem>` (~72 B each), so bound it by what the message can
+    // hold: a bare 12-byte header claiming 65535 items would otherwise allocate ~4.7 MB
     let floor = count
         .checked_mul(DROP_ITEM_MIN)
         .and_then(|n| n.checked_add(12))
@@ -732,12 +719,6 @@ fn parse_resize(b: &[u8]) -> Option<InputEvent> {
     })
 }
 
-/// `[PONG][echoed client stamp u64][host_now_ns u64]`.
-///
-/// The echoed half gives the client its RTT; the host half is what lets it place a host
-/// timestamp on its own timeline at all. The host clock's epoch is this process's start, so
-/// without a measured offset the client has nothing to compare an RTP-recovered capture time
-/// against. Clients older than this field read only the first 9 bytes and ignore the rest.
 /// Wire size of a v1 client stats frame. Anything shorter is rejected; anything longer is a
 /// later version whose extra fields this build ignores.
 pub const CLIENT_STATS_LEN: usize = 72;
@@ -747,7 +728,10 @@ pub const CLIENT_STATS_V2_LEN: usize = 96;
 /// Wire size of a v3 frame: the v2 prefix plus the two audio-redundancy counters.
 /// Bytes 0..96 are byte-identical to v2 and 0..72 to v1.
 pub const CLIENT_STATS_V3_LEN: usize = 104;
-pub const CLIENT_STATS_VERSION: u8 = 3;
+/// Wire size of a v4 frame: the v3 prefix plus the video catch-up counters and state.
+/// Bytes 0..104 are byte-identical to v3.
+pub const CLIENT_STATS_V4_LEN: usize = 120;
+pub const CLIENT_STATS_VERSION: u8 = 4;
 
 fn parse_client_stats(b: &[u8]) -> Option<InputEvent> {
     if b.len() < CLIENT_STATS_LEN {
@@ -757,18 +741,22 @@ fn parse_client_stats(b: &[u8]) -> Option<InputEvent> {
     if version == 0 {
         return None;
     }
-    // The declared length is a floor: a v1 client sends 72 bytes and a client newer than this
-    // build may send more than 96. Take the tail only if all of it arrived.
+    // the declared length is a floor: a v1 client sends 72 bytes and a newer one may send more
+    // than this build reads. Each tail is taken only if all of it arrived
     let tail: &[u8] = if b.len() >= CLIENT_STATS_V2_LEN {
         &b[CLIENT_STATS_LEN..CLIENT_STATS_V2_LEN]
     } else {
         &[]
     };
-    // Each tail is read only when the whole of it arrived, and independently: a v3 client
-    // against a host that stopped at v2 loses only these two fields, and a v2 client here
-    // leaves them at 0, which is what "never sent one" and "not measured" both mean.
+    // tails are independent: a missing one leaves its fields at 0, which is also what "not
+    // measured" means
     let tail3: &[u8] = if b.len() >= CLIENT_STATS_V3_LEN {
         &b[CLIENT_STATS_V2_LEN..CLIENT_STATS_V3_LEN]
+    } else {
+        &[]
+    };
+    let tail4: &[u8] = if b.len() >= CLIENT_STATS_V4_LEN {
+        &b[CLIENT_STATS_V3_LEN..CLIENT_STATS_V4_LEN]
     } else {
         &[]
     };
@@ -798,8 +786,6 @@ fn parse_client_stats(b: &[u8]) -> Option<InputEvent> {
                 & crate::streamer::telemetry::client_flags::CLOCK_VALID
                 != 0,
             rtt_us: rd_u32(b, 68)?,
-            // The tail is read only when the whole of it is present. A v1 client leaves these
-            // at 0, which is also what "not measured" means for every one of them.
             transport_tier: tail.first().copied().unwrap_or(0),
             render_tier: tail.get(1).copied().unwrap_or(0),
             key_tier: tail.get(2).copied().unwrap_or(0),
@@ -811,6 +797,10 @@ fn parse_client_stats(b: &[u8]) -> Option<InputEvent> {
             audio_output_latency_us: tail_u32(tail, 20),
             audio_redundant_used: tail_u32(tail3, 0),
             audio_redundant_discarded: tail_u32(tail3, 4),
+            video_catch_ups: tail_u32(tail4, 0),
+            video_frames_stale: tail_u32(tail4, 4),
+            video_late_peak_us: tail_u32(tail4, 8),
+            video_late_state: tail4.get(12).copied().unwrap_or(0),
         },
     )))
 }
@@ -845,24 +835,34 @@ pub mod hostcap {
     pub const INPUT_SEQUENCE: u16 = 1 << 5;
 }
 
-/// The bits this build sets. See `docs/INPUT-PROTOCOL.md`, "Host capabilities".
+/// The bits this build sets.
 pub const HOST_CAPABILITIES: u16 = hostcap::KEYFRAME_REQUEST
     | hostcap::STATS_V2
     | hostcap::INPUT_TIMESTAMP
     | hostcap::INPUT_EVENT_FLAGS
     | hostcap::INPUT_SEQUENCE;
 
-/// `[PONG][echoed client stamp u64][host_now_ns u64][host capabilities u16]`.
+/// What is true of this session now, as opposed to what the host can do. A byte after the
+/// capabilities; a client that reads fewer bytes sees none of these.
+pub mod hoststate {
+    /// The session was answered before its capture opened, and no frame has left the host yet.
+    /// While it is set the client holds every "no picture yet" timer it has and keeps showing that
+    /// it is connecting; when it clears they start as if the session had just connected.
+    pub const PICTURE_PENDING: u8 = 1 << 0;
+}
+
+/// `[PONG][echoed client stamp u64][host_now_ns u64][host capabilities u16][host state u8]`.
 ///
-/// The tail is appended, never inserted: bytes 0..17 are byte-identical to the previous form, so
-/// a client that reads only those keeps working, and one that reads past them learns what this
-/// host can do without a handshake.
-pub fn build_pong(t_ns: u64, host_ns: u64) -> [u8; 19] {
-    let mut out = [0u8; 19];
+/// The echoed stamp gives the client its RTT; `host_now_ns` (epoch: this process's start) is
+/// what lets it place a host timestamp on its own timeline. Every tail is appended, never
+/// inserted: a client that reads only the 9, 17 or 19 byte prefix of an older form keeps working.
+pub fn build_pong(t_ns: u64, host_ns: u64, state: u8) -> [u8; 20] {
+    let mut out = [0u8; 20];
     out[0] = op::PONG;
     out[1..9].copy_from_slice(&t_ns.to_le_bytes());
     out[9..17].copy_from_slice(&host_ns.to_le_bytes());
     out[17..19].copy_from_slice(&HOST_CAPABILITIES.to_le_bytes());
+    out[19] = state;
     out
 }
 
@@ -1012,8 +1012,8 @@ mod tests {
                 got: 3,
             }
         );
-        // A text frame whose length prefix runs past the end, then one whose bytes are not
-        // UTF-8: the same opcode, two different answers.
+        // a length prefix past the end, then bytes that are not UTF-8: same opcode, two
+        // different answers
         let mut over = vec![op::TEXT_INPUT];
         over.extend_from_slice(&99u32.to_le_bytes());
         over.extend_from_slice(b"hi");
@@ -1031,9 +1031,8 @@ mod tests {
         );
     }
 
-    /// The eight pointer opcodes are the only ones that name a phase. Anything else used to
-    /// come back as `Move`, which would have turned a protocol mistake into an injected cursor
-    /// move rather than a rejection.
+    /// The eight pointer opcodes are the only ones that name a phase. Anything else coming back
+    /// as `Move` would turn a protocol mistake into an injected cursor move.
     #[test]
     fn only_pointer_opcodes_have_a_phase() {
         assert_eq!(Phase::from_opcode(op::POINTER_DOWN), Some(Phase::Down));
@@ -1045,7 +1044,7 @@ mod tests {
 
     #[test]
     fn the_fast_channel_sequence_number_is_optional_on_every_frame_that_carries_one() {
-        // Pointer: v1, then stamp, then stamp + seq.
+        // pointer: v1, then stamp, then stamp + seq
         let mut b = vec![0u8; POINTER_LEN];
         b[0] = op::POINTER_MOVE;
         assert_eq!(parse(&b).unwrap().seq, None);
@@ -1054,7 +1053,7 @@ mod tests {
         b.extend_from_slice(&4242u16.to_le_bytes());
         assert_eq!(parse(&b).unwrap().seq, Some(4242));
 
-        // Mouse delta: v1 8 bytes, flags byte, stamp, seq.
+        // mouse delta: v1 8 bytes, flags byte, stamp, seq
         let mut d = vec![0u8; MOUSE_DELTA_LEN];
         d[0] = op::MOUSE_DELTA;
         assert_eq!(parse(&d).unwrap().seq, None);
@@ -1063,7 +1062,7 @@ mod tests {
         d.extend_from_slice(&5u16.to_le_bytes());
         assert_eq!(parse(&d).unwrap().seq, Some(5));
 
-        // Batch: past the stamp + flags + predicted tail.
+        // batch: past the stamp + flags + predicted tail
         let mut f = batch_frame(2, Some((42, 0, 0)));
         assert_eq!(parse(&f).unwrap().seq, None);
         f.extend_from_slice(&1234u16.to_le_bytes());
@@ -1079,7 +1078,7 @@ mod tests {
             InputEvent::Ping { t_ns } => assert_eq!(t_ns, 123456789),
             _ => panic!(),
         }
-        let pong = build_pong(123456789, 987654321);
+        let pong = build_pong(123456789, 987654321, 0);
         assert_eq!(pong[0], op::PONG);
         assert_eq!(
             u64::from_le_bytes(pong[1..9].try_into().unwrap()),
@@ -1091,10 +1090,44 @@ mod tests {
         );
     }
 
+    /// The host's PONG against the fixture the page's harness reads the same bytes from, so the
+    /// encoder and the page's parser cannot drift apart.
+    #[test]
+    fn host_golden_pongs_match_the_encoder() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("host-frames.json")).expect("valid fixture");
+        let vectors = fixture["vectors"].as_array().expect("vectors");
+        assert!(!vectors.is_empty());
+        for v in vectors {
+            let state = v["state"].as_u64().expect("state") as u8;
+            let built = build_pong(0x0102_0304_0506_0708, 0x1112_1314_1516_1718, state);
+            let hex: String = built.iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(hex, v["hex"].as_str().expect("hex"), "{}", v["name"]);
+        }
+    }
+
+    #[test]
+    fn the_pong_tail_carries_the_picture_state_after_the_capabilities() {
+        let pending = build_pong(1, 2, hoststate::PICTURE_PENDING);
+        let ready = build_pong(1, 2, 0);
+        // everything an older reader reads is identical either way
+        assert_eq!(pending[..19], ready[..19]);
+        assert_eq!(
+            pending[19] & hoststate::PICTURE_PENDING,
+            hoststate::PICTURE_PENDING
+        );
+        assert_eq!(ready[19], 0);
+        // a reader of the 19-byte form still finds the capabilities where they were
+        assert_eq!(
+            u16::from_le_bytes(pending[17..19].try_into().unwrap()),
+            HOST_CAPABILITIES
+        );
+    }
+
     #[test]
     fn the_pong_tail_announces_what_this_host_understands() {
-        let pong = build_pong(1, 2);
-        // The v1 prefix has to stay byte-identical, or a client reading only it breaks.
+        let pong = build_pong(1, 2, 0);
+        // the v1 prefix has to stay byte-identical, or a client reading only it breaks
         assert_eq!(pong[0], op::PONG);
         assert_eq!(u64::from_le_bytes(pong[1..9].try_into().unwrap()), 1);
         assert_eq!(u64::from_le_bytes(pong[9..17].try_into().unwrap()), 2);
@@ -1263,17 +1296,69 @@ mod tests {
             _ => panic!("wrong variant"),
         }
 
-        // One byte short of the tail reads as absent, never as half-parsed — the same floor
-        // rule the v2 tail follows, and the reason a v2 host can read a v3 client at all.
+        // one byte short of the tail reads as absent, never as half-parsed
         let short = &b[..CLIENT_STATS_V3_LEN - 1];
         match parse(short).unwrap().ev {
             InputEvent::ClientStats(c) => {
                 assert_eq!(c.audio_redundant_used, 0);
                 assert_eq!(c.audio_redundant_discarded, 0);
-                // Everything before it still parses.
+                // everything before it still parses
                 assert_eq!(c.version, 3);
             }
             _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn the_v4_tail_is_read_whole_or_not_at_all() {
+        let mut b = vec![0u8; CLIENT_STATS_V4_LEN];
+        b[0] = op::STATS;
+        b[1] = 4;
+        b[56..60].copy_from_slice(&1u32.to_le_bytes());
+        b[CLIENT_STATS_V3_LEN..CLIENT_STATS_V3_LEN + 4].copy_from_slice(&5u32.to_le_bytes());
+        b[CLIENT_STATS_V3_LEN + 4..CLIENT_STATS_V3_LEN + 8].copy_from_slice(&300u32.to_le_bytes());
+        b[CLIENT_STATS_V3_LEN + 8..CLIENT_STATS_V3_LEN + 12]
+            .copy_from_slice(&180_000u32.to_le_bytes());
+        b[CLIENT_STATS_V3_LEN + 12] = 2;
+        match parse(&b).unwrap().ev {
+            InputEvent::ClientStats(c) => {
+                assert_eq!(c.video_catch_ups, 5);
+                assert_eq!(c.video_frames_stale, 300);
+                assert_eq!(c.video_late_peak_us, 180_000);
+                assert_eq!(c.video_late_state, 2);
+                // a catch-up is not a keyframe request: that counter means loss to the host
+                assert_eq!(c.keyframe_requests, 1);
+            }
+            _ => panic!("wrong variant"),
+        }
+        let short = &b[..CLIENT_STATS_V4_LEN - 1];
+        match parse(short).unwrap().ev {
+            InputEvent::ClientStats(c) => {
+                assert_eq!(c.video_catch_ups, 0);
+                assert_eq!(c.video_frames_stale, 0);
+                assert_eq!(c.video_late_peak_us, 0);
+                assert_eq!(c.video_late_state, 0);
+                assert_eq!(c.version, 4);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn the_clients_v4_stats_frame_parses() {
+        let (channel, bytes) = vector("client_stats_v4");
+        assert_eq!(channel, "reliable");
+        match parse(&bytes).expect("client_stats_v4").ev {
+            InputEvent::ClientStats(c) => {
+                assert_eq!(c.version, 4);
+                assert_eq!(c.frames_painted, 5000);
+                assert_eq!(c.keyframe_requests, 1);
+                assert_eq!(c.video_catch_ups, 3);
+                assert_eq!(c.video_frames_stale, 250);
+                assert_eq!(c.video_late_peak_us, 140_250);
+                assert_eq!(c.video_late_state, 2);
+            }
+            other => panic!("parsed as {other:?}"),
         }
     }
 
@@ -1418,7 +1503,7 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
-        // A client that sends only the opcode still gets a request, not a dropped frame.
+        // a client that sends only the opcode still gets a request, not a dropped frame
         assert!(matches!(
             parse(&[op::KEYFRAME_REQUEST]).unwrap().ev,
             InputEvent::KeyframeRequest { .. }
@@ -1432,15 +1517,9 @@ mod tests {
         assert!(parse(&build_bye(bye::HOST_EXIT)).is_err());
     }
 
-    // ---- golden vectors: the same bytes the shipped client produced --------------------
-    //
-    // `client-frames.json` is written by `node scripts/test-client-input.mjs --write` from the
-    // real `input.js` under Node. That harness asserts the bytes against
-    // `docs/INPUT-PROTOCOL.md`; this asserts that the parser turns them into the events the
-    // host acts on. Both sides check the same file, so neither can drift on its own — which is
-    // the gap the audit named: the format was tested here and written there, with nothing
-    // between them.
-    //
+    // golden vectors: the bytes the shipped client produces. `client-frames.json` is written
+    // by `node scripts/test-client-input.mjs --write` from the real `input.js`, and that
+    // harness checks the same file, so client and parser cannot drift apart.
     // Regenerate after any deliberate change to what the client emits, and read the diff: a
     // changed vector is a wire-format change and every shipped client is on the old one.
 
@@ -1490,11 +1569,9 @@ mod tests {
 
     #[test]
     fn every_golden_vector_parses() {
-        // The blunt half: nothing the shipped client sends may come back as a parse error, and
-        // the routing decision has to agree with the channel it went out on. A fast opcode on
-        // the reliable channel is legal — the host routes on the opcode — but a *reliable*
-        // opcode on the fast channel would mean the client is putting ordered input on a lossy
-        // link, which no vector should show.
+        // Nothing the shipped client sends may fail to parse. A fast opcode on the reliable
+        // channel is legal (the host routes on the opcode); a reliable opcode on the fast channel
+        // would put ordered input on a lossy link.
         for (name, channel, bytes) in golden_vectors() {
             let parsed = parse(&bytes).unwrap_or_else(|e| panic!("{name}: {e:?}"));
             if channel == "fast" {
@@ -1534,8 +1611,8 @@ mod tests {
                 assert!((tilt_x + 20.0).abs() < 1e-3, "tiltX {tilt_x}");
                 assert!((tilt_y - 30.0).abs() < 1e-3, "tiltY {tilt_y}");
                 assert!((twist - 90.0).abs() < 1e-3, "twist {twist}");
-                // Normalised, not CSS pixels: the host scales them by the virtual display's own
-                // size, which is not the client's.
+                // normalised, not CSS pixels: the host scales by the virtual display's size, not
+                // the client's
                 assert!(
                     (0.0..=1.0).contains(&x) && (0.0..=1.0).contains(&y),
                     "{x},{y}"
@@ -1562,8 +1639,8 @@ mod tests {
 
     #[test]
     fn a_wheel_in_line_mode_keeps_its_mode_byte() {
-        // The mode decides whether the host multiplies by a line height or takes the delta as
-        // pixels. Losing it turns a three-line scroll into a three-pixel one.
+        // the mode says lines or pixels: losing it turns a three-line scroll into a
+        // three-pixel one
         let (_, bytes) = vector("wheel_lines");
         let parsed = parse(&bytes).expect("wheel_lines");
         assert!(parsed.fast, "wheel is a fast opcode");
@@ -1612,8 +1689,8 @@ mod tests {
 
     #[test]
     fn a_locked_mouse_delta_is_relative_and_signed() {
-        // Signed: a leftward move is a negative dx, and reading it unsigned sends the cursor
-        // 65 531 pixels the other way.
+        // signed: a leftward move is a negative dx, and reading it unsigned sends the cursor
+        // 65 531 pixels the other way
         let (_, bytes) = vector("mouse_delta_locked");
         let parsed = parse(&bytes).expect("mouse_delta_locked");
         assert!(parsed.fast);
@@ -1653,14 +1730,9 @@ mod tests {
 
     #[test]
     fn a_golden_vector_cut_below_its_fixed_length_is_refused() {
-        // The fixture doubles as a corpus of the shapes that actually occur off the wire, and a
-        // short SCTP message is something a peer can send. Anything below the frame's fixed part
-        // has to be an error rather than a read past the end.
-        //
-        // At or above it is *not* an error, deliberately: the optional stamp, flags byte and
-        // fast-channel sequence are all tails an older client simply does not send, so a
-        // MOUSE_DELTA cut to its 8 fixed bytes is a valid frame from a client that predates the
-        // flags byte. That is the compatibility rule, not a gap in the check.
+        // a peer can send a short SCTP message: anything below the frame's fixed part must be
+        // an error, never a read past the end. At or above it is deliberately not an error:
+        // the stamp, flags byte and sequence are tails an older client does not send
         for (name, _, bytes) in golden_vectors() {
             let fixed = fixed_len(bytes[0]).unwrap_or_else(|| panic!("{name}: unknown opcode"));
             for cut in 0..fixed {
@@ -1671,9 +1743,8 @@ mod tests {
                     );
                 }
             }
-            // No claim about `fixed` itself: for the variable-length frames it is only the
-            // header before the length-prefixed strings, so `KEY` cut to 5 bytes is correctly a
-            // `BadLength`. What has to hold is that nothing *below* it is ever read.
+            // no claim about `fixed` itself: for the variable-length frames it is only the
+            // header, so `KEY` cut to 5 bytes is correctly a `BadLength`
         }
     }
 }

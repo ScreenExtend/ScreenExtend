@@ -1,15 +1,14 @@
-# Vendored binaries — provenance
+# Vendored binaries: provenance
 
 These are committed third-party binaries. Checksums are pinned in `SHA256SUMS`
 and verified by the `blob-checksums` job in `.github/workflows/ci.yml`.
 **When updating any blob, update both its SHA-256 here and in
-`SHA256SUMS`.** Values below were recorded during the hardening audit; the
-upstream version/tag marked "confirm" should be verified against the upstream
-release the next time these are refreshed.
+`SHA256SUMS`.** The upstream version/tag marked "confirm" should be verified
+against the upstream release the next time these are refreshed.
 
 ## nefcon console tool (`nefconc-*`)
 
-- **Upstream:** [nefarius/nefcon](https://github.com/nefarius/nefcon) — a CLI for
+- **Upstream:** [nefarius/nefcon](https://github.com/nefarius/nefcon), a CLI for
   creating/removing device nodes and installing drivers (`devcon` replacement).
 - **Used for:** installing/removing the virtual display driver device node
   (see `src-tauri/src/lib.rs` `installdrivers`/`removedrivers`), via Tauri
@@ -27,12 +26,11 @@ release the next time these are refreshed.
 ### macOS placeholder stubs
 
 `nefconc-x86_64-apple-darwin` and `nefconc-aarch64-apple-darwin` are **not**
-nefcon — they are 17-byte no-op shell stubs (`#!/bin/sh\nexit 0`). Tauri's
+nefcon. They are 17-byte no-op shell stubs (`#!/bin/sh\nexit 0`). Tauri's
 `externalBin` requires a file for every target triple and nefcon is Windows-only,
 so they exist to satisfy that. `tauri.macos.conf.json` sets `"externalBin": []`,
 so the macOS bundle ships neither them nor nefcon.
 
 `.gitattributes` marks them `binary`. They contain no NUL byte, so without that
 rule git's text detection rewrites them to CRLF on a Windows checkout and the
-checksums below stop matching — which is exactly what the old CI checksum job
-tripped over.
+checksums below stop matching. The old CI checksum job failed on exactly that.

@@ -54,18 +54,13 @@ pub struct AudioFormat {
     pub channels: u16,
 }
 
-/// What the capture path publishes about itself.
-///
-/// Every field is an atomic or a lock-free histogram, because the producer is a real-time
-/// thread — MMCSS "Pro Audio" on Windows, a HAL IOProc worker on macOS — and must never
-/// allocate or lock to report. The percentiles used to come from a 4096-element `Vec` that was
-/// cloned and sorted on that thread every two seconds; `Histogram` gives the same numbers out
-/// of a fixed array of atomics.
+/// What the capture path publishes about itself. Every field is an atomic or a lock-free
+/// histogram: the producer is a real-time thread (MMCSS "Pro Audio" on Windows, a HAL IOProc
+/// worker on macOS) and must never allocate or lock to report.
 #[derive(Debug, Default)]
 pub struct AudioDiagnostics {
-    /// The engine period actually in force, in frames — `IAudioClient::GetDevicePeriod` on
-    /// Windows, not `GetBufferSize`, which is the whole engine buffer and is several periods
-    /// deep. This field carried the latter and was reported as if it were the former.
+    /// Engine period in force, in frames: `IAudioClient::GetDevicePeriod` on Windows, not
+    /// `GetBufferSize`, which is the whole engine buffer and several periods deep.
     pub period_frames: AtomicU32,
     /// The engine's total buffer capacity in frames (`GetBufferSize`).
     pub buffer_frames: AtomicU32,
@@ -82,18 +77,21 @@ pub struct AudioDiagnostics {
     pub dropped_backpressure: AtomicU64,
     /// Packets the broadcast dropped on a slow subscriber's behalf (`RecvError::Lagged`).
     pub lagged_packets: AtomicU64,
-    /// Drains whose endpoint timestamp was in the future and had to be clamped to the host
-    /// clock. On a Windows loopback stream this is the normal case, not an anomaly — see the
-    /// comment at the anchor in `windows_utils::audio::loopback::drain`.
+    /// Drains whose endpoint timestamp was in the future and was clamped to the host clock.
+    /// Normal on a Windows loopback stream (`windows_utils::audio::loopback::drain`).
     pub capture_ts_clamped: AtomicU64,
     /// Opus encode duration per frame.
     pub encode: crate::streamer::telemetry::Histogram,
-    /// Capture-thread wake-to-wake interval: the engine period as actually delivered, which is
-    /// the number that says whether a low-latency period request took effect.
+    /// Capture-thread wake-to-wake interval: the engine period as delivered, which shows
+    /// whether a low-latency period request took effect.
     pub wake_interval: crate::streamer::telemetry::Histogram,
-    /// `host_now_ns()` when a packet is handed to the transport minus that packet's own
-    /// `capture_ns` — the host-side half of the audio latency budget, end to end.
+    /// `host_now_ns()` at hand-off to the transport minus the packet's `capture_ns`: the
+    /// host-side half of the audio latency budget.
     pub capture_to_packet: crate::streamer::telemetry::Histogram,
+    /// Capture tier in force, named by the backend at acquisition; empty until one reports.
+    /// Not in [`Self::summary`], whose line each backend already extends. Atomic because the
+    /// backend sets it from its real-time capture thread.
+    tier: std::sync::atomic::AtomicPtr<&'static str>,
 }
 
 impl AudioDiagnostics {
@@ -101,6 +99,22 @@ impl AudioDiagnostics {
     #[inline]
     pub fn record_encode_ns(&self, ns: u64) {
         self.encode.record(ns);
+    }
+
+    /// Set at acquisition and re-acquisition, never per packet.
+    pub fn set_tier(&self, tier: &'static &'static str) {
+        let ptr = tier as *const &'static str as *mut &'static str;
+        self.tier.store(ptr, Ordering::Relaxed);
+    }
+
+    pub fn tier(&self) -> &'static str {
+        let ptr = self.tier.load(Ordering::Relaxed);
+        if ptr.is_null() {
+            return "";
+        }
+        // SAFETY: the only pointers ever stored come from `&'static &'static str` in `set_tier`,
+        // so a non-null one is valid for the life of the program and never written through.
+        unsafe { *ptr }
     }
 
     pub fn summary(&self) -> String {
@@ -133,17 +147,10 @@ impl AudioDiagnostics {
 
 pub type AudioStopFn = Box<dyn FnOnce() + Send>;
 
-/// Where a capture backend puts finished packets.
-///
-/// This used to be a `crossbeam_channel::Sender` whose receiver was drained by a dedicated
-/// `audio-bridge` thread that did nothing but copy each packet into the broadcast. That hop
-/// bought nothing: `tokio::sync::broadcast::Sender::send` is a synchronous, non-blocking call
-/// — it takes the ring's tail lock, writes the slot and wakes waiters, and a slow receiver is
-/// told `Lagged` rather than applying backpressure — so a real-time capture thread can call
-/// it directly, exactly as it called the channel. The bridge also ran at default scheduler
-/// priority between a Pro Audio thread and the network, which is the worst place in the path
-/// for an unprioritised hop: every millisecond it was descheduled was jitter the client had
-/// to absorb by holding a deeper buffer, so it cost latency twice.
+/// Where a capture backend puts finished packets. `broadcast::Sender::send` is synchronous
+/// and non-blocking (a slow receiver is told `Lagged`, there is no backpressure), so the
+/// real-time capture thread calls it directly: a relay thread at default priority in
+/// between is jitter the client has to buffer for.
 #[derive(Clone)]
 pub struct AudioSink {
     tx: broadcast::Sender<AudioPacket>,
@@ -154,9 +161,8 @@ impl AudioSink {
         Self { tx }
     }
 
-    /// Publish a packet. Never blocks, and never fails in a way the capture thread should act
-    /// on: "no receivers right now" is normal — every session can toggle its audio off — and
-    /// is not a reason to tear capture down. The stop flag is.
+    /// Never blocks. "No receivers" is normal (every session can toggle its audio off) and is
+    /// not a reason to tear capture down; the stop flag is.
     #[inline]
     pub fn send(&self, pkt: AudioPacket) {
         let _ = self.tx.send(pkt);
@@ -170,15 +176,9 @@ pub struct AudioCapture {
     pub lookahead_samples: i32,
 }
 
-/// Packets of fan-out buffer, at [`encoder::FRAME_MS`] each.
-///
-/// This was 128 — **640 ms** of audio held for a subscriber that had stopped reading. A
-/// subscriber that far behind is not recoverable on a real-time path: by the time it is
-/// declared lagged it is already two thirds of a second late, and everything queued in
-/// between is stale audio nobody wants. 16 packets is 80 ms, comfortably above the largest
-/// burst the hardware produces (a 10 ms engine period delivers two 5 ms packets per wake, and
-/// `probe --audio` measures subscriber inter-arrival p99 at one period) and below the point
-/// where catching up stops being worth doing.
+/// Packets of fan-out buffer, at [`encoder::FRAME_MS`] each: 16 is 80 ms. A 10 ms engine
+/// period delivers two 5 ms packets per wake, and a subscriber further behind than this is
+/// holding stale audio it should drop, not catch up on.
 const BROADCAST_CAPACITY: usize = 16;
 
 struct Running {
@@ -206,17 +206,10 @@ pub struct AudioSubscription {
 
 /// One host-wide capture, fanned out to every session that wants audio.
 ///
-/// The refcounting is the easy part. The subtlety is *when the mutex is held*: opening the OS
-/// capture device is tens to hundreds of milliseconds (a WASAPI client plus the mandatory
-/// silent render companion on Windows; an aggregate device or an SCK stream on macOS) and
-/// closing it joins a real-time thread. Both used to run under the mutex, so toggling audio on
-/// one device stalled every other device's toggle — and a backend whose `stop` returned before
-/// its producer had actually exited would have wedged the entire subsystem, `is_running` and
-/// `diagnostics` included, with no way out but a restart.
-///
-/// The lock now guards only the refcount and the handle. A thread doing device work marks the
-/// hub `busy`, drops the guard, does the work, and re-takes the lock to publish the result;
-/// anyone else waits on the condvar rather than behind the device.
+/// The mutex guards only the refcount and the handle. Opening the OS capture device takes
+/// tens to hundreds of milliseconds and closing it joins a real-time thread, so a thread
+/// doing device work marks the hub `busy`, drops the guard, and re-takes the lock to publish
+/// the result; everyone else waits on the condvar, not behind the device.
 #[derive(Default)]
 pub struct AudioHub {
     inner: Mutex<HubInner>,
@@ -241,11 +234,8 @@ impl AudioHub {
         Arc::new(Self::default())
     }
 
-    /// Take the lock, waiting out any in-flight device open or close.
-    ///
-    /// A poisoned mutex is recovered rather than propagated. The guarded state is a refcount
-    /// and an `Option`; a panicking holder cannot leave it torn, and killing audio for the
-    /// rest of the process because one subscriber panicked is the worse outcome.
+    /// Take the lock, waiting out any in-flight device open or close. Poison is recovered: the
+    /// guarded state is a refcount and an `Option`, which a panicking holder cannot leave torn.
     fn lock_idle(&self) -> std::sync::MutexGuard<'_, HubInner> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         while inner.busy {
@@ -276,9 +266,13 @@ impl AudioHub {
                 cap.format.channels,
                 cap.lookahead_samples
             );
+            // `busy` kept every other opener out while the lock was released
+            debug_assert!(
+                inner.running.is_none(),
+                "a second capture opened while busy"
+            );
             if inner.running.is_some() {
-                // Someone else won the race while the lock was released. Stop the loser's
-                // capture rather than leaking it.
+                // release builds: stop the extra capture rather than leak it
                 (cap.stop)();
             } else {
                 inner.running = Some(Running {
@@ -325,8 +319,7 @@ impl AudioHub {
 
         inner.busy = true;
         drop(inner);
-        // Joins the capture thread. Outside the lock, so a backend that is slow — or wedged —
-        // on the way down cannot take the rest of the audio subsystem with it.
+        // joins the capture thread, outside the lock: a wedged backend must not stall the hub
         stop();
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.busy = false;

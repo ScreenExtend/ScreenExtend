@@ -1,19 +1,13 @@
 //! What the client's offer says it can decode, and what to answer with.
 //!
-//! The host used to send Baseline to everything: `Config::default()` set
-//! `H264Profile::Baseline`, nothing outside the developer probe harness ever wrote the field, and
-//! the offer's `profile-level-id` was logged and thrown away. Baseline costs CAVLC instead of
-//! CABAC and no 8x8 transform — 5-15 % of the bitrate at equal quality, and screen content with
-//! flat regions and sharp text is where the 8x8 transform helps most. On a constrained link,
-//! bytes are queueing delay, so this is a latency question and not only a quality one.
-//!
 //! Two things are decided here and nowhere else: which H.264 profile the encoder is configured
-//! for, and what level the answer advertises.
+//! for, and what level the answer advertises. Baseline for everyone would cost CABAC and the 8x8
+//! transform: 5-15 % of the bitrate at equal quality, and on a constrained link bytes are
+//! queueing delay.
 
 use super::config::H264Profile;
 
-/// H.264 level 3.1 — the level every shipped answer carried regardless of what was being sent.
-/// It is the floor, never the ceiling.
+/// H.264 level 3.1: the floor an answer advertises, never the ceiling.
 pub const LEVEL_3_1: u8 = 0x1f;
 
 /// Annex A limits, ordered. `(level_idc, MaxMBPS, MaxFS)`.
@@ -65,12 +59,12 @@ impl Default for NegotiatedVideo {
 
 /// Profile from the first byte of a `profile-level-id`, per RFC 6184 Table 5.
 ///
-/// Only the profiles the encoders can actually produce are recognised; anything else (extended,
-/// the High 10/422/444 family) maps to `None` so it is neither offered nor encoded.
+/// Only the profiles the encoders can produce are recognised; anything else (the High
+/// 10/422/444 family) maps to `None` so it is neither offered nor encoded.
 fn profile_from_idc(profile_idc: u8, profile_iop: u8) -> Option<H264Profile> {
     match profile_idc {
         0x42 | 0x4d if profile_iop & 0x40 != 0 => {
-            // constraint_set1_flag: Main-compatible-with-Baseline, i.e. constrained baseline.
+            // constraint_set1_flag: Main-compatible, i.e. constrained baseline
             Some(H264Profile::Baseline)
         }
         0x42 => Some(H264Profile::Baseline),
@@ -115,8 +109,8 @@ pub fn read_offer(sdp: &str) -> OfferedVideo {
         if rest.contains("level-asymmetry-allowed=1") {
             out.level_asymmetry_allowed = true;
         }
-        // Packetization mode 0 (single NAL per packet) cannot carry a frame larger than the MTU,
-        // which every real frame is. A payload type that only offers it is not usable.
+        // mode 0 (single NAL per packet) cannot carry a frame larger than the MTU, so a payload
+        // type that only offers it is unusable
         if !rest.contains("packetization-mode=1") {
             continue;
         }
@@ -145,15 +139,14 @@ pub fn level_for(width: u32, height: u32, fps: u32) -> u8 {
             return (*idc).max(LEVEL_3_1);
         }
     }
-    // Past 6.2 there is nothing to name; say the highest that exists rather than lying downwards.
+    // past 6.2 there is nothing to name: say the highest rather than lie downwards
     LEVELS[LEVELS.len() - 1].0
 }
 
-/// Pick the best profile both ends can do.
+/// Pick the best profile both ends can do: High, then Main, then Baseline.
 ///
-/// High beats Main beats Baseline, and Baseline is the floor for a client that offered nothing
-/// recognisable — old Android and smart-TV decoders that only do constrained baseline are exactly
-/// why the floor exists.
+/// Baseline is the floor for a client that offered nothing recognisable (old Android and
+/// smart-TV decoders only do constrained baseline).
 pub fn choose(offer: &OfferedVideo, width: u32, height: u32, fps: u32) -> NegotiatedVideo {
     let profile = if offer.h264_profiles.contains(&H264Profile::High) {
         H264Profile::High
@@ -171,17 +164,13 @@ pub fn choose(offer: &OfferedVideo, width: u32, height: u32, fps: u32) -> Negoti
 
 /// Rewrite the level byte of every H.264 `profile-level-id` in an answer.
 ///
-/// webrtc-rs answers with the *remote* codec parameters — `update_from_remote_description` pushes
-/// the offer's `RTCRtpCodecParameters` into `negotiated_video_codecs` and `get_codecs_by_kind`
-/// hands those straight back — so the level we register in the media engine never reaches the
-/// wire. Chrome offers level 3.1 unconditionally, which is 1280x720@30; a 1440p or 4K session
-/// therefore advertised a decoder ceiling far below what both ends were actually doing, and the
-/// client's own WebCodecs candidate list starts at `avc1.640034` (High, level 5.2).
+/// webrtc-rs answers with the *remote* codec parameters, so the level registered in the media
+/// engine never reaches the wire, and Chrome offers level 3.1 (1280x720@30) unconditionally.
 ///
-/// RFC 6184 §8.2.2 makes the level the one part of `profile-level-id` that need not be symmetric,
-/// and `level-asymmetry-allowed=1` is the peer's explicit statement that it will accept a
-/// different one — so this only runs when the offer said so. The profile bytes are never touched:
-/// those *must* be symmetric, and webrtc-rs's own fmtp matcher compares exactly those two bytes.
+/// RFC 6184 section 8.2.2 makes the level the one part of `profile-level-id` that need not be
+/// symmetric, and `level-asymmetry-allowed=1` is the peer saying it will accept a different
+/// one, so this only runs when the offer said so. The profile bytes are never touched: those
+/// *must* be symmetric, and webrtc-rs's own fmtp matcher compares exactly those two bytes.
 pub fn apply_level_to_answer(answer: &str, level_idc: u8) -> String {
     const KEY: &str = "profile-level-id=";
     let mut out = String::with_capacity(answer.len());
@@ -252,8 +241,8 @@ a=fmtp:108 level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=640c1
 
     #[test]
     fn packetization_mode_zero_is_not_usable() {
-        // Mode 0 cannot fragment, so a payload type that only offers it must not raise the
-        // profile — the 108 line above is High but mode 0.
+        // mode 0 cannot fragment, so a High payload type that only offers it must not raise
+        // the profile
         let sdp =
             "a=fmtp:108 level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=640c1f\r\n";
         assert!(read_offer(sdp).h264_profiles.is_empty());

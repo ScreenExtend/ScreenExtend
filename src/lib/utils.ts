@@ -20,9 +20,7 @@ export function buildWifiQrValue(ssid: string, password: string): string {
   return `WIFI:T:WPA;S:${escape(ssid)};P:${escape(password)};;`;
 }
 
-// A devtools convenience, and nothing in `src/` reads it. In a release build there are no
-// devtools attached, so it was only keeping the whole command surface reachable from a
-// global.
+// devtools convenience, dev only: nothing in `src/` reads it
 if (import.meta.env.DEV) window.commands = commands;
 
 declare global {
@@ -47,10 +45,9 @@ export function useFocus<T extends HTMLElement>() {
 
 export type QrEntry = { title: string; value: string };
 
-/// An empty list has two very different causes, and callers that cannot tell them apart say the
-/// wrong thing: "no networks were found" is right for a machine with no usable adapter and wrong
-/// for an IPC call that failed, where the host may be serving perfectly well on a network we
-/// simply could not read. `adaptersUnavailable` is that distinction.
+/// `adaptersUnavailable` separates a failed IPC call from a machine with no usable adapter:
+/// after a failed read "no networks were found" would be wrong, since the host may be serving
+/// fine on a network that could not be read.
 export type QrValues = { entries: QrEntry[]; adaptersUnavailable: boolean };
 
 export async function readQrValues(
@@ -67,17 +64,14 @@ export async function readQrValues(
     return { entries: [], adaptersUnavailable: true };
   }
   const isIpv4 = (ip: string) => /^\d{1,3}(\.\d{1,3}){3}$/.test(ip);
-  // Anything with a colon is IPv6. `%25eth0`-style zone identifiers and link-local
-  // addresses are dropped: a zone id is meaningful only on the host that wrote it, and
-  // fe80:: cannot be typed into a phone's browser and reach us.
+  // zone ids and link-local addresses are dropped: a zone id means something only on this
+  // host, and fe80:: typed into a phone's browser cannot reach it
   const isRoutableIpv6 = (ip: string) =>
     ip.indexOf(":") >= 0 && ip.indexOf("%") < 0 && !/^fe[89ab]/i.test(ip) && ip !== "::1";
   const entries = adapters
     .map((adapter) => {
-      // IPv4 stays first where an adapter has both -- it is shorter to read off a screen
-      // and every client understands it. The IPv6 branch is what makes an IPv6-only
-      // network show a QR code at all: the host already binds and serves it, and the
-      // bracketed authority form is what a URL needs.
+      // IPv4 first where an adapter has both: shorter to read and every client understands it.
+      // IPv6 is for an IPv6-only network, and a URL needs it in brackets.
       const ipv4 = adapter.ip_addresses.find(isIpv4);
       const host = ipv4 ?? adapter.ip_addresses.find(isRoutableIpv6);
       if (!host) return null;

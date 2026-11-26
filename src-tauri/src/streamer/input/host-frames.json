@@ -1,0 +1,22 @@
+{
+  "readme": [
+    "Golden vectors for the host -> client PONG. GENERATED from the host's build_pong; do not hand-edit.",
+    "",
+    "`streamer::input::protocol`'s `host_golden_pongs_match_the_encoder` builds each one with",
+    "t_ns = 0x0102030405060708 and host_ns = 0x1112131415161718 and compares the bytes;",
+    "scripts/test-client-stats.mjs feeds the same bytes to input.js and checks what the page reads.",
+    "`state` is byte 19; bit 0 is PICTURE_PENDING."
+  ],
+  "vectors": [
+    {
+      "name": "pong_picture_pending",
+      "state": 1,
+      "hex": "61080706050403020118171615141312113b0001"
+    },
+    {
+      "name": "pong_picture_ready",
+      "state": 0,
+      "hex": "61080706050403020118171615141312113b0000"
+    }
+  ]
+}

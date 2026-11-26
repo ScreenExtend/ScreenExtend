@@ -2,10 +2,10 @@
 //! reassembled into access units (RFC 6184 single NAL / STAP-A / FU-A), and decoded with
 //! `VTDecompressionSession` on a thread of their own, the way a browser's hardware decoder would.
 //!
-//! Every frame records the host clock when its first and last packet came off the track (after
-//! SRTP and the interceptor chain), the host capture time recovered from its RTP timestamp
-//! (`host_ns_to_rtp90k` inverted — same process, same clock), when it was handed to the decoder,
-//! when the decoder called back, and the frame stamp read out of the decoded luma.
+//! Every frame records, on the host clock, its first and last packet off the track (after SRTP
+//! and the interceptor chain), the capture time recovered from its RTP timestamp
+//! (`host_ns_to_rtp90k` inverted: same process, same clock), decoder submit and callback, and the
+//! frame stamp read out of the decoded luma.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -93,11 +93,6 @@ pub struct FrameRec {
 /// completes its frame. A frame is emitted when every packet from the previous frame's marker to
 /// its own has arrived; one with a hole is held up to `MAX_HOLD_NS` for the repair and then
 /// emitted incomplete. Owned by the track-reader task.
-///
-/// The first version emitted a frame the moment its marker arrived and treated any sequence gap
-/// as a loss, so NACK repair could never complete a frame — and every late retransmission broke
-/// the frame it landed in as well. A 1,330-packet first keyframe with one loss was then never
-/// decodable (r6, `live-hold-forced`).
 pub struct Assembler {
     tx: Sender<RxFrame>,
     fu: Option<Vec<u8>>,
@@ -189,15 +184,15 @@ impl Assembler {
     fn drain(&mut self, now_ns: u64) {
         loop {
             let Some(start) = self.next_start else { return };
-            // Complete: start, start+1, ... up to a marker, one timestamp, no hole.
+            // complete: start, start+1, ... up to a marker, one timestamp, no hole
             let mut end = None;
             if let Some(first) = self.pending.get(&start) {
                 let ts = first.0;
                 let mut k = start;
                 while let Some(p) = self.pending.get(&k) {
                     if p.0 != ts {
-                        // The next frame began without this one's marker: its tail was lost
-                        // for good only if nothing can fill it, so treat it as the end.
+                        // the next frame began without this one's marker: its tail was lost
+                        // for good only if nothing can fill it, so treat it as the end
                         end = Some((k - 1, false));
                         break;
                     }
@@ -212,7 +207,7 @@ impl Assembler {
                 self.emit_range(start, last, marker, false, now_ns);
                 continue;
             }
-            // Still arriving (no packet past a hole) is not a loss: wait for it.
+            // still arriving (no packet past a hole) is not a loss: wait for it
             let mut c = start;
             while self.pending.contains_key(&c) {
                 c += 1;
@@ -220,7 +215,7 @@ impl Assembler {
             if self.pending.range(c..).next().is_none() {
                 return;
             }
-            // A hole. Give up on it once the oldest held packet has waited long enough.
+            // a hole: give up on it once the oldest held packet has waited long enough
             let Some((&k0, oldest)) = self.pending.iter().next() else {
                 return;
             };
@@ -248,7 +243,7 @@ impl Assembler {
                 .filter_map(|k| self.pending.remove(&k).map(|v| (k, v)))
                 .collect()
         };
-        // Anything older than this frame is gone for good.
+        // anything older than this frame is gone for good
         let stale: Vec<u64> = self.pending.range(..start).map(|(&k, _)| k).collect();
         for k in stale {
             self.pending.remove(&k);
@@ -335,8 +330,6 @@ impl Assembler {
         }
     }
 }
-
-// ---- VideoToolbox decode ---------------------------------------------------------------------
 
 #[repr(C)]
 struct CallbackRecord {
@@ -611,12 +604,10 @@ pub struct RxResult {
     pub plis_requested: u64,
 }
 
-/// Spawn the decode thread. `request_pli` is called (rate-limited) when a frame is incomplete or
-/// fails to decode; decoding then waits for the next keyframe, as a browser's decoder does.
-/// What the live stage's client reports to the host as its page would: the last 512 decoded
-/// frames' arrival→decoded time (the page's `arrival_to_paint`, over the same 512-frame window),
-/// decode time, frames "painted" (decoded), decode errors and keyframe requests — sent as the real
-/// `OP::STATS` frame on the `reliable` channel, so the host's own parser and telemetry path run.
+/// What the live stage's client reports to the host as its page would: arrival->decoded time
+/// over the last 512 decoded frames (the page's `arrival_to_paint` window), decode time, frames
+/// "painted" (decoded), decode errors and keyframe requests, sent as the real `OP::STATS` frame
+/// on the `reliable` channel so the host's own parser and telemetry path run.
 #[derive(Default)]
 pub struct ClientWindow {
     inner: std::sync::Mutex<ClientInner>,
@@ -664,7 +655,7 @@ impl ClientWindow {
     }
 
     /// The 104-byte v3 STATS frame, laid out exactly as `input.js` writes it (little-endian):
-    /// video path 1 (WebCodecs canvas), transport tier 1, render tier 1 — a client that paints.
+    /// video path 1 (WebCodecs canvas), transport tier 1, render tier 1 (a client that paints).
     pub fn stats_frame(&self) -> Vec<u8> {
         let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let pct = |q: &std::collections::VecDeque<u64>| -> [u32; 3] {
@@ -698,6 +689,8 @@ impl ClientWindow {
     }
 }
 
+/// Spawn the decode thread. `request_pli` is called (rate-limited) when a frame is incomplete or
+/// fails to decode; decoding then waits for the next keyframe, as a browser's decoder does.
 pub fn spawn_decoder(
     rx: Receiver<RxFrame>,
     disp: (usize, usize),
@@ -730,7 +723,7 @@ pub fn spawn_decoder(
             let mut last_pli: Option<Instant> = None;
             let mut avcc: Vec<u8> = Vec::with_capacity(1 << 20);
             let pli = |plis: &mut u64, last: &mut Option<Instant>| {
-                // A real receiver repeats it while it has nothing decodable (libwebrtc ~200 ms).
+                // a real receiver repeats it while it has nothing decodable (libwebrtc ~200 ms)
                 if last.is_none_or(|t| t.elapsed() >= Duration::from_millis(250)) {
                     *last = Some(Instant::now());
                     *plis += 1;
@@ -833,9 +826,8 @@ pub fn spawn_decoder(
                 recs.push(r);
                 drain(&mut recs, &index);
             }
-            // Frames still in the decoder come out on their own; the result is handed over BEFORE the
-            // session is closed, because closing can wait on VideoToolbox for ever (seen at 1440p:
-            // a FigSemaphore that never fires) and nothing may wait for that.
+            // the result is handed over BEFORE the session is closed: closing can wait on
+            // VideoToolbox for ever (seen at 1440p: a FigSemaphore that never fires)
             let t = Instant::now();
             while recs
                 .iter()
@@ -868,7 +860,7 @@ mod tests {
             let back = rtp_to_host_ns(ts, ns + 30_000_000);
             assert!(ns - back < 11_200, "{ns} -> {ts} -> {back}");
         }
-        // Past one wrap (~13.25 h) the arrival time picks the right period.
+        // past one wrap (~13.25 h) the arrival time picks the right period
         let ns = 50_000_000_000_000u64;
         let ts = crate::streamer::audio::host_ns_to_rtp90k(ns);
         let back = rtp_to_host_ns(ts, ns + 5_000_000);
@@ -879,10 +871,10 @@ mod tests {
     fn stap_a_and_fu_a_reassemble() {
         let (tx, rx) = unbounded();
         let mut a = Assembler::new(tx);
-        // STAP-A carrying SPS + PPS.
+        // STAP-A carrying SPS + PPS
         let stap = [24u8, 0, 3, 0x67, 1, 2, 0, 2, 0x68, 9];
         a.push(10, 900, false, &stap, 1);
-        // FU-A IDR in three pieces.
+        // FU-A IDR in three pieces
         a.push(11, 900, false, &[0x7c, 0x85, 0xaa], 2);
         a.push(12, 900, false, &[0x7c, 0x05, 0xbb], 3);
         a.push(13, 900, true, &[0x7c, 0x45, 0xcc], 4);
@@ -897,10 +889,10 @@ mod tests {
             ]
         );
         assert_eq!((f.first_ns, f.arrival_ns, f.packets), (1, 4, 4));
-        // A lost packet (14) holds the next frame for its repair...
+        // a lost packet (14) holds the next frame for its repair...
         a.push(15, 1800, true, &[0x41, 1], 5);
         assert!(rx.try_recv().is_err());
-        // ...and a retransmission completes it, counted as recovered.
+        // ...and a retransmission completes it, counted as recovered
         a.push(14, 1800, false, &[0x41, 0], 6);
         let g = rx.try_recv().unwrap();
         assert!(
@@ -908,14 +900,14 @@ mod tests {
             "{:?}",
             (g.complete, g.recovered, g.missing)
         );
-        // A packet lost for good: the frame waits MAX_HOLD_NS, then goes out incomplete.
+        // a packet lost for good: the frame waits MAX_HOLD_NS, then goes out incomplete
         a.push(17, 2700, true, &[0x41, 2], 10);
         assert!(rx.try_recv().is_err());
         a.push(18, 3600, true, &[0x41, 3], 10 + MAX_HOLD_NS);
         let h = rx.try_recv().unwrap();
         assert!(!h.complete && h.gave_up && h.missing == 1);
         assert!(rx.try_recv().unwrap().complete);
-        // The late repair for it is counted, not mis-assembled.
+        // the late repair for it is counted, not mis-assembled
         a.push(16, 2700, false, &[0x41, 9], 20 + MAX_HOLD_NS);
         assert_eq!(a.too_late, 1);
     }

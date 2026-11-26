@@ -1,28 +1,21 @@
 //! The AMF C ABI: one `#[repr(C)]` struct per vtable, in exact slot order.
 //!
-//! Field names are the C member names verbatim (hence `#![allow(non_snake_case)]` on the
-//! module) so `src-tauri/tools/amf_layout_gen.c`'s output pastes straight into
-//! `windows_utils/streamer/test/amd_layout.rs`. Slot order **is** the ABI: calling slot 48
-//! where you meant 49 is not a type error, it is a call through the wrong function pointer.
+//! Slot order is the ABI: a wrong slot is a call through the wrong function pointer, not a type
+//! error. Field names are the C member names verbatim (hence `#![allow(non_snake_case)]`) so
+//! `src-tauri/tools/amf_layout_gen.c`'s output pastes straight into
+//! `windows_utils/streamer/test/amd_layout.rs`. Slots this backend never calls are typed
+//! `*const c_void` but must still be declared: an omitted member shifts every slot after it, and
+//! the total slot count is the only assertion that catches it.
 //!
-//! Slots this backend never calls are typed `*const c_void`. They still have to be declared —
-//! the total slot count is the only assertion that catches a member omitted entirely, and an
-//! omission silently shifts every slot after it.
-//!
-//! Two traps encoded here:
-//! * `AMFFactory` and `AMFTrace` are **not** `AMFInterface`s. `AMFFactory::CreateContext` is
-//!   slot 0, `AMFTrace::TraceW` is slot 0; neither has Acquire/Release/QueryInterface.
-//! * `AMFSurface` has two observer pairs: slots 11/12 take an `AMFPropertyStorageObserver*`,
-//!   slots 31/32 an `AMFSurfaceObserver*`. The C++ header overloads both onto the name
-//!   `AddObserver`; the C branch disambiguates, and so do these names.
+//! `AMFSurface` has two observer pairs: slots 11/12 take an `AMFPropertyStorageObserver*`, slots
+//! 31/32 an `AMFSurfaceObserver*`. The C++ header overloads both onto the name `AddObserver`; the
+//! C branch disambiguates, and so do these names.
 
 use std::ffi::c_void;
 
 use super::types::*;
 
-// ===========================================================================================
-// Objects. Every AMF object is a single pointer to its vtable.
-// ===========================================================================================
+// every AMF object is a single pointer to its vtable
 
 macro_rules! amf_object {
     ($(#[$m:meta])* $name:ident, $vtbl:ident) => {
@@ -49,9 +42,7 @@ amf_object!(AMFIOCaps, AMFIOCapsVtbl);
 amf_object!(AMFFactory, AMFFactoryVtbl);
 amf_object!(AMFTrace, AMFTraceVtbl);
 
-// ===========================================================================================
-// AMFInterface — core/Interface.h (3 slots)
-// ===========================================================================================
+// AMFInterface, core/Interface.h (3 slots)
 
 #[repr(C)]
 pub struct AMFInterfaceVtbl {
@@ -64,13 +55,9 @@ pub struct AMFInterfaceVtbl {
     ) -> AMF_RESULT,
 }
 
-// ===========================================================================================
-// AMFPropertyStorage — core/PropertyStorage.h (13 slots)
-//
-// Slots 0..=12 of AMFData, AMFSurface, AMFBuffer, AMFContext, AMFComponent and AMFCaps are
-// layout-identical to this vtable, which is why `props.rs`'s helpers can drive all of them
-// through one `*mut AMFPropertyStorage` cast.
-// ===========================================================================================
+// AMFPropertyStorage, core/PropertyStorage.h (13 slots). Slots 0..=12 of AMFData, AMFSurface,
+// AMFBuffer, AMFContext, AMFComponent and AMFCaps are layout-identical to this vtable, so the
+// property helpers drive all of them through one `*mut AMFPropertyStorage` cast.
 
 #[repr(C)]
 pub struct AMFPropertyStorageVtbl {
@@ -107,14 +94,17 @@ pub struct AMFPropertyStorageVtbl {
     pub RemoveObserver: *const c_void,
 }
 
-// ===========================================================================================
-// AMFPropertyStorageEx — core/PropertyStorageEx.h (17 slots)
+// AMFPropertyStorageEx, core/PropertyStorageEx.h (17 slots). Declared for the layout test only.
+// `GetPropertyInfo` is never called: `AMFPropertyInfo` is 112 bytes in the C branch and 120 in
+// C++ (it has a virtual destructor), and amfrt64.dll is built from the C++ headers, so a C-shaped
+// binding reads every field one pointer early. Optional properties are probed with `HasProperty`.
 //
-// Declared for the layout test only. `GetPropertyInfo` (slot 15) is deliberately never called:
-// `AMFPropertyInfo` is 112 bytes in the C branch and 120 in C++ (it has a virtual destructor),
-// and amfrt64.dll is built from the C++ headers, so a C-shaped binding reads every field one
-// pointer early. Optional properties are probed with `HasProperty` instead.
-// ===========================================================================================
+// Slots 14 and 15 are named in the vendored 1.5.2 C order, which is wrong on Windows. In C++ they
+// are overloads of `GetPropertyInfo`, and MSVC lays overloaded virtuals out in reverse declaration
+// order: the real slot 14 is `GetPropertyInfo(name)` and slot 15 is `GetPropertyInfo(index)`
+// (AMF 1.5.3 fixed the C headers). The names here and in `AMFComponentVtbl` stay because
+// `test/amd_layout.rs` is generated from the 1.5.2 headers and pins them; renaming means vendoring
+// 1.5.3 and regenerating. Do not wire either slot up by these names.
 
 #[repr(C)]
 pub struct AMFPropertyStorageExVtbl {
@@ -137,9 +127,7 @@ pub struct AMFPropertyStorageExVtbl {
     pub ValidateProperty: *const c_void,
 }
 
-// ===========================================================================================
-// AMFData — core/Data.h (23 slots)
-// ===========================================================================================
+// AMFData, core/Data.h (23 slots)
 
 #[repr(C)]
 pub struct AMFDataVtbl {
@@ -172,9 +160,7 @@ pub struct AMFDataVtbl {
     pub GetDuration: unsafe extern "system" fn(*mut AMFData) -> amf_pts,
 }
 
-// ===========================================================================================
-// AMFSurface — core/Surface.h (33 slots)
-// ===========================================================================================
+// AMFSurface, core/Surface.h (33 slots)
 
 #[repr(C)]
 pub struct AMFSurfaceVtbl {
@@ -221,12 +207,8 @@ pub struct AMFSurfaceVtbl {
     pub RemoveObserver_Surface: *const c_void,
 }
 
-// ===========================================================================================
-// AMFBuffer — core/Buffer.h (28 slots)
-//
-// GetNative (25) + GetSize (24) are the whole hot-path output read: the encoder hands back a
-// buffer whose native pointer is host memory holding the Annex-B access unit.
-// ===========================================================================================
+// AMFBuffer, core/Buffer.h (28 slots). GetNative (25) + GetSize (24) are the whole hot-path
+// output read: the buffer's native pointer is host memory holding the Annex-B access unit.
 
 #[repr(C)]
 pub struct AMFBufferVtbl {
@@ -261,12 +243,8 @@ pub struct AMFBufferVtbl {
     pub RemoveObserver_Buffer: *const c_void,
 }
 
-// ===========================================================================================
-// AMFPlane — core/Plane.h (13 slots)
-//
-// Declared for the layout test and a future CPU-upload path. `GetPlaneAt`/`GetPlane` return a
-// borrowed pointer: the header says "do not store planes outside".
-// ===========================================================================================
+// AMFPlane, core/Plane.h (13 slots). Declared for the layout test and a future CPU-upload path.
+// `GetPlaneAt`/`GetPlane` return a borrowed pointer (the header: "do not store planes outside").
 
 #[repr(C)]
 pub struct AMFPlaneVtbl {
@@ -285,12 +263,8 @@ pub struct AMFPlaneVtbl {
     pub IsTiled: *const c_void,
 }
 
-// ===========================================================================================
-// AMFContext — core/Context.h (55 slots)
-//
-// The OpenCL / OpenGL / XV / Gralloc blocks between slots 22 and 42 are why hand-counting to
-// slot 49 goes wrong. They are all declared, unused.
-// ===========================================================================================
+// AMFContext, core/Context.h (55 slots). The OpenCL / OpenGL / XV / Gralloc blocks between slots
+// 22 and 42 are why hand-counting to slot 49 goes wrong. They are all declared, unused.
 
 #[repr(C)]
 pub struct AMFContextVtbl {
@@ -347,9 +321,9 @@ pub struct AMFContextVtbl {
     pub CreateBufferFromHostNative: *const c_void,
     pub CreateSurfaceFromHostNative: *const c_void,
     pub CreateSurfaceFromDX9Native: *const c_void,
-    /// Slot 49, the hot path. **Wraps, it does not copy** — the `ID3D11Texture2D` must stay
+    /// Slot 49, the hot path. **Wraps, it does not copy**: the `ID3D11Texture2D` must stay
     /// alive and unmodified until the surface's data is released. The third parameter is an
-    /// `AMFSurfaceObserver*`; we pass NULL and rely on one-frame-in-flight discipline instead.
+    /// `AMFSurfaceObserver*`: NULL here, relying on one-frame-in-flight discipline instead.
     pub CreateSurfaceFromDX11Native: unsafe extern "system" fn(
         *mut AMFContext,
         *mut c_void,
@@ -363,10 +337,8 @@ pub struct AMFContextVtbl {
     pub GetCompute: *const c_void,
 }
 
-// ===========================================================================================
-// AMFContext1 — core/Context.h (65 slots). Slots 0..=54 are identical to AMFContext.
+// AMFContext1, core/Context.h (65 slots). Slots 0..=54 are identical to AMFContext.
 // Declared for the layout test; the encoder has no need for AllocSurfaceEx or Vulkan.
-// ===========================================================================================
 
 #[repr(C)]
 pub struct AMFContext1Vtbl {
@@ -437,9 +409,7 @@ pub struct AMFContext1Vtbl {
     pub GetVulkanDeviceExtensions: *const c_void,
 }
 
-// ===========================================================================================
-// AMFComponent — components/Component.h (28 slots). Slots 0..=16 are AMFPropertyStorageEx.
-// ===========================================================================================
+// AMFComponent, components/Component.h (28 slots). Slots 0..=16 are AMFPropertyStorageEx.
 
 #[repr(C)]
 pub struct AMFComponentVtbl {
@@ -462,7 +432,10 @@ pub struct AMFComponentVtbl {
     pub AddObserver: *const c_void,
     pub RemoveObserver: *const c_void,
     pub GetPropertiesInfoCount: *const c_void,
+    /// 1.5.2 C-header name. On Windows this slot is really `GetPropertyInfo(name)`; see the note
+    /// on `AMFPropertyStorageExVtbl`. Never called.
     pub GetPropertyInfoAt: *const c_void,
+    /// 1.5.2 C-header name. On Windows this slot is really `GetPropertyInfo(index)`. Never called.
     pub GetPropertyInfo: *const c_void,
     pub ValidateProperty: *const c_void,
     pub Init: unsafe extern "system" fn(
@@ -471,7 +444,7 @@ pub struct AMFComponentVtbl {
         amf_int32,
         amf_int32,
     ) -> AMF_RESULT,
-    pub ReInit: *const c_void,
+    pub ReInit: unsafe extern "system" fn(*mut AMFComponent, amf_int32, amf_int32) -> AMF_RESULT,
     pub Terminate: unsafe extern "system" fn(*mut AMFComponent) -> AMF_RESULT,
     pub Drain: unsafe extern "system" fn(*mut AMFComponent) -> AMF_RESULT,
     /// Reserved for re-init. Ending a stream is `Drain` then `QueryOutput` until `AMF_EOF`.
@@ -485,9 +458,7 @@ pub struct AMFComponentVtbl {
     pub Optimize: *const c_void,
 }
 
-// ===========================================================================================
-// AMFCaps / AMFIOCaps — components/ComponentCaps.h (16 / 11 slots)
-// ===========================================================================================
+// AMFCaps / AMFIOCaps, components/ComponentCaps.h (16 / 11 slots)
 
 #[repr(C)]
 pub struct AMFCapsVtbl {
@@ -532,10 +503,8 @@ pub struct AMFIOCapsVtbl {
     pub IsInterlacedSupported: *const c_void,
 }
 
-// ===========================================================================================
-// AMFFactory — core/Factory.h (7 slots). NOT an AMFInterface: CreateContext is slot 0 and the
+// AMFFactory, core/Factory.h (7 slots). NOT an AMFInterface: CreateContext is slot 0 and the
 // factory is a DLL-owned singleton that must never be Released.
-// ===========================================================================================
 
 #[repr(C)]
 pub struct AMFFactoryVtbl {
@@ -554,12 +523,9 @@ pub struct AMFFactoryVtbl {
     pub GetPrograms: *const c_void,
 }
 
-// ===========================================================================================
-// AMFTrace — core/Trace.h (25 slots). Also NOT an AMFInterface; it starts at TraceW.
-//
-// Slots 0 and 1 are variadic / `va_list*` and are deliberately left untyped: there is no sound
-// Rust signature for either and nothing here needs them.
-// ===========================================================================================
+// AMFTrace, core/Trace.h (25 slots). Also NOT an AMFInterface; it starts at TraceW. Slots 0 and
+// 1 are variadic / `va_list*` and deliberately left untyped: there is no sound Rust signature
+// for either and nothing here needs them.
 
 #[repr(C)]
 pub struct AMFTraceVtbl {

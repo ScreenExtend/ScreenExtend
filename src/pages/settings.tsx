@@ -73,7 +73,7 @@ function isLikelyIp(value: string): boolean {
 }
 
 function formatLastSeen(ts: number): string {
-  if (!ts) return "—";
+  if (!ts) return "-";
   const mins = Math.floor((Date.now() - ts) / 60000);
   if (mins < 1) return "Just now";
   if (mins < 60) return `${mins} min ago`;
@@ -84,10 +84,8 @@ function formatLastSeen(ts: number): string {
   return new Date(ts).toLocaleDateString();
 }
 
-// Split out and memoized: the markup is unchanged, but Settings holds 34 `useState`
-// hooks -- eleven of them behind controlled text inputs -- and re-rendered this table on
-// every keystroke in any of them. Its props only change when the known-device list or
-// the connected set does.
+// memoized: Settings re-renders on every keystroke in its text inputs, and these props
+// change only with the known-device list or the connected set
 const PastDevicesTable = React.memo(function PastDevicesTable({
   devices,
   connectedTokens,
@@ -118,9 +116,7 @@ const PastDevicesTable = React.memo(function PastDevicesTable({
         </TableRow>
       </TableHeader>
       <TableBody className="border-t">
-        {/* Trust is keyed on the token, not the IP, so the same address legitimately
-            appears more than once -- one row per device that has used it. Keying on the
-            IP alone made React collapse those rows onto one identity. */}
+        {/* token in the key: one IP can appear on several rows, one per device that used it */}
         {devices.map(device => (
           <TableRow key={`${device.token ?? ""}|${device.ip}`} className={device.banned ? "opacity-60" : ""}>
             <TableCell className="font-medium">
@@ -140,7 +136,7 @@ const PastDevicesTable = React.memo(function PastDevicesTable({
                 )}
               </div>
             </TableCell>
-            <TableCell>{device.os || "—"}</TableCell>
+            <TableCell>{device.os || "-"}</TableCell>
             <TableCell>{device.ip}</TableCell>
             <TableCell className="text-muted-foreground">{formatLastSeen(device.lastSeen)}</TableCell>
             <TableCell className="text-right">
@@ -171,9 +167,8 @@ const PastDevicesTable = React.memo(function PastDevicesTable({
   );
 });
 
-// Cheap enough to poll: `get_hosted_network_status` reads the WinRT publisher we already
-// hold (macOS: the interface mode) and never spawns a process. The interval is only there
-// to catch an AP the OS takes down on its own, which is the case the toggle cannot see.
+// polled only to catch an AP the OS takes down on its own, which the toggle cannot see;
+// cheap, the status read spawns no process
 const HOSTED_STATUS_POLL_MS = 10000;
 
 const HOSTED_STATE_STYLE: Record<string, string> = {
@@ -181,20 +176,9 @@ const HOSTED_STATE_STYLE: Record<string, string> = {
   verified: "bg-green-500/15 text-green-500 border-green-500/30",
 };
 
-// The hosted network's real state, which until now only existed in the log. Three things
-// come together here because they answer the same question -- "why will my phone not join
-// this":
-//
-//   * the NotStarted / Advertised / Verified tri-state. Both platforms have collected it
-//     since W6/W14 and neither could report it: `advertised` means the radio accepted the
-//     SSID and nothing more, and an AP whose adapter never got an IPv4 is visible to a
-//     phone and unjoinable, because nothing is serving DHCP.
-//   * the channel, band and security the ladder settled on.
-//   * whether the network is encrypted at all. On macOS the HostAP SPI can refuse every
-//     secured `securityType` and the fallback brings up an open AP; the only signal for
-//     that used to be a destructive toast, which is transient where the network is not --
-//     it stays up for the session with the join URL, session id and OTP readable by
-//     anyone in range who associates.
+// `advertised` = the radio took the SSID, nothing more: with no IPv4 on the adapter the AP
+// is visible but unjoinable (no DHCP). The open-network warning stays up because macOS HostAP
+// can refuse every secured type and come up open: anyone in range reads the session id and OTP
 function HostedNetworkPanel({ running }: { running: boolean }) {
   const { t } = useTranslation();
   const [report, setReport] = useState<HostedNetworkReport | null>(null);
@@ -475,11 +459,8 @@ export default function Settings() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connectedDevices]);
 
-  // A `Set` rather than the linear `connectedDevices.some(...)` this replaced: the sort
-  // comparator below calls it twice per comparison, so the sort was O(n log n * m) in the
-  // number of known and connected devices.
-  // By token, not by address: the address a device had this morning belongs to whatever holds
-  // the lease now, so a "connected" badge keyed by it lights up beside the wrong row.
+  // a Set: the sort comparator below looks up twice per comparison. Keyed by token, not
+  // address: a reused lease would put the "connected" badge beside the wrong row
   const connectedTokens = useMemo(
     () => new Set(connectedDevices.map(d => d.token).filter(Boolean)),
     [connectedDevices]
@@ -546,8 +527,7 @@ export default function Settings() {
     });
   };
 
-  // Recomputed on every render before this, which on this page means every keystroke in
-  // any of its eleven controlled inputs.
+  // memoized: this page re-renders on every keystroke in its inputs
   const sortedKnownDevices = useMemo(
     () =>
       [...knownDevices].sort((a, b) => {
@@ -746,10 +726,8 @@ export default function Settings() {
     }
   }, [spin, setOtp]);
 
-  // Both fields back controlled inputs, so this used to fire an IPC write and a global
-  // config notification per keystroke. Nothing reads the credentials back from the store
-  // while the page is open -- the Save button works off React state -- so the write can
-  // wait until typing settles. The inputs and the button's disabled state are unaffected.
+  // debounced: written per keystroke this is an IPC call and a config notification each,
+  // and nothing reads the credentials back from the store while the page is open
   useEffect(() => {
     if (!configLoaded || !configLoadOk.current) return;
     const pair = JSON.stringify([hostedNetworkName, hostedNetworkPassword]);
@@ -806,8 +784,8 @@ export default function Settings() {
       await commands.stopHostedNetwork();
       wifiOn = await commands.isWifiOn();
     } catch (e) {
-      // Assume Wi-Fi is on: the alternative is offering to turn on a radio we could not
-      // read, and the generic failure toast below still fires.
+      // assume Wi-Fi is on rather than offer to turn on a radio whose state is unknown;
+      // the generic failure toast below still fires
       console.error("reading the Wi-Fi state after a failed hosted network failed", e);
       wifiOn = true;
     }

@@ -10,19 +10,16 @@ import Bootstrap from "@/pages/bootstrap";
 import { loadDashboard, loadDevices, loadSettings } from "@/lib/route-chunks";
 import { Loader2 } from "lucide-react";
 
-// React Router 7 wraps navigations in `startTransition`, so a route that has not finished
-// loading holds the current screen rather than flashing the fallback. Bootstrap warms the
-// dashboard chunk while the Rust `setup()` runs and the other two once it has painted, so
-// in practice these are resolved before anything navigates to them.
+// React Router 7 wraps navigations in `startTransition`, so a route still loading holds the
+// current screen instead of flashing the fallback. Bootstrap warms these chunks before
+// anything navigates to them.
 const Dashboard = lazy(loadDashboard);
 const Devices = lazy(loadDevices);
 const Settings = lazy(loadSettings);
 
-// `nextstepjs` and the `motion` it pulls behind it were the largest non-React item in the
-// entry chunk (-146.01 kB / -25.8% measured on `main-*.js` when they are taken out), for a
-// tour that runs at most once per install. They are behind this dynamic import now; the
-// two wrapper elements `NextStepReact` used to render around the app are rendered
-// statically below so the DOM does not change when the chunk arrives.
+// Lazy: `nextstepjs` and the `motion` it pulls in are 146 kB (25.8%) of the entry chunk, for a
+// tour that runs at most once per install. `WalkthroughFrame` renders its two wrapper
+// elements statically so the DOM does not change when the chunk arrives.
 const WalkthroughMount = lazy(() => import("@/components/walkthrough-mount"));
 import { WalkthroughContext, type WalkthroughControl } from "@/components/walkthrough-context";
 
@@ -83,9 +80,9 @@ const router = createMemoryRouter(
   )
 );
 
-// `networkChange` fires on any adapter change -- a VPN coming up, Wi-Fi roaming -- and
-// usually reports the same set. Handing back the previous array keeps the QR components
-// and every other consumer of the context out of the commit.
+// `networkChange` fires on any adapter change (a VPN coming up, Wi-Fi roaming) and usually
+// reports the same set; handing back the previous array keeps the context's consumers out of
+// the commit
 const sameQrValues = (a: QrValue[], b: QrValue[]): boolean =>
   a.length === b.length && a.every((v, i) => v.title === b[i].title && v.value === b[i].value);
 
@@ -121,10 +118,9 @@ function ClosingOverlay() {
   );
 }
 
-// Owns every piece of global state and every backend subscription. It renders
-// `children` untouched, so the element tree below it is referentially stable and
-// React skips it when this component re-renders: only the consumers of the one
-// context that actually changed commit.
+// Owns all global state and every backend subscription. `children` is rendered untouched, so
+// React skips that tree when this re-renders: only consumers of the context that changed
+// commit.
 function GlobalState({ children }: { children: ReactNode }) {
   const [hostedNetworkOn, setHostedNetworkOn] = useState(false);
   const [otp, setOtp] = useState("");
@@ -135,13 +131,13 @@ function GlobalState({ children }: { children: ReactNode }) {
     []
   );
   const [loaded, setLoaded] = useState(false);
-  // One entry per live join. A device with two tabs open is two rows sharing one token.
+  // one entry per live join: a device with two tabs open is two rows sharing one token
   const [devices, setDevices] = useState<ConnectedDevice[]>([]);
   const [publicSessionsEnabled, setPublicSessionsEnabled] = useState(true);
   const [avatar, setAvatar] = useState<string | null>(null);
   const [zoom, setZoom] = useState(DEFAULT_ZOOM);
-  // Keyed by device token: two tabs of one browser enumerate the same speakers and share the
-  // sink the host chooses, so there is one entry per device and not one per join.
+  // keyed by device token, not join: two tabs of one browser enumerate the same speakers and
+  // share the sink the host chooses
   const [audioOutputsByToken, setAudioOutputsByToken] = useState<Record<string, AudioOutputsInfo>>({});
   const zoomReady = useRef(false);
   const appliedZoom = useRef(DEFAULT_ZOOM);
@@ -199,8 +195,7 @@ function GlobalState({ children }: { children: ReactNode }) {
     })();
   }, []);
 
-  // The rescale is applied per keypress; only the store write is coalesced, so
-  // holding Ctrl+`+` through five steps is one write instead of five.
+  // the rescale applies per keypress; only the store write is coalesced
   useEffect(() => {
     if (!zoomReady.current) return;
     void applyZoom(zoom).then(() => {
@@ -314,8 +309,7 @@ function GlobalState({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (!loaded) return;
     void (async () => {
-      // One-time migration: this used to live in localStorage, which `ScreenExtend serve`
-      // cannot read, so a configured grace was silently ignored by the headless host.
+      // one-time migration out of localStorage, which `ScreenExtend serve` cannot read
       const legacy = localStorage.getItem("disconnectGraceSecs");
       if (legacy !== null) {
         const migrated = Number(legacy);
@@ -337,9 +331,8 @@ function GlobalState({ children }: { children: ReactNode }) {
       unlisteners.push(await events.deviceJoin.listen(event => {
         const device = event.payload as ConnectedDevice;
         setDevices(prev => {
-          // By join, so a second tab from the same machine is a second row rather than a
-          // replacement for the first. The filter is still needed: a reconnect on the same
-          // join id re-announces it.
+          // By join, so a second tab from the same machine is a second row. The filter stays:
+          // a reconnect on the same join id re-announces it.
           const next = prev.filter(d => d.joinId !== device.joinId);
           next.push(device);
           return next;
@@ -373,13 +366,12 @@ function GlobalState({ children }: { children: ReactNode }) {
         const device = event.payload as ConnectedDevice;
         setDevices(prev => {
           const index = prev.findIndex(d => d.joinId === device.joinId);
-          // The host says this join is live, so the row exists whether or not this window was
-          // listening when it arrived — a reload of the desktop UI over a running host has no
-          // rows at all, and dropping the update would leave a connected device invisible until
-          // it left. No notification and no `knownDevices` write: nothing arrived.
+          // The join is live even if this window never saw it arrive (a UI reload over a
+          // running host has no rows), so add the row. No notification and no `knownDevices`
+          // write: nothing arrived.
           if (index < 0) return [...prev, device];
-          // A no-op modify must not allocate a new array: `devices` identity
-          // drives an extra IPC burst in Dashboard and Settings.
+          // a no-op modify must not allocate a new array: `devices` identity drives an extra
+          // IPC burst in Dashboard and Settings
           if (deviceEquals(prev[index], device)) return prev;
           const next = prev.slice();
           next[index] = device;
@@ -388,9 +380,9 @@ function GlobalState({ children }: { children: ReactNode }) {
       }));
       unlisteners.push(await events.deviceAudioOutputs.listen(event => {
         const p = event.payload;
-        // `current` is the sink the client reports it is actually playing on. `null` means
-        // this client never said -- an older page, or one that has not posted yet -- which
-        // is not the same answer as `""`, the device's default output.
+        // `current` is the sink the client reports it is playing on. `null` means it never
+        // said (an older page, or one that has not posted yet), which is not the same answer
+        // as `""`, the device's default output.
         if (!p.token) return;
         setAudioOutputsByToken(prev => ({
           ...prev,
@@ -405,8 +397,7 @@ function GlobalState({ children }: { children: ReactNode }) {
       }));
       unlisteners.push(await events.deviceRemove.listen(event => {
         const device = event.payload as ConnectedDevice;
-        // One join ended; the device may still hold others, and the row that goes is that
-        // join's alone.
+        // one join ended; the device may still hold others, so only that join's row goes
         const known = devicesRef.current.find(d => d.joinId === device.joinId);
         const name = known?.name || device.name || known?.ip || device.ip;
         setDevices(prev => prev.filter(d => d.joinId !== device.joinId));
@@ -426,10 +417,9 @@ function GlobalState({ children }: { children: ReactNode }) {
         const payload = event.payload as { sessionId: string; otp?: string };
         const newId = payload.sessionId;
         if (!newId) return;
-        // An empty otp means only the id moved (the relay rotated one it found taken). When the
-        // host reports a new code too -- `ScreenExtend session new` -- it has to land here, or
-        // the effect that mirrors these two values pushes the old code back over it and the
-        // credential the CLI just printed stops working.
+        // An empty otp means only the id moved (the relay rotated one it found taken). A new
+        // code (`ScreenExtend session new`) has to land here, or the effect that mirrors both
+        // values pushes the old code back over it.
         if (payload.otp) setOtp(payload.otp);
         setSessionId(newId);
         try {
@@ -528,13 +518,10 @@ function GlobalState({ children }: { children: ReactNode }) {
   );
 }
 
-// `NextStepReact` rendered these two around the whole app, and the outer one's
-// `position: relative` is the containing block for every absolutely-positioned descendant
-// with no closer positioned ancestor -- `#innerSidebar` among them. They are reproduced
-// here byte for byte (same `data-name`s, same inline styles) so removing the library from
-// the boot path does not move anything. The overlay, pointer and card the library renders
-// go through its own `DynamicPortal` into `document.body`, so nothing else it draws needs
-// to be an ancestor of the app.
+// The two wrappers `NextStepReact` renders around the app, reproduced with the same
+// `data-name`s and inline styles so loading the library lazily moves nothing: the outer one's
+// `position: relative` is the containing block for absolutely-positioned descendants such as
+// `#innerSidebar`. The library's overlay, pointer and card portal into `document.body`.
 function WalkthroughFrame({ children }: { children: ReactNode }) {
   return (
     <div data-name="nextstep-wrapper" data-nextstep="dev" style={{ position: "relative", width: "100%" }}>
@@ -546,9 +533,8 @@ function WalkthroughFrame({ children }: { children: ReactNode }) {
 }
 
 function App() {
-  // `run` is bumped per start so "Replay Tour" remounts the provider and the tour begins
-  // from step one; it is never unmounted, since after the first start the chunk is
-  // resident and the tree it leaves behind is two zero-height divs.
+  // `run` is bumped per start so "Replay Tour" remounts the provider and the tour begins from
+  // step one. It is never unmounted: after the first start the chunk is resident.
   const [run, setRun] = useState<{ id: number; tour: string } | null>(null);
   const start = useCallback((tour: string) => {
     setRun(prev => ({ id: (prev?.id ?? 0) + 1, tour }));

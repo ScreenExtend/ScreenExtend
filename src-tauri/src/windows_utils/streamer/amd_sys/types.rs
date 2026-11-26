@@ -1,13 +1,11 @@
 //! Scalars, plain structs, enum values and GUIDs of the AMF C ABI.
 //!
-//! Every number here is measured, not read off the headers by eye — see
+//! Every number here is measured, not read off the headers by eye: see
 //! `windows_utils/streamer/test/amd_layout.rs` and `src-tauri/tools/amf_layout_gen.c`.
 
 use std::ffi::c_void;
 
-// ===========================================================================================
-// Scalars (core/Platform.h)
-// ===========================================================================================
+// scalars (core/Platform.h)
 
 pub type amf_int32 = i32;
 pub type amf_uint32 = u32;
@@ -27,12 +25,10 @@ pub type amf_long = i32;
 /// Presentation timestamp, in units of 100 ns.
 pub type amf_pts = i64;
 
-/// One second in `amf_pts` ticks (`AMF_SECOND`).
+/// One second in `amf_pts` ticks.
 pub const AMF_SECOND: amf_pts = 10_000_000;
 
-// ===========================================================================================
-// Version packing (core/Version.h)
-// ===========================================================================================
+// version packing (core/Version.h)
 
 pub const fn make_full_version(major: u64, minor: u64, release: u64, build: u64) -> amf_uint64 {
     (major << 48) | (minor << 32) | (release << 16) | build
@@ -52,18 +48,20 @@ pub const fn version_build(v: amf_uint64) -> u64 {
 }
 
 /// `AMF_FULL_VERSION` of the headers vendored in `resources/amf-headers` (1.5.2.0).
-/// Recorded for provenance only — see `AMFINIT_VERSION` for what we actually ask for.
+/// Recorded for provenance only: `AMFINIT_VERSION` is what is actually requested.
 pub const HEADERS_FULL_VERSION: amf_uint64 = 281_496_451_678_208;
 
-/// The version handed to `AMFInit`. Pinned **low** on purpose: AMF's compatibility contract is
-/// that a newer runtime serves an older client, never the reverse, so asking a 2023-era driver
-/// for 1.5.2 would fail `AMFInit` on hardware whose VCN encodes perfectly well. 1.4.30 is
-/// Adrenalin 23.5.2. Every optional feature is probed at runtime instead.
+/// The version handed to `AMFInit` first. 1.4.30 is Adrenalin 23.5.2.
+///
+/// FFmpeg, OBS and AMD's `AMFFactory.cpp` all pass their newest `AMF_FULL_VERSION`, but whether
+/// a runtime older than the version asked for refuses `AMFInit` is not established. So the
+/// request is pinned at the oldest SDK whose properties this backend writes ungated, and
+/// `Encoder::open` retries once with the runtime's own `AMFQueryVersion` value when that is lower
+/// and the pinned request was refused (`init_version_retry`). Every optional feature is probed
+/// at runtime, never by version.
 pub const AMFINIT_VERSION: amf_uint64 = make_full_version(1, 4, 30, 0);
 
-// ===========================================================================================
-// Plain structs (core/Platform.h, core/Interface.h, core/Variant.h)
-// ===========================================================================================
+// plain structs (core/Platform.h, core/Interface.h, core/Variant.h)
 
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -113,7 +111,7 @@ impl AMFGuid {
 }
 
 /// `AMFSize` is **signed**; `AMFRate`/`AMFRatio` are **unsigned**. All three are eight bytes of
-/// two 32-bit ints, so only the variant type tag distinguishes them — passing a `Rate` where a
+/// two 32-bit ints, so only the variant type tag distinguishes them: passing a `Rate` where a
 /// `Size` is wanted compiles and is rejected by AMF at runtime.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -211,11 +209,10 @@ pub struct AMFVariantStruct {
 }
 
 impl AMFVariantStruct {
-    /// `AMFVariantInit` is `static AMF_INLINE` in the header — not exported from the DLL — so it
+    /// `AMFVariantInit` is `static AMF_INLINE` in the header, not exported from the DLL, so it
     /// is reimplemented here. Every variant this backend writes is Bool / Int64 / Size / Rate,
-    /// none of which owns memory, so "init" is a zeroed struct and "clear" is a no-op. Only
-    /// STRING / WSTRING (`CoTaskMemFree`) and INTERFACE (`Release`) would need cleanup, and the
-    /// encoder never reads one.
+    /// none of which owns memory, so "clear" is a no-op. Only STRING / WSTRING (`CoTaskMemFree`)
+    /// and INTERFACE (`Release`) would need cleanup, and the encoder never reads one.
     pub const fn empty() -> Self {
         Self {
             r#type: AMF_VARIANT_EMPTY,
@@ -297,13 +294,10 @@ impl AMFVariantStruct {
     }
 }
 
-// ===========================================================================================
-// AMF_RESULT (core/Result.h)
-//
-// A plain sequential C enum with no explicit values, so these are positional and must be
-// regenerated if AMD ever inserts a member. Bound as `i32` rather than a Rust enum: a value
-// outside the declared set is UB in a `#[repr(i32)] enum` and AMF is free to return one.
-// ===========================================================================================
+// AMF_RESULT (core/Result.h): a plain sequential C enum with no explicit values, so these are
+// positional and must be regenerated if AMD ever inserts a member. Bound as `i32` rather than a
+// Rust enum: a value outside the declared set is UB in a `#[repr(i32)] enum` and AMF is free to
+// return one.
 
 pub type AMF_RESULT = amf_int32;
 
@@ -381,9 +375,7 @@ pub fn result_name(r: AMF_RESULT) -> &'static str {
     }
 }
 
-// ===========================================================================================
-// Core enums (core/Surface.h, core/Data.h, core/Context.h, components/ComponentCaps.h)
-// ===========================================================================================
+// core enums (core/Surface.h, core/Data.h, core/Context.h, components/ComponentCaps.h)
 
 pub type AMF_SURFACE_FORMAT = amf_int32;
 pub const AMF_SURFACE_UNKNOWN: AMF_SURFACE_FORMAT = 0;
@@ -438,8 +430,8 @@ pub const AMF_PLANE_PACKED: AMF_PLANE_TYPE = 1;
 pub const AMF_PLANE_Y: AMF_PLANE_TYPE = 2;
 pub const AMF_PLANE_UV: AMF_PLANE_TYPE = 3;
 
-/// Note that `AMF_ACCEL_HARDWARE` is **0**, not a truthy "supported" flag: the "not supported"
-/// case is the negative one.
+/// `AMF_ACCEL_HARDWARE` is **0**, not a truthy "supported" flag: "not supported" is the
+/// negative one.
 pub type AMF_ACCELERATION_TYPE = amf_int32;
 pub const AMF_ACCEL_NOT_SUPPORTED: AMF_ACCELERATION_TYPE = -1;
 pub const AMF_ACCEL_HARDWARE: AMF_ACCELERATION_TYPE = 0;
@@ -456,13 +448,10 @@ pub fn acceleration_name(a: AMF_ACCELERATION_TYPE) -> &'static str {
     }
 }
 
-// ===========================================================================================
-// AVC encoder enums (components/VideoEncoderVCE.h)
-//
-// These are AVC's values. HEVC and AV1 renumber the "same" enums — AVC's CBR = 1 means
-// LATENCY_CONSTRAINED_VBR on HEVC, AVC's SPEED = 1 is 10 on HEVC and 100 on AV1, and AV1 swaps
-// ULTRA_LOW_LATENCY with LOW_LATENCY. Any future codec gets its own module, never these.
-// ===========================================================================================
+// AVC encoder enums (components/VideoEncoderVCE.h). These are AVC's values: HEVC and AV1
+// renumber the "same" enums (AVC's CBR = 1 means LATENCY_CONSTRAINED_VBR on HEVC, AVC's
+// SPEED = 1 is 10 on HEVC and 100 on AV1, and AV1 swaps ULTRA_LOW_LATENCY with LOW_LATENCY).
+// Any future codec gets its own module, never these.
 
 pub type AMF_VIDEO_ENCODER_USAGE = amf_int32;
 pub const AMF_VIDEO_ENCODER_USAGE_TRANSCODING: AMF_VIDEO_ENCODER_USAGE = 0;
@@ -535,6 +524,13 @@ pub const AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE_IDR: AMF_VIDEO_ENCODER_OUTPUT_DATA_
 pub const AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE_I: AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE = 1;
 pub const AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE_P: AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE = 2;
 
+/// `AMF_VIDEO_ENCODER_LTR_MODE_ENUM` (components/VideoEncoderVCE.h, AMF 1.4.21+). The default,
+/// `RESET_UNUSED`, discards every long-term reference not named in a frame's
+/// `ForceLTRReferenceBitfield` as soon as one is used; `KEEP_UNUSED` keeps them.
+pub type AMF_VIDEO_ENCODER_LTR_MODE = amf_int32;
+pub const AMF_VIDEO_ENCODER_LTR_MODE_RESET_UNUSED: AMF_VIDEO_ENCODER_LTR_MODE = 0;
+pub const AMF_VIDEO_ENCODER_LTR_MODE_KEEP_UNUSED: AMF_VIDEO_ENCODER_LTR_MODE = 1;
+
 pub type AMF_VIDEO_ENCODER_PREENCODE_MODE = amf_int32;
 pub const AMF_VIDEO_ENCODER_PREENCODE_DISABLED: AMF_VIDEO_ENCODER_PREENCODE_MODE = 0;
 pub const AMF_VIDEO_ENCODER_PREENCODE_ENABLED: AMF_VIDEO_ENCODER_PREENCODE_MODE = 1;
@@ -560,12 +556,8 @@ pub const AMF_TRACE_WARNING: amf_int32 = 1;
 pub const AMF_TRACE_INFO: amf_int32 = 2;
 pub const AMF_TRACE_NOLOG: amf_int32 = 100;
 
-// ===========================================================================================
-// IIDs (AMF_DECLARE_IID, C branch)
-//
-// AMFCaps, AMFIOCaps, AMFFactory and AMFTrace have no IID in either branch and cannot be
-// reached through QueryInterface.
-// ===========================================================================================
+// IIDs (AMF_DECLARE_IID, C branch). AMFCaps, AMFIOCaps, AMFFactory and AMFTrace have no IID in
+// either branch and cannot be reached through QueryInterface.
 
 pub const IID_AMF_BUFFER: AMFGuid = AMFGuid::new(
     0xb04b_7248,

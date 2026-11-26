@@ -1,47 +1,24 @@
 //! Host-side cursor compositing for the WGC capture path.
 //!
-//! # Why this exists
+//! Off by default; `SE_CURSOR_OVERLAY=1` turns it on (`pipeline.rs`, `host_composites_cursor`).
+//! With WGC compositing the pointer a move is itself a captured frame; drawn here it is only
+//! redrawn on the encode thread's idle tick, which is polled, quantised to the frame period and
+//! never reached while real frames keep arriving: 59 fps for a pointer sweep against 85.
 //!
-//! `IsCursorCaptureEnabled` asks the compositor to draw the pointer into the captured surface,
-//! and on a *direct* display that is exactly right. On an **indirect** display — which is every
-//! display this app creates — it is not, because DWM does not produce a new frame for a pointer
-//! that moved over an otherwise static desktop. Measured on the Windows dev box with the pointer
-//! swept continuously across an empty virtual display: **2–10 real frames a second**, in both the
-//! pre-engagement build and the current one (`docs/RESULTS.md`, "User-facing stream quality").
-//! Everything else the stream emits in that scene is a keepalive repeat of the last captured
-//! surface, and that surface carries the pointer wherever WGC last composited it. The user's
-//! word for it is "the cursor freezes and is painted on stale frames", and they are right.
+//! When on, WGC is asked for the desktop without the cursor and the pointer is drawn onto every
+//! frame staged into a ring slot, on the GPU; a move with no new frame is redrawn on the slot the
+//! encode thread holds and re-encoded. That needs a render-target view on the encoder's own input
+//! textures, which only the async ring's slots have. If setup fails the overlay is not built,
+//! [`LiveCapture::cursor_capture_override`] returns `None` and WGC keeps compositing: never both
+//! draw the pointer, never neither.
 //!
-//! So the pointer stops being something the compositor owes us:
-//!
-//! 1. WGC is asked for the desktop **without** the cursor;
-//! 2. every frame staged into a ring slot gets the pointer drawn onto it here, on the GPU;
-//! 3. when the pointer moves and no new frame arrives, the encode thread redraws it on the slot
-//!    it is already holding and re-encodes — a few hundred bytes of P-frame — so pointer motion
-//!    runs at the stream's frame rate rather than the compositor's mood.
-//!
-//! The DXGI backend has always worked this way (`dxgi/mod.rs`, `frame()`); this is the WGC
-//! equivalent, and it reuses the same sprite builder and the same quad renderer so both backends
-//! draw the identical pointer.
-//!
-//! # The fallback, and why the tier is probed rather than assumed
-//!
-//! Everything here needs a render-target view on the encoder's own input textures, which is only
-//! true of the async ring's slots. If any part of the setup fails, the overlay is simply not
-//! built, [`LiveCapture::cursor_capture_override`] returns `None`, and WGC keeps compositing the
-//! pointer exactly as before. There is no state in which both draw it, and none in which neither
-//! does.
-//!
-//! # Threading
-//!
-//! Two threads reach this type: the WGC callback (a fresh frame) and the ring encode thread (a
-//! pointer that moved with no fresh frame). D3D11 makes *individual* context calls thread-safe,
-//! not a set-state-then-draw sequence, so the whole thing lives behind one `std::sync::Mutex`
-//! that both sides take around their GPU work. Neither side blocks on the other while holding
-//! it, and the encode thread only ever takes it on a tick where no frame arrived.
+//! The WGC callback and the ring encode thread both reach this type. D3D11 makes individual
+//! context calls thread-safe, not a set-state-then-draw sequence, so everything sits behind one
+//! `std::sync::Mutex` that both sides take around their GPU work. The encode thread takes it only
+//! on a tick where no frame arrived.
 
 use std::sync::atomic::Ordering;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context as _, Result};
 use windows::Win32::Graphics::Direct3D11::{
@@ -49,26 +26,24 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
-use windows::Win32::Graphics::Dxgi::IDXGIKeyedMutex;
+use windows::Win32::Graphics::Dxgi::{IDXGIKeyedMutex, DXGI_OUTDUPL_POINTER_SHAPE_INFO};
 use windows::Win32::Graphics::Gdi::{HMONITOR, MONITORINFO};
 use windows::Win32::UI::WindowsAndMessaging::HCURSOR;
 
 use super::dxgi::cursor::{
     build_sprite, quad_verts, shape_from_hcursor, CursorSprite, QuadRenderer,
 };
+use super::keyed::{self, Acquired};
 use super::nvidia::encoder::KEY_WRITER;
 use crate::streamer::telemetry::SharedTelemetry;
 
-/// Ceiling on the undo texture, in destination pixels.
-///
-/// Windows' largest cursor at 400 % is 256 px square; a display scaled past that would need more,
-/// and this is the point at which saving-and-restoring stops being cheaper than not bothering.
+/// Ceiling on the undo texture, in destination pixels. Windows' largest cursor at 400 % is 256 px
+/// square; past this, saving and restoring stops being cheaper than not drawing.
 const MAX_UNDO_DIM: u32 = 512;
 
-/// How often the monitor rectangle and the pointer's DPI are re-read.
-///
-/// Both change on a `/reconfig` that resizes or rescales the virtual display. One `GetMonitorInfoW`
-/// and one `GetDpiForMonitor` a second is nothing; doing it per frame at 120 Hz is not.
+/// How often the monitor rectangle and the pointer's DPI are re-read. Both change on a
+/// `/reconfig` that resizes or rescales the virtual display; one `GetMonitorInfoW` and one
+/// `GetDpiForMonitor` per frame at 120 Hz is too much.
 const GEOMETRY_REFRESH: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// How many cursor shapes to keep converted at once. Windows' whole standard set is fourteen and
@@ -77,13 +52,71 @@ const MAX_CACHED_SPRITES: usize = 8;
 
 /// How long [`CursorOverlay::recompose`] waits for the slot it was told is free.
 ///
-/// The held slot's key was released by the encoder and nobody else can hold it, so this should
-/// never wait at all. `KEY_TIMEOUT_MS` (1 s) is the wrong ceiling here: the WGC callback wants
-/// this same lock for the *next* frame, and a pointer redraw that misses one tick costs a tick.
+/// The encoder released the held slot's key and nobody else can hold it, so this should never
+/// wait. `KEY_TIMEOUT_MS` (1 s) is the wrong ceiling here: the WGC callback wants this same lock
+/// for the next frame, and a pointer redraw that misses one tick costs a tick.
 const RECOMPOSE_KEY_TIMEOUT_MS: u32 = 8;
 
 /// Smallest gap between the "no pointer drawn" lines. See [`CursorOverlay::note_absent`].
 const ABSENT_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long a cursor that would not convert is left alone before it is read again: one
+/// `GetIconInfoExW` + `GetDIBits` attempt every couple of seconds rather than one per tick, and
+/// short enough that a transient failure does not leave it undrawn for the rest of the session.
+const BAD_SHAPE_RETRY: Duration = Duration::from_secs(2);
+
+/// Identity of a cursor's *pixels*: its shape type, size, pitch, hotspot and bitmap bytes.
+///
+/// An `HCURSOR` is not that identity. System cursors' handles are stable; browsers, Electron apps
+/// and games create cursors with `CreateIconIndirect` and destroy them, and a later cursor can be
+/// handed the same handle value.
+fn shape_key(info: &DXGI_OUTDUPL_POINTER_SHAPE_INFO, data: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    // SipHash with fixed keys: the same pixels give the same key for the life of the process
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (
+        info.Type,
+        info.Width,
+        info.Height,
+        info.Pitch,
+        info.HotSpot.x,
+        info.HotSpot.y,
+    )
+        .hash(&mut h);
+    data.hash(&mut h);
+    h.finish()
+}
+
+/// Cursor handles whose shape would not convert, most recently failed last.
+///
+/// Remembered so a cursor that cannot be read is not re-read on every tick, with an expiry so a
+/// transient failure is not permanent, and evicting the oldest past the cap.
+struct BadShapes {
+    entries: Vec<(isize, Instant)>,
+}
+
+impl BadShapes {
+    fn new() -> Self {
+        Self {
+            entries: Vec::with_capacity(MAX_CACHED_SPRITES),
+        }
+    }
+
+    /// Whether `handle` failed within the last [`BAD_SHAPE_RETRY`].
+    fn contains(&mut self, handle: isize, now: Instant) -> bool {
+        self.entries
+            .retain(|(_, at)| now.saturating_duration_since(*at) < BAD_SHAPE_RETRY);
+        self.entries.iter().any(|(h, _)| *h == handle)
+    }
+
+    fn insert(&mut self, handle: isize, now: Instant) {
+        self.entries.retain(|(h, _)| *h != handle);
+        if self.entries.len() >= MAX_CACHED_SPRITES {
+            self.entries.remove(0);
+        }
+        self.entries.push((handle, now));
+    }
+}
 
 /// Everything about the pointer that decides what gets drawn where. Two equal values draw the
 /// same picture, which is exactly the test the encode thread's idle tick needs.
@@ -107,8 +140,8 @@ struct Rect {
 /// The three coordinate spaces the pointer has to cross, in one value so the arithmetic that
 /// crosses them can be tested without a GPU.
 ///
-/// Desktop pixels (what `GetCursorInfo` reports) → this display's pixels (subtract the origin) →
-/// the encoder's pixels (multiply by the video scale). The hotspot is subtracted in *display*
+/// Desktop pixels (what `GetCursorInfo` reports) -> this display's pixels (subtract the origin)
+/// -> the encoder's pixels (multiply by the video scale). The hotspot is subtracted in *display*
 /// pixels, after the DPI correction and before the video scale, because that is the space the
 /// cursor bitmap itself is measured in.
 #[derive(Clone, Copy)]
@@ -186,31 +219,37 @@ pub struct CursorOverlay {
     dpi_scale: f32,
     geometry_checked: Instant,
 
-    /// Built sprites, most recently used first, keyed by `HCURSOR`.
-    ///
-    /// A cache rather than a single slot because a pointer crossing a text field alternates
-    /// arrow and I-beam several times a second, and rebuilding a sprite is two `GetDIBits` and a
-    /// texture upload. System cursor handles are stable for the life of the process, so a handle
-    /// is a sound key.
-    sprites: Vec<(isize, CursorSprite)>,
-    /// Shapes that would not convert. Kept so a cursor we cannot read is not re-attempted sixty
-    /// times a second.
-    bad_shapes: Vec<isize>,
+    /// Built sprites, most recently used first. A cache rather than a single slot because a
+    /// pointer crossing a text field alternates arrow and I-beam several times a second, and
+    /// building a sprite is a texture upload. Keyed by [`shape_key`] when `revalidate` is set,
+    /// by the `HCURSOR` value otherwise.
+    sprites: Vec<(u64, CursorSprite)>,
+    /// `cursor_overlay_shape_revalidate` (ships on): read the cursor's bitmaps again whenever the
+    /// handle differs from the one drawn last, and look the sprite up by its pixels. The cost is
+    /// one `GetIconInfoExW` and one or two small `GetDIBits` per shape *change*, never per tick.
+    revalidate: bool,
+    /// The handle the front sprite was last resolved for. A pointer that keeps its handle keeps
+    /// its sprite without a read; a handle value an application destroyed and had re-issued
+    /// while it stayed the current pointer is the one case this cannot see.
+    current_handle: Option<isize>,
+    /// Shapes that would not convert, so an unreadable cursor is not re-read every tick.
+    bad_shapes: BadShapes,
     shape_errors: u32,
+    /// `AcquireSync` on a held slot that did not hand the slot over, counted for the log.
+    key_misses: u32,
     absent_logged: u32,
     absent_logged_at: Instant,
 
     telemetry: SharedTelemetry,
 }
 
-// The COM pointers here are all created from, and only ever used with, the one capture device,
-// and every call into them happens under the `Mutex` this type is stored in. Same argument, and
-// the same shape, as `Scaler` and the encoders next door.
+// SAFETY: the COM pointers here are all created from, and only ever used with, the one capture
+// device, and every call into them happens under the `Mutex` this type is stored in.
 unsafe impl Send for CursorOverlay {}
 
 impl CursorOverlay {
-    /// Builds the overlay for one session's ring slots, or fails — in which case the caller must
-    /// leave WGC compositing the pointer.
+    /// Builds the overlay for one session's ring slots. On failure the caller must leave WGC
+    /// compositing the pointer.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: &ID3D11Device,
@@ -250,9 +289,8 @@ impl CursorOverlay {
             });
         }
 
-        // The pointer is reported in desktop coordinates, so the display's own origin is the
-        // difference between drawing it where the user is pointing and drawing it a whole screen
-        // away. A virtual display normally sits at a negative x.
+        // the pointer is reported in desktop coordinates, so the display's origin has to be
+        // subtracted: a virtual display normally sits at a negative x
         let rect = monitor_rect(monitor);
         if rect.is_none() {
             teprintln!(
@@ -278,11 +316,14 @@ impl CursorOverlay {
             dpi_scale: cursor_dpi_scale(monitor),
             geometry_checked: Instant::now(),
             sprites: Vec::with_capacity(MAX_CACHED_SPRITES),
-            bad_shapes: Vec::new(),
+            revalidate: super::tune::on("cursor_overlay_shape_revalidate"),
+            current_handle: None,
+            bad_shapes: BadShapes::new(),
             shape_errors: 0,
+            key_misses: 0,
             absent_logged: 0,
-            // Far enough in the past that the first absence reports immediately. `checked_sub`
-            // because `Instant - Duration` panics on a machine that booted seconds ago.
+            // in the past, so the first absence reports immediately. `checked_sub` because
+            // `Instant - Duration` panics on a machine that booted seconds ago.
             absent_logged_at: Instant::now()
                 .checked_sub(ABSENT_LOG_INTERVAL)
                 .unwrap_or_else(Instant::now),
@@ -307,14 +348,13 @@ impl CursorOverlay {
 
     /// Draw the pointer onto a slot the capture callback has just overwritten with a fresh frame.
     ///
-    /// The caller already owns the slot — for the NVENC ring that means it holds `KEY_WRITER` —
-    /// and flushes afterwards, so this only issues draws.
+    /// The caller already owns the slot (for the NVENC ring it holds `KEY_WRITER`) and flushes
+    /// afterwards, so this only issues draws.
     pub fn compose_fresh(&mut self, slot: usize) {
         let started = Instant::now();
         let want = self.read_pointer();
         if let Some(s) = self.slots.get_mut(slot) {
-            // A fresh frame overwrote the whole slot: nothing is drawn on it and nothing under it
-            // is worth keeping.
+            // a fresh frame overwrote the whole slot: nothing is drawn on it, nothing to undo
             s.drawn = None;
             s.shows = None;
         }
@@ -339,10 +379,22 @@ impl CursorOverlay {
         let held = match self.mutexes.get(slot) {
             Some(m) => {
                 // The held slot sits at `KEY_WRITER`: `encode_input_slot` releases it there and
-                // `encode_repeat_slot` takes and returns it there.
-                if let Err(e) = unsafe { m.AcquireSync(KEY_WRITER, RECOMPOSE_KEY_TIMEOUT_MS) } {
-                    teprintln!("cursor overlay: AcquireSync(writer) on slot {slot} failed: {e}");
-                    return false;
+                // `encode_repeat_slot` takes and returns it there. `AcquireSync` reports a
+                // timeout and an abandoned mutex as success codes, so only `Owned` may go on to
+                // touch the texture or call `ReleaseSync`.
+                match keyed::acquire(m, KEY_WRITER, RECOMPOSE_KEY_TIMEOUT_MS) {
+                    Ok(Acquired::Owned) => {}
+                    other => {
+                        self.key_misses += 1;
+                        if self.key_misses <= 3 || self.key_misses.is_multiple_of(1000) {
+                            teprintln!(
+                                "cursor overlay: AcquireSync(writer) on slot {slot} did not \
+                                 hand the slot over ({other:?}; {} so far); pointer not redrawn",
+                                self.key_misses
+                            );
+                        }
+                        return false;
+                    }
                 }
                 Some(m.clone())
             }
@@ -372,9 +424,8 @@ impl CursorOverlay {
             .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
 
-    /// Erase whatever is drawn on this slot, then draw the pointer where it is now.
-    ///
-    /// Returns whether any pixel was touched.
+    /// Erase whatever is drawn on this slot, then draw the pointer where it is now. Returns
+    /// whether any pixel was touched.
     fn render(&mut self, slot: usize, want: Option<Pointer>) -> Result<bool> {
         if slot >= self.slots.len() {
             bail!("cursor overlay: slot {slot} out of range");
@@ -394,23 +445,21 @@ impl CursorOverlay {
             return Ok(touched);
         }
 
-        // The geometry is read out and the borrow dropped before `save_undo` needs `&mut self`.
-        // `ensure_sprite` has just put the one we want at the front.
+        // `ensure_sprite` has just put the wanted sprite at the front
         let (x, y, w, h) = match self.sprites.first() {
             Some((_, sprite)) => place_sprite(&self.geometry(), p.x, p.y, sprite),
             None => return Ok(touched),
         };
         let Some(clip) = clip_to(x, y, w, h, self.dst_w, self.dst_h) else {
-            // Entirely off the destination: the pointer is on this monitor but its sprite lands
-            // outside the encoded area, which a video-scale below 100 % makes reachable.
+            // on this monitor but entirely off the encoded area, which a video scale below
+            // 100 % makes reachable
             return Ok(touched);
         };
         self.save_undo(slot, clip)?;
 
         let verts = quad_verts(x, y, w, h, self.dst_w, self.dst_h);
         let (dst_w, dst_h) = (self.dst_w, self.dst_h);
-        // Split the borrow: `draw` takes `&self.renderer` while the sprite and the slot's view
-        // are borrowed out of the same struct.
+        // split the borrow: the renderer, the sprite and the slot's view all come out of `self`
         let Self {
             renderer,
             sprites,
@@ -441,9 +490,8 @@ impl CursorOverlay {
 
     fn save_undo(&mut self, slot: usize, r: Rect) -> Result<()> {
         if r.w > MAX_UNDO_DIM || r.h > MAX_UNDO_DIM {
-            // Refuse rather than allocate without bound, and refuse *before* drawing: a sprite
-            // that cannot be saved cannot be erased either, so drawing it would smear a trail of
-            // pointers across the picture and leave them there. No pointer is the lesser fault.
+            // refuse before drawing: a sprite that cannot be saved cannot be erased either, and
+            // would leave a trail of pointers across the picture
             bail!(
                 "cursor sprite is {}x{} destination pixels, past the {MAX_UNDO_DIM} px undo cap",
                 r.w,
@@ -535,29 +583,56 @@ impl CursorOverlay {
         Ok(())
     }
 
+    /// Moves the sprite cached under `key` to the front. False when there is none.
+    fn promote(&mut self, key: u64) -> bool {
+        match self.sprites.iter().position(|(k, _)| *k == key) {
+            Some(i) => {
+                self.sprites[..=i].rotate_right(1);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Makes sure a usable sprite for this cursor is at the front of the cache.
     fn ensure_sprite(&mut self, shape: isize) -> bool {
-        if let Some(i) = self.sprites.iter().position(|(h, _)| *h == shape) {
-            self.sprites[..=i].rotate_right(1);
+        if self.revalidate {
+            // same handle the front sprite was resolved for: nothing to read
+            if self.current_handle == Some(shape) && !self.sprites.is_empty() {
+                return true;
+            }
+        } else if self.promote(shape as u64) {
             return true;
         }
-        if self.bad_shapes.contains(&shape) {
+        let now = Instant::now();
+        if self.bad_shapes.contains(shape, now) {
             return false;
         }
-        let built = shape_from_hcursor(HCURSOR(shape as *mut core::ffi::c_void))
-            .and_then(|s| build_sprite(&self.device, &s.info, &s.data));
+        let built = shape_from_hcursor(HCURSOR(shape as *mut core::ffi::c_void)).and_then(|s| {
+            let key = if self.revalidate {
+                shape_key(&s.info, &s.data)
+            } else {
+                shape as u64
+            };
+            if self.revalidate && self.promote(key) {
+                return Ok(None);
+            }
+            build_sprite(&self.device, &s.info, &s.data).map(|sprite| Some((key, sprite)))
+        });
         match built {
-            Ok(sprite) => {
-                self.sprites.truncate(MAX_CACHED_SPRITES - 1);
-                self.sprites.insert(0, (shape, sprite));
+            Ok(fresh) => {
+                if let Some((key, sprite)) = fresh {
+                    self.sprites.truncate(MAX_CACHED_SPRITES - 1);
+                    self.sprites.insert(0, (key, sprite));
+                }
+                self.current_handle = Some(shape);
                 true
             }
             Err(e) => {
-                // Remembered so a cursor we cannot read is not re-attempted 60 times a second,
-                // and counted so a host drawing no pointer at all is visible in `status --json`.
-                if self.bad_shapes.len() < MAX_CACHED_SPRITES {
-                    self.bad_shapes.push(shape);
-                }
+                // remembered so an unreadable cursor is not re-attempted every tick, and counted
+                // so a host drawing no pointer at all is visible in `status --json`
+                self.bad_shapes.insert(shape, now);
+                self.current_handle = None;
                 self.shape_errors += 1;
                 self.telemetry
                     .degradation
@@ -573,18 +648,17 @@ impl CursorOverlay {
 
     /// The pointer, if it is showing *and* over the display being captured.
     ///
-    /// The bounds test is what keeps a pointer that has wandered onto the host's own screen from
-    /// being painted onto the client's — the per-device pointer scope defaults to `all`, so it
-    /// leaves this display all the time. It is a rectangle test against the monitor's own bounds
-    /// rather than `MonitorFromPoint`, matching `dxgi/mod.rs::refresh_cursor_state`: the two agree
-    /// wherever the rectangle is known, and where it is not the rectangle test still draws a
-    /// pointer at a slightly wrong offset, where the handle test draws none at all.
+    /// The bounds test keeps a pointer that has wandered onto the host's own screen from being
+    /// painted onto the client's (the per-device pointer scope defaults to `all`, so it leaves
+    /// this display all the time). It is a rectangle test against the monitor's own bounds rather
+    /// than `MonitorFromPoint`, matching `dxgi/mod.rs::refresh_cursor_state`: where the rectangle
+    /// is not known it still draws a pointer at a slightly wrong offset, where the handle test
+    /// draws none at all.
     fn read_pointer(&mut self) -> Option<Pointer> {
         use windows::Win32::UI::WindowsAndMessaging::{GetCursorInfo, CURSORINFO, CURSOR_SHOWING};
 
-        // Before the bounds test, not after: the rectangle it tests against is what a `/reconfig`
-        // moves, and testing against the old one puts the pointer on the wrong display for a
-        // second.
+        // before the bounds test: a `/reconfig` moves the rectangle, and testing against the old
+        // one puts the pointer on the wrong display for a second
         self.refresh_geometry();
         let mut info = CURSORINFO {
             cbSize: std::mem::size_of::<CURSORINFO>() as u32,
@@ -618,8 +692,7 @@ impl CursorOverlay {
     /// being drawn.
     ///
     /// A host drawing no pointer because the user's mouse is on their own screen and a host
-    /// drawing no pointer because its geometry is wrong look identical from the outside, and the
-    /// second one is the whole failure this module exists to avoid.
+    /// drawing no pointer because its geometry is wrong look identical from the outside.
     fn note_absent(&mut self, why: &str, x: i32, y: i32) {
         const MAX_LINES: u32 = 3;
         if self.absent_logged >= MAX_LINES || self.absent_logged_at.elapsed() < ABSENT_LOG_INTERVAL
@@ -678,10 +751,9 @@ fn monitor_rect(monitor: isize) -> Option<(i32, i32, u32, u32)> {
 /// How much bigger the pointer should be drawn than the bitmap `GetIconInfoExW` handed over.
 ///
 /// The cursor bitmap comes out at the DPI of the thread asking for it; the display being captured
-/// may be running at another one, because the client picks its own scale. Comparing the two
-/// `SM_CXCURSOR` metrics is self-correcting: where the two DPIs agree the ratio is exactly 1 and
-/// nothing is scaled, and where they do not it is the ratio Windows would itself have used. Any
-/// failure returns 1, which is the old behaviour rather than a wrong one.
+/// may be running at another one, because the client picks its own scale. The ratio of the two
+/// `SM_CXCURSOR` metrics is exactly 1 where the DPIs agree and otherwise the ratio Windows would
+/// itself have used. Any failure returns 1 (no scaling).
 fn cursor_dpi_scale(monitor: isize) -> f32 {
     use windows::Win32::UI::HiDpi::{GetDpiForMonitor, GetSystemMetricsForDpi, MDT_EFFECTIVE_DPI};
     use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXCURSOR};
@@ -732,9 +804,8 @@ mod tests {
     }
 
     /// The hotspot is the pixel the user is pointing at, so it must land exactly on the pointer's
-    /// own coordinate — not the sprite's corner. Getting this wrong is the classic "the cursor is
-    /// drawn but clicks land somewhere else" bug, and it is invisible on an arrow whose hotspot is
-    /// (0,0); every other shape (the I-beam, the resize handles, the hand) has a centred one.
+    /// own coordinate, not the sprite's corner. Getting it wrong is invisible on an arrow, whose
+    /// hotspot is (0,0); the I-beam, the resize handles and the hand have a centred one.
     #[test]
     fn the_hotspot_lands_on_the_pointer() {
         let g = geom((0, 0), (1920, 1080), (1920, 1080), 1.0);
@@ -763,7 +834,7 @@ mod tests {
         assert_eq!((x, y, w, h), (960, 540, 16, 16));
     }
 
-    /// A display at 200 % gets a cursor bitmap twice the size Windows handed us, so the sprite is
+    /// A display at 200 % gets a cursor bitmap twice the size Windows handed over, so the sprite is
     /// drawn twice as large and its hotspot moves with it.
     #[test]
     fn the_dpi_factor_scales_the_sprite_and_its_hotspot() {
@@ -812,5 +883,56 @@ mod tests {
         assert_eq!(a, a);
         assert_ne!(a, Pointer { x: 11, ..a });
         assert_ne!(a, Pointer { shape: 0x5678, ..a });
+    }
+
+    fn info(w: u32, h: u32, hx: i32, hy: i32) -> DXGI_OUTDUPL_POINTER_SHAPE_INFO {
+        let mut i = DXGI_OUTDUPL_POINTER_SHAPE_INFO {
+            Type: 4, // COLOR
+            Width: w,
+            Height: h,
+            Pitch: w * 4,
+            ..Default::default()
+        };
+        i.HotSpot.x = hx;
+        i.HotSpot.y = hy;
+        i
+    }
+
+    /// One handle value, two different cursors over time. Keyed by the handle the second lookup
+    /// would hit the first cursor's sprite; keyed by the pixels it misses and gets rebuilt.
+    #[test]
+    fn a_reused_handle_with_new_pixels_is_a_new_sprite() {
+        let a = vec![0xFFu8; 32 * 32 * 4];
+        let mut b = a.clone();
+        b[17] = 0;
+        let i = info(32, 32, 0, 0);
+        assert_ne!(shape_key(&i, &a), shape_key(&i, &b));
+        assert_eq!(shape_key(&i, &a), shape_key(&i, &a.clone()));
+        // same pixels with a different hotspot is a different pointer: clicks land elsewhere
+        assert_ne!(shape_key(&i, &a), shape_key(&info(32, 32, 16, 16), &a));
+    }
+
+    /// Past the cap the newest failure is still remembered (the oldest is evicted), and every
+    /// entry expires, so one transient failure does not blacklist a handle for the session.
+    #[test]
+    fn unreadable_shapes_are_remembered_evicted_and_retried() {
+        let t0 = Instant::now();
+        let mut bad = BadShapes::new();
+        for h in 0..=MAX_CACHED_SPRITES as isize {
+            bad.insert(h, t0);
+        }
+        // the ninth is remembered: the oldest made room for it
+        assert!(bad.contains(MAX_CACHED_SPRITES as isize, t0));
+        assert!(!bad.contains(0, t0));
+        assert!(bad.contains(1, t0));
+        assert_eq!(bad.entries.len(), MAX_CACHED_SPRITES);
+        // every entry expires, so a cursor that failed once is tried again
+        let later = t0 + BAD_SHAPE_RETRY;
+        assert!(!bad.contains(1, later));
+        assert!(bad.entries.is_empty());
+        // failing again refreshes rather than duplicates
+        bad.insert(5, later);
+        bad.insert(5, later);
+        assert_eq!(bad.entries.len(), 1);
     }
 }

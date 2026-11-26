@@ -1,17 +1,10 @@
 //! Scheduling for the two hot threads on the macOS encode path.
 //!
-//! Two schemes, one per thread, rather than four stacked on both:
+//! The encode thread runs under `THREAD_TIME_CONSTRAINT_POLICY` and takes no QoS class: with
+//! both set, the last writer wins. The drain thread is plain `USER_INTERACTIVE` QoS (a memcpy and
+//! a channel send per frame, no deadline of its own).
 //!
-//! * the **encode** thread runs under `THREAD_TIME_CONSTRAINT_POLICY` and takes no QoS class,
-//!   because a QoS class is the kernel's way of *managing* a thread's priority and a
-//!   time-constraint reservation is the way of taking that management away. Setting both means
-//!   the last writer wins and the log says nothing about which one that was.
-//! * the **drain** thread is a plain `USER_INTERACTIVE` QoS thread. It does almost nothing per
-//!   frame (a memcpy and a channel send) and has no deadline of its own.
-//!
-//! Every call's return value is checked. `thread_policy_set` returns `kern_return_t` and
-//! `pthread_set_qos_class_self_np` returns 0/errno; both were previously discarded, so a policy
-//! that never applied looked exactly like one that did.
+//! Every call's status is checked: a policy that never applied must not look like one that did.
 
 use std::ffi::c_int;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -35,9 +28,8 @@ unsafe extern "C" {
 
 /// Log a scheduling call that failed, once per process per call site.
 ///
-/// A failing `thread_policy_set` is not fatal — the thread simply runs at the default priority —
-/// but it changes what every latency number below it means, so it must not be silent. Repeating
-/// it per session would spam the log bus without adding information.
+/// Not fatal (the thread runs at the default priority), but it changes what every latency number
+/// means, so it must not be silent.
 fn report(what: &str, rc: i32, seen: &AtomicBool) {
     if rc == KERN_SUCCESS {
         return;
@@ -66,17 +58,16 @@ pub fn pin_current_thread_user_initiated() -> i32 {
 
 /// The share of the period the encode thread reserves as guaranteed CPU.
 ///
-/// The old value was `period / 8` — 2.08 ms out of a 16.67 ms frame — which is under a third of
-/// what a 1080p VideoToolbox submit plus the Annex B walk costs on this box, so the thread was
-/// descheduled mid-frame as a matter of course. Chromium reserves ~0.75 of the period on its own
-/// deadline threads (`base/threading/platform_thread_mac.mm`); a reservation smaller than the
-/// work is worse than none, because the scheduler holds you to it.
+/// A reservation smaller than the work is worse than none, because the scheduler holds the
+/// thread to it: `period / 8` (2.08 ms of a 16.67 ms frame) is under a third of a 1080p
+/// VideoToolbox submit plus the Annex B walk. Chromium reserves ~0.75 of the period on its
+/// deadline threads (`base/threading/platform_thread_mac.mm`).
 const COMPUTATION_FRACTION: f64 = 0.75;
 
 /// Put the calling thread on the real-time (deadline) scheduler.
 ///
 /// `preemptible` stays true: a non-preemptible thread that overruns its computation can wedge
-/// the machine, and nothing here is worth that.
+/// the machine.
 pub fn pin_current_thread_time_constraint(period_ns: u64) -> i32 {
     let computation_ns = (period_ns as f64 * COMPUTATION_FRACTION) as u64;
     pin_current_thread_time_constraint_with(period_ns, computation_ns, period_ns)
@@ -165,8 +156,8 @@ const HOT_THREAD_IMPORTANCE: c_int = 63;
 
 /// Raise the thread's importance within its band.
 ///
-/// Only meaningful for a timeshare thread — a deadline thread's priority comes from its
-/// reservation — so this is for the drain thread, not the encode thread.
+/// Only meaningful for a timeshare thread (a deadline thread's priority comes from its
+/// reservation), so this is for the drain thread, not the encode thread.
 pub fn raise_current_thread_precedence() -> i32 {
     static SEEN: AtomicBool = AtomicBool::new(false);
     let mut data = thread_precedence_policy_data_t {
@@ -186,8 +177,8 @@ pub fn raise_current_thread_precedence() -> i32 {
 
 /// Ask the scheduler to keep the capture/encode threads in one cache affinity set.
 ///
-/// Intel-only: `THREAD_AFFINITY_POLICY` is documented as unimplemented on Apple silicon, where
-/// it returns `KERN_NOT_SUPPORTED` rather than doing nothing quietly.
+/// Intel-only: `THREAD_AFFINITY_POLICY` is unimplemented on Apple silicon and returns
+/// `KERN_NOT_SUPPORTED` there.
 #[cfg(target_arch = "x86_64")]
 pub fn pin_current_thread_encode_affinity() -> i32 {
     use mach2::thread_policy::{

@@ -67,7 +67,7 @@ pub fn parse_asbd(asbd: &AudioStreamBasicDescription) -> Result<AudioFormatDesc>
             other => bail!("unsupported signed-int ASBD bit depth {other}"),
         }
     } else {
-        bail!("unsupported ASBD format flags 0x{flags:08x} ({bits}-bit) — not float or signed int");
+        bail!("unsupported ASBD format flags 0x{flags:08x} ({bits}-bit): not float or signed int");
     };
 
     Ok(AudioFormatDesc {
@@ -84,7 +84,7 @@ fn read_sample(kind: SampleKind, bytes: &[u8], off: usize) -> f32 {
         SampleKind::F32 => {
             f32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
         }
-        // Divide by 32768, not 32767: the int16 range is asymmetric (−32768..=32767).
+        // divide by 32768, not 32767: the int16 range is asymmetric (-32768..=32767)
         SampleKind::I16 => {
             let v = i16::from_le_bytes([bytes[off], bytes[off + 1]]);
             (v as f32) / 32768.0
@@ -109,7 +109,7 @@ fn downmix_channels(ch: &[f32]) -> (f32, f32) {
             let c = ch[2] * M3DB;
             (ch[0] + c, ch[1] + c)
         }
-        // Quad: FL, FR, BL, BR
+        // quad: FL, FR, BL, BR
         4 => (ch[0] + ch[2] * M3DB, ch[1] + ch[3] * M3DB),
         // 5.1: FL, FR, FC, LFE, BL, BR (LFE dropped)
         6 => {
@@ -124,7 +124,7 @@ fn downmix_channels(ch: &[f32]) -> (f32, f32) {
                 ch[1] + c + (ch[5] + ch[7]) * M3DB,
             )
         }
-        // Unknown layout: average everything into both channels (attenuated to avoid clip).
+        // unknown layout: average everything into both channels (attenuated to avoid clipping)
         n => {
             let m = ch.iter().sum::<f32>() / n as f32;
             (m, m)
@@ -144,20 +144,15 @@ pub fn convert_interleaved(
     let bps = desc.kind.bytes();
     let stride = ch * bps;
 
-    // 48 kHz stereo f32 interleaved is already the encoder's own layout, and it is what every
-    // backend delivers on this Mac's common path. Reassembling each sample from four indexed byte
-    // reads, running it through a two-channel "downmix" and clamping it is five scalar passes to
-    // arrive back at the bytes we started with. One `copy_nonoverlapping` plus a clamp pass does
-    // the same work in two vectorisable ones — on the real-time capture thread, where cost is
-    // IOProc deadline-miss risk rather than throughput.
+    // 48 kHz stereo f32 interleaved is already the encoder's layout: one copy plus a clamp pass
+    // instead of per-sample byte reads, on the real-time capture thread where the cost is
+    // IOProc deadline-miss risk.
     if desc.is_fast_path() {
         let n = (frames * OUT_CHANNELS)
             .min(out.len())
             .min(src.len() / std::mem::size_of::<f32>());
-        // SAFETY: `out` is `&mut [f32]` so its pointer is f32-aligned, and copying bytes into it
-        // is sound because every bit pattern is a valid f32. The source is read as bytes, so no
-        // alignment is required of it — a CoreAudio buffer is aligned in practice, but the copy
-        // does not depend on that.
+        // SAFETY: `out` is `&mut [f32]`, so it is f32-aligned and every bit pattern copied into
+        // it is a valid f32. The source is read as bytes, so its alignment does not matter.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 src.as_ptr(),
@@ -184,7 +179,7 @@ pub fn convert_interleaved(
             }
             downmix_channels(&scratch[..ch])
         } else {
-            // >8 channels: average without the fixed scratch.
+            // >8 channels: average without the fixed scratch
             let mut acc = 0.0f32;
             for c in 0..ch {
                 acc += read_sample(desc.kind, src, base + c * bps);

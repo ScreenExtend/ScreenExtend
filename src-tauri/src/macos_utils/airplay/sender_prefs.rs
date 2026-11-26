@@ -1,28 +1,11 @@
 //! The sender-side preference that looks like a geometry lever, and is not.
 //!
-//! macOS reduces an AirPlay receiver's advertised size to a single bit —
-//! `kCGSVirtualDisplay1080pMode = (height >= 1080)` in MediaToolbox's
-//! `scr_bringAirDisplayOnline` — and that bit only chooses which entry of a
-//! fixed mode table CoreDisplay makes the default.
-//!
-//! `com.apple.coremedia`'s `wirelessdisplaymac_set_display_size` looks like the
-//! way out: with it set, MediaToolbox additionally emits
-//! `com.apple.windowserver.virtualDisplayWidth`/`Height`. But CoreDisplay's
-//! custom-geometry branch also requires `…virtualDisplayResolution`, and nothing
-//! in the system ever writes that key — so the custom-mode path is dead code.
-//! Measured: with the preference confirmed set to 1, a request for 1440x900
-//! still produced a stock 1280x720 display.
-//!
-//! So this module does **not** write the preference. Mutating a global user
-//! setting for no measurable benefit is not a trade worth making; the real
-//! geometry control is picking from the published mode ladder afterwards
-//! ([`super::topology::closest_mode`]). What stays here is the ceiling, the
-//! refresh-rate truth, and a read-only probe so the preference's state can be
-//! reported if someone wants to experiment on another macOS release.
-//!
-//! The write machinery is gone rather than merely unused: keeping a working
-//! `CFPreferencesSetAppValue` path for a preference the module has decided not
-//! to write is an ability this module should not have.
+//! macOS keeps one bit of an AirPlay receiver's advertised size (`kCGSVirtualDisplay1080pMode`,
+//! `height >= 1080`, set in MediaToolbox), which picks the default entry of a fixed mode table.
+//! `wirelessdisplaymac_set_display_size` does not change that: CoreDisplay's custom-geometry
+//! branch also needs a `virtualDisplayResolution` key nothing writes (with the preference at 1,
+//! a 1440x900 request still produced 1280x720). So the preference is only read here: do not
+//! write a global user setting that buys nothing.
 
 use objc2_core_foundation::{CFNumber, CFRetained, CFString};
 
@@ -35,12 +18,8 @@ const KEY: &str = "wirelessdisplaymac_set_display_size";
 pub const MAX_WIDTH: u32 = 1920;
 pub const MAX_HEIGHT: u32 = 1080;
 
-/// What the receiver advertises in `/info`, regardless of what was requested.
-///
-/// The advertised size is not a request for that size — macOS keeps only one
-/// bit of it, `height >= 1080`, and that bit picks which mode ladder the
-/// display gets. Advertising 1080-tall is what makes 1920x1080 available at all;
-/// the client's actual geometry is then selected from the ladder.
+/// What the receiver advertises in `/info`, regardless of what was requested. macOS keeps only
+/// `height >= 1080` of it, and advertising 1080-tall is what makes 1920x1080 available at all.
 pub const ADVERTISED_WIDTH: u32 = 1920;
 pub const ADVERTISED_HEIGHT: u32 = 1080;
 /// The only refresh rate reachable on this path: the sender hardcodes 60 when it
@@ -66,8 +45,7 @@ fn read() -> Option<i64> {
         if v.is_null() {
             return None;
         }
-        // The value is written as a number; anything else we treat as absent
-        // rather than guessing at a coercion.
+        // a non-number is treated as absent
         let n = if CFGetTypeID(v) == CFNumberGetTypeID() {
             (*(v as *const CFNumber)).as_i64()
         } else {
@@ -83,10 +61,8 @@ pub fn exact_geometry_enabled() -> bool {
     read().is_some_and(|v| v != 0)
 }
 
-/// Clamps a requested geometry to what this path can actually produce.
-///
-/// Returns the geometry to advertise plus a note when something had to give, so
-/// the caller can log the difference instead of silently lying to the user.
+/// Clamps a requested geometry to what this path can produce. The note says what had to give,
+/// for the caller to log.
 pub fn clamp(width: u32, height: u32, refresh_hz: u32) -> (u32, u32, u32, Option<String>) {
     let w = width.clamp(2, MAX_WIDTH);
     let h = height.clamp(2, MAX_HEIGHT);
@@ -161,7 +137,7 @@ mod tests {
 
     #[test]
     fn reading_the_preference_does_not_panic() {
-        // May be absent; the point is that the FFI round-trips safely.
+        // may be absent: the point is that the FFI round-trips safely
         let _ = exact_geometry_enabled();
     }
 }

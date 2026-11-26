@@ -1,13 +1,11 @@
-// Runs audio-worklet.js — the client's jitter buffer — under Node, and drives real decoded
-// samples into it through audio-worker.js so the planar ring is exercised end to end by the two
-// files that actually own it.
+// Runs audio-worklet.js (the client's jitter buffer) under Node, and drives real decoded samples
+// into it through audio-worker.js, so the planar ring is exercised end to end by the two files
+// that own it.
 //
-// The ring's byte layout is described identically in three files (audio.js allocates,
-// audio-worker.js writes, audio-worklet.js reads) and nothing checked that they agree. A
-// disagreement is silent: the writer fills bytes nobody reads and the listener hears nothing.
-// So the shared-ring case here is a genuine cross-file contract test, not a restatement of the
-// layout — the worker writes and the worklet reads, and the samples either come out or they do
-// not. The private-ring case covers the postMessage transport the same way.
+// The ring's byte layout is a contract between three files (audio.js allocates, audio-worker.js
+// writes, audio-worklet.js reads), and a disagreement is silent: the writer fills bytes nobody
+// reads and the listener hears nothing. The shared-ring case has the worker write and the
+// worklet read; the private-ring case covers the postMessage transport the same way.
 //
 //   node scripts/test-client-worklet.mjs [path/to/static]
 import fs from 'node:fs';
@@ -28,7 +26,7 @@ const QUANTUM = 128;
 const CTRL_BYTES = 64;
 const CAP = 4096; // a power of two, small enough that overrun is reachable in a test
 
-// ── the worklet under a minimal AudioWorkletGlobalScope ──────────────────────────────────
+// the worklet under a minimal AudioWorkletGlobalScope
 function loadWorklet() {
   let Processor = null;
   const ctx = {
@@ -74,15 +72,14 @@ function pump(p, blocks) {
   return collected;
 }
 
-// ── 1. the capacity invariant ────────────────────────────────────────────────────────────
-// Absolute uint32 frame positions are masked with `pos & (cap-1)`, so a non-power-of-two
-// capacity silently aliases two ring slots onto one.
+// 1. The capacity invariant. Absolute uint32 frame positions are masked with `pos & (cap-1)`,
+//    so a non-power-of-two capacity silently aliases two ring slots onto one.
 let threw = false;
 try { makeProcessor({ capacityFrames: 5000 }); } catch (_) { threw = true; }
 if (threw) ok('a capacity that is not a power of two is refused, not silently aliased');
 else fail('the worklet accepted a non-power-of-two capacity');
 
-// ── 2. the shared ring, written by audio-worker.js and read by audio-worklet.js ───────────
+// 2. The shared ring, written by audio-worker.js and read by audio-worklet.js.
 const sab = new SharedArrayBuffer(CTRL_BYTES + CAP * 4 * 2);
 
 const decodedPosts = [];
@@ -145,21 +142,21 @@ for (let i = 0; i < 12; i++) packet(worker, 0.5);
 const played = pump(reader, 4);
 const allHalf = played.every((q) => q.every((s) => Math.abs(s - 0.5) < 1e-6));
 if (allHalf) ok('a sample written by audio-worker.js comes back out of audio-worklet.js unchanged');
-else fail('the shared ring round trip produced ' + played[0][0] + ', expected 0.5 — the two files disagree on the layout');
+else fail('the shared ring round trip produced ' + played[0][0] + ', expected 0.5: the two files disagree on the layout');
 
 // The reader's position must be visible to the writer, or the ring fills and never drains.
 const ctrl = new Int32Array(sab, 0, 16);
 if ((ctrl[1] >>> 0) === 4 * QUANTUM) ok('the worklet publishes its read position for the writer');
 else fail('read position is ' + (ctrl[1] >>> 0) + ', expected ' + 4 * QUANTUM);
 
-// ── 3. overrun accounting ────────────────────────────────────────────────────────────────
-// Fill past capacity: the writer must count the overrun rather than wrap over unread audio.
+// 3. Overrun accounting. Fill past capacity: the writer must count the overrun rather than
+//    wrap over unread audio.
 const beforeOverruns = ctrl[2];
 for (let i = 0; i < CAP / 240 + 4; i++) packet(worker, 0.25);
 if (ctrl[2] > beforeOverruns) ok('the writer counts an overrun instead of overwriting unread audio');
 else fail('a full ring did not register an overrun');
 
-// ── 4. priming: silence until the target depth, then audio ───────────────────────────────
+// 4. Priming: silence until the target depth, then audio.
 const primer = makeProcessor({ capacityFrames: CAP });
 primer.send({ type: 'samples', l: new Float32Array(QUANTUM).fill(0.9), r: new Float32Array(QUANTUM).fill(0.9) });
 const early = pump(primer, 1)[0];
@@ -174,7 +171,7 @@ const primed = pump(primer, 1)[0];
 if (primed.every((s) => Math.abs(s - 0.9) < 1e-6)) ok('once primed the private ring plays the samples the page relayed');
 else fail('the private-ring transport did not deliver: got ' + primed[0]);
 
-// ── 5. an underrun conceals with a decaying repeat, never a square-edged silence ─────────
+// 5. An underrun conceals with a decaying repeat, never a square-edged silence.
 const starved = pump(primer, 8);
 const firstStarved = starved.find((q) => q.some((s) => s !== 0.9));
 if (!firstStarved) fail('the ring never actually starved');
@@ -184,9 +181,8 @@ const tail = starved[starved.length - 1];
 if (Math.max(...tail.map(Math.abs)) < 0.9) ok('the concealment decays rather than looping forever');
 else fail('concealment is not decaying');
 
-// ── 6. drift is trimmed only at a silence boundary ───────────────────────────────────────
-// Correcting mid-phrase is audible; the whole design is to wait for a quiet moment. A ring
-// above its commanded target holding loud audio must be left alone.
+// 6. Drift is trimmed only at a silence boundary. Correcting mid-phrase is audible, so a ring
+//    above its commanded target holding loud audio must be left alone.
 function depthAfter(fill, targetMs) {
   const p = makeProcessor({ capacityFrames: CAP });
   p.send({ type: 'target', targetMs });
@@ -219,7 +215,7 @@ pump(flooded, 1);
 if (flooded.available() < floodedBefore - QUANTUM) ok('a quarter second of backlog is trimmed regardless of content');
 else fail('the hard slack limit did not fire on a flooded ring (' + floodedBefore + ' -> ' + flooded.available() + ')');
 
-// ── 7. a mode mismatch falls back rather than writing into a ring nobody reads ────────────
+// 7. A mode mismatch falls back rather than writing into a ring nobody reads.
 const mismatched = makeProcessor({ capacityFrames: CAP, sab });
 if (!mismatched.shared) fail('setup: the processor did not map the shared ring');
 mismatched.send({ type: 'mode', shared: false });
@@ -231,7 +227,7 @@ privateSide.send({ type: 'mode', shared: true });
 if (privateSide.posted.some((m) => m.type === 'mode-mismatch')) ok('the reverse mismatch is reported to the page, which is the only side that can fix it');
 else fail('a reader that could not map the ring did not tell the page');
 
-// ── 8. a discontinuity re-primes immediately ─────────────────────────────────────────────
+// 8. A discontinuity re-primes immediately.
 const disc = makeProcessor({ capacityFrames: CAP });
 for (let i = 0; i < 6; i++) {
   disc.send({ type: 'samples', l: new Float32Array(QUANTUM).fill(0.4), r: new Float32Array(QUANTUM).fill(0.4) });
@@ -243,7 +239,7 @@ disc.send({ type: 'discontinuity' });
 if (disc.priming === true) ok('a host-reported discontinuity re-primes at once instead of waiting for a silence boundary');
 else fail('a discontinuity did not re-prime');
 
-// ── 9. the MessageChannel handoff is acknowledged, which is what releases the far end ─────
+// 9. The MessageChannel handoff is acknowledged, which is what releases the far end.
 const ported = makeProcessor({ capacityFrames: CAP });
 const port = { postMessage() {}, onmessage: null };
 ported.send({ type: 'ringport', port });
@@ -253,9 +249,9 @@ ported.send({ type: 'samples', l: new Float32Array(QUANTUM).fill(0.2), r: new Fl
 if (typeof port.onmessage === 'function') ok('the worklet listens on the handed-over port');
 else fail('the handed-over port has no listener');
 
-// ── 10. stats report the commanded target, which is how audio.js measures A/V offset ─────
-// The free-running target adapts on underruns, so command one and assert the worklet reports
-// back the number it was given rather than its own.
+// 10. Stats report the commanded target, which is how audio.js measures A/V offset. The
+//     free-running target adapts on underruns, so command one and assert the worklet reports
+//     back the number it was given rather than its own.
 const statsProc = makeProcessor({ capacityFrames: BIG_CAP });
 statsProc.send({ type: 'target', targetMs: 20 });
 const quantum = () => statsProc.send({ type: 'samples', l: new Float32Array(QUANTUM).fill(0.1), r: new Float32Array(QUANTUM).fill(0.1) });

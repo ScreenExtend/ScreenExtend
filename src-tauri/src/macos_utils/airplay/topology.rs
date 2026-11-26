@@ -1,20 +1,10 @@
 //! Finding the display macOS created for us, and moving it out of the mirror set.
 //!
-//! Two jobs, both pure CoreGraphics and both public API:
-//!
-//! * **Detection** — diff `CGGetActiveDisplayList()` across the AirPlay connect
-//!   and pick the display that appeared. Polling rather than
-//!   `CGDisplayRegisterReconfigurationCallback`, because those callbacks are
-//!   delivered on the process's main run loop and `ScreenExtend serve` parks its
-//!   main thread on a channel receive without ever starting one. Registering on
-//!   a worker thread succeeds and then never fires.
-//! * **Extend** — macOS attaches an AirPlay display in *mirror* mode. The
-//!   "Use As Separate Display" menu item in `Displays.menu` is a one-line
-//!   trampoline into `-[MPDisplayMgr stopMirroringForDisplay:]`, which is
-//!   `CGBeginDisplayConfiguration` + `CGConfigureDisplayMirrorOfDisplay(cfg, id,
-//!   kCGNullDirectDisplay)` + `CGCompleteDisplayConfiguration(cfg,
-//!   kCGConfigurePermanently)`. That is all public, so we do it directly instead
-//!   of driving the menu.
+//! Detection polls the display list rather than using
+//! `CGDisplayRegisterReconfigurationCallback`: those callbacks need the main run loop, which
+//! `ScreenExtend serve` never starts (registering on a worker thread succeeds and never fires).
+//! Un-mirroring is the public CoreGraphics sequence behind "Use As Separate Display"
+//! (`-[MPDisplayMgr stopMirroringForDisplay:]`), done directly instead of driving the menu.
 
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
@@ -35,8 +25,8 @@ use crate::macos_utils::streamer::display::active_displays;
 /// `kCGNullDirectDisplay`.
 const NULL_DISPLAY: u32 = 0;
 
-/// Attach and reconfiguration both land in well under a second, so poll
-/// often — this interval is paid on every join.
+/// Poll often: attach and reconfiguration both land in well under a second, and this interval
+/// is paid on every join.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Snapshot of the active display set, taken before we ask macOS to connect.
@@ -46,23 +36,15 @@ pub fn baseline() -> Baseline {
     Baseline(active_displays().into_iter().collect())
 }
 
-/// The vendor and model CoreGraphics reports for a display macOS created for an
-/// AirPlay session.
-///
-/// MediaToolbox hands WindowServer a fixed `kCGSVirtualDisplayVendorID` /
-/// `kCGSVirtualDisplayModelID` pair when it brings an AirPlay display online, so
-/// these two numbers identify one exactly. Confirmed on the live display:
-/// `(1633775724, 1634300528)` = `b"aapl"`, `b"airp"`.
+/// The vendor and model CoreGraphics reports for a display macOS created for an AirPlay
+/// session: MediaToolbox hands WindowServer a fixed pair, `b"aapl"` / `b"airp"`
+/// (`(1633775724, 1634300528)` on the live display).
 const AIRPLAY_VENDOR: u32 = u32::from_be_bytes(*b"aapl");
 const AIRPLAY_MODEL: u32 = u32::from_be_bytes(*b"airp");
 
-/// Every display CoreGraphics knows about, including ones that are not drawable.
-///
-/// Deliberately the *online* list, not the active one. When macOS attaches an
-/// AirPlay session as a **mirror**, the AirPlay display is online but not
-/// active — mirror slaves are excluded from `CGGetActiveDisplayList` — so a
-/// search of the active list finds nothing and the session looks like it failed.
-/// We need to see it in order to un-mirror it, after which it becomes active.
+/// Every display CoreGraphics knows about. The online list, not the active one: a display
+/// attached as a mirror slave is excluded from `CGGetActiveDisplayList`, and we have to see it
+/// to un-mirror it.
 fn online_displays() -> Vec<u32> {
     const MAX_DISPLAYS: usize = 16;
     let mut ids = [0u32; MAX_DISPLAYS];
@@ -82,18 +64,11 @@ pub fn is_airplay_display(id: u32) -> bool {
 
 /// The exact mode every display was in before we touched the topology.
 ///
-/// Attaching an AirPlay display starts in **mirror** mode, and to mirror, macOS
-/// changes the built-in display's mode to match the AirPlay one. Un-mirroring
-/// does *not* put it back — the Mac's own screen is left at the client's
-/// resolution, showing as "Scaled" in Displays preferences until someone picks
-/// "Default for display" by hand. So we remember what every display was doing
-/// and restore it ourselves.
+/// To mirror, macOS changes the built-in display's mode to match the AirPlay one, and
+/// un-mirroring does not put it back, so we restore it ourselves.
 ///
-/// Stored as `io_display_mode_id`, not the `CGDisplayMode` object: the object is
-/// neither `Send` nor `Sync` so it cannot live in the session registry, and the
-/// id is the stable handle anyway — it is what distinguishes "Default for
-/// display" from a scaled mode of the same logical size, which is exactly the
-/// distinction that has to survive.
+/// Stored as `io_display_mode_id`: `CGDisplayMode` is neither `Send` nor `Sync`, and the id is
+/// what tells "Default for display" from a scaled mode of the same logical size.
 #[derive(Debug, Default)]
 pub struct ModeSnapshot(Vec<(u32, i32)>);
 
@@ -112,22 +87,15 @@ pub fn snapshot_modes() -> ModeSnapshot {
 }
 
 impl ModeSnapshot {
-    /// Puts every remembered display back the way it was, skipping `skip` — the
-    /// display we deliberately reconfigured.
-    ///
-    /// Returns how many were actually changed back.
+    /// Puts every remembered display except `skip` back the way it was. Returns how many were
+    /// changed back.
     pub fn restore_except(&self, skip: u32) -> usize {
         self.restore_and_set(skip, None)
     }
 
-    /// Restores every other display *and*, in the same commit, moves `target`
-    /// onto `mode`.
-    ///
-    /// `CGBeginDisplayConfiguration` exists to batch a whole topology change
-    /// into one commit, and this is exactly that case: the restore and the
-    /// target's own mode change used to be two consecutive configurations, each
-    /// of which blanks every attached screen for about a second, with a two
-    /// second settle poll hung off the second one. They are one now.
+    /// Restores every other display and, in the same commit, moves `target` onto `mode`. One
+    /// commit because each display configuration blanks every attached screen for about a
+    /// second.
     pub fn restore_and_set(&self, target: u32, mode: Option<(u32, u32)>) -> usize {
         let stale: Vec<(u32, i32)> = self
             .0
@@ -242,11 +210,8 @@ unsafe fn queue_size(
     }
 }
 
-/// The AirPlay display currently attached, if any.
-///
-/// Identity rather than a remembered id: reconfiguring the display topology can
-/// make macOS renumber displays, so an id captured a moment ago is not
-/// guaranteed to still name the same screen.
+/// The AirPlay display currently attached, if any. Found by identity, not a remembered id:
+/// reconfiguring the topology can make macOS renumber displays.
 pub fn find_airplay_display() -> Option<u32> {
     online_displays()
         .into_iter()
@@ -263,12 +228,9 @@ pub struct Attached {
 
 /// Waits for macOS to attach an AirPlay display.
 ///
-/// Identified by vendor/model rather than purely by diffing the active list,
-/// because macOS reuses the same `CGDirectDisplayID` across sessions: if a
-/// previous display has not finished going away, a genuinely new session
-/// reattaches *that* id and a diff would see nothing appear. A display that was
-/// already present is still ours to use — the baseline only lets us prefer a
-/// freshly-appeared one when there is a choice.
+/// Identified by vendor/model, not only by diffing the active list: macOS reuses the same
+/// `CGDirectDisplayID` across sessions, so a new session can reattach an id that never went
+/// away. The baseline only lets us prefer a freshly appeared one when there is a choice.
 pub fn wait_for_airplay_display(base: &Baseline, timeout: Duration) -> Result<Attached, String> {
     let deadline = Instant::now() + timeout;
     loop {
@@ -295,7 +257,7 @@ pub fn wait_for_airplay_display(base: &Baseline, timeout: Duration) -> Result<At
             return match fallback {
                 Some(a) => Ok(a),
                 None => Err(
-                    "macOS did not attach a display within the timeout — the AirPlay session was \
+                    "macOS did not attach a display within the timeout: the AirPlay session was \
                      never accepted, or it was accepted and no display was created"
                         .to_string(),
                 ),
@@ -340,7 +302,7 @@ pub fn stop_mirroring(id: u32) -> Result<(), String> {
 
         let err = CGConfigureDisplayMirrorOfDisplay(config, id, NULL_DISPLAY);
         if err != CGError::Success {
-            // Cancel rather than leaving a half-built configuration behind.
+            // cancel rather than leave a half-built configuration behind
             let _ = CGCompleteDisplayConfiguration(config, CGConfigureOption::ForAppOnly);
             return Err(format!(
                 "CGConfigureDisplayMirrorOfDisplay({id}, kCGNullDirectDisplay) -> CGError {}",
@@ -357,8 +319,7 @@ pub fn stop_mirroring(id: u32) -> Result<(), String> {
         }
     }
 
-    // The reconfiguration is asynchronous; let it land before the caller starts
-    // capturing.
+    // the reconfiguration is asynchronous: let it land before the caller captures
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
         if !is_mirroring(id) {
@@ -371,11 +332,9 @@ pub fn stop_mirroring(id: u32) -> Result<(), String> {
     ))
 }
 
-/// Every mode macOS published for a display, as `(width, height, refresh)`.
-///
-/// An AirPlay display gets a fixed ladder synthesised by CoreDisplay rather
-/// than anything derived from an EDID, so this is the complete set of
-/// geometries reachable with `CGDisplaySetDisplayMode` once it exists.
+/// Every mode macOS published for a display, as `(width, height, refresh)`. CoreDisplay
+/// synthesises a fixed ladder for an AirPlay display (no EDID), so this is the complete set of
+/// reachable geometries.
 pub fn available_modes(id: u32) -> Vec<(u32, u32, u32)> {
     let mut out = Vec::new();
     unsafe {
@@ -400,20 +359,12 @@ pub fn available_modes(id: u32) -> Vec<(u32, u32, u32)> {
     out
 }
 
-/// The published mode closest to what was asked for, or `None` when the display
-/// is already there and nothing needs to change.
+/// The published mode closest to what was asked for, or `None` when the display is already
+/// there.
 ///
-/// macOS decides an AirPlay display's *initial* size from a single bit — whether
-/// the advertised height reached 1080 — so a request for anything else lands on
-/// 1280x720 or 1920x1080. But it then publishes a real ladder of modes, and
-/// those are selectable like any other display's. This is what turns "the size
-/// macOS felt like" into "the size the client asked for", whenever the request
-/// is on the ladder.
-///
-/// Selection only: the move itself is queued into the same display
-/// configuration as the other displays' restores
-/// ([`ModeSnapshot::restore_and_set`]) so the two are one commit rather than
-/// two screen blanks.
+/// macOS picks an AirPlay display's initial size from one bit (advertised height >= 1080), so
+/// it starts at 1280x720 or 1920x1080, then publishes a ladder of modes that are selectable
+/// like any other display's. Selection only: `ModeSnapshot::restore_and_set` queues the move.
 pub fn closest_mode(id: u32, want: (u32, u32)) -> Option<(u32, u32)> {
     let current = geometry(id);
     if current == want {
@@ -425,8 +376,7 @@ pub fn closest_mode(id: u32, want: (u32, u32)) -> Option<(u32, u32)> {
         return None;
     }
 
-    // Exact match first; otherwise the mode closest in area that does not
-    // distort the aspect ratio more than the alternatives.
+    // an exact match scores 0; otherwise aspect error counts double against area error
     let target_aspect = want.0 as f64 / want.1.max(1) as f64;
     let target_area = want.0 as f64 * want.1 as f64;
     let chosen = modes
@@ -459,10 +409,8 @@ pub fn closest_mode(id: u32, want: (u32, u32)) -> Option<(u32, u32)> {
     Some((w, h))
 }
 
-/// Waits for a queued mode change to land, and reports the geometry in effect.
-///
-/// A display configuration commits asynchronously, so the caller cannot read the
-/// new size straight afterwards.
+/// Waits for a queued mode change to land and reports the geometry in effect. A display
+/// configuration commits asynchronously.
 pub fn settle_geometry(id: u32, want: (u32, u32), timeout: Duration) -> (u32, u32) {
     let deadline = Instant::now() + timeout;
     loop {
@@ -484,15 +432,11 @@ pub fn settle_geometry(id: u32, want: (u32, u32), timeout: Duration) -> (u32, u3
     }
 }
 
-/// Switches a display to a published mode, as a *permanent* configuration.
+/// Switches a display to a published mode, as a permanent configuration.
 ///
-/// Deliberately not `CGDisplaySetDisplayMode`. That call scopes the change to
-/// the calling application, and macOS then keeps the display alive until that
-/// application exits — measured here: with `CGDisplaySetDisplayMode` the AirPlay
-/// display survived 48 s past the end of its session and only vanished when the
-/// process died, while without any mode change it disappeared immediately.
-/// Going through a display configuration committed with `kCGConfigurePermanently`
-/// gets the same geometry without the process association.
+/// Not `CGDisplaySetDisplayMode`: that scopes the change to the calling application, and macOS
+/// then keeps the display alive until the application exits (measured: the AirPlay display
+/// survived 48 s past its session and went only when the process died).
 pub(crate) fn set_mode_permanently(id: u32, width: u32, height: u32) -> Result<(), String> {
     if geometry(id) == (width, height) {
         return Ok(());
@@ -504,7 +448,7 @@ pub(crate) fn set_mode_permanently(id: u32, width: u32, height: u32) -> Result<(
             return Err(format!("CGBeginDisplayConfiguration -> CGError {}", err.0));
         }
         if let Err(e) = queue_size(config, id, width, height) {
-            // Cancel rather than leaving a half-built configuration behind.
+            // cancel rather than leave a half-built configuration behind
             let _ = CGCompleteDisplayConfiguration(config, CGConfigureOption::ForAppOnly);
             return Err(e);
         }
@@ -533,12 +477,9 @@ pub const MODE_SETTLE: Duration = Duration::from_secs(2);
 
 /// Hands every display configuration this process made back to the system.
 ///
-/// Any `CGCompleteDisplayConfiguration` we perform — the un-mirror, or a mode
-/// change — associates the affected display with this process, and macOS then
-/// keeps an AirPlay display alive until we exit rather than removing it when its
-/// session ends. Measured: 48 s and counting, versus immediate removal when we
-/// never touched the configuration. This is the documented way to drop that
-/// association, and it is what makes teardown prompt.
+/// Any `CGCompleteDisplayConfiguration` we perform associates the display with this process,
+/// and macOS then keeps an AirPlay display alive until we exit (measured: 48 s and counting,
+/// versus immediate removal untouched). This drops the association.
 pub fn release_display_configuration() {
     unsafe { CGRestorePermanentDisplayConfiguration() };
 }
@@ -562,9 +503,8 @@ pub fn geometry(id: u32) -> (u32, u32) {
 mod tests {
     use super::*;
 
-    /// CoreGraphics only reports displays to a process in a console session.
-    /// Over ssh — which is how this crate is usually tested on the 10.15 box —
-    /// every list comes back empty, so the display tests have nothing to say.
+    /// CoreGraphics only reports displays to a process in a console session. Over ssh every
+    /// list comes back empty.
     fn has_a_console_session() -> bool {
         !active_displays().is_empty()
     }
@@ -597,11 +537,8 @@ mod tests {
 
     #[test]
     fn whatever_is_found_is_an_airplay_display_and_not_the_builtin() {
-        // The name used to promise "none is found when none is attached" and the
-        // body was an `if let` that ran no assertion in exactly that case — the
-        // one the name describes. Both halves are now stated: the search agrees
-        // with the predicate, and the built-in is never the answer, because the
-        // built-in is what the host would otherwise start capturing and resizing.
+        // the search agrees with the predicate, and the built-in is never the answer: it is
+        // what the host would otherwise start capturing and resizing
         let found = find_airplay_display();
         match found {
             Some(id) => {
@@ -612,8 +549,7 @@ mod tests {
                 assert!(is_airplay_display(id));
             }
             None => {
-                // Nothing was found, so nothing on this machine may satisfy the
-                // predicate either. That is the assertion the old name promised.
+                // nothing found, so nothing on this machine may satisfy the predicate either
                 let matching: Vec<_> = active_displays()
                     .into_iter()
                     .filter(|id| is_airplay_display(*id))

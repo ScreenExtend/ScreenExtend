@@ -12,11 +12,8 @@ export function Sidebar() {
   const location = useLocation();
 
   return (
-    // `transition-all` here was inert during the collapse -- nothing on this element
-    // changes while the wrapper's width animates -- but it made the style system keep a
-    // full transition snapshot of the element on every recalc, on the same subtree as a
-    // 300 ms per-frame layout. The one property that really does flip is the right border
-    // at the lg breakpoint, so that is all it now tracks.
+    // only the right border flips (at lg), so transition just that: `transition-all` keeps a
+    // full transition snapshot on every recalc of the 300 ms collapse
     <div className="absolute bg-background z-10 border-r lg:border-r-0 lg:relative h-screen lg:block transition-[border-right-width] duration-500 max-w-full left-0" id="innerSidebar">
       <div className="space-y-4 h-full flex flex-col w-full border-r">
         <div className="px-3 py-2 pt-0 h-full">

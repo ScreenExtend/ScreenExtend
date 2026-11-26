@@ -28,18 +28,10 @@ type FrameHandler = RcBlock<
     dyn Fn(CGDisplayStreamFrameStatus, u64, *mut IOSurfaceRef, *const CGDisplayStreamUpdate),
 >;
 
-// ---------------------------------------------------------------------------
-// CGDisplayStream, resolved at runtime rather than linked against.
-//
-// The whole API is *obsoleted* — not merely deprecated — in the macOS 15 SDK, and this is the
-// fallback tier, reached only where ScreenCaptureKit is absent. A link-time reference to a symbol
-// Apple has announced the end of is a bet that the loader will keep finding it, and on the day it
-// does not, dyld fails the *entire binary* before `main` and every other feature goes with it.
-// That is the rule this codebase already applies to ScreenCaptureKit and to the newer VideoToolbox
-// keys, applied in the other direction: to an API on its way out rather than one not yet in.
-//
-// `nm -u target/release/ScreenExtend | grep -i displaystream` must print nothing.
-// ---------------------------------------------------------------------------
+// CGDisplayStream, the capture tier below ScreenCaptureKit, is resolved by dlsym, never linked:
+// the API is obsoleted (not just deprecated) in the macOS 15 SDK, and a link-time symbol dyld
+// cannot find fails the whole binary before `main`.
+// `nm -u target/release/ScreenExtend | grep -i displaystream` must print nothing
 
 type CreateFn = unsafe extern "C" fn(
     display: u32,
@@ -68,9 +60,8 @@ struct CgDisplayStreamApi {
     ycbcr_709: &'static CFString,
 }
 
-// Function pointers and immutable framework string constants. `CFString` is not `Sync` because a
-// CFString can be mutable in general; these five are process-lifetime constants inside
-// CoreGraphics that nothing writes to.
+// SAFETY: function pointers plus five process-lifetime CoreGraphics string constants nothing
+// writes to (`CFString` is not `Sync` only because one can be mutable in general)
 unsafe impl Send for CgDisplayStreamApi {}
 unsafe impl Sync for CgDisplayStreamApi {}
 
@@ -134,20 +125,15 @@ pub struct CgDisplayStreamBackend {
     cfg: CaptureConfig,
     sink: Arc<FrameSink>,
     frames: Arc<AtomicU64>,
-    /// Frames WindowServer produced that never reached us, summed from
-    /// `CGDisplayStreamUpdateGetDropCount`. CoreGraphics computes this on every delivery and
-    /// hands it to us in the update we were already holding; not reading it is why every
-    /// question about this capture path — is `queueDepth` starving us, is the
-    /// `minimumFrameTime` hold-off costing frames, is WindowServer contention the real problem —
-    /// could only be answered by hypothesis.
+    /// Frames WindowServer produced that were never delivered, summed from
+    /// `CGDisplayStreamUpdateGetDropCount` (CoreGraphics computes it on every delivery).
     drops: Arc<AtomicU64>,
     wrap_ns: Arc<AtomicU64>,
     telemetry: SharedTelemetry,
     stream: Option<CFRetained<CGDisplayStream>>,
     _queue: Option<DispatchRetained<DispatchQueue>>,
     _handler: Option<FrameHandler>,
-    /// Stops the once-a-second reporter. The delivery block is a real-time dispatch callback, so
-    /// it only ever does a relaxed `fetch_add`; the logging happens on a thread of its own.
+    /// Stops the once-a-second drop reporter thread.
     report_stop: Option<Arc<AtomicBool>>,
     report_thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -182,39 +168,33 @@ impl CgDisplayStreamBackend {
         self.frames.load(Ordering::Relaxed)
     }
 
-    /// Frames WindowServer produced and threw away because we were not keeping up, summed over
-    /// the session. Apple documents `CGDisplayStreamUpdateGetDropCount` as *"primarily useful
-    /// for performance measurement to determine if the client is keeping up with all
-    /// WindowServer updates"* — it is the only capture-side back-pressure signal this API has,
-    /// and near zero is the signal that we are keeping up.
+    /// Frames WindowServer produced and threw away because this client was not keeping up,
+    /// summed over the session. The only capture-side back-pressure signal this API has: near
+    /// zero is healthy.
     pub fn frames_dropped(&self) -> u64 {
         self.drops.load(Ordering::Relaxed)
     }
 
     /// Mean nanoseconds spent inside the delivery callback wrapping the surface and publishing
-    /// it — the whole per-frame allocation cost this backend pays, measured rather than argued
-    /// about. Two monotonic clock reads and one relaxed add per frame; no allocation.
+    /// it. Costs two monotonic clock reads and one relaxed add per frame; no allocation.
     fn mean_wrap_ns(&self) -> Option<u64> {
         let frames = self.frames.load(Ordering::Relaxed);
         (frames > 0).then(|| self.wrap_ns.load(Ordering::Relaxed) / frames)
     }
 }
 
-/// Surfaces the stream keeps in flight.
-///
-/// Apple's own default is 3. Ours was 2, while the pipeline held two at once — the frame in the
-/// latest-wins slot and the one pinned as `last_frame` for the keepalive — plus whatever
-/// VideoToolbox retains, so the stream had nothing free to composite into. OBS uses 5 on the
-/// same API; measured here, 2 collapses a 58 fps capture to one frame in six seconds the moment
-/// an encoder joins the holding pattern.
+/// Surfaces the stream keeps in flight. Apple's default is 3 and OBS uses 5. The pipeline holds
+/// two at once (the latest-wins slot and `last_frame` for the keepalive) plus whatever
+/// VideoToolbox retains: at 2 the stream has nothing free to composite into, and a 58 fps
+/// capture collapses to one frame in six seconds.
 const QUEUE_DEPTH: isize = 5;
 
 /// Capture A/B switches, read once from the environment (the bench `live` stage sets them; a
-/// shipped host never does). Unset means today's properties, unchanged:
+/// shipped host never does). Unset leaves the default properties:
 ///
-/// - `SE_CGDS_QUEUE_DEPTH=<n>` — `kCGDisplayStreamQueueDepth` (default [`QUEUE_DEPTH`]).
-/// - `SE_CGDS_MIN_FRAME_TIME=<seconds>` — adds `kCGDisplayStreamMinimumFrameTime` (default: absent,
-///   see below; `0` sets it explicitly to zero).
+/// - `SE_CGDS_QUEUE_DEPTH=<n>`: `kCGDisplayStreamQueueDepth` (default [`QUEUE_DEPTH`]).
+/// - `SE_CGDS_MIN_FRAME_TIME=<seconds>`: adds `kCGDisplayStreamMinimumFrameTime` (absent by
+///   default, see `make_cg_properties`; `0` sets it explicitly to zero).
 #[derive(Clone, Debug, Default)]
 struct CgdsKnobs {
     queue_depth: Option<isize>,
@@ -226,7 +206,7 @@ fn cgds_knobs() -> &'static CgdsKnobs {
     static KNOBS: OnceLock<CgdsKnobs> = OnceLock::new();
     KNOBS.get_or_init(|| {
         let mut k = CgdsKnobs::default();
-        let var = |n: &str| std::env::var(n).ok().filter(|v| !v.trim().is_empty());
+        let var = |n: &str| crate::envcfg::var(n).ok().filter(|v| !v.trim().is_empty());
         if let Some(v) = var("SE_CGDS_QUEUE_DEPTH") {
             match v.trim().parse::<isize>() {
                 Ok(n) if (1..=32).contains(&n) => k.queue_depth = Some(n),
@@ -262,16 +242,15 @@ fn make_cg_properties(api: &CgDisplayStreamApi) -> Option<CFRetained<CFDictionar
     let show_cursor = CFBoolean::new(true);
     let preserve_ar = CFBoolean::new(false);
     let min_frame_time = knobs.min_frame_time_s.map(CFNumber::new_f64);
-    // Resolved only when asked for; absent from the dictionary otherwise.
+    // resolved only when asked for; absent from the dictionary otherwise
     let key_min_frame_time = min_frame_time
         .as_ref()
         .and_then(|_| cf_constant(b"kCGDisplayStreamMinimumFrameTime\0"));
 
-    // `kCGDisplayStreamMinimumFrameTime` is deliberately absent. Its documented default is
-    // zero, so setting it added a throttle rather than relaxing one: after a delivery the
-    // stream refuses to deliver again for that long, which delays every update that lands
-    // mid-interval by up to a frame period (mean ~8 ms at 60 fps). OBS does not set it either.
-    // (`SE_CGDS_MIN_FRAME_TIME` puts it back, for an A/B measurement only.)
+    // `kCGDisplayStreamMinimumFrameTime` is deliberately absent: its documented default is zero,
+    // so setting it adds a throttle. After a delivery the stream refuses to deliver again for
+    // that long, delaying an update that lands mid-interval (mean ~8 ms at 60 fps). OBS does not
+    // set it either. `SE_CGDS_MIN_FRAME_TIME` adds it, for an A/B measurement only.
     let mut keys: Vec<*const c_void> = vec![
         (api.key_queue_depth as *const CFString).cast(),
         (api.key_show_cursor as *const CFString).cast(),
@@ -331,8 +310,8 @@ fn handle_frame(
     let (sink, frames, width, height) = (&ctx.sink, &ctx.frames, ctx.width, ctx.height);
 
     if let Some(update_ref) = unsafe { update.as_ref() } {
-        // WindowServer counts what it had to throw away because our surfaces were still busy.
-        // Three relaxed atomics on the delivery queue; no allocation, no logging.
+        // what WindowServer threw away because our surfaces were still busy. This is the
+        // delivery queue: relaxed atomics only, no allocation, no logging
         let dropped = unsafe { (ctx.api.drop_count)(update_ref) } as u64;
         if dropped != 0 {
             ctx.drops.fetch_add(dropped, Ordering::Relaxed);
@@ -347,11 +326,9 @@ fn handle_frame(
         return;
     }
 
-    // Skip a frame whose dirty-rect list is empty — nothing changed, so re-encoding it buys
-    // nothing. Except the *first* one: a client that joins a still display (a freshly created
-    // virtual display is exactly that, and it stays still until the user drags a window onto
-    // it) would otherwise wait for the first change to see anything at all, and the 200 ms
-    // keepalive cannot rescue it because the pipeline has no previous frame to repeat.
+    // skip a frame with no dirty rects, except the first: a client joining a still display (a
+    // new virtual display is one until a window is dragged onto it) would see nothing until
+    // the first change, and the 200 ms keepalive has no previous frame to repeat
     if ctx.published_one.load(Ordering::Relaxed) {
         if let Some(update_ref) = unsafe { update.as_ref() } {
             let mut rect_count: usize = 0;
@@ -374,8 +351,8 @@ fn handle_frame(
         let Some(out) = NonNull::new(out) else {
             return;
         };
-        // CoreVideo can return non-zero *and* hand back a +1 buffer; taking ownership first and
-        // dropping it is what stops that path leaking one CVPixelBuffer per bad frame.
+        // CoreVideo can return non-zero and still hand back a +1 buffer: take ownership before
+        // the check so that path does not leak a CVPixelBuffer per bad frame
         let pixbuf = CFRetained::from_raw(out);
         if r != 0 {
             return;
@@ -397,7 +374,7 @@ fn handle_frame(
                 _surface: HeldSurface::hold(surface_ret),
             },
         });
-        // Only now is the gate armed, so a failed wrap does not consume the one free pass.
+        // armed only now, so a failed wrap does not consume the one free pass
         ctx.published_one.store(true, Ordering::Relaxed);
         ctx.wrap_ns.fetch_add(
             super::mach::mach_delta_ns(wrap_started, mach_now()),
@@ -462,7 +439,7 @@ impl CaptureBackend for CgDisplayStreamBackend {
             )
         };
         let stream = NonNull::new(stream).ok_or(CaptureError::StreamCreateFailed)?;
-        // The create call is a `Create`, so the stream arrives +1 and this takes that ownership.
+        // Create rule: the stream arrives +1 and `from_raw` takes that ownership
         let stream: CFRetained<CGDisplayStream> = unsafe { CFRetained::from_raw(stream) };
 
         let err = unsafe { (api.start)((&*stream as *const CGDisplayStream).cast_mut()) };
@@ -488,8 +465,8 @@ impl CaptureBackend for CgDisplayStreamBackend {
     }
 
     fn stop(&mut self) {
-        // The reporter goes first: it reads the same counters the stop line below prints, and
-        // joining it afterwards would race a thread that is about to log a partial total.
+        // reporter first: it reads the counters the stop line below prints, and joined later it
+        // could still log a partial total
         if let Some(stop) = self.report_stop.take() {
             stop.store(true, Ordering::Relaxed);
         }
@@ -513,11 +490,9 @@ impl CaptureBackend for CgDisplayStreamBackend {
 }
 
 impl CgDisplayStreamBackend {
-    /// One thread, one line a second, and only when the number moved.
-    ///
-    /// The delivery block runs on a `UserInteractive` dispatch queue and must not allocate or do
-    /// I/O — every logbus line is a JSON IPC event to the UI — so the callback only counts and
-    /// this reports.
+    /// One thread, one line a second, and only when the number moved. The delivery block runs on
+    /// a `UserInteractive` dispatch queue and must not allocate or do I/O, so the callback only
+    /// counts and this reports.
     fn start_drop_reporter(&mut self) {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
@@ -618,13 +593,13 @@ mod tests {
         SessionTelemetry::new_shared()
     }
 
-    /// The W5 measurement instrument: delivered frame rate, WindowServer drop count, and the
-    /// `displayTime → our callback` delivery latency, on the main display with animated content.
-    /// Every capture-side change in `docs/OPTIMIZATIONS.md` is A/B'd with this.
+    /// Measures delivered frame rate, WindowServer drop count and the `displayTime` to callback
+    /// delivery latency, on the main display with animated content: the A/B instrument for a
+    /// capture-side change.
     ///
     /// The main display, not a virtual one: a freshly created `CGVirtualDisplay` has no windows
-    /// and the cursor cannot be warped onto it, so it produces literally zero dirty rects and
-    /// measures nothing (that emptiness is its own finding — see `probe_virtual_display`).
+    /// and the cursor cannot be warped onto it, so it produces zero dirty rects and measures
+    /// nothing.
     #[test]
     #[ignore = "requires a console session, Screen Recording and animated content on the main display; run with --ignored --nocapture"]
     fn capture_rate() {
@@ -653,8 +628,8 @@ mod tests {
             CgDisplayStreamBackend::new(id, gpu, sink, cfg, test_telemetry()).expect("backend");
         backend.start().expect("capture starts");
 
-        // Drain like the encode loop does, so the surface-holding pattern under test is the
-        // production one: take the latest frame, hold it until the next arrives.
+        // drain like the encode loop does, so surfaces are held the production way: take the
+        // latest frame, hold it until the next arrives
         let mut delivery_ms: Vec<f64> = Vec::new();
         let mut taken = 0usize;
         let mut no_os_stamp = 0usize;
@@ -668,8 +643,8 @@ mod tests {
                 if frame.os_time_raw_ns == 0 {
                     no_os_stamp += 1;
                 } else {
-                    // Signed: CGDisplayStream's `displayTime` is *"when the frame was to be
-                    // displayed by the WindowServer"*, which can be ahead of our callback.
+                    // signed: `displayTime` is when WindowServer was to display the frame,
+                    // which can be ahead of our callback
                     delivery_ms.push((arrived as i64 - frame.os_time_raw_ns as i64) as f64 / 1e6);
                 }
                 held = Some(frame);
@@ -713,8 +688,8 @@ mod tests {
     /// All scaling is delegated to it: the stream is created at the encode size and no
     /// `SourceRect`, `DestinationRect` or scaling-quality key is set, so a client asking for half
     /// resolution makes the compositor resample every frame before we see it. Run this next to
-    /// `capture_rate` (which captures at native size) and compare the two `displayTime→callback`
-    /// distributions. If they match, the scaler is free and `gpu.rs` has nothing to do.
+    /// `capture_rate` (native size) and compare the two `displayTime` to callback distributions.
+    /// If they match, the scaler is free and `gpu.rs` has nothing to do.
     #[test]
     #[ignore = "the half-scale A/B of capture_rate; same requirements; run with --ignored --nocapture"]
     fn capture_rate_downscaled() {

@@ -1,17 +1,13 @@
 //! Hand-written FFI for AMD's Advanced Media Framework (AMF) C API.
 //!
-//! Same philosophy as `nvidia/nvenc_sys`: **no SDK at build time, no import library.** The AMF
-//! runtime ships with the Radeon driver as `amfrt64.dll`; it is loaded with `libloading` at
-//! runtime and only two exported functions are resolved — `AMFInit` and `AMFQueryVersion`.
+//! No SDK at build time and no import library: `amfrt64.dll` ships with the Radeon driver, is
+//! loaded with `libloading`, and only `AMFInit` and `AMFQueryVersion` are resolved from it.
 //! Everything else is reached through COM-like vtables, whose slot order is in `vtbl.rs`.
+//! `dumpbin /imports ScreenExtend.exe | findstr /i amf` must print nothing: with `amfrt64` in the
+//! import table the binary stops starting on every machine without a Radeon driver.
 //!
-//! `dumpbin /imports target\release\ScreenExtend.exe | findstr /i amf` must print nothing. If
-//! `amfrt64` ever appears in the import table something linked instead of loading, and the
-//! binary stops starting on every machine without a Radeon driver.
-//!
-//! Provenance of every constant: `src-tauri/resources/amf-headers` (AMF 1.5.2.0, MIT), measured
-//! by `src-tauri/tools/amf_layout_gen.c` and asserted in
-//! `windows_utils/streamer/test/amd_layout.rs`.
+//! Every constant comes from `src-tauri/resources/amf-headers` (AMF 1.5.2.0, MIT), measured by
+//! `src-tauri/tools/amf_layout_gen.c` and asserted in `windows_utils/streamer/test/amd_layout.rs`.
 
 #![allow(non_snake_case, non_camel_case_types, dead_code)]
 
@@ -28,8 +24,7 @@ use std::ffi::c_void;
 use anyhow::{Context as _, Result};
 
 /// `AMFInit` and `AMFQueryVersion` are `__cdecl`; every vtable method is `__stdcall`. On x64
-/// Windows both collapse into the single Microsoft x64 calling convention, so this is only a
-/// documentation difference — but it is a real one on x86, which this project does not ship.
+/// Windows both are the one Microsoft x64 convention; they differ on x86, which is not shipped.
 type AMFInitFn = unsafe extern "C" fn(amf_uint64, *mut *mut AMFFactory) -> AMF_RESULT;
 type AMFQueryVersionFn = unsafe extern "C" fn(*mut amf_uint64) -> AMF_RESULT;
 
@@ -47,12 +42,11 @@ unsafe impl Send for Amf {}
 
 impl Amf {
     /// Loads `amfrt64.dll`. A missing DLL is the normal outcome on any machine without a Radeon
-    /// driver (and `LoadLibrary` error 126 also shows up on minimal driver installs and boxes
-    /// missing the VC runtime) — it is a clean `Err`, not something to surface to the user.
+    /// driver (`LoadLibrary` error 126 also shows up on minimal driver installs and boxes missing
+    /// the VC runtime): a clean `Err`, not something to surface to the user.
     pub fn load() -> Result<Self> {
-        // SAFETY: `Library::new` runs the DLL's entry point. `amfrt64.dll` is a normal
-        // user-mode library installed by the Radeon driver; loading it has no side effects
-        // beyond its own initialisation.
+        // SAFETY: `Library::new` runs the DLL's entry point; `amfrt64.dll` is a normal user-mode
+        // library with no side effects beyond its own initialisation.
         let lib = unsafe { libloading::Library::new("amfrt64.dll") }.context(
             "loading amfrt64.dll (the AMF runtime; ships with the AMD Radeon/Adrenalin driver)",
         )?;
@@ -76,7 +70,7 @@ impl Amf {
         })
     }
 
-    /// The runtime's own version. Logged for support and used for **nothing else** — every
+    /// The runtime's own version. Logged for support and used for **nothing else**: every
     /// optional feature is probed. Never parse the DLL's `ProductVersion` resource instead: a
     /// 2025 driver shipped it as `1.5.0.0;1.2;CL`.
     pub fn query_version(&self) -> Result<amf_uint64> {
@@ -87,11 +81,10 @@ impl Amf {
         Ok(v)
     }
 
-    /// Creates the factory. `version` is what we were *built* against, not what the runtime is:
-    /// AMF serves clients built against older SDKs and rejects newer ones, so
-    /// [`AMFINIT_VERSION`] is pinned low.
+    /// Creates the factory. `version` is the SDK version the client claims; see
+    /// [`AMFINIT_VERSION`] for why it is pinned and when it is retried lower.
     ///
-    /// The returned factory is a DLL-owned singleton — never `Release` it.
+    /// The returned factory is a DLL-owned singleton: never `Release` it.
     pub fn init_factory(&self, version: amf_uint64) -> Result<*mut AMFFactory> {
         let mut factory: *mut AMFFactory = std::ptr::null_mut();
         // SAFETY: exported `AMFInit`; the out-parameter is a live local, and the returned
@@ -129,7 +122,7 @@ pub enum AmfErrorClass {
 /// Classifies an `AMF_RESULT` for the submit/query loop.
 ///
 /// `AMF_RESOLUTION_CHANGED`'s own header comment is "client needs to Drain/Terminate/Init", and
-/// `AMF_NO_DEVICE` / `AMF_DIRECTX_FAILED` are the device-lost class — all three mean rebuild,
+/// `AMF_NO_DEVICE` / `AMF_DIRECTX_FAILED` are the device-lost class: all three mean rebuild,
 /// not abandon. `AMF_ENCODER_NOT_PRESENT`, `AMF_SURFACE_FORMAT_NOT_SUPPORTED` and
 /// `AMF_INVALID_RESOLUTION` are configuration facts about this machine and never improve.
 pub fn classify(r: AMF_RESULT) -> AmfErrorClass {
@@ -160,7 +153,7 @@ pub fn check(r: AMF_RESULT, what: &str) -> Result<()> {
 ///
 /// # Safety
 /// `p` must be a live pointer to an AMF object whose vtable starts with the `AMFPropertyStorage`
-/// prefix — that is, anything but `AMFFactory`, `AMFTrace` and `AMFPlane`.
+/// prefix, that is, anything but `AMFFactory`, `AMFTrace` and `AMFPlane`.
 pub unsafe fn as_property_storage<T>(p: *mut T) -> *mut AMFPropertyStorage {
     p.cast()
 }
@@ -180,7 +173,7 @@ pub unsafe fn set_property(
         "property names must be NUL-terminated"
     );
     // SAFETY: vtable slot 3 (AMFPropertyStorage::SetProperty). The variant is passed by value,
-    // which on x64 Windows means by hidden reference to this stack copy — valid for the call.
+    // which on x64 Windows means by hidden reference to this stack copy, valid for the call.
     unsafe { ((*(*storage).pVtbl).SetProperty)(storage, name.as_ptr(), value) }
 }
 
@@ -202,7 +195,7 @@ pub unsafe fn get_property(
     }
 }
 
-/// `AMFPropertyStorage::HasProperty`, vtable slot 5 — the cheap "does this build of the runtime
+/// `AMFPropertyStorage::HasProperty`, vtable slot 5, the cheap "does this build of the runtime
 /// know the property at all" probe, and the reason `GetPropertyInfo` is never called.
 ///
 /// # Safety

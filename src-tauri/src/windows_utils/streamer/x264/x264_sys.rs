@@ -7,24 +7,24 @@ use libloading::{Library, Symbol};
 
 pub const X264_BUILD: i32 = 164;
 
-// --- colour space (i_csp) ---
+// colour space (i_csp)
 pub const X264_CSP_MASK: c_int = 0x00ff;
 pub const X264_CSP_I420: c_int = 0x0002;
 pub const X264_CSP_NV12: c_int = 0x0004;
 pub const X264_CSP_BGRA: c_int = 0x000f;
 
-// --- picture type (i_type) ---
+// picture type (i_type)
 pub const X264_TYPE_AUTO: c_int = 0x0000;
 pub const X264_TYPE_IDR: c_int = 0x0001;
 pub const X264_TYPE_I: c_int = 0x0002;
 pub const X264_TYPE_P: c_int = 0x0003;
 
-// --- rate control (rc.i_rc_method) ---
+// rate control (rc.i_rc_method)
 pub const X264_RC_CQP: c_int = 0;
 pub const X264_RC_CRF: c_int = 1;
 pub const X264_RC_ABR: c_int = 2;
 
-// --- log level (i_log_level) ---
+// log level (i_log_level)
 pub const X264_LOG_NONE: c_int = -1;
 pub const X264_LOG_ERROR: c_int = 0;
 pub const X264_LOG_WARNING: c_int = 1;
@@ -33,7 +33,7 @@ pub const X264_LOG_DEBUG: c_int = 3;
 
 pub const X264_KEYINT_MAX_INFINITE: c_int = 1 << 30;
 
-// --- NAL unit types (nal_unit_type_e) ---
+// NAL unit types (nal_unit_type_e)
 pub const NAL_UNKNOWN: c_int = 0;
 pub const NAL_SLICE: c_int = 1;
 pub const NAL_SLICE_IDR: c_int = 5;
@@ -364,8 +364,6 @@ type FnParamDefaultPreset =
     unsafe extern "C" fn(*mut x264_param_t, *const c_char, *const c_char) -> c_int;
 type FnParamApplyProfile = unsafe extern "C" fn(*mut x264_param_t, *const c_char) -> c_int;
 type FnEncoderOpen = unsafe extern "C" fn(*mut x264_param_t) -> *mut x264_t;
-type FnEncoderHeaders =
-    unsafe extern "C" fn(*mut x264_t, *mut *mut x264_nal_t, *mut c_int) -> c_int;
 type FnEncoderEncode = unsafe extern "C" fn(
     *mut x264_t,
     *mut *mut x264_nal_t,
@@ -374,12 +372,9 @@ type FnEncoderEncode = unsafe extern "C" fn(
     *mut x264_picture_t,
 ) -> c_int;
 type FnEncoderReconfig = unsafe extern "C" fn(*mut x264_t, *mut x264_param_t) -> c_int;
-type FnEncoderIntraRefresh = unsafe extern "C" fn(*mut x264_t);
 type FnEncoderDelayedFrames = unsafe extern "C" fn(*mut x264_t) -> c_int;
-/// `void x264_encoder_parameters(x264_t *, x264_param_t *)` — the *effective* parameters, after
-/// the preset, the tune, `param_apply_profile` and libx264's own validation have all had their
-/// say. Without it every claim about the encoder's configuration is a claim about what was
-/// asked for.
+/// `void x264_encoder_parameters(x264_t *, x264_param_t *)`: the effective parameters, after
+/// the preset, the tune, `param_apply_profile` and libx264's own validation.
 type FnEncoderParameters = unsafe extern "C" fn(*mut x264_t, *mut x264_param_t);
 type FnEncoderClose = unsafe extern "C" fn(*mut x264_t);
 type FnPictureInit = unsafe extern "C" fn(*mut x264_picture_t);
@@ -390,10 +385,8 @@ pub struct X264Api {
     pub param_default_preset: FnParamDefaultPreset,
     pub param_apply_profile: FnParamApplyProfile,
     pub encoder_open: FnEncoderOpen,
-    pub encoder_headers: FnEncoderHeaders,
     pub encoder_encode: FnEncoderEncode,
     pub encoder_reconfig: FnEncoderReconfig,
-    pub encoder_intra_refresh: FnEncoderIntraRefresh,
     pub encoder_delayed_frames: FnEncoderDelayedFrames,
     pub encoder_parameters: FnEncoderParameters,
     pub encoder_close: FnEncoderClose,
@@ -406,83 +399,121 @@ unsafe impl Sync for X264Api {}
 
 const LIB_NAMES: &[&str] = &["libx264-164.dll", "libx264.dll", "x264.dll"];
 
-fn open_library() -> Result<(Library, std::path::PathBuf)> {
-    let mut last_err: Option<String> = None;
-    let attempt = |candidate: std::path::PathBuf, last_err: &mut Option<String>| match unsafe {
-        Library::new(&candidate)
-    } {
-        Ok(lib) => Some((lib, candidate)),
-        Err(e) => {
-            *last_err = Some(format!("{}: {e}", candidate.display()));
-            None
-        }
-    };
-
+/// Every place a libx264 is looked for, in order.
+///
+/// The app directory (and, for a test binary in `target/<profile>/deps/`, its parent, where
+/// cargo stages `resources/`), then the checkout's own `resources/` under `cargo test`, then
+/// the bare names. A bare name is loaded with `LOAD_LIBRARY_SEARCH_DEFAULT_DIRS` (see
+/// [`load_flags`]), so it reaches the application directory, System32 and any
+/// `AddDllDirectory` path, and never the current directory or `PATH`: a DLL's `DllMain` runs
+/// inside the HIGH_PRIORITY_CLASS host before any ABI check can refuse it.
+pub(crate) fn library_candidates() -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
-        // `dir` is the app directory for a shipped build. For a test binary it is
-        // `target/<profile>/deps/`, one level below where cargo stages `resources/`, hence
-        // the grandparent probe — without it the software-encode tests found no libx264 and
-        // "passed" having encoded nothing.
         let dirs = exe
             .parent()
             .into_iter()
             .chain(exe.parent().and_then(|d| d.parent()));
         for dir in dirs {
             for name in LIB_NAMES {
-                if let Some(lib) = attempt(dir.join("resources").join(name), &mut last_err) {
-                    return Ok(lib);
-                }
-                if let Some(lib) = attempt(dir.join(name), &mut last_err) {
-                    return Ok(lib);
-                }
+                out.push(dir.join("resources").join(name));
+                out.push(dir.join(name));
             }
         }
     }
-
     #[cfg(test)]
     for name in LIB_NAMES {
-        let staged = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("resources")
-            .join(name);
-        if let Some(lib) = attempt(staged, &mut last_err) {
-            return Ok(lib);
-        }
+        out.push(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("resources")
+                .join(name),
+        );
     }
-
     for name in LIB_NAMES {
-        if let Some(lib) = attempt(std::path::PathBuf::from(name), &mut last_err) {
-            return Ok(lib);
-        }
+        out.push(std::path::PathBuf::from(name));
     }
-
-    for build in (150..=175).rev() {
-        if let Some(lib) = attempt(
-            std::path::PathBuf::from(format!("libx264-{build}.dll")),
-            &mut last_err,
-        ) {
-            return Ok(lib);
-        }
-    }
-
-    Err(anyhow!(
-        "could not load libx264 (tried bundled resources, exe dir, PATH for {:?}, and \
-         libx264-<150..175>.dll): {}",
-        LIB_NAMES,
-        last_err.unwrap_or_default()
-    ))
+    out
 }
 
-/// `x264_param_t` is hand-translated for exactly one ABI (build 164) and libx264 is not
-/// ABI-stable across builds — `i_bitdepth`, `i_avcintra_flavor`, `mastering_display`,
-/// `content_light_level` and `i_alternative_transfer` were each inserted at different builds.
-/// A mismatched library reading a build-164 struct is not a clean failure; it is libx264
-/// reading and writing the wrong offsets.
+/// `LoadLibraryExW` flags for one candidate. An absolute path resolves its own imports from its
+/// own directory first (`DLL_LOAD_DIR`) and then the safe default set; a bare name is searched
+/// for in the safe default set only. Neither consults the current directory or `PATH`.
+pub(crate) fn load_flags(candidate: &std::path::Path) -> u32 {
+    use libloading::os::windows::{
+        LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
+    };
+    if candidate.is_absolute() {
+        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS
+    } else {
+        LOAD_LIBRARY_SEARCH_DEFAULT_DIRS
+    }
+}
+
+/// Load one candidate and accept it only if it carries the build-164 ABI stamp. Checked per
+/// candidate, so a `libx264.dll` of another build earlier in the order does not hide a good
+/// `libx264-164.dll` further down.
+fn open_validated(candidate: &std::path::Path) -> std::result::Result<Library, String> {
+    let flags = load_flags(candidate);
+    let lib: Library =
+        match unsafe { libloading::os::windows::Library::load_with_flags(candidate, flags) } {
+            Ok(lib) => lib.into(),
+            Err(e) => return Err(format!("{}: {e}", candidate.display())),
+        };
+    if let Some(b) = unsafe { read_build(&lib) }.filter(|&b| b != X264_BUILD) {
+        return Err(format!(
+            "{}: refused, reports x264_build {b} but the vendored x264_param_t is pinned to \
+             build {X264_BUILD}",
+            candidate.display()
+        ));
+    }
+    if let Err(e) = unsafe { resolve_encoder_open(&lib) } {
+        return Err(format!(
+            "{}: refused, loads but does not export x264_encoder_open_{X264_BUILD}, so it is \
+             not build {X264_BUILD} and its x264_param_t layout would not match the vendored \
+             one ({e})",
+            candidate.display()
+        ));
+    }
+    Ok(lib)
+}
+
+/// The first candidate `open` accepts, or every refusal in order. Generic so the rule "keep
+/// going past a library that loads but is refused" is testable without a filesystem.
+pub(crate) fn first_accepted<T>(
+    candidates: &[std::path::PathBuf],
+    mut open: impl FnMut(&std::path::Path) -> std::result::Result<T, String>,
+) -> std::result::Result<(T, std::path::PathBuf), Vec<String>> {
+    let mut refused = Vec::new();
+    for candidate in candidates {
+        match open(candidate) {
+            Ok(v) => return Ok((v, candidate.clone())),
+            Err(e) => refused.push(e),
+        }
+    }
+    Err(refused)
+}
+
+fn open_library_from(candidates: &[std::path::PathBuf]) -> Result<(Library, std::path::PathBuf)> {
+    first_accepted(candidates, open_validated).map_err(|refused| {
+        // a library that loaded and was refused is the refusal worth reading, so those lead
+        let (wrong, missing): (Vec<_>, Vec<_>) =
+            refused.into_iter().partition(|r| r.contains(": refused,"));
+        anyhow!(
+            "could not load a build-{X264_BUILD} libx264 (tried bundled resources, the exe dir \
+             and the safe system search for {:?}). Refused: [{}]. Not loadable: [{}]",
+            LIB_NAMES,
+            wrong.join("; "),
+            missing.join("; ")
+        )
+    })
+}
+
+/// `x264_param_t` is hand-translated for exactly one ABI (build 164), and libx264 is not
+/// ABI-stable across builds: a mismatched library reads and writes the wrong offsets.
 ///
-/// libx264 versions `x264_encoder_open` by mangling the build number into the symbol name for
-/// exactly this reason, so the exported name is the ABI stamp. Resolving only
-/// `x264_encoder_open_164` is therefore the check — accepting a neighbouring build, as the
-/// loader used to, meant proceeding with an ABI we know is wrong. `x264_build` is read too
-/// where it exists, but the shipped MinGW DLL exports functions only, so it cannot be required.
+/// libx264 mangles the build number into the `x264_encoder_open` symbol name, so resolving only
+/// `x264_encoder_open_164` is the ABI check. `x264_build` is read too where it exists, but the
+/// shipped MinGW DLL exports functions only, so it cannot be required.
 unsafe fn read_build(lib: &Library) -> Option<i32> {
     let sym: Symbol<*const c_int> = unsafe { lib.get(b"x264_build\0") }.ok()?;
     Some(unsafe { **sym })
@@ -501,16 +532,30 @@ impl X264Api {
         &self.path
     }
 
-    pub fn load() -> Result<Self> {
-        let (lib, path) = open_library()?;
-        let build = unsafe { read_build(&lib) };
-        if let Some(b) = build.filter(|&b| b != X264_BUILD) {
-            return Err(anyhow!(
-                "libx264 at {} reports x264_build {b}, but the vendored x264_param_t is pinned \
-                 to build {X264_BUILD}",
-                path.display()
-            ));
+    /// The process-wide libx264, loaded once.
+    ///
+    /// A success is kept for the life of the process, so the DLL is never unloaded under a live
+    /// encoder handle; a failure is not kept, so a later session tries again.
+    pub fn shared() -> Result<&'static X264Api> {
+        static API: std::sync::OnceLock<X264Api> = std::sync::OnceLock::new();
+        if let Some(api) = API.get() {
+            return Ok(api);
         }
+        let loaded = Self::load()?;
+        // two first sessions racing both load; the loser's handle drops (one FreeLibrary on a
+        // reference-counted module) and both use the winner
+        let _ = API.set(loaded);
+        API.get()
+            .ok_or_else(|| anyhow!("libx264 loaded but the process-wide handle was not kept"))
+    }
+
+    pub fn load() -> Result<Self> {
+        Self::load_from(&library_candidates())
+    }
+
+    pub(crate) fn load_from(candidates: &[std::path::PathBuf]) -> Result<Self> {
+        let (lib, path) = open_library_from(candidates)?;
+        let build = unsafe { read_build(&lib) };
         unsafe {
             let param_default_preset: Symbol<FnParamDefaultPreset> = lib
                 .get(b"x264_param_default_preset\0")
@@ -518,18 +563,12 @@ impl X264Api {
             let param_apply_profile: Symbol<FnParamApplyProfile> = lib
                 .get(b"x264_param_apply_profile\0")
                 .context("resolving x264_param_apply_profile")?;
-            let encoder_headers: Symbol<FnEncoderHeaders> = lib
-                .get(b"x264_encoder_headers\0")
-                .context("resolving x264_encoder_headers")?;
             let encoder_encode: Symbol<FnEncoderEncode> = lib
                 .get(b"x264_encoder_encode\0")
                 .context("resolving x264_encoder_encode")?;
             let encoder_reconfig: Symbol<FnEncoderReconfig> =
                 lib.get(b"x264_encoder_reconfig\0")
                     .context("resolving x264_encoder_reconfig")?;
-            let encoder_intra_refresh: Symbol<FnEncoderIntraRefresh> = lib
-                .get(b"x264_encoder_intra_refresh\0")
-                .context("resolving x264_encoder_intra_refresh")?;
             let encoder_parameters: Symbol<FnEncoderParameters> = lib
                 .get(b"x264_encoder_parameters\0")
                 .context("resolving x264_encoder_parameters")?;
@@ -542,13 +581,10 @@ impl X264Api {
             let picture_init: Symbol<FnPictureInit> = lib
                 .get(b"x264_picture_init\0")
                 .context("resolving x264_picture_init")?;
-
+            // `open_validated` already proved this resolves; this is for the pointer
             let encoder_open = resolve_encoder_open(&lib).with_context(|| {
                 format!(
-                    "libx264 at {} does not export x264_encoder_open_{X264_BUILD}, so it is not \
-                     build {X264_BUILD} and its x264_param_t layout will not match the vendored \
-                     one. Refusing it rather than reading it at the wrong offsets — install the \
-                     bundled libx264-{X264_BUILD}.dll or take the mismatched libx264 off PATH.",
+                    "resolving x264_encoder_open_{X264_BUILD} in {}",
                     path.display()
                 )
             })?;
@@ -559,10 +595,8 @@ impl X264Api {
                 param_default_preset: *param_default_preset,
                 param_apply_profile: *param_apply_profile,
                 encoder_open,
-                encoder_headers: *encoder_headers,
                 encoder_encode: *encoder_encode,
                 encoder_reconfig: *encoder_reconfig,
-                encoder_intra_refresh: *encoder_intra_refresh,
                 encoder_delayed_frames: *encoder_delayed_frames,
                 encoder_parameters: *encoder_parameters,
                 encoder_close: *encoder_close,

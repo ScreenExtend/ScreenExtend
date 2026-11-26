@@ -6,7 +6,7 @@
 # Usage:
 #   ./scripts/fetch-libaspl.sh && ./scripts/build.sh    # x86_64, unsigned
 #   SE_ARCHS="x86_64 arm64" ./scripts/build.sh          # universal (needs an SDK that can)
-#   SE_SIGN_IDENTITY="Developer ID Application: …" ./scripts/build.sh
+#   SE_SIGN_IDENTITY="Developer ID Application: ..." ./scripts/build.sh
 #   SE_CLEAN=1 ./scripts/build.sh                       # discard the object cache first
 set -euo pipefail
 
@@ -16,7 +16,6 @@ OUT="${BUILD}/ScreenExtendAudio.driver"
 
 die() { echo "error: $*" >&2; exit 1; }
 
-# locate libASPL
 LIBASPL_DIR="${SE_LIBASPL_DIR:-${LIBASPL_DIR:-}}"
 if [ -z "${LIBASPL_DIR}" ] && [ -d "${HERE}/third_party/libASPL/include/aspl" ]; then
   LIBASPL_DIR="${HERE}/third_party/libASPL"
@@ -26,10 +25,10 @@ if [ -z "${LIBASPL_DIR}" ] || [ ! -d "${LIBASPL_DIR}/include/aspl" ]; then
 fi
 echo "libASPL: ${LIBASPL_DIR}"
 
-command -v xcrun >/dev/null 2>&1 || die "xcrun is not on PATH — install the Command Line Tools"
-SDK="$(xcrun --show-sdk-path 2>/dev/null)" || die "xcrun --show-sdk-path failed — no SDK selected"
+command -v xcrun >/dev/null 2>&1 || die "xcrun is not on PATH: install the Command Line Tools"
+SDK="$(xcrun --show-sdk-path 2>/dev/null)" || die "xcrun --show-sdk-path failed: no SDK selected"
 [ -d "${SDK}" ] || die "the SDK path xcrun reported is not a directory: ${SDK}"
-CXX="$(xcrun -f clang++ 2>/dev/null)" || die "xcrun -f clang++ failed — no toolchain"
+CXX="$(xcrun -f clang++ 2>/dev/null)" || die "xcrun -f clang++ failed: no toolchain"
 [ -x "${CXX}" ] || die "clang++ is not executable: ${CXX}"
 echo "SDK: ${SDK}"
 

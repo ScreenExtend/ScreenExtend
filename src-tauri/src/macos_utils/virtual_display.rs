@@ -24,13 +24,11 @@ extern "C" {
 }
 const DISPATCH_QUEUE_PRIORITY_HIGH: isize = 2;
 const DEFAULT_PPI: f64 = 96.0;
-/// MAC-DISPLAY-4K. The declared pixel density of a 4K-class panel (both axes at or above
-/// 3840x2160). At 96 PPI such a panel is a 40-inch screen, and macOS gives it a scaled "looks
-/// like" default — 3840x2160 came up at 1920x1080, 4096x2160 at 1920x1012 — whatever mode list
-/// it registered, and the native mode can then only be selected through
-/// `CGDisplaySetDisplayMode`, whose mode list macOS 26 withholds for every display after a
-/// process's first. Declared at 200 PPI the same panel comes up at 3840x2160, first display and
-/// later ones alike (measured on the M1, macOS 26.7.1; 60 PPI behaves as 96).
+/// Declared pixel density of a 4K-class panel (both axes at or above 3840x2160). At 96 PPI macOS
+/// gives such a panel a scaled "looks like" default (3840x2160 came up at 1920x1080), and the
+/// native mode is then only reachable through `CGDisplaySetDisplayMode`, whose mode list macOS 26
+/// withholds for every display after a process's first. At 200 PPI it comes up native, first
+/// display and later ones alike (M1, macOS 26.7.1; 60 PPI behaves as 96).
 const LARGE_PANEL_PPI: f64 = 200.0;
 
 fn panel_ppi(width: u32, height: u32) -> f64 {
@@ -41,11 +39,11 @@ fn panel_ppi(width: u32, height: u32) -> f64 {
     }
 }
 
-/// A pre-registered mode is normally visible on the first `CGDisplayCopyAllDisplayModes`, so the
-/// find loop should not need a second pass at all. The deadline stays as a backstop.
+/// Backstop: a pre-registered mode is normally visible on the first
+/// `CGDisplayCopyAllDisplayModes`.
 const MODE_FIND_TIMEOUT: Duration = Duration::from_millis(1500);
 const MODE_SETTLE_TIMEOUT: Duration = Duration::from_millis(1500);
-/// Poll tightly at first — a settle that takes 20 ms should cost 20 ms, not 50.
+/// Poll tightly at first: a settle that takes 20 ms should cost 20 ms, not 50.
 const FAST_POLL_WINDOW: Duration = Duration::from_millis(250);
 const FAST_POLL: Duration = Duration::from_millis(5);
 const SLOW_POLL: Duration = Duration::from_millis(25);
@@ -200,11 +198,10 @@ fn to_logical((width, height): (u32, u32), hidpi: u32) -> (u32, u32) {
 
 /// The mode list to register at `applySettings:` time, in points.
 ///
-/// macOS is not Windows here: `hiDPI` is one flag over the whole settings object, so the DPR
-/// ladder cannot be expressed as a mode list the way the IDD does it. What a mode list *does* buy
-/// on macOS is every geometry the session can reach without another `applySettings:` — the primary
-/// mode, its transpose (so an orientation flip is a pure mode switch), and the ladder's other
-/// resolutions with their transposes.
+/// `hiDPI` is one flag over the whole settings object, so unlike the Windows IDD the DPR ladder
+/// cannot be a mode list. What the list buys is every geometry the session can reach without
+/// another `applySettings:`: the primary mode, its transpose (so an orientation flip is a pure
+/// mode switch), and the ladder's other resolutions with their transposes.
 fn mode_list(width: u32, height: u32, hidpi: u32, extra_backing: &[(u32, u32)]) -> Vec<(u32, u32)> {
     fn push(modes: &mut Vec<(u32, u32)>, m: (u32, u32)) {
         if m.0 >= 2 && m.1 >= 2 && !modes.contains(&m) {
@@ -246,11 +243,9 @@ unsafe fn make_settings(
     settings
 }
 
-/// `refreshDeadline`, `rotation` and `isReference` were added to `CGVirtualDisplaySettings`
-/// somewhere between 10.14.6 and the present. Log what this machine has, once, so a report from
-/// the field says which levers were even available. Nothing is set: `refreshDeadline` is the only
-/// latency-named knob on the WindowServer side of this boundary, but its units and semantics are
-/// unpublished and it cannot be measured on the 10.15 floor, where the property does not exist.
+/// Log once which of `refreshDeadline`, `rotation` and `isReference` this machine's
+/// `CGVirtualDisplaySettings` has (all added after 10.14.6). Nothing is set: `refreshDeadline`
+/// has unpublished units and semantics, and does not exist on the 10.15 floor.
 fn report_settings_surface() {
     static ONCE: OnceLock<()> = OnceLock::new();
     ONCE.get_or_init(|| {
@@ -282,11 +277,9 @@ fn report_settings_surface() {
     });
 }
 
-/// WindowServer can tear a virtual display down under us — a log out, a fast user switch, a real
-/// display hot-plug that forces a topology rebuild. The descriptor has always been given a
-/// dispatch queue for exactly this callback; until now nothing was registered on it, so the
-/// registry kept a live handle to a display that no longer existed and the session kept streaming
-/// a display id that resolved to nothing.
+/// WindowServer can tear a virtual display down under us (a log out, a fast user switch, a real
+/// display hot-plug that forces a topology rebuild). This drops the registry's handle when it
+/// does, so a session does not keep streaming a display id that resolves to nothing.
 unsafe fn install_termination_handler(desc: &CGVirtualDisplayDescriptor, token: u32) {
     let responds: bool = objc2::msg_send![desc, respondsToSelector: sel!(setTerminationHandler:)];
     if !responds {
@@ -312,32 +305,21 @@ unsafe fn install_termination_handler(desc: &CGVirtualDisplayDescriptor, token: 
         }
     });
     desc.setTerminationHandler(&handler);
-    // The handler outlives every Rust owner: WindowServer may run it at any point up to and past
-    // the display's own teardown, so the block is deliberately never freed. It is one small
-    // allocation per display created.
+    // deliberately leaked: WindowServer may run the handler up to and past the display's own
+    // teardown. One small allocation per display created
     std::mem::forget(handler);
 }
 
-/// The display's serial number, derived from its name so that the same client device gets the same
-/// display identity every time.
+/// The display's serial number: FNV-1a of its identity string, folded away from 0 because a
+/// serial of 0 reads as "unset".
 ///
-/// macOS keys per-display state — arrangement position, colour profile, resolution preference — on
-/// vendor/product/serial. The serial used to be a process-local counter starting at 1, so the
-/// *first* device to join after every launch inherited whatever arrangement the previous run's
-/// first device had left behind, and a returning device never got its own back. `name` is
-/// `"ScreenExtend - <device name>"`, which is the most stable per-device identity that reaches this
-/// layer.
-///
-/// FNV-1a, folded away from 0 because a serial of 0 reads as "unset".
-///
-/// MAC-DISPLAY-ORIGIN: the identity is the device name AND the size it is created at
-/// ([`display_identity`]). WindowServer restores the geometry it remembers for an identity, and
-/// with one identity per device a size change came up at the old size and, once re-applied, at the
-/// old origin — 1920 wide at x = -800 over the built-in panel — where no origin change could move
-/// it (WindowServer still snaps a left neighbour to the remembered width: -1920 is read back as
-/// -800, and on every display after a process's first `CGConfigureDisplayOrigin` fails outright).
-/// Per device and size, what is remembered is always a geometry of exactly this size, so the
-/// user's arrangement for it comes back and can never overlap.
+/// macOS keys per-display state (arrangement position, colour profile, resolution preference) on
+/// vendor/product/serial, so a stable serial gives a returning device its own arrangement back.
+/// The identity is the device name AND the size ([`display_identity`]): WindowServer restores the
+/// geometry it remembers for an identity, so one identity per device brings a resized display up
+/// at the remembered size and origin (1920 wide at x = -800 over the built-in panel), and no
+/// origin change can move it: WindowServer snaps a left neighbour to the remembered width, and
+/// `CGConfigureDisplayOrigin` fails outright on every display after a process's first.
 fn display_serial(name: &str) -> u32 {
     let mut hash: u32 = 0x811c_9dc5;
     for byte in name.as_bytes() {
@@ -415,7 +397,7 @@ unsafe fn create_with_identity(
     desc.setMaxPixelsWide(max_wide);
     desc.setMaxPixelsHigh(max_high);
     #[cfg(test)]
-    let ppi = std::env::var("SE_EXP_PPI")
+    let ppi = crate::envcfg::var("SE_EXP_PPI")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(panel_ppi(width, height));
@@ -436,7 +418,7 @@ unsafe fn create_with_identity(
 
     let display = CGVirtualDisplay::initWithDescriptor(CGVirtualDisplay::alloc(), &desc)
         .ok_or_else(|| {
-            "CGVirtualDisplay initWithDescriptor returned nil — the private API is \
+            "CGVirtualDisplay initWithDescriptor returned nil: the private API is \
              unavailable or the app is missing the com.apple.CG.virtual-display \
              entitlement"
                 .to_string()
@@ -444,7 +426,7 @@ unsafe fn create_with_identity(
 
     if !display.applySettings(&settings) {
         return Err(
-            "CGVirtualDisplay applySettings returned NO — the requested mode is \
+            "CGVirtualDisplay applySettings returned NO: the requested mode is \
              invalid or the display was already destroyed"
                 .to_string(),
         );
@@ -484,10 +466,9 @@ fn reconfigure_signal() -> &'static ReconfigureSignal {
     })
 }
 
-/// What WindowServer has told this process about one display id. Ids are reused — on 10.15 every
-/// display a process creates gets the SAME id — and for some milliseconds after a create CoreGraphics
-/// still answers for the display that was just removed, so a reading is evidence about a display
-/// only after an Add event newer than the create (MAC-DISPLAY-FRESH).
+/// What WindowServer has told this process about one display id. Ids are reused (on 10.15 every
+/// display a process creates gets the SAME id) and CoreGraphics briefly still answers for the
+/// removed display, so a reading counts only after an Add event newer than the create.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 struct IdEvents {
     adds: u64,
@@ -566,12 +547,10 @@ unsafe extern "C-unwind" fn on_display_reconfigured(
 
 /// Whether WindowServer's reconfiguration events are reaching us.
 ///
-/// `CGDisplayRegisterReconfigurationCallback` is 10.3+, but it delivers on the run loop of the
-/// thread that registered it — and the join path runs on a `spawn_blocking` worker with no run
-/// loop of its own. So the registration lives on a thread that exists to run one. The answer is
-/// only ever an accelerator: `wait_for_settle` re-reads the geometry on a bounded timeout whether
-/// or not an event ever arrives, so a machine where the callback never fires is no slower than the
-/// poll it replaced.
+/// `CGDisplayRegisterReconfigurationCallback` (10.3+) delivers on the run loop of the thread that
+/// registered it, and the join path runs on a `spawn_blocking` worker with none, so the
+/// registration lives on a thread that exists to run one. The events are only an accelerator:
+/// `wait_for_settle` re-reads the geometry on a bounded timeout whether or not one arrives.
 fn reconfiguration_events_available() -> bool {
     static STARTED: OnceLock<bool> = OnceLock::new();
     *STARTED.get_or_init(|| {
@@ -609,10 +588,8 @@ fn reconfiguration_events_available() -> bool {
     })
 }
 
-/// Wait for `display_id` to report `width x height` points.
-///
-/// Event-driven where WindowServer will tell us, with the previous poll cadence as the ceiling on
-/// how long a missed event can cost.
+/// Wait for `display_id` to report `width x height` points. Event-driven where WindowServer
+/// will tell us, with a poll as the ceiling on what a missed event can cost.
 fn wait_for_settle(display_id: u32, width: u32, height: u32) -> Result<(), String> {
     wait_for_settle_until(
         display_id,
@@ -676,11 +653,9 @@ pub(crate) fn activate_mode(display_id: u32, width: u32, height: u32) -> Result<
     let switched = unsafe {
         let find_deadline = started + MODE_FIND_TIMEOUT;
         loop {
-            // A display created a moment ago is not online yet: `CGDisplayCopyAllDisplayModes`
-            // answers nil until WindowServer has brought it up. That is "not yet", exactly like a
-            // mode missing from the list, and gets the same bounded retry. Failing at the first
-            // nil left the display in whatever mode macOS restored for this display identity —
-            // the last size that identity had — instead of the one the client asked for.
+            // `CGDisplayCopyAllDisplayModes` answers nil until WindowServer has brought a new
+            // display up: "not yet", retried like a missing mode. Failing at the first nil would
+            // leave the display at whatever size macOS restored for its identity.
             let Some(modes) = CGDisplayCopyAllDisplayModes(display_id, None) else {
                 nil_polls += 1;
                 if Instant::now() < find_deadline {
@@ -772,10 +747,9 @@ fn registry() -> &'static Mutex<DisplayRegistry> {
     })
 }
 
-/// The geometry we last applied to a display we created, in backing pixels, plus its refresh and
-/// HiDPI flag. `CGDisplayPixelsWide` reports *points*, so a caller that wants to re-apply a
-/// geometry cannot read it back from CoreGraphics without halving it a second time on every HiDPI
-/// round trip.
+/// The geometry last applied to a display we created, in backing pixels, plus refresh and HiDPI
+/// flag. `CGDisplayPixelsWide` reports *points*, so reading it back from CoreGraphics would halve
+/// it again on every HiDPI round trip.
 pub fn applied_backing(device_name: &str) -> Option<(u32, u32, u32, u32)> {
     let id: u32 = device_name.trim().parse().ok()?;
     let guard = registry().lock().unwrap();
@@ -827,7 +801,7 @@ pub fn probe_display_backend() -> DisplayBackend {
         if cd_virtual_display_available() {
             tprintln!(
                 "[display] CGVirtualDisplay is absent but CoreDisplay exports CDVirtualDisplayCreate \
-                 — a direct C path may be possible on this OS; please report this"
+                 (a direct C path may be possible on this OS); please report this"
             );
         }
         DisplayBackend::AirPlayFallback
@@ -854,13 +828,11 @@ pub fn new_shared_controller() -> Option<SharedVirtualDisplay> {
 
 /// Flip a display we created between 1x and HiDPI without changing its geometry.
 ///
-/// The caller used to compute this from `CGDisplayPixelsWide`, which reports points — so asking
-/// for HiDPI on a display that was already HiDPI halved it again. Working from the geometry we
-/// remember applying makes the call idempotent, which in turn makes it free on the join path now
-/// that the display is born at the client's DPR.
+/// Works from the geometry we remember applying, not `CGDisplayPixelsWide` (which reports
+/// points, so a second HiDPI request would halve it again). That makes the call idempotent.
 pub fn set_display_hidpi(device_name: &str, hidpi: u32) -> Result<(), String> {
     let Some((width, height, refresh, current)) = applied_backing(device_name) else {
-        // Not a display we created — the AirPlay tier owns its own mode list.
+        // not a display we created: the AirPlay tier owns its own mode list
         return Ok(());
     };
     if current == hidpi {
@@ -890,13 +862,10 @@ pub fn reconfigure_display(
 
     if super::airplay::owns_display(id) {
         let (logical_w, logical_h) = to_logical((width, height), hidpi);
-        // Deliberately not `activate_mode`. That is `CGDisplaySetDisplayMode`,
-        // which scopes the change to the calling process and makes macOS hold
-        // the display open until that process exits — measured at 48 s past the
-        // end of a session, which is exactly why `airplay::topology` routes
-        // every mode change through a `kCGConfigurePermanently` configuration
-        // instead. Calling it here, on the display that module had just
-        // created, undid the precaution on every single join.
+        // Deliberately not `activate_mode`: `CGDisplaySetDisplayMode` scopes the change to the
+        // calling process and makes macOS hold the display open until that process exits
+        // (48 s past the end of a session), so the AirPlay tier changes modes through a
+        // `kCGConfigurePermanently` configuration.
         return super::airplay::topology::set_mode_permanently(id, logical_w, logical_h).map_err(|e| {
             let ladder = super::airplay::topology::available_modes(id)
                 .iter()
@@ -904,7 +873,7 @@ pub fn reconfigure_display(
                 .collect::<Vec<_>>()
                 .join(", ");
             format!(
-                "{e}. This display was created over AirPlay, so its geometry is whatever macOS negotiated — the only modes macOS published for it are: {ladder}"
+                "{e}. This display was created over AirPlay, so its geometry is whatever macOS negotiated. The only modes macOS published for it are: {ladder}"
             )
         });
     }
@@ -926,11 +895,11 @@ pub fn reconfigure_display(
     };
 
     let (logical_w, logical_h) = to_logical((width, height), hidpi);
-    // SCREENS-GUARD: before our display is touched.
+    // screens guard: snapshot before our display is touched
     let screens = foreign_screens();
 
-    // A geometry already covered by the registered mode list at the same HiDPI is a plain mode
-    // switch — no mode-list rewrite, no WindowServer settings round trip.
+    // a geometry already in the registered mode list at the same HiDPI is a plain mode switch:
+    // no mode-list rewrite, no WindowServer settings round trip
     let covered = applied.hidpi == hidpi
         && applied.refresh == refresh
         && applied.modes.contains(&(logical_w, logical_h));
@@ -982,9 +951,8 @@ const ATTEMPT_BUDGET: Duration = Duration::from_millis(4000);
 const ORIGIN_SETTLE_TIMEOUT: Duration = Duration::from_millis(1000);
 
 /// A display is online when it is in the active list with a non-degenerate geometry. A 10.15
-/// display that has just been created reads 1x1 while it attaches — that is "not up yet", never
-/// "at a remembered size" (measured: a re-apply on such a display left it never attaching, a
-/// failed join, 1 of 20 runs).
+/// display that has just been created reads 1x1 while it attaches: that is "not up yet", never
+/// "at a remembered size" (a re-apply on such a display left it never attaching, 1 run in 20).
 fn is_online(id: u32) -> bool {
     display_is_active(id)
         && unsafe { CGDisplayPixelsWide(id) >= 64 && CGDisplayPixelsHigh(id) >= 64 }
@@ -1039,19 +1007,16 @@ fn offline_for_test() -> bool {
     false
 }
 
-/// Run the calling thread's run loop for up to `seconds`.
+/// `SE_MAIN_PUMP=1` (opt-in, unproven): run the main thread's run loop in `serve` and the bench.
 ///
-/// On the main thread this is what keeps CoreGraphics' picture of the displays current: WindowServer's
-/// changes are delivered to the main run loop, and a process up for a few seconds without one can
-/// stop seeing the displays it creates (0x0 for good, every attempt, while every other process
-/// sees them online). The desktop app always has one (wry); `serve` parked its main thread
-/// (MAC-DISPLAY-STALE).
-/// Opt-in, unproven (`SE_MAIN_PUMP=1`): run the main thread's run loop in `serve` and the bench. One batch
-/// of fresh processes stopped seeing their displays with main blocked and not with it running; a second
-/// showed no difference, and the bench's 1440p teardown hung with it on (MAC-DISPLAY-STALE).
+/// WindowServer's changes are delivered to the main run loop, and a process up for a few seconds
+/// without one can stop seeing the displays it creates (0x0 for good, while every other process
+/// sees them online). The desktop app always has one (wry); `serve` parks its main thread. The
+/// evidence is mixed: one batch of fresh processes lost their displays only with main blocked, a
+/// second showed no difference, and the bench's 1440p teardown hung with the pump on.
 pub fn main_pump_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("SE_MAIN_PUMP").as_deref() == Ok("1"))
+    *ON.get_or_init(|| crate::envcfg::var("SE_MAIN_PUMP").as_deref() == Ok("1"))
 }
 
 pub fn pump_main_run_loop(seconds: f64) {
@@ -1062,7 +1027,7 @@ pub fn pump_main_run_loop(seconds: f64) {
     let mode = unsafe { kCFRunLoopDefaultMode };
     let t = Instant::now();
     CFRunLoop::run_in_mode(mode, seconds, true);
-    // A run loop with nothing to wait on returns at once; do not spin on it.
+    // a run loop with nothing to wait on returns at once; do not spin on it
     if t.elapsed().as_secs_f64() < seconds / 10.0 {
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -1222,8 +1187,8 @@ impl Steps {
 /// arrangement. Every step is bounded by `deadline`:
 ///
 /// 1. **Size.** Only a size that has read valid-but-wrong for `WRONG_SIZE_FOR` is corrected:
-///    apply the display's settings again with the requested mode first (MAC-DISPLAY-MODE), then
-///    the mode list as a fallback.
+///    apply the display's settings again with the requested mode first, then the mode list as a
+///    fallback.
 /// 2. **Arrangement.** See [`fix_arrangement`]; on the join path it only runs when the display
 ///    really overlaps another or is mirrored.
 fn ensure_geometry(
@@ -1363,7 +1328,7 @@ pub(crate) fn teach_origin_left(id: u32) -> i32 {
 }
 
 /// The active displays whose rectangles overlap display `id`'s, and whether `id` is in a mirror
-/// set — what a reader of the arrangement (the bench's live stage) checks a run against.
+/// set. The bench's live stage checks a run against this.
 pub(crate) fn arrangement_conflicts(id: u32) -> (Vec<u32>, bool) {
     let rects = display_rects();
     let Some(&(_, x, y, w, h)) = rects.iter().find(|r| r.0 == id) else {
@@ -1380,7 +1345,7 @@ pub(crate) fn arrangement_conflicts(id: u32) -> (Vec<u32>, bool) {
 }
 
 /// The origin that takes `me` off every display it overlaps while keeping its side: left of
-/// them stays left (x = their leftmost edge − width), otherwise to their right (x = their
+/// them stays left (x = their leftmost edge - width), otherwise to their right (x = their
 /// rightmost edge). `None` when it overlaps nothing. Pure.
 pub(crate) fn non_overlapping_origin(
     me: (i32, i32, i32, i32),
@@ -1446,9 +1411,9 @@ fn fix_arrangement(id: u32, deadline: Instant) {
         }
         // ForSession, never Permanently. A permanent write saves the WHOLE configuration of the
         // set of connected displays, including the modes of the user's own screens, and macOS
-        // re-applies it every time that set comes back (SCREENS-GUARD). On the M1 (26.7.1) a
-        // ForSession origin on a virtual display returns success and is not honoured; the display
-        // identity (name + size) is what keeps the arrangement valid, so this is a best effort.
+        // re-applies it every time that set comes back. On the M1 (26.7.1) a ForSession origin on
+        // a virtual display returns success and is not honoured; the display identity (name +
+        // size) is what keeps the arrangement valid, so this is a best effort.
         CGCompleteDisplayConfiguration(cfg, CGConfigureOption::ForSession)
     };
     let Some(err) = bounded(
@@ -1484,14 +1449,10 @@ fn fix_arrangement(id: u32, deadline: Instant) {
     );
 }
 
-// ---------------------------------------------------------------------------------------------
-// SCREENS-GUARD. Creating, resizing or removing one of our displays makes macOS re-plan the whole
-// arrangement, and a saved arrangement for that set of displays can carry a different mode for the
-// user's own screens (seen: a built-in display flipping 1680x1050 <-> 1440x900 every time one test
-// display came and went). A host must never leave the user's screens different from how it found
-// them, so every such operation remembers the mode of every screen that is not ours and puts it
-// back if it moved.
-// ---------------------------------------------------------------------------------------------
+// The screens guard. Creating, resizing or removing one of our displays makes macOS re-plan the
+// whole arrangement, and a saved arrangement can carry a different mode for the user's own
+// screens (a built-in display flipping 1680x1050 <-> 1440x900). So every such operation snapshots
+// the mode of every screen that is not ours and puts back any that moved.
 
 /// What a display mode is, comparably.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1538,7 +1499,7 @@ fn mode_sig(mode: &CGDisplayMode) -> ModeSig {
 
 /// `SE_SCREENS_GUARD=0` turns the guard off (a measurement switch).
 fn screens_guard_enabled() -> bool {
-    std::env::var("SE_SCREENS_GUARD").as_deref() != Ok("0")
+    crate::envcfg::var("SE_SCREENS_GUARD").as_deref() != Ok("0")
 }
 
 /// Every online display that is not one of ours, with its current mode. Empty when the guard is
@@ -1609,7 +1570,7 @@ fn restore_screen(screen: &ForeignScreen) -> CGError {
         if set != CGError::Success {
             return set;
         }
-        // ForSession: never Permanently. This undoes a side effect; it must not become a setting.
+        // ForSession, never Permanently: this undoes a side effect and must not become a setting
         CGCompleteDisplayConfiguration(cfg, CGConfigureOption::ForSession)
     }
 }
@@ -1681,8 +1642,8 @@ impl MacosVirtualDisplay {
 
 /// The DPR the join asked for, recovered from the ladder.
 ///
-/// `extra_modes` is `dpr_mode_ladder(css_w, css_h)` — the client's CSS size multiplied by every
-/// ratio in `platform::display_dpr_ladder()`, sorted — so its smallest entry is the 1x size and
+/// `extra_modes` is `dpr_mode_ladder(css_w, css_h)` (the client's CSS size multiplied by every
+/// ratio in `platform::display_dpr_ladder()`, sorted), so its smallest entry is the 1x size and
 /// `width / ladder[0].0` is the requested ratio. macOS's ladder is {1.0, 2.0} because HiDPI there
 /// is a binary flag, so this only has to tell 1x from 2x.
 fn hidpi_from_ladder(width: u32, extra_modes: &[(u32, u32)]) -> u32 {
@@ -1723,7 +1684,7 @@ fn attempt_create(
 ) -> Result<u32, String> {
     let mut steps = Steps::new();
     let deadline = steps.started + ATTEMPT_BUDGET;
-    // Before the display exists, so its Add event cannot be missed.
+    // before the display exists, so its Add event cannot be missed
     reconfiguration_events_available();
     let before = id_events()
         .lock()
@@ -1819,8 +1780,8 @@ fn destroy_display(id: u32) -> bool {
 
 fn destroy_display_now(id: u32) -> bool {
     let was = events_of(id);
-    // Taken out first and dropped with the registry unlocked: the teardown is a WindowServer round
-    // trip and may run the termination handler, which takes the same lock.
+    // taken out first and dropped with the registry unlocked: the teardown is a WindowServer round
+    // trip and may run the termination handler, which takes the same lock
     let Some(entry) = registry().lock().unwrap().displays.remove(&id) else {
         return false;
     };
@@ -1838,8 +1799,8 @@ fn destroy_display_now(id: u32) -> bool {
             inactive_since = None;
         } else {
             let since = *inactive_since.get_or_insert_with(Instant::now);
-            // The list alone is good enough after a grace: the event can fail to arrive.
-            // ...and never waited for in a process no such event has ever reached.
+            // the list alone is enough after a grace (the event can fail to arrive), and at once
+            // in a process no such event has ever reached
             let ever = CALLBACKS.load(Ordering::Relaxed) > 0;
             if removed || !events || !ever || since.elapsed() >= REMOVE_EVENT_GRACE {
                 tprintln!(
@@ -1902,11 +1863,11 @@ impl VirtualDisplayController for MacosVirtualDisplay {
             refresh_rate as f64
         };
         let hidpi = hidpi_from_ladder(width, extra_modes);
-        // SCREENS-GUARD: before our display exists.
+        // screens guard: snapshot before our display exists
         let screens = foreign_screens();
 
-        // MAC-DISPLAY-RETRY: a display WindowServer never brings online is destroyed and created
-        // once more under a salted identity, which bypasses anything remembered for the first.
+        // a display WindowServer never brings online is destroyed and created once more under a
+        // salted identity, which bypasses anything remembered for the first
         let identity = display_identity(&name, width, height);
         let mut why = String::new();
         for attempt in 1..=2u32 {
@@ -1937,7 +1898,7 @@ impl VirtualDisplayController for MacosVirtualDisplay {
                 Err(e) => {
                     teprintln!("[display] create attempt {attempt} of 2 failed: {e}");
                     if attempt == 1 {
-                        // The removal is confirmed; give WindowServer a moment of its own too.
+                        // the removal is confirmed; give WindowServer a moment of its own too
                         std::thread::sleep(RETRY_PAUSE);
                     }
                     why = e;
@@ -1967,7 +1928,7 @@ impl VirtualDisplayController for MacosVirtualDisplay {
 
     fn remove_display(&self, id: u32) {
         if !destroy_display(id) {
-            teprintln!("virtual_display: remove_display({id}) — unknown display id");
+            teprintln!("virtual_display: remove_display({id}): unknown display id");
         }
     }
 
@@ -1998,20 +1959,20 @@ mod tests {
         }
     }
 
-    /// SCREENS-GUARD: only a screen still there in another mode counts, and nothing is ever
+    /// Screens guard: only a screen still there in another mode counts, and nothing is ever
     /// "restored" that was not seen before our operation.
     #[test]
     fn only_a_screen_that_moved_is_put_back() {
         let before = [(1, sig(1680, 1050)), (2, sig(1920, 1080))];
         assert!(changed_screens(&before, &before).is_empty());
-        // The built-in display flipping is the case this exists for.
+        // the built-in display flipping is the case this exists for
         assert_eq!(
             changed_screens(&before, &[(1, sig(1440, 900)), (2, sig(1920, 1080))]),
             vec![1]
         );
-        // An unplugged screen and a new one are not changes.
+        // an unplugged screen and a new one are not changes
         assert!(changed_screens(&before, &[(1, sig(1680, 1050)), (7, sig(800, 600))]).is_empty());
-        // A different refresh rate is a different mode.
+        // a different refresh rate is a different mode
         let mut hz = sig(1680, 1050);
         hz.millihertz = 120_000;
         assert_eq!(
@@ -2022,15 +1983,14 @@ mod tests {
 
     #[test]
     fn our_own_displays_are_never_among_the_screens_to_protect() {
-        // The descriptor is created with these very constants, so a display of ours carries them.
+        // the descriptor is created with these very constants, so a display of ours carries them
         assert_ne!((OUR_VENDOR, OUR_PRODUCT), (0, 0));
     }
 
     #[test]
     fn a_display_name_resolves_only_to_a_live_display() {
-        // CoreGraphics reports no displays at all to a process outside a logged-in console
-        // session, and ssh is how this crate is usually tested on the 10.15 box. The assertion is
-        // about a live display, so with none present there is nothing to assert.
+        // CoreGraphics reports no displays to a process outside a logged-in console session
+        // (ssh), and the assertion needs a live display
         if crate::macos_utils::streamer::display::active_displays().is_empty() {
             crate::test_support::skip_because(
                 "macos display name correlation",
@@ -2047,25 +2007,25 @@ mod tests {
     #[test]
     fn a_grown_display_is_moved_off_its_neighbour_keeping_its_side() {
         let main = (0, 0, 1680, 1050);
-        // The measured case: 800x600 remembered on the left, re-applied to 1920x1080 at x = -800.
+        // the measured case: 800x600 remembered on the left, re-applied to 1920x1080 at x = -800
         assert_eq!(
             non_overlapping_origin((-800, 0, 1920, 1080), &[main]),
             Some((-1920, 0))
         );
-        // On the right it grows away from the panel: nothing to do.
+        // on the right it grows away from the panel: nothing to do
         assert_eq!(non_overlapping_origin((1680, 0, 1920, 1080), &[main]), None);
-        // Overlapping from the right (origin inside the panel): pushed to its right edge.
+        // overlapping from the right (origin inside the panel): pushed to its right edge
         assert_eq!(
             non_overlapping_origin((100, 0, 1920, 1080), &[main]),
             Some((1680, 0))
         );
-        // Two displays to its right: left of the leftmost one it overlaps.
+        // two displays to its right: left of the leftmost one it overlaps
         let right = (1680, 0, 1280, 720);
         assert_eq!(
             non_overlapping_origin((-800, 0, 2560, 1440), &[main, right]),
             Some((-2560, 0))
         );
-        // Touching edges are not an overlap.
+        // touching edges are not an overlap
         assert_eq!(
             non_overlapping_origin((-1920, 0, 1920, 1080), &[main]),
             None
@@ -2081,15 +2041,15 @@ mod tests {
             id_used_before: true,
             serial: 0xB,
         };
-        // Same id, active and readable, but every reading is still the predecessor's.
+        // same id, active and readable, but every reading is still the predecessor's
         assert!(!want.is_fresh(m[&7], 0xA));
         note_event(&mut m, 7, false, true); // its removal arrives late
         assert!(!want.is_fresh(m[&7], 0xA));
-        // The new display's own serial, or its own Add.
+        // the new display's own serial, or its own Add
         assert!(want.is_fresh(m[&7], 0xB));
         note_event(&mut m, 7, true, false);
         assert!(want.is_fresh(m[&7], 0xA));
-        // An id never used before has no predecessor to read.
+        // an id never used before has no predecessor to read
         let first = Freshness {
             id_used_before: false,
             ..want
@@ -2099,7 +2059,7 @@ mod tests {
 
     #[test]
     fn displays_are_dropped_with_the_registry_unlocked() {
-        // The teardown of one may run the termination handler, which takes the registry lock.
+        // the teardown of one may run the termination handler, which takes the registry lock
         static LOCK: Mutex<Option<HashMap<u32, Probe>>> = Mutex::new(None);
         static FREE: AtomicU32 = AtomicU32::new(0);
         struct Probe;
@@ -2112,7 +2072,7 @@ mod tests {
         fill();
         drop(take_all(&LOCK, |m| m.as_mut().unwrap()));
         assert_eq!(FREE.swap(0, Ordering::Relaxed), 2);
-        // The old ordering (`lock().displays.clear()`) held it through both drops.
+        // clearing under the lock holds it through both drops
         fill();
         LOCK.lock().unwrap().as_mut().unwrap().clear();
         assert_eq!(FREE.load(Ordering::Relaxed), 0);
@@ -2157,7 +2117,7 @@ mod tests {
             )
         };
         let ext = || {
-            let p = std::env::var("SE_EXP_PROBE").unwrap_or_default();
+            let p = crate::envcfg::var("SE_EXP_PROBE").unwrap_or_default();
             let o = std::process::Command::new(p).output();
             o.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                 .unwrap_or_default()
@@ -2211,7 +2171,6 @@ mod tests {
         });
     }
 
-    /// A display that never comes online is created again (live: real displays).
     #[test]
     #[ignore = "creates virtual displays on the live desktop"]
     fn a_display_that_stays_offline_is_retried_once() {
@@ -2238,7 +2197,7 @@ mod tests {
         assert_eq!(ipad, display_serial("ScreenExtend - Sarvesh's iPad"));
         assert_ne!(ipad, display_serial("ScreenExtend - Pixel 7"));
         assert_ne!(display_serial(""), 0, "a serial of 0 reads as unset");
-        // One identity per device and size: a size change never inherits another size's geometry.
+        // one identity per device and size: a size change never inherits another size's geometry
         let a = display_serial(&display_identity("ScreenExtend - iPad", 1920, 1080));
         assert_eq!(
             a,
@@ -2250,9 +2209,8 @@ mod tests {
         );
     }
 
-    /// The settle wait is event-driven only where the registration takes. Over ssh it may not, and
-    /// the poll fallback is what then has to keep working — so this asserts that the probe answers
-    /// and caches, not which answer it gives.
+    /// The registration may not take (over ssh, for one), and the poll fallback then has to keep
+    /// working, so this asserts that the probe answers and caches, not which answer it gives.
     #[test]
     fn the_reconfiguration_watcher_reports_whether_it_registered() {
         let available = reconfiguration_events_available();
@@ -2260,11 +2218,10 @@ mod tests {
         assert_eq!(available, reconfiguration_events_available());
     }
 
-    /// The size sequence that exposed MAC-DISPLAY-MODE: one process, one display name (so one
-    /// display identity, which macOS remembers geometry for), joins at 1280x720 -> 2560x1440 ->
-    /// 1920x1080 -> 800x600 -> 1920x1080, each created with the production DPR ladder and removed
-    /// before the next. Logs what the display looked like while it came up and asserts each one
-    /// reached its requested size.
+    /// One process, one display name (so one display identity, which macOS remembers geometry
+    /// for), joining at 1280x720 -> 2560x1440 -> 1920x1080 -> 800x600 -> 1920x1080, each created
+    /// with the production DPR ladder and removed before the next. Asserts each one reached its
+    /// requested size.
     #[test]
     #[ignore = "creates real virtual displays; needs a console session and the encoder lock; run with --ignored --nocapture"]
     fn a_sequence_of_sizes_each_reaches_its_requested_mode() {
@@ -2337,8 +2294,8 @@ mod tests {
         }
     }
 
-    /// MAC-DISPLAY-MODE investigation: create/remove a sequence of sizes under three regimes and
-    /// log, per display, when the mode list stops being nil and what the geometry is over time.
+    /// Create/remove a sequence of sizes under three regimes and log, per display, when the mode
+    /// list stops being nil and what the geometry is over time.
     /// `SE_EXP=same|gap|unique` (same name 0.5 s apart / same name 4 s apart / a new name each).
     #[test]
     #[ignore = "creates real virtual displays; console session + encoder lock; --ignored --nocapture"]
@@ -2346,7 +2303,7 @@ mod tests {
         if !cg_virtual_display_available() {
             return;
         }
-        let exp = std::env::var("SE_EXP").unwrap_or_else(|_| "same".into());
+        let exp = crate::envcfg::var("SE_EXP").unwrap_or_else(|_| "same".into());
         let _vd = MacosVirtualDisplay;
         for (k, (w, h)) in [
             (1280u32, 720u32),
@@ -2391,7 +2348,7 @@ mod tests {
                 )
             };
             if exp == "reapply" && px_now != (w, h) {
-                // Re-apply the same settings (requested mode first) and watch the geometry.
+                // re-apply the same settings (requested mode first) and watch the geometry
                 let modes = mode_list(w, h, 0, &[]);
                 let ok = unsafe { display.applySettings(&make_settings(&modes, 60.0, 0)) };
                 let t1 = Instant::now();
@@ -2406,7 +2363,7 @@ mod tests {
                 println!("[reapply] applySettings again -> {ok}; geometry (ms, pixels) {after:?}");
             }
             if exp == "reapply2" && px_now != (w, h) {
-                // A different mode first, then the requested one: force WindowServer to move.
+                // a different mode first, then the requested one: force WindowServer to move
                 let other = mode_list(w + 2, h + 2, 0, &[]);
                 let a = unsafe { display.applySettings(&make_settings(&other, 60.0, 0)) };
                 std::thread::sleep(Duration::from_millis(300));
@@ -2518,7 +2475,7 @@ mod tests {
                 return -1;
             }
             let e = CGConfigureDisplayOrigin(cfg, id, x, y);
-            // Never Permanently, not even in an investigation: it saves the user's screens too.
+            // never Permanently, not even in an experiment: it saves the user's screens too
             let _ = permanently;
             let opt = CGConfigureOption::ForSession;
             let c = CGCompleteDisplayConfiguration(cfg, opt);
@@ -2526,17 +2483,17 @@ mod tests {
         }
     }
 
-    /// MAC-DISPLAY-ORIGIN / MAC-4K investigation. `SE_EXP=left`: teach an identity 800x600 on the
-    /// LEFT of the main display, then re-create it at 1920x1080 and 2560x1440 and log the whole
-    /// arrangement after the settings re-apply at 0 / 50 / 500 / 2000 ms. `SE_EXP=4k`: what a
-    /// fresh identity reaches at 3840x2160 (hiDPI off and on) and at nearby large sizes.
+    /// `SE_EXP=left`: teach an identity 800x600 on the LEFT of the main display, then re-create
+    /// it at 1920x1080 and 2560x1440 and log the whole arrangement after the settings re-apply
+    /// at 0 / 50 / 500 / 2000 ms. `SE_EXP=4k`: what a fresh identity reaches at 3840x2160 (hiDPI
+    /// off and on) and at nearby large sizes.
     #[test]
     #[ignore = "creates real virtual displays and moves one; console session + encoder lock"]
     fn investigate_arrangement_and_large_modes() {
         if !cg_virtual_display_available() {
             return;
         }
-        let exp = std::env::var("SE_EXP").unwrap_or_else(|_| "left".into());
+        let exp = crate::envcfg::var("SE_EXP").unwrap_or_else(|_| "left".into());
         let log = |tag: &str| {
             let a = arrangement();
             println!("  {tag}: CG {a:?} overlaps {:?}", overlaps(&a));
@@ -2546,9 +2503,10 @@ mod tests {
             // A live resize of one display (the `/reconfig` path): 800x600 on the left, then
             // its settings changed to 1920x1080 in place, then the arrangement repair.
             let ext0 = || {
-                let o =
-                    std::process::Command::new(std::env::var("SE_EXP_PROBE").unwrap_or_default())
-                        .output();
+                let o = std::process::Command::new(
+                    crate::envcfg::var("SE_EXP_PROBE").unwrap_or_default(),
+                )
+                .output();
                 o.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                     .unwrap_or_default()
             };
@@ -2591,13 +2549,13 @@ mod tests {
                 log("before re-apply");
                 let ext0 = || {
                     let o = std::process::Command::new(
-                        std::env::var("SE_EXP_PROBE").unwrap_or_default(),
+                        crate::envcfg::var("SE_EXP_PROBE").unwrap_or_default(),
                     )
                     .output();
                     o.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                         .unwrap_or_default()
                 };
-                if let Ok(px) = std::env::var("SE_EXP_PRE") {
+                if let Ok(px) = crate::envcfg::var("SE_EXP_PRE") {
                     let x: i32 = if px == "w" {
                         -(w as i32)
                     } else {
@@ -2611,7 +2569,7 @@ mod tests {
                 let t0 = Instant::now();
                 let ext = |tag: &str| {
                     let o = std::process::Command::new(
-                        std::env::var("SE_EXP_PROBE").unwrap_or_default(),
+                        crate::envcfg::var("SE_EXP_PROBE").unwrap_or_default(),
                     )
                     .output();
                     println!(
@@ -2627,7 +2585,7 @@ mod tests {
                     log(&format!("re-apply {ok} +{at} ms"));
                     ext(&format!("re-apply +{at} ms"));
                 }
-                let mode = std::env::var("SE_EXP_FIX").unwrap_or_else(|_| "session".into());
+                let mode = crate::envcfg::var("SE_EXP_FIX").unwrap_or_else(|_| "session".into());
                 let rc = match mode.as_str() {
                     "perm" => configure_origin(id, -(w as i32), 0, true),
                     "right" => configure_origin(id, 1680, 0, false),
@@ -2655,7 +2613,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(1500));
             }
         } else {
-            let sizes: Vec<(u32, u32, u32)> = std::env::var("SE_EXP_SIZES")
+            let sizes: Vec<(u32, u32, u32)> = crate::envcfg::var("SE_EXP_SIZES")
                 .ok()
                 .map(|v| {
                     v.split(',')
@@ -2714,8 +2672,7 @@ mod tests {
     ///
     /// **Run it from a Terminal window in the console session.** Over SSH the process has no
     /// WindowServer connection, and `initWithDescriptor:` / `applySettings:` block indefinitely
-    /// rather than failing — measured: the test hangs and has to be killed, even though the
-    /// read-only CoreGraphics calls in the rest of the suite work fine there.
+    /// rather than failing (the suite's read-only CoreGraphics calls still work there).
     ///
     /// ```text
     /// cargo test --lib macos_utils::virtual_display::tests::time_a_retina_join -- --ignored --nocapture
@@ -2727,12 +2684,12 @@ mod tests {
             println!("CGVirtualDisplay is not available on this Mac");
             return;
         }
-        // A 800x600 CSS client at dpr 2, exactly as `dpr_mode_ladder` would produce it.
+        // a 800x600 CSS client at dpr 2, exactly as `dpr_mode_ladder` would produce it
         let (w, h, refresh) = (1600u32, 1200u32, 60.0);
         let ladder = [(800u32, 600u32), (1600u32, 1200u32)];
 
         // Before: born at 1x with one registered mode, then a full applySettings + mode switch to
-        // reach HiDPI, which is what `apply_display_scale(200)` did on every Retina join.
+        // reach HiDPI.
         let started = Instant::now();
         let old = unsafe { create_cg_virtual_display("SE-old", w, h, refresh, 0, &[]) };
         let Ok((display, applied, token)) = old else {
@@ -2770,7 +2727,7 @@ mod tests {
         let _ = set_display_hidpi(&id.to_string(), 1);
         let new_total = started.elapsed();
 
-        // And an orientation flip, which the transposed mode should make a pure mode switch.
+        // and an orientation flip, which the transposed mode should make a pure mode switch
         let rotated = Instant::now();
         let _ = reconfigure_display(&id.to_string(), h, w, refresh as u32, 1);
         let rotate = rotated.elapsed();
@@ -2783,12 +2740,12 @@ mod tests {
 
     #[test]
     fn the_ladder_decides_hidpi() {
-        // A 390x844 phone at dpr 2: backing 780x1688, ladder [(390,844), (780,1688)].
+        // a 390x844 phone at dpr 2: backing 780x1688, ladder [(390,844), (780,1688)]
         let ladder = [(390, 844), (780, 1688)];
         assert_eq!(hidpi_from_ladder(780, &ladder), 1);
-        // The same phone at dpr 1: backing 390x844, same ladder.
+        // the same phone at dpr 1: backing 390x844, same ladder
         assert_eq!(hidpi_from_ladder(390, &ladder), 0);
-        // No ladder at all (the plain create_display path) never claims HiDPI.
+        // no ladder at all (the plain create_display path) never claims HiDPI
         assert_eq!(hidpi_from_ladder(1920, &[]), 0);
     }
 

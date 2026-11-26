@@ -43,9 +43,8 @@ const removeBridged: ListenerBridge = function (type, listener) {
 };
 
 function bridgeMediaQueryListEvents() {
-  // Unlike the others this one replaces a global function rather than filling a gap on a
-  // prototype, so bail out before touching `window.matchMedia` when the host already has
-  // the events. Otherwise every matchMedia call on WebView2 pays an extra JS frame.
+  // this one replaces a global rather than filling a prototype gap, so bail out when the
+  // host already has the events: otherwise every matchMedia call on WebView2 pays a JS frame
   if (
     typeof MediaQueryList !== "undefined"
     && typeof MediaQueryList.prototype.addEventListener === "function"

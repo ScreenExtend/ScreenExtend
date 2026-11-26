@@ -6,16 +6,12 @@ use objc2_core_foundation::CFRetained;
 use objc2_core_video::CVPixelBuffer;
 use objc2_io_surface::IOSurfaceRef;
 
-/// A capture surface held past the delivery callback, with its **use count** held too.
+/// A capture surface held past the delivery callback, with its use count held too.
 ///
-/// `CGDisplayStream.h` is explicit about the contract: *"If you intend to hold on to the
-/// IOSurface beyond the lifetime of the handler call, you must `CFRetain()` the IOSurface until
-/// you are done with it and you must call `IOSurfaceIncrementUseCount()` to let the
-/// CGDisplayStream know that the frame is not ready for re-use."* The two counters are
-/// independent — Apple says so, and `CVPixelBufferCreateWithIOSurface` documents only that it
-/// *retains* the surface. A retain alone keeps the object alive while WindowServer happily
-/// composites new pixels into the buffer VideoToolbox is reading, which is tearing and stale
-/// bands rather than a clean stall.
+/// `CGDisplayStream.h` requires both a `CFRetain()` and `IOSurfaceIncrementUseCount()` for a
+/// surface kept past the handler call, and `CVPixelBufferCreateWithIOSurface` only retains. A
+/// retain alone keeps the object alive while WindowServer composites new pixels into the buffer
+/// VideoToolbox is reading: tearing and stale bands.
 pub struct HeldSurface(CFRetained<IOSurfaceRef>);
 
 impl HeldSurface {
@@ -44,21 +40,18 @@ pub struct Frame {
     pub height: usize,
     pub arrived_mach: u64,
     pub captured_at: std::time::Instant,
-    /// The OS's own frame time on the shared host clock — CGDisplayStream's `displayTime`,
-    /// ScreenCaptureKit's PTS — when that time is in the past, and the callback's own arrival
+    /// The OS's own frame time on the shared host clock (CGDisplayStream's `displayTime`,
+    /// ScreenCaptureKit's PTS) when that time is in the past, and the callback's own arrival
     /// otherwise. Never 0 for a delivered frame.
     ///
-    /// The clamp is not defensive coding. Measured on 10.15.8 at 60 Hz, CGDisplayStream's
-    /// `displayTime` is ahead of the delivery callback on *every* frame, by −15.5 ms at p50 and
-    /// −11.4 ms at its closest: it is the presentation time WindowServer scheduled the frame for,
-    /// not the moment it was composited. Header wording agrees — "when the frame was to be
-    /// displayed". Used raw it makes `capture_to_encode` a frame period shorter than the truth,
-    /// and on a fast host it can go negative.
+    /// `displayTime` is the presentation time WindowServer scheduled the frame for, not when it
+    /// was composited: on 10.15.8 at 60 Hz it is ahead of the delivery callback on every frame
+    /// (15.5 ms at p50, 11.4 ms at its closest). Used raw it makes `capture_to_encode` a frame
+    /// period too short, and on a fast host negative.
     pub os_time_ns: u64,
     /// The OS stamp exactly as the backend reported it, unclamped, and 0 when it reported none.
-    /// Telemetry must not use this; it exists so `capture_rate` can report the
-    /// `displayTime -> callback` distribution, which is how the clamp above was found and is the
-    /// one number that says whether a given Mac's stamp means what its header says.
+    /// Telemetry must not use this: it exists so `capture_rate` can report the
+    /// `displayTime -> callback` distribution.
     pub os_time_raw_ns: u64,
     pub backing: Backing,
 }
@@ -128,10 +121,9 @@ impl FrameSource {
 
     /// Consume a pending wake token.
     ///
-    /// The channel is a `bounded(1)` counter, and a frame can be taken by `try_take_latest`
-    /// without its token ever being received — after a timed-out `wait`, say. The token then
-    /// makes the *next* `wait` return immediately with nothing to take, which spins the loop and,
-    /// when an IDR is pending, spends the wake on a duplicate encode of the previous frame.
+    /// `try_take_latest` can take a frame without receiving its token (after a timed-out
+    /// `wait`). The leftover token makes the next `wait` return at once with nothing to take,
+    /// and with an IDR pending that wake is spent re-encoding the previous frame.
     pub fn drain_wake(&self) {
         let _ = self.wake_rx.try_recv();
     }

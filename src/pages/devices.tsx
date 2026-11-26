@@ -37,8 +37,7 @@ function RefreshStream({ device, label }: { device: ConnectedDevice; label: stri
   const refresh = async () => {
     setBusy(true);
     try {
-      // This tab's stream, not the device's: a device with two open restarts only the one
-      // whose row was clicked.
+      // this tab's stream, not the device's: with two tabs open only the clicked row restarts
       const restarted = await commands.refreshDeviceStream(device.token, device.joinId);
       toast(
         restarted
@@ -85,10 +84,9 @@ function RefreshStream({ device, label }: { device: ConnectedDevice; label: stri
   );
 }
 
-// One row per live session, so a machine with two tabs open is two rows carrying the same
-// device name. The screen size tells them apart when it differs; when it does not, the row's
-// position among that device's own sessions does. Neither shows anything for a device holding
-// a single session, which is every device until the owner opens a second tab.
+// One row per live session, so two tabs of one device share a name: tell them apart by
+// screen size when it differs, else by position among that device's sessions. A device with
+// a single session gets no suffix.
 function rowLabel(device: ConnectedDevice, all: ConnectedDevice[]): string {
   const name = device.name || device.ip || "Unknown device";
   const siblings = all.filter(d => d.token && d.token === device.token);

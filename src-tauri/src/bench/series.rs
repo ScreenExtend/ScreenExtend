@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value as Json};
 
+#[cfg(target_os = "macos")]
 use super::cf;
 use super::metrics::summary;
 
@@ -23,6 +24,7 @@ pub struct Sampler {
     t0: Instant,
 }
 
+#[cfg(target_os = "macos")]
 fn sample(t0: Instant) -> Json {
     let (rss, peak) = cf::rss();
     json!({
@@ -32,6 +34,13 @@ fn sample(t0: Instant) -> Json {
         "thermal": cf::thermal_state(),
         "low_power": cf::low_power_mode(),
     })
+}
+
+/// Windows: the same keys (thermal and low-power are `null` there) plus the system counters
+/// of `win::sys`.
+#[cfg(windows)]
+fn sample(t0: Instant) -> Json {
+    super::win::sys::sample(t0)
 }
 
 impl Sampler {
@@ -174,7 +183,7 @@ mod tests {
         assert_eq!(b[0]["latency_ms"]["n"], json!(2));
         assert_eq!(b[1]["dropped"], json!(1));
         assert_eq!(b[1]["emitted"], json!(1));
-        // 500 bytes over the 5 s the last bucket covers.
+        // 500 bytes over the 5 s the last bucket covers
         assert_eq!(b[1]["mbps"], json!(0.001));
         assert_eq!(b[1]["to_s"], json!(15.0));
     }

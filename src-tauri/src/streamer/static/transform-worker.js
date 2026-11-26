@@ -1,8 +1,8 @@
 'use strict';
 
 // Video fast path: encoded H.264 off the RTP transform, WebCodecs decode, paint on this
-// thread. Nothing here may use syntax newer than ES2017 -- the file is served verbatim to
-// whatever browser the client happens to have and one unsupported token kills it whole.
+// thread. Nothing here may use syntax newer than ES2017: the file is served verbatim to
+// whatever browser the client has and one unsupported token kills it whole.
 
 let canvas = null;
 let ctx = null;
@@ -30,11 +30,9 @@ let rtpWraps = 0;
 let videoDelayEmaMs = null;
 let lastAvsyncPostMs = 0;
 
-// Host-to-local clock offset measured by the page over PING/PONG (see input.js). Until it
-// arrives this stays 0, which reproduces the old behaviour exactly: the reported delay is
-// then the distance between two unrelated epochs, so it is only meaningful as a *difference*
-// against the audio worker's identically-biased number, which is what A/V sync uses. Once the
-// offset lands the same figure becomes a real display lag in milliseconds.
+// Host-to-local clock offset, measured by the page over PING/PONG (see input.js). At 0, until
+// it arrives, the reported delay spans two unrelated epochs and only means something as a
+// difference against the audio worker's identically-biased number, which is what A/V sync uses.
 let hostOffsetMs = 0;
 let clockValid = false;
 
@@ -47,70 +45,39 @@ const CODEC_CANDIDATES = [
 ];
 
 const KEY_REQUEST_MIN_INTERVAL_MS = 250;
-// A stream with no keyframe for this long is not going to recover by waiting.
+// a stream with no keyframe for this long will not recover by waiting
 const KEY_WAIT_ESCALATE_MS = 1500;
 const KEY_WAIT_GIVE_UP_MS = 8000;
 
-// decodeQueueSize counts *acceptance*, not completion: it drops as soon as the control
-// message is handed toward the codec, so it can read zero with frames still in flight. The
-// real backpressure signal is how many decodes have not yet produced an output.
-//
-// The cap used to be 2, on the reasoning that a live stream wants one frame in flight. That is
-// what a decoder that has *fallen behind* looks like; it is also what a hardware decoder looks
-// like when it is keeping up perfectly, because it is pipelined — a Windows Media Foundation
-// H.264 decoder holds several pictures even with `optimizeForLatency`. Tripping on the count
-// alone therefore fired constantly on a healthy session, and the response is severe: every
-// delta is thrown away until a keyframe arrives, and the host gates keyframes to one per
-// 200 ms, so each false trip is a 200 ms freeze and a full-size IDR. Measured on the Windows
-// dev box against a Chrome client, the host was emitting 74 IDRs in 30 s.
-//
-// So the count is now the cheap half of the test and `BACKLOG_STALL_MS` is the load-bearing
-// half: a decoder that is producing outputs is keeping up however many pictures it is holding.
-//
-// And "no output for BACKLOG_STALL_MS" is only evidence of a stalled decoder if the decoder had
-// work for that long. The clock used to run from the last output whether or not anything had
-// arrived since, so it counted time with no input. A 1-2 MB IDR from the Intel Mac host at
-// 1920x1080 spends ~150 ms crossing the network with nothing reaching the decoder; when it and
-// the clump of deltas queued behind it land, `now - lastOutput > 66 ms` is already true before
-// the decoder has been given anything, and the 7th delta of the clump tripped the test: deltas
-// dropped, another IDR just as large requested and answered at once. Measured: 20-49 IDRs in
-// 20 s with no packet lost, 41.5 Mbps on the wire for a 27 Mbps stream, host-capture->paint p90
-// 181 ms; starting the clock no earlier than the keyframe submit took that to 7 IDRs, 0 dropped,
-// p90 35 ms. Nothing about it is specific to keyframes: any arrival gap over ~66 ms (idle ping
-// between the two dev Macs reaches 75 ms, an AWDL retune is tens of ms) followed by a clump of
-// seven deltas does the same to a healthy decoder. So the stall clock has a floor that moves
-// whenever input resumes — after an arrival gap (`ARRIVAL_GAP_MS`), when a submit finds the
-// decoder idle (its last output drained the count to zero), and at a keyframe submit.
-//
-// A gap only counts as a resume while the decoder is answering: at most MAX_UNANSWERED submits
-// since its last output. Judging the gap against an estimated frame rate instead left a hole,
-// because the estimate learned from rendered frames and froze with them: once arrivals were
-// further apart than it expected (a 5 fps keepalive desktop, 24-29 fps after 60), every arrival
-// moved the floor and a decoder that had died was never caught here. A decoder that answered its
-// last input may be given any gap; one that has not is given none.
-//
-// Counting is too slow for a sparse stream (seven frames at 5 fps is 1.4 s, and by then the
-// stale reset has zeroed the count), so silence is a second test of its own: SILENT_MIN submits
-// and SILENT_MS of arrivals with no output at all. Each gap is worth at most SILENT_GAP_CAP_MS,
-// so a suspended machine waking up with work outstanding is not a dead decoder.
-//
-// Separately, a keyframe that genuinely takes longer than the window to decode while frames keep
-// flowing: nothing can come out until it does (client decode ran p90 47 ms, p99 58-88 ms on those
-// IDRs). While a keyframe decode is pending, for at most `KEY_DECODE_GRACE_MS`, the backlog test
-// neither drops nor requests and the stale-count resets leave the count alone. Past the grace the
-// old test applies again, so a decoder that really died on a keyframe is still caught.
+// decodeQueueSize counts acceptance, not completion, and can read zero with frames in flight:
+// backpressure is the decodes that have not produced an output yet. That count alone is not a
+// stall: a pipelined hardware decoder (Windows Media Foundation H.264, even with
+// `optimizeForLatency`) holds several pictures while keeping up, and a false trip drops every
+// delta until a keyframe: a full-size IDR and a freeze of up to 200 ms, the host's keyframe
+// gate (74 IDRs in 30 s at a cap of 2).
 const MAX_IN_FLIGHT = 6;
-// No output at all for this long, with the queue over the cap, is a decoder that has stopped
-// rather than one that is pipelined. Two frame periods at 30 fps, so it cannot fire on jitter.
+// No output for this long with the count over the cap is a stopped decoder. Two frame periods
+// at 30 fps, so it cannot fire on jitter. The clock must not run while nothing arrives:
+// stallFloor() moves it to wherever input resumed (after an arrival gap, a submit that found the
+// decoder idle, a keyframe submit). Run from the last output alone, the clump behind a large
+// IDR tripped it: 20-49 IDRs in 20 s with no packet lost, 7 with the floor.
 const BACKLOG_STALL_MS = 66;
+// A keyframe in decode is not a stall for this long: nothing can come out until it finishes
+// (p99 58-88 ms on a large IDR), so the backlog test and the stale resets stand down. Bounded,
+// so a decoder that dies on a keyframe is still caught.
 const KEY_DECODE_GRACE_MS = 1000;
 let keyDecodeTs = null;        // RTP stamp of the keyframe handed to the decoder, until its output
 let keyDecodeSinceMs = 0;      // when it was handed over
 let lastKeySubmitMs = 0;       // the stall clock never starts before the latest keyframe submit
 let keyDecodeGraceHits = 0;    // frames the backlog test would have dropped during a key decode
-// Half the stall window: a shorter gap cannot by itself fill it.
+// half the stall window: a shorter gap cannot by itself fill it
 const ARRIVAL_GAP_MS = 33;
+// a gap moves the floor only while the decoder is answering (at most this many submits since
+// its last output), or a dead decoder on a sparse stream is never caught
 const MAX_UNANSWERED = 2;
+// Counting is too slow for a sparse stream (seven frames at 5 fps is 1.4 s), so silence is its
+// own test: SILENT_MIN submits and SILENT_MS of arrivals with no output. Each gap counts for at
+// most SILENT_GAP_CAP_MS, so a machine waking from suspend is not a dead decoder.
 const SILENT_MS = 700;
 const SILENT_MIN = 3;
 const SILENT_GAP_CAP_MS = 400;
@@ -121,36 +88,110 @@ let lastArrivalMs = 0;
 let floorGapMs = 0;            // arrival of the first frame after an arrival gap
 let floorIdleMs = 0;           // submit that found the decoder drained by its own outputs, or a count resync
 let idleSinceOutput = false;   // the count reached zero through outputs, not through a reset
-// Backlog trips the old clock would have made and the floor prevented, by the latest floor.
+// backlog trips the floor prevented, counted by which floor was latest
 let stallFloorSaves = 0;
 let stallFloorSavesKey = 0;
 let stallFloorSavesGap = 0;
 let stallFloorSavesIdle = 0;
 let inFlight = 0;
 let backlogStreak = 0;
-// The counter is only repaid by an output, and a decoder may accept a chunk and silently
-// discard it — a delta whose reference frame was lost, a frame dropped after a corrupt NAL.
-// Three of those put the count permanently over the cap, every subsequent delta is dropped and
-// the stream collapses into a keyframe-only slideshow that nothing demotes, because keyframes
-// still render. So the count is resynchronised from two independent signals: an empty accept
-// queue, and no output at all for this long.
+// The count is only repaid by an output, and a decoder may accept a chunk and silently discard
+// it (a delta whose reference was lost, a frame after a corrupt NAL). A few of those would pin
+// the count over the cap and drop every delta from then on, so it is resynchronised from two
+// signals: an empty accept queue, and no output at all for this long.
 const IN_FLIGHT_STALE_MS = 500;
 let lastOutputAtMs = 0;
 
-// Bounded so a decoder that errors on every frame cannot spin: after this many resets we
-// stop rebuilding and let the page decide.
+// bounded so a decoder that errors on every frame cannot spin: past this, the page decides
 const MAX_DECODER_RESETS = 3;
 let decoderResets = 0;
+
+// Falling behind. The stall test only catches a decoder that stops. One that keeps producing
+// outputs, slower than frames arrive, drifts seconds behind with every counter healthy (a 25 ms
+// paint against 60 fps: capture to paint p50 2.5 s). Only time lost on this machine is acted
+// on: a frame the network delivered late is still painted. Per output, before the paint:
+//  - `lost`: now minus the arrival of the frame that released this output (a decoder holding H
+//    pictures outputs frame i when frame i+H goes in), less the least seen since configure. A
+//    fixed floor: a recent minimum would rise with a backlog that never drains.
+//  - `ahead`: frames submitted after this one, beyond H. Above zero a newer picture is already
+//    decodable, so skipping this paint costs the viewer nothing.
+// H is the fewest frames submitted after any output in 2-4 s, learned only in step (behind, a
+// backlog reads as depth). A draining backlog is left alone. One stuck for LATE_STUCK_MS:
+//  1. Skip the paint of any frame with a newer one ahead. Every frame is still decoded, so the
+//     reference chain stays whole.
+//  2. If that has not helped within LATE_TRIAL_MS, paint everything again; if the lost time
+//     keeps growing past CATCHUP_MS, ask for a keyframe and restart the decoder from it when it
+//     arrives. Never empty the decoder before the keyframe is in hand: an unanswered request
+//     must cost a late picture, not a frozen one.
+const LATE_MS = 50;
+const LATE_RESUME_MS = 20;
+const LATE_STUCK_MS = 150;
+const LATE_TRIAL_MS = 150;
+// a frame this far lost with a newer one ahead is not painted even while draining: a tab that
+// comes back with seconds queued shows the newest picture, not a replay
+const STALE_MS = 250;
+const CATCHUP_MS = 120;
+const CATCHUP_GROWTH_MS = 30;
+// Catch-ups are spaced this far apart, doubling to the max while they recur: a keyframe is the
+// largest frame on the wire and the slowest to decode. The real cure is the host lowering the
+// frame rate, which the state in the stats frame is there to tell it.
+const CATCHUP_MIN_INTERVAL_MS = 1000;
+// One keyframe every 2 s caps the cost of a client that can never keep up at half a keyframe a
+// second, and its lateness at about 2 s times how far its decoder is short (1 s at two thirds of
+// the frame rate) between them.
+const CATCHUP_MAX_INTERVAL_MS = 2000;
+// a catch-up followed by another within this long did not bring the lateness down
+const CATCHUP_RECUR_MS = 10000;
+const CATCHUP_KEY_RETRY_MS = 500;
+// a request unanswered for this long turns catch-ups off for the session
+const CATCHUP_KEY_WAIT_MS = 2500;
+// "ahead" also needs the next frame captured within this of the current one (RTP stamps): at a
+// 5 fps keepalive the next picture is 200 ms away and skipping to it only shows the change late
+const SKIP_NEIGHBOUR_MS = 50;
+const LATE_WINDOW_MS = 2000;
+// Reported in the stats frame: 0 in step, 1 skipping stale paints, 2 behind with skipping no help
+// (painting everything, waiting to catch up or unable to), 3 waiting for a catch-up keyframe
+// (still painting everything).
+const LATE = { inStep: 0, skipping: 1, behind: 2, catchingUp: 3 };
+let lateState = LATE.inStep;
+// Arrival time per submitted frame, by submission order. A ring, so it never reads empty for a
+// backlog larger than `pending`.
+const ARRIVAL_RING = 4096;
+const arrivalTs = new Uint32Array(ARRIVAL_RING);
+const arrivalAt = new Float64Array(ARRIVAL_RING);
+let submitSeq = 0;
+let outputSeq = 0;
+let holdMinCur = Infinity;
+let holdMinPrev = Infinity;
+let lostFloor = Infinity;
+let lateWindowAtMs = 0;
+let lateWindows = 0;
+let behindSinceMs = 0;
+let behindBest = 0;
+let behindBestAtMs = 0;
+let trialExcess = 0;
+let catchUpDue = false;
+let catchUpArmed = false;
+let catchUpArmedAtMs = 0;
+let catchUpsOff = false;
+let holdKnown = -1;
+let catchUpKeyPending = false;
+let lastCatchUpMs = -Infinity;
+let catchUpIntervalMs = CATCHUP_MIN_INTERVAL_MS;
+let activeConfig = null;
+let lateMs = 0;
+let latePeakMs = 0;
+let lateCatchUps = 0;
+let catchUpRequests = 0;
+let framesStale = 0;
 
 let estimatedFps = 60;
 let lastRtpTicks = null;
 let lastRtpWallMs = null;
 
-// The negotiated profile-level-id and the coded size. They are posted by the page after the
-// WHEP round trip, but the pump starts as soon as the transform is installed — before
-// setRemoteDescription — so without a wait every client probed and configured avc1.640034
-// with no coded size at all, which is exactly the configuration isConfigSupported is least
-// able to answer honestly about and the thing "probe what you install" was meant to fix.
+// The negotiated profile-level-id and the coded size, posted by the page after the WHEP round
+// trip. The pump starts as soon as the transform is installed, before setRemoteDescription, so
+// the configure waits for them (bounded) rather than probing avc1.640034 with no coded size.
 // Waiting costs nothing: no frame can be decoded before the first keyframe anyway.
 let preferredCodec = null;
 let hintWidth = 0;
@@ -172,8 +213,7 @@ function waitForCodecHint() {
   ]);
 }
 
-// Which mechanisms are actually live, reported to the host in the stats frame. A degradation
-// nobody can see is a degradation nobody fixes.
+// which mechanisms are live, reported to the host in the stats frame
 const TRANSPORT = { none: 0, scriptTransform: 1, encodedStreams: 2 };
 const RENDER = { none: 0, canvas2d: 1, trackGenerator: 2 };
 const KEYREQ = { none: 0, sendKeyFrameRequest: 1, outOfBand: 2 };
@@ -186,19 +226,13 @@ let suppressed = 0;
 
 function note() { suppressed++; }
 
-// ---------------------------------------------------------------------------
-// The receiver's own decoder, kept quiet.
-//
-// The transform consumes every frame, so libwebrtc's VideoReceiveStream never gets one, and a
-// receive stream with no decodable frame for 200 ms (its keyframe wait) asks for a keyframe:
-// an RTCP PLI about every 200-300 ms for the whole session, which the host answers with an IDR
-// almost every time (measured: ~3 PLIs and ~3 IDRs per second on every WebCodecs session, old
-// page and new alike). Handing each *keyframe* back to the receiver gives it one decodable
-// frame; it then waits for the next one with its 3 s frame timeout instead, so the request
-// rate drops about tenfold (measured: 3-4 PLIs and keyframes per 10 s instead of 28-35) at the
-// cost of one extra decode every ~3 s. Deltas are not handed back: that silences it entirely
-// but decodes every frame twice. The host's own PLI limiter (G03) is still needed for pages
-// that do not do this (the relay serves an older page).
+// The receiver's own decoder, kept quiet. The transform consumes every frame, so libwebrtc's
+// VideoReceiveStream never gets one and asks for a keyframe after 200 ms without a decodable
+// frame: an RTCP PLI every 200-300 ms for the whole session, each answered with an IDR. Handing
+// each keyframe back gives it one decodable frame, after which it waits on its 3 s frame
+// timeout instead: 3-4 PLIs per 10 s instead of 28-35, for one extra decode every ~3 s. Deltas
+// are not handed back: that would silence it entirely but decode every frame twice. The host's
+// PLI limiter is still needed for pages that do not do this (the relay serves an older page).
 let receiverWriter = null;
 let keyframesForwarded = 0;
 function attachReceiverWritable(writable) {
@@ -206,7 +240,7 @@ function attachReceiverWritable(writable) {
   if (!writable || typeof writable.getWriter !== 'function') return;
   try { receiverWriter = writable.getWriter(); } catch (_) { note(); }
 }
-// After the frame has been handed to our own decoder: the write may take the frame's data.
+// call after the frame has gone to this worker's decoder: the write may take the frame's data
 function forwardKeyframe(encodedFrame) {
   if (!receiverWriter) return;
   try {
@@ -219,14 +253,9 @@ function forwardKeyframe(encodedFrame) {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Per-frame stage timing.
-//
-// The host measures itself as far as the socket; this is the other half. Stages are kept as a
-// sliding window of raw samples rather than an EMA, because the interesting number is the p99,
-// and 512 doubles is nothing next to a decoded frame. Timestamps are absolute
-// (`timeOrigin + now()`) so they are comparable with the page's and with the host clock once
-// the offset is known.
+// Per-frame stage timing, the half the host cannot measure. A sliding window of raw samples,
+// not an EMA, because the interesting number is the p99. Timestamps are absolute
+// (`timeOrigin + now()`) so they compare with the page's and, given the offset, the host clock.
 const STATS_WINDOW = 512;
 const PENDING_MAX = 128;
 
@@ -241,11 +270,9 @@ StatWindow.prototype.push = function (v) {
   this.i = (this.i + 1) % STATS_WINDOW;
   if (this.n < STATS_WINDOW) this.n++;
 };
-// Runs on this thread, between two decoder output callbacks, once a second for each of three
-// windows. A typed-array copy sorts numerically with no comparator call per step: the same result
-// as the boxed Array + `(x, y) => x - y` it replaced, at about a quarter of the time (measured in
-// Node/V8, 3 x 512 samples: ~320 us -> ~77 us), which is time a frame waiting to be painted no
-// longer waits.
+// A typed-array copy sorts numerically with no comparator call: about a quarter of the time of
+// a boxed Array with `(x, y) => x - y` (~320 us -> ~77 us for 3 x 512 samples in V8), and this
+// runs on the decode thread between two output callbacks.
 StatWindow.prototype.pct = function () {
   if (!this.n) return null;
   const a = this.buf.slice(0, this.n);
@@ -265,9 +292,16 @@ let decodeErrors = 0;
 let keyRequests = 0;
 let framesDroppedBacklog = 0;
 let decoderHardware = false;
-// Set when every candidate was refused with the coded-size hint and accepted without it:
-// the hint was the client's request, not the host's stream. Reported, because it is the
-// difference between "this device cannot decode H.264" and "we asked the wrong question".
+// outputs that arrived before the first paint and were not painted themselves
+let outputsBeforeFirstPaint = 0;
+// When the decoder was last configured, and how often a first keyframe found it idle long enough
+// to configure it again (see the pump).
+const IDLE_RECONFIGURE_MS = 5000;
+let configuredAtMs = 0;
+let idleReconfigures = 0;
+// Set when every candidate was refused with the coded-size hint and accepted without it. The
+// hint is the client's request, not the host's stream, so this is "the wrong question was
+// asked", not "this device cannot decode H.264".
 let sizeHintRejected = false;
 
 function nowAbsMs() { return performance.timeOrigin + performance.now(); }
@@ -280,21 +314,16 @@ function notePending(ts, arrivalMs) {
   pending.set(ts, { arrival: arrivalMs, submit: 0 });
 }
 
-// ---------------------------------------------------------------------------
 // Presentation tiers.
-//
-// 1. OffscreenCanvas 2D on this thread (the floor, and already good: DidDraw ->
-//    SetNeedsBeginFrame -> the display compositor picks the newest content at the next
-//    vsync, without ever touching the page's main thread).
-// 2. VideoTrackGenerator / MediaStreamTrackGenerator, which hands decoded frames to a real
-//    <video> element and *may* let the compositor take a hardware overlay in fullscreen.
-//    Chrome 94 has the old name, Safari 18 the new one, nobody has both, and no public
-//    measurement says the overlay actually happens -- so it is feature-detected but opt-in
-//    (`?present=track`), not the default. See docs/manual-tests/client-page.md for the A/B.
+// 1. OffscreenCanvas 2D on this thread, the floor: the display compositor picks the newest
+//    content at the next vsync without touching the page's main thread.
+// 2. VideoTrackGenerator (Safari 18) / MediaStreamTrackGenerator (Chrome 94), which hands
+//    decoded frames to a real <video> and may let the compositor take a hardware overlay in
+//    fullscreen. Nothing public says the overlay happens, so it is opt-in (`?present=track`).
 //
 // `desynchronized` is deliberately absent: Chromium implements the low-latency path only on
-// HTMLCanvasElement (LowLatencyEnabled lives in html_canvas_element.cc; offscreen_canvas.cc
-// overrides none of it), so on an OffscreenCanvas it is inert and only misleads a reader.
+// HTMLCanvasElement (LowLatencyEnabled lives in html_canvas_element.cc), so on an
+// OffscreenCanvas it is inert.
 function setupCanvas(off) {
   canvas = off;
   try {
@@ -303,9 +332,8 @@ function setupCanvas(off) {
     note();
     ctx = null;
   }
-  // Claiming the tier without a context meant every frame counted as rendered while nothing
-  // was drawn: the watchdog was cleared, the stall detector saw progress, and the session sat
-  // live on a black canvas reporting renderTier 1.
+  // never claim the tier without a context: every frame would count as rendered on a black
+  // canvas, with the watchdog cleared
   if (!ctx) {
     canvas = null;
     renderTier = RENDER.none;
@@ -345,9 +373,8 @@ function setupTrackGenerator() {
   }
 }
 
-// A generator that was set up and then could not be handed to the page owns nothing, but
-// `genWriter` still wins in presentFrame, so every decoded frame goes into a writable attached
-// to no sink: a permanently black canvas that reports itself as live.
+// A generator that could not be handed to the page must be released: `genWriter` still wins in
+// presentFrame, so every frame would go into a writable attached to no sink.
 function releaseTrackGenerator() {
   if (genWriter) {
     try { genWriter.close().then(null, note); } catch (_) { note(); }
@@ -360,18 +387,16 @@ function releaseTrackGenerator() {
   genWriter = null;
 }
 
-// Three outcomes, not two: a frame handed to a writable, a frame drawn, and a frame that
-// reached no sink at all. The last one used to be indistinguishable from the second, so it
-// still counted as rendered — which cleared the no-frame watchdog and blinded the stall
-// detector to the very state it exists to catch.
+// Three outcomes, not two: handed to a writable, drawn, or reached no sink at all. The last
+// must not count as rendered, or it clears the no-frame watchdog and blinds the stall detector.
 const PRESENT = { handedOff: 1, painted: 2, noSink: 0 };
 let lastPostedWidth = 0;
 
 function presentFrame(frame) {
   if (genWriter) {
     try {
-      // The writer's promise is the only backpressure signal the generator offers, and we
-      // never await it on the decode path: a slow sink must drop, not queue.
+      // the writer's promise is the generator's only backpressure signal and is never awaited
+      // on the decode path: a slow sink must drop, not queue
       genWriter.write(frame).then(null, note);
       return PRESENT.handedOff; // the writable owns the frame from here
     } catch (_) {
@@ -386,9 +411,8 @@ function presentFrame(frame) {
       canvas.height = frame.displayHeight;
     }
   }
-  // The picture rect input coordinates are normalised against needs the intrinsic size, and
-  // the 1 s stats poll's first tick is a full second after the stream starts — every tap in
-  // that window landed off by half the letterbox bar. Push it the moment it is known.
+  // input coordinates are normalised against the picture rect, which needs the intrinsic size:
+  // push it as soon as it is known, not on the 1 s stats poll
   if (canvas.width > 0 && canvas.width !== lastPostedWidth) {
     lastPostedWidth = canvas.width;
     self.postMessage({ type: 'size', width: canvas.width, height: canvas.height });
@@ -399,8 +423,131 @@ function presentFrame(frame) {
   return PRESENT.painted;
 }
 
+// a line for the page's console, the only one a test harness records
+function diag(text) {
+  try { self.postMessage({ type: 'diag', text: text }); } catch (_) { note(); }
+}
+
+// counters for the diag lines: enough to see a decoder that accepts frames and answers nothing
+function decoderSummary() {
+  let queue = -1;
+  try { if (decoder) queue = decoder.decodeQueueSize; } catch (_) { note(); }
+  return 'in=' + framesIn + ' key=' + keyframesIn + ' decoded=' + framesDecoded +
+    ' rendered=' + framesRendered + ' inFlight=' + inFlight + ' queue=' + queue +
+    ' configured=' + configured + ' configuring=' + (configuring !== null) +
+    (configuring !== null ? ' configuringMs=' + Math.round(performance.now() - configureStartedAtMs) : '') +
+    ' sinceConfigureMs=' + (configuredAtMs ? Math.round(performance.now() - configuredAtMs) : -1) +
+    ' state=' + (decoder ? decoder.state : 'none') + ' waitingForKey=' + waitingForKey +
+    ' keysHandedBack=' + keyframesForwarded + ' stale=' + framesStale +
+    ' unpainted=' + framesUnpainted + ' droppedBeforeFirstPaint=' + outputsBeforeFirstPaint +
+    ' decodeErrors=' + decodeErrors + ' suppressed=' + suppressed + ' resets=' + decoderResets;
+}
+
+// How long a decoder gets to start: a configuration from its own start, or decodes queued with
+// nothing out from the keyframe that went in. The same 5 s as the page's no-picture clock. A
+// demotion costs the session its fast path for good, so these err on the late side; a hardware
+// initialisation on a phone, at 4K, can take seconds and then work.
+const DECODER_START_BOUND_MS = 5000;
+let decoderStartReported = false;
+function reportDecoderNotStarting(why) {
+  if (decoderStartReported) return;
+  decoderStartReported = true;
+  diag('decoder did not start: ' + why + ': ' + decoderSummary());
+  self.postMessage({ type: 'decodernotstarting', reason: why });
+}
+
+// One restart before the first picture, whoever asks for it: this worker when decodes sit queued
+// with nothing out, or the page when frames arrive and none paint. `startEpoch` moves with it, so
+// a bound armed for the decoder before is not counted against the new one.
+let startRestarts = 0;
+let startEpoch = 0;
+let queueBoundEpoch = -1;
+function restartDecoder(why) {
+  startRestarts++;
+  startEpoch++;
+  diag('decoder restart, ' + why + ': ' + decoderSummary());
+  resetAndRequestKey();
+  ensureConfigured().catch(note);
+}
+
+// A hidden page may have its decoding suspended while timers run: both bounds are void while it
+// is hidden, and start again in full when it is shown. `boundGen` moves on every hide.
+let pageHidden = false;
+let boundGen = 0;
+let queueBoundHeld = false;
+let configureBoundHeld = false;
+function setPageHidden(hidden) {
+  if (hidden === pageHidden) return;
+  pageHidden = hidden;
+  if (hidden) {
+    boundGen++;
+    if (queueBoundEpoch === startEpoch && framesDecoded === 0) queueBoundHeld = true;
+    if (configuring) configureBoundHeld = true;
+    return;
+  }
+  if (queueBoundHeld) {
+    queueBoundHeld = false;
+    startQueueTimer();
+  }
+  if (configureBoundHeld) {
+    configureBoundHeld = false;
+    if (configuring) {
+      configureStartedAtMs = performance.now();
+      startConfigureTimer(configuring);
+    }
+  }
+}
+
+// from a keyframe into a decoder that has produced nothing yet, once per decoder
+function armQueueBound() {
+  if (framesDecoded > 0 || queueBoundEpoch === startEpoch) return;
+  queueBoundEpoch = startEpoch;
+  startQueueTimer();
+}
+
+function startQueueTimer() {
+  if (pageHidden) { queueBoundHeld = true; return; }
+  const epoch = startEpoch;
+  const gen = boundGen;
+  setTimeout(function () {
+    if (epoch !== startEpoch || gen !== boundGen || framesDecoded > 0) return;
+    let queue = 0;
+    try { if (decoder) queue = decoder.decodeQueueSize; } catch (_) { note(); }
+    if (queue <= 0) return;
+    if (startRestarts === 0 && canAskForKey()) restartDecoder('decodes queued with nothing out');
+    else reportDecoderNotStarting('decodes queued behind its initialisation');
+  }, DECODER_START_BOUND_MS);
+}
+
+// once per session, about a second after the first keyframe reached the worker
+function noteFirstKeyframe() {
+  setTimeout(function () { diag('one second after the first keyframe: ' + decoderSummary()); }, 1000);
+}
+
 self.onmessage = (e) => {
   if (!e.data) return;
+  if (e.data.type === 'resetdecoder') {
+    // The page saw frames arrive and none paint. A fresh decoder and a keyframe are cheaper than
+    // the <video> path for the rest of the session, and are tried once before it, but only where
+    // a keyframe can actually be asked for: otherwise emptying the decoder only delays the
+    // demotion.
+    if (!canAskForKey()) {
+      diag('decoder restart refused: no way to ask for a keyframe: ' + decoderSummary());
+      self.postMessage({ type: 'restartrefused' });
+      return;
+    }
+    // the one restart already ran; a second gets the page nothing but a later demotion
+    if (startRestarts > 0) {
+      diag('decoder restart asked by the page, already restarted once: ' + decoderSummary());
+      return;
+    }
+    restartDecoder('asked by the page');
+    return;
+  }
+  if (e.data.type === 'visibility') {
+    setPageHidden(!!e.data.hidden);
+    return;
+  }
   if (e.data.type === 'canvas') {
     releaseTrackGenerator();
     setupCanvas(e.data.canvas);
@@ -447,6 +594,8 @@ self.onmessage = (e) => {
     postStats();
   } else if (e.data.type === 'videostats') {
     self.postMessage({ type: 'videostats', stats: collectStats() });
+    // the peak is per poll: the page asks once a second
+    latePeakMs = lateMs;
   } else if (e.data.type === 'rendercount') {
     self.postMessage({ type: 'rendercount', n: framesRendered });
   } else if (e.data.type === 'encodedstream') {
@@ -485,9 +634,8 @@ function advanceRtpUnwrap(tsTicks) {
 }
 
 // `renderFromTs` is the raw stamp of the keyframe the stream resumed from and is never
-// refreshed once the stream is running, so a plain `ts >= renderFromTs` dropped every frame
-// for the rest of the session after the wrap — silently, with no counter, until the stall
-// detector demoted the whole session to <video> thirteen hours in.
+// refreshed, so compare wrap-aware: a plain `ts >= renderFromTs` drops every frame after the
+// 32-bit wrap.
 function beforeRenderStart(ts) {
   if (renderFromTs === null) return false;
   return (((ts >>> 0) - renderFromTs) | 0) < 0;
@@ -536,9 +684,15 @@ function collectStats() {
     hostToPaint: wHostToPaint.pct(),
     framesIn: framesIn,
     framesDecoded: framesDecoded,
+    idleReconfigures: idleReconfigures,
     framesRendered: framesRendered,
     framesUnpainted: framesUnpainted,
     framesDropped: framesDroppedBacklog,
+    framesStale: framesStale,
+    lateCatchUps: lateCatchUps,
+    catchUpRequests: catchUpRequests,
+    lateState: lateState,
+    lateMs: latePeakMs,
     keyDecodeGraceHits: keyDecodeGraceHits,
     silentTrips: silentTrips,
     stallFloorSaves: stallFloorSaves,
@@ -589,11 +743,167 @@ function clearKeyDecode() { keyDecodeTs = null; keyDecodeSinceMs = 0; }
 function stallFloor() { return Math.max(lastOutputAtMs, lastKeySubmitMs, floorGapMs, floorIdleMs); }
 function resetStallFloor() { lastArrivalMs = 0; floorGapMs = 0; floorIdleMs = 0; idleSinceOutput = false; submitsSinceOutput = 0; silentMs = 0; }
 
+function forgetLateness() {
+  holdMinCur = Infinity; holdMinPrev = Infinity; lostFloor = Infinity; holdKnown = -1;
+  lateWindowAtMs = 0; lateWindows = 0; behindSinceMs = 0; lateMs = 0;
+  outputSeq = submitSeq;
+  catchUpArmed = false;
+}
+
+// After a catch-up's reset the depth is learned again, and the one learned before stands in until
+// a window has been seen: same configuration, so the same decoder, and too high is harmless.
+function relearnHold() {
+  const h = Math.min(holdMinPrev, holdMinCur);
+  if (h !== Infinity) holdKnown = h;
+  holdMinCur = Infinity; holdMinPrev = Infinity;
+  lateWindowAtMs = 0; lateWindows = 0;
+}
+
+// when this frame first became known on this machine, recorded as it goes to the decoder
+function noteSubmitted(ts, knownAtMs) {
+  const i = submitSeq & (ARRIVAL_RING - 1);
+  arrivalTs[i] = ts >>> 0;
+  arrivalAt[i] = knownAtMs;
+  submitSeq++;
+  if (submitSeq - outputSeq > ARRIVAL_RING) outputSeq = submitSeq - ARRIVAL_RING;
+}
+
+function canAskForKey() {
+  if (outOfBandKey) return true;
+  return !!(transformer && typeof transformer.sendKeyFrameRequest === 'function' &&
+    sendKeyFailures < MAX_SEND_KEY_FAILURES);
+}
+
+// Called once per output, before the paint; true means "do not paint this one". On a session
+// that keeps up: a ring lookup, a few compares and two subtractions.
+function judgeLateness(ts, nowMs) {
+  const t = ts >>> 0;
+  const mask = ARRIVAL_RING - 1;
+  // anything older that never came out was dropped by the decoder
+  while (outputSeq < submitSeq && arrivalTs[outputSeq & mask] !== t &&
+         ((t - arrivalTs[outputSeq & mask]) | 0) > 0) outputSeq++;
+  if (outputSeq >= submitSeq || arrivalTs[outputSeq & mask] !== t) return false;
+  const seq = outputSeq++;
+  const after = submitSeq - 1 - seq;
+  if (nowMs - lateWindowAtMs > LATE_WINDOW_MS) {
+    holdMinPrev = holdMinCur;
+    holdMinCur = Infinity;
+    lateWindowAtMs = nowMs;
+    lateWindows++;
+  }
+  if (lateState === LATE.inStep && after < holdMinCur) holdMinCur = after;
+  const learning = lateWindows < 2;
+  let hold = Math.min(holdMinPrev, holdMinCur);
+  if (hold !== Infinity && !learning) holdKnown = hold;
+  else hold = holdKnown >= 0 ? holdKnown : 0;
+  const release = seq + hold;
+  const lost = release < submitSeq ? nowMs - arrivalAt[release & mask] : 0;
+  if (lost < lostFloor) lostFloor = lost;
+  const excess = lost - lostFloor;
+  lateMs = excess;
+  if (excess > latePeakMs) latePeakMs = excess;
+  // the first window after a configure is spent learning how many pictures this decoder holds
+  if ((learning && holdKnown < 0) || lateState === LATE.catchingUp) return false;
+  const newer = after > hold &&
+    ((arrivalTs[(seq + 1) & mask] - t) >>> 0) <= SKIP_NEIGHBOUR_MS * RTP_HZ / 1000;
+
+  if (excess <= (lateState === LATE.skipping ? LATE_RESUME_MS : LATE_MS)) {
+    behindSinceMs = 0;
+    lateState = LATE.inStep;
+    return false;
+  }
+  const stale = newer && excess > STALE_MS && lateState !== LATE.behind;
+  if (!behindSinceMs || excess < behindBest) {
+    // late, but draining (or only just late): nothing to fix yet
+    if (!behindSinceMs) behindSinceMs = nowMs;
+    behindBest = excess;
+    behindBestAtMs = nowMs;
+    return stale || (newer && lateState === LATE.skipping);
+  }
+  const wait = lateState === LATE.skipping ? LATE_TRIAL_MS : LATE_STUCK_MS;
+  if (nowMs - behindBestAtMs < wait) return stale || (newer && lateState === LATE.skipping);
+
+  if (lateState === LATE.inStep) {
+    // behind and not catching up on its own: skipping is always tried first
+    lateState = LATE.skipping;
+    behindBest = excess;
+    behindBestAtMs = nowMs;
+    trialExcess = excess;
+    return newer;
+  }
+  // Skipping did not help, so the paint is not what is slow: paint everything the decoder
+  // gives, and catch up if the lost time keeps growing and a keyframe can be asked for.
+  lateState = LATE.behind;
+  if (excess > CATCHUP_MS && excess > trialExcess + CATCHUP_GROWTH_MS && !catchUpDue &&
+      !catchUpArmed && !catchUpsOff && nowMs - lastCatchUpMs >= catchUpIntervalMs &&
+      canAskForKey() && !keyDecodeInGrace(nowMs)) {
+    catchUpDue = true;
+  }
+  return false;
+}
+
+// A keyframe is in hand: throw away what the decoder holds and start again from it. Runs in the
+// pump, between two reads, never inside an output callback.
+function catchUp(nowMs) {
+  catchUpDue = false;
+  catchUpArmed = false;
+  // back again this soon: the last one did not bring the lateness down for long
+  if (nowMs - lastCatchUpMs < CATCHUP_RECUR_MS) {
+    catchUpIntervalMs = Math.min(catchUpIntervalMs * 2, CATCHUP_MAX_INTERVAL_MS);
+  } else {
+    catchUpIntervalMs = CATCHUP_MIN_INTERVAL_MS;
+  }
+  lastCatchUpMs = nowMs;
+  lateCatchUps++;
+  const discarded = inFlight;
+  try {
+    decoder.reset();
+    decoder.configure(activeConfig);
+  } catch (_) {
+    note();
+    resetAndRequestKey();
+    return false;
+  }
+  framesDroppedBacklog += discarded;
+  inFlight = 0;
+  lastOutputAtMs = 0;
+  clearKeyDecode();
+  resetStallFloor();
+  pending.clear();
+  outputSeq = submitSeq;
+  relearnHold();
+  behindSinceMs = 0;
+  lateState = LATE.inStep;
+  return true;
+}
+
+// A catch-up's own request: out of band where the host parses it (it skips the host's PLI
+// back-off), else sendKeyFrameRequest. Not counted in `keyRequests`, which the host reads as a
+// sign of loss. One swallowed by the request spacing is sent on the next read instead.
+function requestCatchUpKey() {
+  const now = performance.now();
+  if (now - lastKeyRequestAt < KEY_REQUEST_MIN_INTERVAL_MS) { catchUpKeyPending = true; return; }
+  catchUpKeyPending = false;
+  if (!canAskForKey()) { requestKey(true); return; }
+  lastKeyRequestAt = now;
+  catchUpRequests++;
+  if (outOfBandKey) {
+    self.postMessage({ type: 'requestkey' });
+    return;
+  }
+  try {
+    const p = transformer.sendKeyFrameRequest();
+    if (p && p.then) p.then(function () { sendKeyFailures = 0; }, noteSendKeyFailure);
+  } catch (_) { noteSendKeyFailure(); }
+}
+
 function onDecodedFrame(frame) {
+  const beforeFirstPaint = !renderedOnce;
   framesDecoded++;
   if (inFlight > 0) inFlight--;
   if (inFlight === 0) idleSinceOutput = true;
-  lastOutputAtMs = performance.now();
+  const nowMs = performance.now();
+  lastOutputAtMs = nowMs;
   submitsSinceOutput = 0;
   silentMs = 0;
   let handedOff = false;
@@ -603,11 +913,16 @@ function onDecodedFrame(frame) {
   if (keyDecodeTs !== null && (((ts >>> 0) - keyDecodeTs) | 0) >= 0) clearKeyDecode();
   try {
     if (!beforeRenderStart(ts)) {
+      if (judgeLateness(ts, nowMs)) {
+        framesStale++;
+        pending.delete(ts);
+        return;
+      }
       const outcome = presentFrame(frame);
       handedOff = outcome === PRESENT.handedOff;
       if (outcome === PRESENT.noSink) {
-        // Nothing painted it, so it is not a rendered frame. Counting it cleared the page's
-        // no-frame watchdog and hid the stall from the detector that would have recovered it.
+        // nothing painted it, so it is not a rendered frame: counting it would clear the
+        // page's no-frame watchdog
         framesUnpainted++;
         advanceRtpUnwrap(ts);
       } else {
@@ -628,16 +943,17 @@ function onDecodedFrame(frame) {
         reportAvSync(ts);
         if (!renderedOnce) {
           renderedOnce = true;
+          diag('first frame painted: ' + decoderSummary());
           self.postMessage({ type: 'rendered' });
         }
       }
     }
   } catch (err) {
-    // A throw out of the output callback used to stall framesRendered silently and let the
-    // page's watchdog demote the whole session to <video>.
+    // report it: a throw out of the output callback would otherwise stall framesRendered silently
     note();
     self.postMessage({ type: 'painterror', message: String(err) });
   } finally {
+    if (beforeFirstPaint && !renderedOnce) outputsBeforeFirstPaint++;
     if (!handedOff) {
       try { frame.close(); } catch (_) { note(); }
     }
@@ -654,9 +970,9 @@ function makeDecoder() {
       resetAndRequestKey();
     },
   });
-  // Chrome 106+, Firefox 130+, Safari 16.4+. It is the browser's own "input accepted" edge;
-  // we use it only to clear a stale backlog promptly, since the completion signal that
-  // actually gates submission is the output callback above.
+  // ondequeue: Chrome 106+, Firefox 130+, Safari 16.4+. It is the browser's "input accepted"
+  // edge, used only to clear a stale backlog promptly: what gates submission is the output
+  // callback above.
   if ('ondequeue' in d) {
     hasDequeueEvent = true;
     d.ondequeue = function () {
@@ -673,15 +989,11 @@ function makeDecoder() {
   return d;
 }
 
-// The coded size is a *hint*, never a requirement. It is what the client asked the host for,
-// and the host does not build that: it snaps the DPR to a step the OS actually exposes, rounds
-// the backing size down to an even number, clamps it, and then applies a per-device video scale
-// that shrinks the encoded frame again. So the hinted size is routinely larger than the stream
-// that arrives — and a UA that answers `isConfigSupported` honestly about a size it cannot
-// decode would fail every candidate and demote the whole session to <video> for good.
-//
-// A real size still lets a UA answer honestly rather than guess, so it is worth offering; it is
-// simply never worth failing over. `sized` false is the same configuration without it.
+// The coded size is a hint, never a requirement. It is what the client asked for, and the host
+// snaps the DPR, rounds the backing size down to even, clamps it and applies a per-device video
+// scale, so the hint is routinely larger than the stream. A UA that answers `isConfigSupported`
+// honestly about a size it cannot decode would fail every candidate, so `sized` false is the
+// same configuration without it.
 function decoderConfig(codec, sized) {
   const cfg = { codec: codec, optimizeForLatency: true };
   if (sized && hintWidth > 0 && hintHeight > 0) {
@@ -701,19 +1013,34 @@ function withAcceleration(cfg, mode) {
   return out;
 }
 
-// Memoised while it runs: startPump calls this un-awaited to get the first keyframe request
-// out, and the pump awaits it again on the first frame. Both used to run the whole probe loop
-// and both used to assign `decoder`, orphaning a configured VideoDecoder — a GPU-process
-// decode session on Chromium — with no close() on every session start.
+// Memoised while it runs: startPump calls this un-awaited and the pump awaits it again on the
+// first frame. Two runs would both assign `decoder` and orphan a configured VideoDecoder (a
+// GPU-process decode session on Chromium) with no close().
 let configuring = null;
+let configureStartedAtMs = 0;
 function ensureConfigured() {
   if (configured && decoder && decoder.state !== 'closed') return Promise.resolve(true);
   if (!configuring) {
     const done = function () { configuring = null; };
-    configuring = doConfigure();
+    const mine = doConfigure();
+    configuring = mine;
+    configureStartedAtMs = performance.now();
     configuring.then(done, done);
+    startConfigureTimer(mine);
   }
   return configuring;
+}
+
+// Bounded from the configuration's own start. Reported only once frames are arriving (the pump
+// checks again when one does); a restart would get the same unresolved configure back, so this
+// one demotes directly.
+function startConfigureTimer(mine) {
+  if (pageHidden) { configureBoundHeld = true; return; }
+  const gen = boundGen;
+  setTimeout(function () {
+    if (gen !== boundGen || pageHidden) return;
+    if (configuring === mine && framesIn > 0) reportDecoderNotStarting('configuration still pending');
+  }, DECODER_START_BOUND_MS);
 }
 
 async function doConfigure() {
@@ -722,9 +1049,8 @@ async function doConfigure() {
     ? [preferredCodec].concat(CODEC_CANDIDATES.filter((c) => c !== preferredCodec))
     : CODEC_CANDIDATES.slice();
 
-  // Probe exactly the configuration we are about to install. The old code probed
-  // `{codec}` and configured `{codec, optimizeForLatency}`, so a UA that accepted the first
-  // and rejected the second threw where nothing was watching.
+  // probe exactly the configuration about to be installed: a UA can accept `{codec}` and
+  // reject `{codec, optimizeForLatency}`
   let chosen = decoderConfig(candidates[0], hasSizeHint());
   if (typeof VideoDecoder.isConfigSupported === 'function') {
     let anySupported = false;
@@ -748,8 +1074,8 @@ async function doConfigure() {
         } catch (_) { note(); }
       }
       if (!anySupported && rounds[r]) {
-        // Worth naming: it means the hinted size was the thing being refused, and the size is
-        // the client's request rather than the host's stream.
+        // the hinted size was what got refused, and that is the client's request, not the
+        // host's stream
         sizeHintRejected = true;
         console.warn('[webcodecs] no configuration accepted ' + hintWidth + 'x' + hintHeight +
           '; retrying without the coded-size hint');
@@ -760,8 +1086,8 @@ async function doConfigure() {
       self.postMessage({ type: 'configerror', message: configError, codec: candidates[0] });
       throw new Error(configError);
     }
-    // Separately: does this device have a hardware decoder for the chosen config at all?
-    // The answer only feeds telemetry -- we still configure with `no-preference`.
+    // telemetry only: whether this device has a hardware decoder for the chosen config. The
+    // decoder is still configured with `no-preference`.
     try {
       const hw = await VideoDecoder.isConfigSupported(withAcceleration(chosen, 'prefer-hardware'));
       decoderHardware = !!(hw && hw.supported);
@@ -771,21 +1097,30 @@ async function doConfigure() {
   decoder = makeDecoder();
   try {
     decoder.configure(chosen);
+    activeConfig = chosen;
+    diag('decoder configured: ' + chosen.codec + (decoderHardware ? ' (hardware available)' : ''));
   } catch (err) {
     configError = String(err);
     self.postMessage({ type: 'configerror', message: configError, codec: chosen.codec });
     throw err;
   }
   configured = true;
+  configuredAtMs = performance.now();
   setWaitingForKey(true);
   inFlight = 0;
   lastOutputAtMs = 0;
   clearKeyDecode();
   resetStallFloor();
+  forgetLateness();
+  lateState = LATE.inStep;
+  catchUpDue = false;
+  catchUpIntervalMs = CATCHUP_MIN_INTERVAL_MS;
   return true;
 }
 
 function setWaitingForKey(on) {
+  // a catch-up decided before this wait would reset the decoder under the keyframe that ends it
+  if (on) catchUpDue = false;
   if (on && !waitingForKey) waitingSince = performance.now();
   if (on && waitingSince === 0) waitingSince = performance.now();
   if (!on) waitingSince = 0;
@@ -822,11 +1157,10 @@ function resetAndRequestKey() {
   requestKey(true);
 }
 
-// The legacy createEncodedStreams transform has no way to ask for an IDR: the transform runs
-// instead of the reference finder, so the machinery that would normally emit a PLI never sees
-// a frame. Ask the host directly over the input channel instead of freezing — but only when it
-// has said it parses the opcode, or `none` is the honest tier and the page's demotion is the
-// only remedy left.
+// The legacy createEncodedStreams transform cannot ask for an IDR: it runs instead of the
+// reference finder, so nothing that would emit a PLI ever sees a frame. Ask the host over the
+// input channel, but only when it has said it parses the opcode; otherwise `none` is the
+// honest tier and the page's demotion is the remedy.
 function requestKeyOutOfBand() {
   if (outOfBandKey) {
     keyTier = KEYREQ.outOfBand;
@@ -879,14 +1213,12 @@ self.onrtctransform = (event) => {
 function startPump(readable) {
   const reader = readable.getReader();
 
-  // Stamp the keyframe wait here, not inside the configure. `waitingSince` starts at 0, and
-  // the pump can see frames before the configure has run — so the "waited" it computed was
-  // performance.now(), i.e. however long the page had been open. On a page that had been up
-  // for more than KEY_WAIT_GIVE_UP_MS that reads as an instant give-up on the first delta.
+  // stamp the keyframe wait here, not in the configure: the pump can see frames before the
+  // configure has run, and a `waitingSince` of 0 reads as an instant give-up on the first delta
   setWaitingForKey(true);
 
-  // Ask for the first IDR straight away rather than behind the configure: the configure now
-  // waits for the codec hint, and the host should be producing the keyframe while it does.
+  // ask for the first IDR now, not behind the configure, which waits for the codec hint: the
+  // host should be producing the keyframe meanwhile
   requestKey(true);
   ensureConfigured().catch(note);
 
@@ -911,13 +1243,49 @@ function startPump(readable) {
       framesIn++;
       const arrivalMs = nowAbsMs();
       const arrivedAtMs = performance.now();
+      // the browser's own receive time, where it reports one, also covers the wait in the
+      // transform's input, which a slow paint or a frozen thread fills
+      let knownAtMs = arrivedAtMs;
+      if (typeof encodedFrame.getMetadata === 'function') {
+        try {
+          const rt = encodedFrame.getMetadata().receiveTime;
+          if (rt > 0 && rt <= arrivedAtMs && arrivedAtMs - rt < 60000) knownAtMs = rt;
+        } catch (_) { note(); }
+      }
       const gapMs = lastArrivalMs ? arrivedAtMs - lastArrivalMs : 0;
       if (gapMs > ARRIVAL_GAP_MS && submitsSinceOutput <= MAX_UNANSWERED) floorGapMs = arrivedAtMs;
       if (keyDecodeInGrace(arrivedAtMs)) silentMs = 0;
       else if (submitsSinceOutput > 0) silentMs += Math.min(gapMs, SILENT_GAP_CAP_MS);
       lastArrivalMs = arrivedAtMs;
       const type = encodedFrame.type === 'key' ? 'key' : 'delta';
-      if (type === 'key') keyframesIn++;
+      if (type === 'key') {
+        keyframesIn++;
+        if (keyframesIn === 1) noteFirstKeyframe();
+        armQueueBound();
+      }
+
+      if (catchUpDue && decoder && configured && !waitingForKey && !keyDecodeInGrace(arrivedAtMs)) {
+        catchUpDue = false;
+        catchUpArmed = true;
+        catchUpArmedAtMs = arrivedAtMs;
+        // a keyframe arriving now needs no request
+        if (type !== 'key') {
+          lateState = LATE.catchingUp;
+          requestCatchUpKey();
+        }
+      }
+      if (catchUpArmed && decoder && configured) {
+        if (type === 'key') {
+          catchUp(arrivedAtMs);
+        } else if (arrivedAtMs - catchUpArmedAtMs > CATCHUP_KEY_WAIT_MS) {
+          // unanswered: this path does not deliver a keyframe when asked, so stop asking for good
+          catchUpArmed = false;
+          catchUpsOff = true;
+          lateState = LATE.behind;
+        } else if (catchUpKeyPending || arrivedAtMs - lastKeyRequestAt >= CATCHUP_KEY_RETRY_MS) {
+          requestCatchUpKey();
+        }
+      }
 
       if (waitingForKey && type !== 'key') {
         const waited = performance.now() - waitingSince;
@@ -965,7 +1333,7 @@ function startPump(readable) {
           (pumpNowMs - stallFloor()) > BACKLOG_STALL_MS;
         if (inFlight > MAX_IN_FLIGHT && !outputStalled && lastOutputAtMs !== 0 &&
             pumpNowMs - lastOutputAtMs > BACKLOG_STALL_MS) {
-          // The old clock would have called this a stall; say which floor said otherwise.
+          // the last-output clock alone would call this a stall: count which floor said otherwise
           stallFloorSaves++;
           const f = Math.max(lastKeySubmitMs, floorGapMs, floorIdleMs);
           if (f === lastKeySubmitMs) stallFloorSavesKey++;
@@ -973,7 +1341,7 @@ function startPump(readable) {
           else stallFloorSavesIdle++;
         }
         if (inFlight > MAX_IN_FLIGHT && outputStalled && keyBusy) {
-          // The decoder is on a keyframe: submit the delta, it is needed.
+          // the decoder is on a keyframe: submit the delta, it is needed
           keyDecodeGraceHits++;
           backlogStreak = 0;
         } else if (inFlight > MAX_IN_FLIGHT && outputStalled) {
@@ -993,10 +1361,32 @@ function startPump(readable) {
       try {
         if (!configured || !decoder || decoder.state === 'closed') {
           if (decoderResets > MAX_DECODER_RESETS) continue;
-          await ensureConfigured();
+          const pending = ensureConfigured();
+          // a configuration already past its bound when the first frames arrive
+          if (configuring && !pageHidden && !configureBoundHeld &&
+              performance.now() - configureStartedAtMs >= DECODER_START_BOUND_MS) {
+            reportDecoderNotStarting('configuration still pending');
+          }
+          await pending;
         }
         if (waitingForKey && type === 'key') {
+          // The first keyframe into a decoder configured long before (the host answered before
+          // its picture was ready) goes into a fresh configuration. Configuring again in front
+          // of a keyframe loses nothing, so a decoder that sat configured and idle for a long
+          // time is never the one asked to start from it.
+          if (framesDecoded === 0 && decoder && decoder.state === 'configured' && activeConfig &&
+              performance.now() - configuredAtMs > IDLE_RECONFIGURE_MS) {
+            const idleMs = Math.round(performance.now() - configuredAtMs);
+            try {
+              decoder.reset();
+              decoder.configure(activeConfig);
+              configuredAtMs = performance.now();
+              idleReconfigures++;
+              diag('decoder configured again before its first keyframe, idle ' + idleMs + ' ms');
+            } catch (_) { note(); }
+          }
           setWaitingForKey(false);
+          if (lateState === LATE.catchingUp) lateState = LATE.inStep;
           renderFromTs = encodedFrame.timestamp;
           decoderResets = 0;
         }
@@ -1007,7 +1397,8 @@ function startPump(readable) {
         idleSinceOutput = false;
         submitsSinceOutput++;
         inFlight++;
-        // Marked before the decode call: a decoder may output synchronously.
+        noteSubmitted(encodedFrame.timestamp, knownAtMs);
+        // marked before the decode call: a decoder may output synchronously
         if (type === 'key') {
           keyDecodeTs = encodedFrame.timestamp >>> 0;
           keyDecodeSinceMs = performance.now();

@@ -1,12 +1,9 @@
 // Drives the ICE gathering wait out of index.html under Node with a fake RTCPeerConnection.
-// The page has no build step and its script is inline, so the functions are lifted out of the
-// file by name and run directly — the same trick would break on a bundler and is exactly why
-// this file exists rather than a browser test.
+// The page's script is inline with no build step, so the functions are lifted out by name.
 //
-// What it protects: a relayed (TURN) join must not end gathering on a host candidate. The
-// offer is a single WHEP POST with no PATCH to trickle candidates later, so a relay candidate
-// that has not been gathered by then can never be used, and the session simply fails to
-// connect with nothing on screen to say why.
+// What it protects: a relayed (TURN) join must not end gathering on a host candidate. Without
+// trickle the offer is a single WHEP POST, so a relay candidate not gathered by then can never
+// be used and the session fails to connect with nothing on screen to say why.
 import fs from 'node:fs';
 import vm from 'node:vm';
 
@@ -22,7 +19,7 @@ let failures = 0;
 function ok(msg) { console.log('ok  - ' + msg); }
 function fail(msg) { failures++; console.log('FAIL- ' + msg); }
 
-// --- lift the pieces under test out of the page --------------------------------------------
+// lift the pieces under test out of the page
 
 function takeConst(name) {
   const m = new RegExp('\\bconst\\s+' + name + '\\s*=\\s*[^;]+;').exec(page);
@@ -52,9 +49,9 @@ function takeLet(name) {
   return m[0];
 }
 
-// The stage hold's real deadline is 8 s, which is not a thing to sit through in a unit suite.
-// Its *value* is asserted from the page below; only the lifted copy is shortened, and the
-// rewrite has to match or this throws rather than silently testing nothing.
+// The stage hold's shipped deadline is 8 s, too long for a unit suite. Its value is asserted
+// from the page below; only the lifted copy is shortened, and a rewrite that matches nothing
+// throws rather than silently testing nothing.
 const HOLD_DEADLINE_MS = 120;
 function takeShortenedDeadline() {
   const src = takeConst('ICE_SETTLE_DEADLINE_MS');
@@ -86,7 +83,7 @@ const source = [
   takeFunction('armIceSettleDeadline'),
   takeFunction('releaseIceHold'),
   takeFunction('iceSettled'),
-  // `const` is lexically scoped to the script and never reaches the context object.
+  // `const` is lexically scoped to the script and never reaches the context object
   'this.__grace = { host: ICE_HOST_GRACE_MS, relay: ICE_RELAY_GRACE_MS };',
   'this.__maxBatch = TRICKLE_MAX_BATCH;',
   'this.__firstAckMs = TRICKLE_FIRST_ACK_MS;',
@@ -122,8 +119,7 @@ const ctx = {
   onStreamLive() { liveShown++; },
   fetch(url, opts) {
     patches.push({ url, opts });
-    // A request that is accepted by the socket and then never answered — the case the
-    // first-ack deadline exists for. A promise that never settles is exactly that.
+    // a request the socket accepts and never answers: the case the first-ack deadline is for
     if (ctx.__hangFetch) return new Promise(() => {});
     const status = nextPatchStatus;
     return Promise.resolve({ status, ok: status >= 200 && status < 300 });
@@ -132,10 +128,9 @@ const ctx = {
 vm.createContext(ctx);
 vm.runInContext(source, ctx, { filename: 'index.html:ice' });
 
-// --- who actually needs a relay ------------------------------------------------------------
-// The host serves TURN to same-subnet clients on purpose, as a backup, so the presence of a TURN
-// entry says nothing about whether the session will be relayed. Only the host's own locality
-// does, and it is the field `/ice-config` was extended to carry.
+// Who needs a relay. The host serves TURN to same-subnet clients too, as a backup, so a TURN
+// entry says nothing about whether the session will be relayed. Only the `locality` field of
+// `/ice-config` does.
 
 const TURN = [{ urls: ['turn:relay.example:3478'], username: 'u', credential: 'c' }];
 const STUN = [{ urls: 'stun:stun.example:19302' }];
@@ -153,14 +148,11 @@ for (const [cfg, want, msg] of relayCases) {
   else ok(msg);
 }
 
-// --- the shape the public relay actually forwards -------------------------------------------
-// Captured from https://session.screenextend.app on 2026-09-10. The relay does not tunnel
-// `/ice-config` or `/net-config` to the host at all — `cloud.rs::dispatch` answers only `/whep`,
-// `/reconfig` and `/leave` — so a client that joined through the relay is reading the relay
-// service's own answers, not this host's. Those answers are a third-party contract this repo
-// cannot change and does not build, which is exactly why they belong in a test: they carry no
-// `locality`, no TURN and no `trickleIce`, and every one of those absences has to land on the
-// conservative branch rather than on a fast path the relay cannot support.
+// The shape the public relay serves, captured from https://session.screenextend.app on
+// 2026-09-10. The relay does not tunnel `/ice-config` or `/net-config` (`cloud.rs::dispatch`
+// answers only `/whep`, `/reconfig` and `/leave`), so a relayed client reads the relay's own
+// answers. They carry no `locality`, no TURN and no `trickleIce`, and each absence must land
+// on the conservative branch.
 
 const RELAY_ICE_CONFIG = { iceServers: [{ urls: ['stun:stun.l.google.com:19302'] }] };
 const RELAY_NET_CONFIG = { httpsPort: 443 };
@@ -177,11 +169,9 @@ if (RELAY_ICE_CONFIG.locality !== undefined) {
   ok('the relay /ice-config carries no locality, so the client stays on the honest unknown branch');
 }
 
-// `trickleIce` decides whether the offer may leave before gathering finishes, and the whole
-// trickle exchange is `PATCH /whep/{id}` — a route the relay tunnel does not carry. An absent
-// field must therefore read as "no trickle", which is what the strict `=== true` buys. A
-// truthiness test here would turn every relayed join into one that posts early and then trickles
-// its candidates into a 404.
+// Trickle is `PATCH /whep/{id}`, a route the relay tunnel does not carry, so an absent
+// `trickleIce` must read as no trickle: hence the strict `=== true`. A truthiness test would
+// make every relayed join post early and trickle its candidates into a 404.
 if (!/netConfig\.trickleIce\s*===\s*true/.test(page)) {
   fail('the trickle decision must compare `trickleIce === true`, so an absent field is not trickle');
 } else {
@@ -193,7 +183,7 @@ if (RELAY_NET_CONFIG.trickleIce !== undefined) {
   ok('the relay /net-config omits trickleIce, so a relayed join gathers before it posts');
 }
 
-// --- the pure gating table -----------------------------------------------------------------
+// the pure gating table
 
 const HOST = ctx.__grace.host;
 const RELAY = ctx.__grace.relay;
@@ -223,7 +213,7 @@ if (ctx.iceCandidateType({ candidate: 'candidate:1 1 udp 41885439 10.0.0.1 5000 
 if (ctx.iceCandidateType({ candidate: '' }) !== '') fail('an empty candidate is not a type');
 else ok('an empty candidate line yields no type');
 
-// --- the wait itself, against a fake peer connection ---------------------------------------
+// the wait itself, against a fake peer connection
 
 function fakePc() {
   const subs = {};
@@ -254,11 +244,9 @@ async function timed(fn) {
   return Date.now() - t0;
 }
 
-// --- trickle ICE, RFC 9725 §4.6 --------------------------------------------------------------
-// The half that replaces the wait above: the offer leaves immediately and the candidates follow
-// over PATCH. What has to hold is that nothing is sent before the host names a resource, that a
-// candidate the offer already carried is not sent twice, and that the body is the sdpfrag the
-// host's parser reads.
+// Trickle ICE, RFC 9725 section 4.6: the offer leaves immediately and the candidates follow
+// over PATCH. Nothing may be sent before the host names a resource, a candidate the offer
+// already carried is not sent twice, and the body is the sdpfrag the host's parser reads.
 
 function settle() { return new Promise((r) => setTimeout(r, 0)); }
 
@@ -267,7 +255,6 @@ function cand(text, mid) {
 }
 
 async function trickle() {
-  // The fragment body.
   {
     const body = ctx.trickleFragment('ABCD', [cand('candidate:1 1 udp 2 10.0.0.1 5000 typ host')], false);
     const lines = body.split('\r\n').filter((l) => l.length);
@@ -321,8 +308,8 @@ async function trickle() {
       fail('content type was ' + patches[0].opts.headers['Content-Type']);
     } else ok('opening the resource flushes the buffer as one PATCH of trickle-ice-sdpfrag');
     // The resource id rides a cleartext `Location` on the HTTP listener, so it is not the whole
-    // authority. The second factor used to be the peer's address, which a roam changes under a
-    // live session; it is the device token now, and the client has to send it.
+    // authority. The second factor is the device token (an address changes under a roam), and
+    // the client has to send it.
     if (patches[0].opts.headers['X-Device-Token'] !== 'aaaaaaaabbbbbbbbccccccccdddddddd') {
       fail('the PATCH presented ' + JSON.stringify(patches[0].opts.headers['X-Device-Token']));
     } else ok('the PATCH presents the device token as the resource\'s second factor');
@@ -452,7 +439,7 @@ async function trickle() {
     t.stop();
   }
 
-  // Nothing was ever attempted — a network with no candidates at all — so there is nothing to
+  // Nothing was ever attempted (a network with no candidates at all), so there is nothing to
   // blame on the endpoint and no rejoin to ask for.
   {
     let deadReason = null;
@@ -465,10 +452,9 @@ async function trickle() {
     t.stop();
   }
 
-  // ── the settle callback ────────────────────────────────────────────────────────────────
-  // The page holds the streaming stage back until the sender says it will send nothing more,
-  // so that a rejoin with a gathered offer can only ever happen in front of the join form.
-  // Every exit has to reach it, or the picture never appears.
+  // The settle callback. The page holds the streaming stage back until the sender says it will
+  // send nothing more, so that a rejoin with a gathered offer can only happen in front of the
+  // join form. Every exit has to reach it, or the picture never appears.
 
   // The happy path: the last batch carries `a=end-of-candidates` and is acknowledged.
   {
@@ -489,8 +475,8 @@ async function trickle() {
     else ok('an acknowledged end-of-candidates settles the sender exactly once');
   }
 
-  // A dead sender settles too — after `onDead`, so a rejoin replaces the gate rather than
-  // racing it, and the page is never left holding a stage for a sender that gave up.
+  // A dead sender settles too, after `onDead`, so a rejoin replaces the gate rather than
+  // racing it and the page is never left holding a stage for a sender that gave up.
   {
     patches.length = 0;
     nextPatchStatus = 405;
@@ -525,12 +511,10 @@ async function trickle() {
     nextPatchStatus = 204;
   }
 
-  // ── the end of gathering has two signals, and either one has to be enough ──────────────
-  // Waiting only for the null candidate makes the whole sender — and with it the streaming
-  // stage — depend on one event. A browser that reports completion through the state alone,
-  // or one whose null candidate landed in the task before the listener was attached, then
-  // never sends `a=end-of-candidates`, never settles, and the page reports a gathering
-  // timeout on a session that gathered in a hundred milliseconds.
+  // The end of gathering has two signals and either must be enough. A browser that reports
+  // completion through the state alone, or whose null candidate landed before the listener was
+  // attached, would otherwise never send `a=end-of-candidates` and never settle, and the page
+  // would report a gathering timeout on a session that gathered in 100 ms.
   {
     patches.length = 0;
     let settles = 0;
@@ -570,10 +554,10 @@ async function trickle() {
     t.stop();
   }
 
-  // Every candidate was already in the offer, so the batch is empty. Without an end-of-
-  // gathering signal that is a sender which PATCHes nothing, reports nothing and never
-  // settles — and `open()`'s first-ack timer deliberately stays quiet, because nothing was
-  // attempted. The stage would then wait out the whole deadline for a healthy session.
+  // Every candidate was already in the offer, so the batch is empty. Without an end-of-gathering
+  // signal that sender PATCHes nothing, reports nothing and never settles, and `open()`'s
+  // first-ack timer stays quiet on purpose because nothing was attempted: the stage would wait
+  // out the whole deadline for a healthy session.
   {
     patches.length = 0;
     let settles = 0;
@@ -608,7 +592,7 @@ async function trickle() {
     t.stop();
   }
 
-  // An older call site passes no callback at all; the sender must not throw on its way out.
+  // the callbacks are optional: a sender given none must not throw on its way out
   {
     const pc = fakePc();
     const t = ctx.startTrickle(pc);
@@ -619,10 +603,9 @@ async function trickle() {
     t.stop();
   }
 
-  // The golden vector the Rust parser is tested against. It is produced by the *shipped*
-  // `trickleFragment`, not by a copy of it, so a change to the client body either updates this
-  // file — and the Rust test then parses the new bytes — or fails here. A hand-written literal on
-  // the Rust side could not do either.
+  // The golden vector the Rust parser is tested against, produced by the shipped
+  // `trickleFragment`: a change to the client body either updates the fixture (and the Rust test
+  // then parses the new bytes) or fails here.
   {
     const body = ctx.trickleFragment('UF01', [
       cand('candidate:1 1 udp 2130706431 192.168.1.5 54321 typ host'),
@@ -675,14 +658,10 @@ async function trickle() {
   }
 }
 
-// --- the streaming stage's hold ------------------------------------------------------------
-// The hold keeps the picture back until the trickle sender says it will send nothing more, so
-// that a rejoin with a gathered offer can only ever happen in front of the join form. Its
-// deadline is the net under that. What this section pins is *when the net is armed*: at the
-// offer it also covered the WHEP round trip, and that round trip builds a virtual display —
-// `DISPLAY_ATTACH_TIMEOUT` is 5 s on its own and the correlation lock serialises it across
-// joins — so a host that was merely slow made the page report `ice_gathering_timed_out` for a
-// join that then succeeded, and hold the picture for 8 s to do it.
+// The streaming stage's hold and its deadline. This pins when the deadline is armed: when the
+// resource is opened, not at the offer. The WHEP round trip builds a virtual display
+// (`DISPLAY_ATTACH_TIMEOUT` is 5 s on its own, and joins are serialised), so armed at the offer
+// a merely slow host would report `ice_gathering_timed_out` for a join that then succeeds.
 
 async function stageHold() {
   const shipped = /=\s*(\d+)\s*;/.exec(takeConst('ICE_SETTLE_DEADLINE_MS'));
@@ -692,21 +671,20 @@ async function stageHold() {
   if (!whep) fail('WHEP_TIMEOUT_MS is not a plain number any more');
   else ok('the WHEP POST has its own ' + whep[1] + ' ms timeout, which is what bounds a host that never answers');
 
-  // Armed at the offer, this is where the false timeout came from: the sender cannot PATCH
-  // before the answer names its resource, so every millisecond the host spends creating a
-  // display counted against a deadline about ICE.
+  // Holding alone must not start the deadline: the sender cannot PATCH before the answer names
+  // its resource, so time the host spends creating a display must not count against ICE.
   {
     deadlineBits = 0;
     liveShown = 0;
     ctx.holdStageForIce();
     await sleep(HOLD_DEADLINE_MS * 3);
     if (deadlineBits & ctx.DEG.ICE_GATHERING_DEADLINE) fail('the hold expired while the WHEP POST was still in flight');
-    else ok('holding the stage does not start the deadline — nothing can settle before the answer');
+    else ok('holding the stage does not start the deadline: nothing can settle before the answer');
     if (!ctx.__holdPending()) fail('the hold released itself with no settle');
     else ok('the hold is still in force while the answer is outstanding');
   }
 
-  // Armed when the resource is opened, it is a real deadline again.
+  // Armed when the resource is opened, it is a real deadline.
   {
     deadlineBits = 0;
     liveShown = 0;
@@ -745,11 +723,9 @@ async function stageHold() {
   }
 }
 
-// --- what the offer waits for, in milliseconds --------------------------------------------
-// The one number this change is about: how long `setLocalDescription` resolving is from the
-// WHEP POST going out. Trickle removes the wait entirely, so the measured quantity is the wait
-// itself. Three network shapes, five trials each, median reported — the timers are `setTimeout`
-// so the floor is the event loop, not the code.
+// What the offer waits for: the time from `setLocalDescription` resolving to the WHEP POST
+// going out, which trickle removes entirely. Three network shapes, five trials each, median
+// reported. The timers are `setTimeout`, so the floor is the event loop, not the code.
 
 async function measure() {
   const TRIALS = 5;

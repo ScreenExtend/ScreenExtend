@@ -21,7 +21,7 @@
     },
     "joinAttemptsPaused": {
       "title": "Join Attempts Paused",
-      "description": "Too many incorrect codes were entered from different devices — someone may be guessing your code. New joins are paused for {seconds} seconds."
+      "description": "Too many incorrect codes were entered from different devices. Someone may be guessing your code. New joins are paused for {seconds} seconds."
     },
     "displaySettingsUnavailable": {
       "title": "Unable to Open Display Settings",
@@ -76,7 +76,7 @@
       "title": "Server Ports Updated",
       "description": "Local network streaming now uses HTTP port {http} and HTTPS port {https}. Connected devices were disconnected and must rejoin using the updated links.",
       "failureTitle": "Couldn't Update Server Ports",
-      "failureDescription": "The ports couldn't be changed — another program may already be using them. The previous ports are still in use."
+      "failureDescription": "The ports couldn't be changed. Another program may already be using them. The previous ports are still in use."
     },
     "networkCreate": {
       "successTitle": "Network Creation Success",
@@ -215,11 +215,11 @@
     },
     "driverInstall": {
       "failureTitle": "Couldn't Install Drivers",
-      "failureDescription": "Driver installation didn't complete — it needs administrator approval. Try again and accept the prompt."
+      "failureDescription": "Driver installation didn't complete. It needs administrator approval. Try again and accept the prompt."
     },
     "uninstallDrivers": {
       "failureTitle": "Couldn't Remove Drivers",
-      "failureDescription": "Driver removal didn't complete — it needs administrator approval. ScreenExtend stayed open so you can try again."
+      "failureDescription": "Driver removal didn't complete. It needs administrator approval. ScreenExtend stayed open so you can try again."
     },
     "exitApp": {
       "failureTitle": "Couldn't Close ScreenExtend",
@@ -275,7 +275,7 @@
     },
     "driverBusy": {
       "quitFailedTitle": "Couldn't Quit the Other Copy",
-      "quitFailedDescription": "The copy holding the display driver did not answer. Close it yourself — check the taskbar, or any terminal running ScreenExtend — then press Try Again."
+      "quitFailedDescription": "The copy holding the display driver did not answer. Close it yourself: check the taskbar, or any terminal running ScreenExtend, then press Try Again."
     }
   },
   "device": {
@@ -422,7 +422,7 @@
     "setupError": {
       "title": "Setup Error",
       "bodyBeforePrompt": "There was an error while attempting to start ScreenExtend. This often occurs due to core drivers or libraries not being installed. ",
-      "settingsBody": "ScreenExtend started, but your saved settings could not be applied. Your configuration file may be damaged — open Settings › config.json to check it. This is not a problem with your drivers. ",
+      "settingsBody": "ScreenExtend started, but your saved settings could not be applied. Your configuration file may be damaged. Open Settings › config.json to check it. This is not a problem with your drivers. ",
       "internalBody": "ScreenExtend started, but ran into an unexpected error before the dashboard could open. This is not a problem with your drivers. ",
       "installPrompt": "Click the button below to install the missing components.",
       "bodyAfterPrompt": " If this error is recurring, contact support at ",
@@ -455,8 +455,8 @@
       "recheck": "Re-check",
       "relaunch": "Restart",
       "revokedTitle": "Screen Recording Is Off",
-      "revokedBody": "macOS is not letting ScreenExtend record the screen — the permission was either never granted or has been turned off — so the connected devices were disconnected. Without it, capture keeps running and sends nothing but your desktop wallpaper, which is why the session is ended instead.",
-      "revokedBodyWithCount": "macOS is not letting ScreenExtend record the screen — the permission was either never granted or has been turned off — so {count} connected device(s) were disconnected. Without it, capture keeps running and sends nothing but your desktop wallpaper, which is why the session is ended instead.",
+      "revokedBody": "macOS is not letting ScreenExtend record the screen: the permission was either never granted or has been turned off, so the connected devices were disconnected. Without it, capture keeps running and sends nothing but your desktop wallpaper, which is why the session is ended instead.",
+      "revokedBodyWithCount": "macOS is not letting ScreenExtend record the screen: the permission was either never granted or has been turned off, so {count} connected device(s) were disconnected. Without it, capture keeps running and sends nothing but your desktop wallpaper, which is why the session is ended instead.",
       "revokedSteps": "Turn ScreenExtend on under System Settings → Privacy & Security → Screen Recording, then restart it and reconnect the device. macOS may give a newly granted permission only to a freshly launched app.",
       "openSettings": "Open Settings",
       "retry": "Retry",

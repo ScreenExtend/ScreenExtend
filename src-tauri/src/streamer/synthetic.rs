@@ -1,28 +1,14 @@
-//! Scripted synthetic workloads for the probe harness.
-//!
-//! Encoder and transport numbers only mean something next to the content that produced them: a
-//! static desktop and a full-frame 60 fps wipe are different problems for the same encoder, and
-//! a single "moving box" pattern measures neither. These four are the shapes that actually show
-//! up, chosen so the bitrate and the encode cost separate:
-//!
-//! - [`Workload::Static`] — nothing changes. Exercises the idle path, the keepalive repeater and
-//!   whatever floor the rate control refuses to go below.
-//! - [`Workload::Scroll`] — text-like rows sliding vertically. Small per-frame residual, high
-//!   spatial detail: the case intra-refresh and QP choice show up in.
-//! - [`Workload::Motion`] — full-frame movement every frame. The worst case; if a pipeline keeps
-//!   up here it keeps up anywhere.
-//! - [`Workload::Drag`] — a rigid block translating over a static background, which is what
-//!   dragging a window looks like to an encoder. Almost pure motion vectors.
-//!
-//! [`Counter`] paints a large frame number and a millisecond clock over any of them. That is the
-//! target for the camera method in `docs/BASELINE.md`: film the host display and the client
-//! screen in one shot at 240 fps and subtract the two readings.
+//! Scripted synthetic workloads for the probe harness, so an encoder or transport number can
+//! name the content that produced it: `Static` (idle path, rate-control floor), `Scroll` (small
+//! residual, high spatial detail), `Motion` (every pixel changes, the worst case) and `Drag`
+//! (a rigid block, almost pure motion vectors). `draw_counter` overlays a frame number and a
+//! millisecond clock, for filming the host and client screens in one shot at 240 fps.
 //!
 //! Output is BGRA8, four bytes per pixel, matching what the capture backends hand the encoders.
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Workload {
-    /// The historical pattern: a drifting box and a sweeping bar over a gradient.
+    /// A drifting box and a sweeping bar over a gradient.
     #[default]
     Mixed,
     Static,
@@ -77,7 +63,7 @@ pub fn fill(buf: &mut [u8], width: u32, height: u32, frame: u32, workload: Workl
     let f = frame as usize;
 
     match workload {
-        // Byte-identical every frame. Anything the pipeline reports here is its own overhead.
+        // byte-identical every frame: anything the pipeline reports here is its own overhead
         Workload::Static => {
             for y in 0..h {
                 let row = y * w * 4;
@@ -89,9 +75,8 @@ pub fn fill(buf: &mut [u8], width: u32, height: u32, frame: u32, workload: Workl
             }
         }
 
-        // Text-like: dense high-contrast rows scrolling upward one line per frame. Cheap in
-        // motion vectors, expensive in residual detail, which is the combination that separates
-        // a well-chosen QP from a badly chosen one.
+        // text-like rows scrolling upward: cheap in motion vectors, expensive in residual
+        // detail, the mix that separates a well-chosen QP from a bad one
         Workload::Scroll => {
             let line_h = (h / 30).max(8);
             let offset = (f * 3) % line_h.max(1);
@@ -101,7 +86,7 @@ pub fn fill(buf: &mut [u8], width: u32, height: u32, frame: u32, workload: Workl
                 let in_line = ((y + offset) % line_h) < line_h * 2 / 3;
                 for x in 0..w {
                     let o = row + x * 4;
-                    // Deterministic per-cell "glyph" so every line differs from its neighbours.
+                    // deterministic per-cell "glyph" so every line differs from its neighbours
                     let cell = x / 9;
                     let on = in_line
                         && ((cell.wrapping_mul(2654435761) ^ ly.wrapping_mul(40503)) & 3) != 0;
@@ -114,8 +99,8 @@ pub fn fill(buf: &mut [u8], width: u32, height: u32, frame: u32, workload: Workl
             }
         }
 
-        // Every pixel changes every frame: a diagonal colour wipe plus per-pixel noise the
-        // encoder cannot predict away. The upper bound on encode cost.
+        // every pixel changes every frame (a colour wipe plus noise the encoder cannot predict
+        // away): the upper bound on encode cost
         Workload::Motion => {
             for y in 0..h {
                 let row = y * w * 4;
@@ -135,14 +120,14 @@ pub fn fill(buf: &mut [u8], width: u32, height: u32, frame: u32, workload: Workl
             }
         }
 
-        // A rigid block over a fixed background: what dragging a window looks like to the
-        // encoder. Should compress to almost nothing but motion vectors.
+        // a rigid block over a fixed background, what a window drag looks like to the encoder:
+        // should compress to almost nothing but motion vectors
         Workload::Drag => {
             let bw = w / 3;
             let bh = h / 3;
             let span_x = w.saturating_sub(bw).max(1);
             let span_y = h.saturating_sub(bh).max(1);
-            // Ping-pong rather than wrap, so the block never teleports across the frame.
+            // ping-pong rather than wrap, so the block never teleports across the frame
             let px = f * 6 % (span_x * 2);
             let py = f * 4 % (span_y * 2);
             let bx = if px < span_x { px } else { span_x * 2 - px };
@@ -165,7 +150,7 @@ pub fn fill(buf: &mut [u8], width: u32, height: u32, frame: u32, workload: Workl
         }
 
         Workload::Noise => {
-            // xorshift64*, seeded per frame: deterministic, different every frame.
+            // xorshift64*, seeded per frame: deterministic, different every frame
             let mut x: u64 =
                 0x9E37_79B9_7F4A_7C15 ^ ((f as u64 + 1).wrapping_mul(0x2545_F491_4F6C_DD1D));
             for px in buf[..w * h * 4].as_chunks_mut::<4>().0.iter_mut() {
@@ -237,7 +222,7 @@ fn glyph(c: char) -> Option<[u8; 7]> {
     GLYPHS.iter().find(|(g, _)| *g == c).map(|(_, rows)| *rows)
 }
 
-/// Paint `text` at (`x0`, `y0`) scaled by `scale`, on a black plate so it reads on any content.
+/// Paint `text` on a black plate, so it reads on any content.
 fn draw_text(
     buf: &mut [u8],
     width: u32,
@@ -288,9 +273,8 @@ fn draw_text(
 
 /// Overlay a frame number and a millisecond clock, sized to be legible on camera.
 ///
-/// The clock is the elapsed host time in `SSS.mmm`, not a wall clock: only the *difference*
-/// between the host reading and the client reading matters, and an elapsed counter cannot be
-/// confused with a time zone.
+/// The clock is elapsed host time in `SSS.mmm`, not a wall clock: only the difference between
+/// the host and client readings matters.
 pub fn draw_counter(buf: &mut [u8], width: u32, height: u32, frame: u32, elapsed_ms: u64) {
     let scale = ((width / 160).max(3)) as usize;
     let secs = elapsed_ms / 1000;
@@ -368,7 +352,7 @@ mod tests {
         assert!(changed > 0, "scroll must actually scroll");
         assert!(
             changed < a.len() * 9 / 10,
-            "scroll changed {changed}/{} bytes — that is a full-frame workload, not a scroll",
+            "scroll changed {changed}/{} bytes: that is a full-frame workload, not a scroll",
             a.len()
         );
     }

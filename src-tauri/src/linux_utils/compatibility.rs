@@ -26,9 +26,7 @@ fn os_version_string() -> String {
 #[tauri::command]
 #[specta::specta]
 pub fn check_system_requirements() -> CompatibilityReport {
-    // The scaffold has no display, capture or encode backend, so it is missing all three parts
-    // of the bare minimum. It used to report `os_supported: true` with an empty list, which the
-    // startup gate reads as a working host.
+    // no display, capture or encode backend; an empty list would read as a working host
     CompatibilityReport {
         os_name: "Linux".to_string(),
         os_version: os_version_string(),

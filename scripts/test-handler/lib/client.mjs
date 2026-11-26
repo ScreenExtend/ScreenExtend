@@ -1,6 +1,6 @@
 // One test browser: a fresh headless Chrome, one page, the observer script, the paint hook in
 // every worker (lib/paint-hook.mjs) that the primary metric reads, and the join.
-import { launchChrome, newPage, closeChrome, sleep } from './cdp.mjs';
+import { launchChrome, newPage, closeChrome, sleep, browserBinary, connect } from './cdp.mjs';
 import { observerSource, GEOMETRY_EXPR, SECONDARY_EXPR, AUDIO_DECODE_TAP_SOURCE } from './inject.mjs';
 import { decodePng, pngSize, rgb } from './png.mjs';
 import { stampLayout, decodeStamp, unwrap } from './stamp.mjs';
@@ -8,19 +8,33 @@ import { dist } from './metrics.mjs';
 import { HOOK_SOURCE, VIDEO_SAMPLER_SOURCE } from './paint-hook.mjs';
 import { preciseNow } from './clock.mjs';
 
+async function attachRemote(port) {
+  let ver = null;
+  for (let i = 0; i < 150 && !ver; i++) { try { ver = await (await fetch(`http://127.0.0.1:${port}/json/version`)).json(); } catch { await sleep(200); } }
+  if (!ver) throw new Error('remote browser debugging port never answered on forwarded port ' + port);
+  const ws = ver.webSocketDebuggerUrl.replace(/^ws:\/\/[^/]+/, `ws://127.0.0.1:${port}`);
+  const browser = await connect(ws);
+  return { proc: { pid: null, kill() {} }, browser, version: ver.Browser, args: [], exited: false };
+}
+
 export class Client {
-  constructor({ port, profile, flags = [], headed = false, log, scWidth = 480 }) { Object.assign(this, { port, profile, flags, headed, log, scWidth }); this.frameHandler = null; this.geom = null; this.console = []; this.workers = new Map(); this.stampCfg = null; }
+  constructor({ port, profile, flags = [], headed = false, log, scWidth = 480, browser = 'chrome', workerExtra = '', remote = null, gate = null }) { Object.assign(this, { port, profile, flags, headed, log, scWidth, browser, workerExtra, remote }); this.gate = gate || (async () => null); this.joined = false; this.frameHandler = null; this.geom = null; this.console = []; this.workers = new Map(); this.stampCfg = null; }
 
   async open({ client, observer }) {
-    this.chrome = await launchChrome({ port: this.port, profile: this.profile, flags: [...this.flags, `--window-size=${client.width},${client.height}`], headed: this.headed });
+    // remote: a browser another machine already started, reached through a forwarded debugging port
+    this.chrome = this.remote ? await attachRemote(this.port) : await launchChrome({ port: this.port, profile: this.profile, flags: [...this.flags, `--window-size=${client.width},${client.height}`], headed: this.headed, binary: browserBinary(this.browser) });
     this.page = await newPage(this.port);
     const p = this.page;
     p.on((d) => {
       if (d.method === 'Page.screencastFrame') {
         p.send('Page.screencastFrameAck', { sessionId: d.params.sessionId }).catch(() => {});
         if (this.frameHandler) { try { this.frameHandler({ ts: d.params.metadata.timestamp * 1000, data: d.params.data, meta: d.params.metadata, arrived: Date.now() }); } catch (e) { this.log('frame handler: ' + e.message); } }
+      } else if (d.method && d.method.startsWith('Media.')) {
+        // Chrome's media log (WebCodecs decoders included): the one place a decoder that produces
+        // nothing says why
+        if (this.media.length < 5000) this.media.push({ t: Date.now(), src: d.sessionId ? 'worker' : 'page', method: d.method, params: JSON.stringify(d.params).slice(0, 1500) });
       } else if (d.method === 'Runtime.consoleAPICalled') {
-        if (this.console.length < 3000) this.console.push({ t: Date.now(), level: d.params.type, text: d.params.args.map((a) => (a.value !== undefined ? String(a.value) : a.description || '')).join(' ').slice(0, 400) });
+        if (this.console.length < 3000) this.console.push({ t: Date.now(), src: d.sessionId ? 'worker' : 'page', level: d.params.type, text: d.params.args.map((a) => (a.value !== undefined ? String(a.value) : a.description || '')).join(' ').slice(0, 400) });
       } else if (d.method === 'Runtime.exceptionThrown') {
         this.console.push({ t: Date.now(), level: 'exception', text: JSON.stringify(d.params.exceptionDetails.exception ? d.params.exceptionDetails.exception.description : d.params.exceptionDetails.text).slice(0, 400) });
       } else if (d.method === 'Log.entryAdded') {
@@ -37,35 +51,38 @@ export class Client {
       else if (d.method === 'Network.requestWillBeSent' && /^https?:\/\/[^/]+\/(ice-config|net-config|reconfig|leave|audio-outputs|transform-worker\.js|audio-worklet\.js|audio-worker\.js)/.test(q.request.url)) { const r = { id: q.requestId, method: q.request.method, url: q.request.url.replace(/^https?:\/\/[^/]+/, '').replace(/join=[0-9a-f]+/, 'join=<id>'), sent: q.wallTime * 1000, ts0: q.timestamp }; reqs.set(q.requestId, r); this.api.push(r); if (this.api.length > 400) this.api.splice(0, 200); }
       else if (d.method === 'Network.responseReceived' && reqs.has(q.requestId)) {
         const r = reqs.get(q.requestId); r.status = q.response.status; r.answered = r.sent + (q.timestamp - r.ts0) * 1000;
-        // Where the time went, on the browser's side: queued before a socket, connecting, TLS,
-        // sending, then waiting for the first response byte (ms relative to requestTime).
+        // where the time went on the browser's side (ms relative to requestTime)
         const t = q.response.timing;
         if (t) { const k = (x) => (x >= 0 ? Math.round(x) : null); r.timing = { requestTimeOffsetMs: Math.round((t.requestTime - r.ts0) * 1000), connectStart: k(t.connectStart), sslEnd: k(t.sslEnd), sendStart: k(t.sendStart), sendEnd: k(t.sendEnd), receiveHeadersStart: k(t.receiveHeadersStart), receiveHeadersEnd: k(t.receiveHeadersEnd) }; }
         r.connectionId = q.response.connectionId; r.connectionReused = q.response.connectionReused; r.protocol = q.response.protocol;
       }
       else if (d.method === 'Network.loadingFinished' && reqs.has(q.requestId)) { const r = reqs.get(q.requestId); if (!r.answered) { r.answered = r.sent + (q.timestamp - r.ts0) * 1000; r.answeredFrom = 'loadingFinished'; } }
-      else if (d.method === 'Network.loadingFailed' && reqs.has(q.requestId)) { const r = reqs.get(q.requestId); r.failed = q.errorText; }
+      else if (d.method === 'Network.loadingFailed' && reqs.has(q.requestId)) { const r = reqs.get(q.requestId); r.failed = q.errorText; r.failedAt = r.sent + (q.timestamp - r.ts0) * 1000; }
     });
-    // Every worker the page starts gets the paint hook through the debugger's auto-attach.
+    // every worker the page starts gets the paint hook through the debugger's auto-attach
     p.on((d) => {
       if (d.method === 'Target.attachedToTarget') {
         const sid = d.params.sessionId, info = d.params.targetInfo;
         (async () => {
           // Resume first: an evaluate sent to a worker still paused at start can wait for a
-          // context that does not exist yet, holding the worker (and the join) for the CDP
-          // timeout. The hook patches a prototype, so installing it a moment after the worker's
-          // script starts is enough: the first paint comes long after.
+          // context that does not exist yet, holding the worker (and the join) for the CDP timeout.
+          // The hook patches a prototype and the first paint comes long after, so late is fine.
           if (d.params.waitingForDebugger) await p.send('Runtime.runIfWaitingForDebugger', {}, sid).catch(() => {});
           if (info.type === 'worker') {
             this.workers.set(sid, { url: info.url });
-            await p.send('Runtime.evaluate', { expression: HOOK_SOURCE + AUDIO_DECODE_TAP_SOURCE }, sid, 5000).catch((e) => this.log('hook install: ' + e.message));
+            // the worker's own console and media log
+            await p.send('Runtime.enable', {}, sid, 5000).catch(() => {});
+            await p.send('Media.enable', {}, sid, 5000).catch(() => {});
+            await p.send('Runtime.evaluate', { expression: HOOK_SOURCE + AUDIO_DECODE_TAP_SOURCE + (this.workerExtra || '') }, sid, 5000).catch((e) => this.log('hook install: ' + e.message));
             if (this.stampCfg) await p.send('Runtime.evaluate', { expression: `self.__seStamp && (__seStamp.cfg = ${JSON.stringify(this.stampCfg)})` }, sid, 5000).catch(() => {});
           }
         })();
       } else if (d.method === 'Target.detachedFromTarget') this.workers.delete(d.params.sessionId);
     });
     await p.send('Network.enable');
+    this.media = this.media || [];
     await p.send('Runtime.enable'); await p.send('Page.enable'); await p.send('Log.enable');
+    await p.send('Media.enable').catch(() => {});
     await p.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: false, flatten: true });
     await this.setClient(client);
     await p.send('Page.addScriptToEvaluateOnNewDocument', { source: observerSource(observer || {}) + HOOK_SOURCE + VIDEO_SAMPLER_SOURCE });
@@ -74,14 +91,12 @@ export class Client {
 
   async setClient(c) {
     this.clientSpec = c;
-    // The observer script fixed the reported refresh rate at the first spec's; a spec change (the
-    // hi-res scenario) must change it too, or a "120 Hz" client tells the host 60.
+    // the observer fixed the reported refresh rate at the first spec's: a spec change must move it
+    // too, or a "120 Hz" client tells the host 60
     if (c.refresh && this.page) await this.page.send('Page.addScriptToEvaluateOnNewDocument', { source: `self.__seRefresh = ${Number(c.refresh)};` }).catch(() => {});
     await this.page.send('Emulation.setDeviceMetricsOverride', { width: c.width, height: c.height, deviceScaleFactor: c.dpr, mobile: false, screenWidth: c.width, screenHeight: c.height });
-    // The observer pins `screen.refreshRate` once, at open, so a browser switched to another
-    // client spec (the standard hi-res scenario reuses the 60 Hz browser) kept reporting the
-    // first spec's rate and the "120 Hz" scenario ran at 60. Re-pin it for this page and for
-    // every document loaded after it; the later script runs after the observer's and wins.
+    // re-pin `screen.refreshRate` for this page and every document loaded after it: the later
+    // script runs after the observer's and wins
     if (c.refresh) {
       const pin = `Object.defineProperty(Screen.prototype, 'refreshRate', { get: () => ${Number(c.refresh)}, configurable: true });`;
       await this.page.send('Page.addScriptToEvaluateOnNewDocument', { source: pin }).catch(() => {});
@@ -89,7 +104,22 @@ export class Client {
     }
   }
 
+  /** Navigate away from the page; a page holding a join gives its display back, so it is gated. */
+  async away(label = 'leave') {
+    if (this.joined) { await this.gate(label); this.joined = false; }
+    if (this.page && !this.page.closed) await this.page.send('Page.navigate', { url: 'about:blank' }).catch(() => {});
+  }
+
   async close() {
+    if (this.joined) { await this.gate('close a browser holding a join'); this.joined = false; }
+    if (this.remote) {
+      this.stopScreencast().catch(() => {});
+      await this.chrome.browser.send('Browser.close').catch(() => {});
+      this.chrome.browser.close();
+      const r = await this.remote.cleanup().catch((e) => ({ error: e.message }));
+      this.chrome.exited = !(r && r.left);
+      return { exited: this.chrome.exited, remote: r };
+    }
     this.stopScreencast().catch(() => {}); await closeChrome(this.chrome);
     for (let i = 0; i < 10; i++) { try { (await import('node:fs')).rmSync(this.profile, { recursive: true, force: true }); break; } catch { await sleep(500); } }
     return { exited: this.chrome ? this.chrome.exited : true };
@@ -109,16 +139,12 @@ export class Client {
   }
 
   /**
-   * Each JavaScript context has its own `performance.timeOrigin`, and Chrome takes it from the
-   * wall clock at the context's creation. When Windows runs at its default 15.6 ms timer
-   * resolution that wall clock is coarse, so two contexts' `timeOrigin + now()` can disagree by
-   * up to ~16 ms: measured after a reboot, the page's offset from the system clock was 0.95 to
-   * 13.76 ms run to run, and the paint hook's samples come from the *worker*, whose own origin
-   * error is independent of the page's. Subtracting one page-measured offset from worker
-   * timestamps left a per-run bias of up to ±16 ms in the stamp metric. So every context gets
-   * its own offset (min-RTT, like `clockOffset`), measured once per worker and once per page
-   * document, and every sample is moved onto the reference clock (`Client.refOffsetMs`, the
-   * main page's offset the handler subtracts everywhere) before anyone sees it.
+   * One context's clock minus the system clock (min-RTT, like `clockOffset`). Chrome takes each
+   * context's `performance.timeOrigin` from the wall clock, which is coarse at Windows' default
+   * 15.6 ms timer resolution: two contexts can disagree by up to ~16 ms (the page's offset
+   * measured 0.95 to 13.76 ms run to run), and a worker's error is independent of the page's.
+   * So each worker and each page document gets its own offset, and every sample is moved onto
+   * the reference clock (`Client.refOffsetMs`, the main page's offset the handler subtracts).
    */
   async contextOffset(sid) {
     let best = null;
@@ -198,15 +224,17 @@ export class Client {
   }
 
   /**
-   * Navigate and join. Returns timing measured on the browser's clock:
-   * submit -> /whep answer (the browser's network log) -> first painted frame, i.e. the first
-   * screencast frame carrying a readable clock stamp from `stage` (a stage.ps1 started before
-   * the submit, waiting for the join's display to attach and drawing the moment it does).
+   * Navigate and join. Returns timing measured on the browser's clock: submit -> /whep answer
+   * (the browser's network log) -> first painted frame carrying a readable clock stamp from
+   * `stage` (a stage.ps1 that waits for the join's display to attach and draws the moment it does).
    */
-  async join({ url, origin, grant, micChoice = 'continue', timeoutMs = 40000, stage = null, restage = null }) {
+  async join({ url, origin, grant, micChoice = 'continue', timeoutMs = 40000, stage = null, restage = null, submitAt: submitNotBefore = 0, prepared = false }) {
     const p = this.page; const res = { modals: [], url: url.replace(/otp=\d+/, 'otp=<otp>') };
     let firstPicture = null; let submitAt = null; let stageInfo = null;
-    for (let attempt = 0; attempt < 3; attempt++) {
+    // leaving a page that holds a join removes (or hands back) its display
+    if (this.joined) { await this.gate('navigate away from a live join'); this.joined = false; }
+    // `prepared`: the page is already loaded on this URL (the load itself was the leave)
+    for (let attempt = 0; attempt < (prepared ? 0 : 3); attempt++) {
       res.navigate = await p.send('Page.navigate', { url }).then((r) => (r.errorText ? r.errorText : 'ok'), (e) => e.message);
       if (res.navigate === 'ok') break;
       await sleep(1500);
@@ -216,29 +244,31 @@ export class Client {
     if (grant !== null && grant !== undefined) {
       await this.chrome.browser.send('Browser.grantPermissions', { origin, permissions: grant }).catch((e) => { res.grantError = e.message; });
     }
-    for (let i = 0; i < 10; i++) { const m = await this.sweepModals(micChoice); if (m) res.modals.push(m); await sleep(150); }
+    for (let i = 0; i < (prepared ? 2 : 10); i++) { const m = await this.sweepModals(micChoice); if (m) res.modals.push(m); await sleep(150); }
     const canJoin = await p.ev('!document.getElementById("connect").disabled').catch(() => false);
     if (!canJoin) {
       const diag = await p.ev('({ href: location.href.replace(/otp=\d+/, "otp=<otp>"), ready: document.readyState, err: (document.getElementById("errorMessage") || {}).textContent, title: document.title })').catch((e) => ({ evalError: e.message }));
       res.error = 'Connect stayed disabled: ' + JSON.stringify(diag); this.frameHandler = null; await this.stopScreencast(); return res;
     }
-    // Started now, not earlier, so its wait for the display covers the join and nothing else.
+    // started now, not earlier, so its wait for the display covers the join and nothing else
     const st = stage ? stage() : null;
     if (st) { this.joinStage = st; st.ready.then((r) => { stageInfo = r; res.stage = r; if (!r.error) this.setStampCfg({ mode: 'stamp', width: r.width, height: r.height, cell: r.cell, cellH: r.cellH }); }); }
+    res.gate = await this.gate('join');
+    // a rejoin at a fixed time after the leave: everything above happened during the gap
+    if (submitNotBefore) { res.submitLateMs = Date.now() - submitNotBefore; if (Date.now() < submitNotBefore) await sleep(submitNotBefore - Date.now()); }
     submitAt = await p.ev('(() => { const t = performance.timeOrigin + performance.now(); document.getElementById("joinForm").requestSubmit(); return t; })()', { gesture: true });
+    this.joined = true;
     const t0 = Date.now();
     const answered = () => this.whep.some((w) => w.method === 'POST' && w.sent >= submitAt - 50 && (w.answered || w.failed));
     while (Date.now() - t0 < timeoutMs && !(firstPicture && answered())) {
       const m = await this.sweepModals(micChoice); if (m) res.modals.push(m);
-      // The page can retry the offer (a slow answer, a fallback); the stream it ends on may be
-      // on a different display from the one the stage found. Follow it.
+      // the page can retry the offer (a slow answer, a fallback), and the stream it ends on may be
+      // on a different display from the one the stage found: follow it
       const lastAnswer = Math.max(0, ...this.whep.filter((w) => w.method === 'POST' && w.answered && w.sent >= submitAt - 50).map((w) => w.answered));
       // Frames that paint without a stamp ('guard') mean the stream is up but the stage is not on
       // it, or drew at a stale geometry: the display often attaches at the first mode of the DPR
-      // ladder (e.g. 2400x1350) and is set to the client's size a moment later, and the stage
-      // kept the first geometry. That cost 4-6 s of every slow "first picture" on the current
-      // head (hookBeforeFirstPicture: 180-295 guard reads before the restage). Restage after
-      // 0.8 s of guard-only paints instead of waiting 4 s.
+      // ladder (e.g. 2400x1350) and gets the client's size a moment later. Restage after 0.8 s
+      // of guard-only paints: waiting the usual 4 s cost 4-6 s of every slow first picture.
       const hk = res.hookBeforeFirstPicture || {};
       const guardOnly = (hk.guard || 0) >= 20 && (hk.stamp || 0) * 10 < hk.guard;
       const restageAfter = guardOnly ? 800 : 4000;
@@ -247,7 +277,7 @@ export class Client {
         const st2 = await restage(this.joinStage);
         if (st2) { this.joinStage = st2; st2.ready.then((r) => { stageInfo = r; res.stage2 = r; if (!r.error) this.setStampCfg({ mode: 'stamp', width: r.width, height: r.height, cell: r.cell, cellH: r.cellH }); }); }
       }
-      // The display may still be changing mode after the attach; the stage reports every change.
+      // the display may still be changing mode after the attach; the stage reports every change
       const cur = this.joinStage && this.joinStage.current;
       if (stageInfo && cur && !cur.error && (cur.width !== stageInfo.width || cur.cell !== stageInfo.cell)) { stageInfo = cur; res.stageUpdates = (res.stageUpdates || 0) + 1; await this.setStampCfg({ mode: 'stamp', width: cur.width, height: cur.height, cell: cur.cell, cellH: cur.cellH }); }
       if (stageInfo && !firstPicture) {
@@ -264,7 +294,7 @@ export class Client {
     res.submitAt = submitAt;
     res.answerMs = firstPost && firstPost.answered ? Math.round(firstPost.answered - submitAt) : null;
     res.answerStatus = firstPost ? firstPost.status : null;
-    res.whepRequests = this.whep.filter((w) => w.sent >= submitAt - 50).map(({ ts0, id, ...w }) => ({ ...w, sentMs: Math.round(w.sent - submitAt), answeredMs: w.answered ? Math.round(w.answered - submitAt) : null, sent: undefined, answered: undefined }));
+    res.whepRequests = this.whep.filter((w) => w.sent >= submitAt - 50).map(({ ts0, id, ...w }) => ({ ...w, sentMs: Math.round(w.sent - submitAt), answeredMs: w.answered ? Math.round(w.answered - submitAt) : null, failedMs: w.failedAt ? Math.round(w.failedAt - submitAt) : null, sent: undefined, answered: undefined, failedAt: undefined }));
     res.apiRequests = this.api.filter((w) => w.sent >= submitAt - 50).slice(0, 60).map(({ ts0, id, timing, connectionId, connectionReused, ...w }) => ({ ...w, sentMs: Math.round(w.sent - submitAt), answeredMs: w.answered ? Math.round(w.answered - submitAt) : null, sent: undefined, answered: undefined }));
     res.firstPictureMs = firstPicture ? Math.round(firstPicture - submitAt) : null;
     res.offers = res.whepRequests.filter((w) => w.method === 'POST').length;
@@ -275,8 +305,8 @@ export class Client {
   }
 
   /**
-   * Read stamps from every screencast frame for `ms`. Returns raw samples
-   * [{ ts, stamp (epoch ms, system clock) | error }].
+   * Read stamps for `ms`, from the paint hook or (method 'screencast') every screencast frame.
+   * Returns raw samples [{ ts, stamp (epoch ms, system clock) | error }].
    */
   async collectStamps(stage, ms, { method = 'paint', follow = null } = {}) {
     if (method === 'screencast') return this.collectStampsScreencast(stage, ms);
@@ -286,8 +316,7 @@ export class Client {
     const samples = []; let counters = null; const t0 = Date.now();
     while (Date.now() - t0 < ms) {
       await sleep(250); const d = await this.drainStamps(); samples.push(...d.samples); counters = d.counters;
-      // A settings edit can change the display's size under the stage; the stage follows it and
-      // says so, and the reader follows the stage.
+      // a settings edit can resize the display under the stage, which reports it: follow the stage
       const n = follow && follow.current;
       if (n && !n.error && (n.width !== cur.width || n.height !== cur.height || n.cell !== cur.cell)) { cur = n; geometryChanges++; await this.setStampCfg({ mode: 'stamp', width: cur.width, height: cur.height, cell: cur.cell, cellH: cur.cellH }); }
     }
@@ -369,10 +398,10 @@ export class Client {
 export function stampMetrics(samples, { from, to, offsetMs = 0 }) {
   const inWin = samples.filter((s) => s.ts >= from && s.ts <= to);
   const errors = {}; for (const s of inWin) if (s.error) errors[s.error] = (errors[s.error] || 0) + 1;
-  // The cell luminances of the first failed reads (paint hook keeps up to 40 per context), so a
-  // failure can be told apart: two valid stamps torn together, or cells blurred towards grey.
+  // cell luminances of the first failed reads (the paint hook keeps up to 40 per context), to tell
+  // a failure apart: two valid stamps torn together, or cells blurred towards grey
   const errorLuma = inWin.filter((s) => s.luma).slice(0, 12).map((s) => ({ ts: Math.round(s.ts), luma: s.luma }));
-  // A misread that slips past the 8-bit check shows up as an impossible age; count it, drop it.
+  // a misread that slips past the 8-bit check shows up as an impossible age: count it, drop it
   const ok = inWin.filter((s) => s.stamp !== undefined && s.ts - offsetMs - s.stamp > -5 && s.ts - offsetMs - s.stamp < 5000);
   const implausible = inWin.filter((s) => s.stamp !== undefined).length - ok.length;
   if (implausible) errors.implausible = implausible;

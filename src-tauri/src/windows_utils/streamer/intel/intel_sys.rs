@@ -10,9 +10,7 @@ use std::ffi::c_void;
 use anyhow::{Context as _, Result};
 use libloading::Library;
 
-// ===========================================================================================
-// Primitive typedefs (mfxdefs.h)
-// ===========================================================================================
+// primitive typedefs (mfxdefs.h)
 
 pub type mfxU8 = u8;
 pub type mfxI8 = i8;
@@ -46,9 +44,7 @@ pub const fn make_fourcc(a: u8, b: u8, c: u8, d: u8) -> u32 {
     (a as u32) | ((b as u32) << 8) | ((c as u32) << 16) | ((d as u32) << 24)
 }
 
-// ===========================================================================================
-// Status codes (mfxdefs.h: mfxStatus)
-// ===========================================================================================
+// status codes (mfxdefs.h, mfxStatus)
 
 pub const MFX_ERR_NONE: mfxStatus = 0;
 pub const MFX_ERR_UNKNOWN: mfxStatus = -1;
@@ -61,10 +57,12 @@ pub const MFX_ERR_NOT_INITIALIZED: mfxStatus = -8;
 pub const MFX_ERR_NOT_FOUND: mfxStatus = -9;
 pub const MFX_ERR_MORE_DATA: mfxStatus = -10;
 pub const MFX_ERR_MORE_SURFACE: mfxStatus = -11;
+pub const MFX_ERR_ABORTED: mfxStatus = -12;
 pub const MFX_ERR_DEVICE_FAILED: mfxStatus = -17;
 pub const MFX_ERR_DEVICE_LOST: mfxStatus = -13;
 pub const MFX_ERR_INCOMPATIBLE_VIDEO_PARAM: mfxStatus = -14;
 pub const MFX_ERR_INVALID_VIDEO_PARAM: mfxStatus = -15;
+pub const MFX_ERR_GPU_HANG: mfxStatus = -21;
 pub const MFX_WRN_IN_EXECUTION: mfxStatus = 1;
 pub const MFX_WRN_DEVICE_BUSY: mfxStatus = 2;
 pub const MFX_WRN_VIDEO_PARAM_CHANGED: mfxStatus = 3;
@@ -75,9 +73,7 @@ pub const MFX_WRN_OUT_OF_RANGE: mfxStatus = 7;
 
 pub const MFX_INFINITE: u32 = 0xFFFF_FFFF;
 
-// ===========================================================================================
-// Implementation / acceleration / handle / resource enums (mfxcommon.h, mfxstructures.h)
-// ===========================================================================================
+// implementation, acceleration, handle and resource enums (mfxcommon.h, mfxstructures.h)
 
 pub const MFX_IMPL_TYPE_SOFTWARE: mfxImplType = 0x0001;
 pub const MFX_IMPL_TYPE_HARDWARE: mfxImplType = 0x0002;
@@ -91,13 +87,12 @@ pub const MFX_HANDLE_D3D11_DEVICE: mfxHandleType = 3;
 pub const MFX_RESOURCE_DX11_TEXTURE: mfxResourceType = 5;
 
 pub const MFX_VARIANT_TYPE_U32: mfxVariantType = 5; // == MFX_DATA_TYPE_U32
+pub const MFX_VARIANT_TYPE_PTR: mfxVariantType = 11; // == MFX_DATA_TYPE_PTR
 
 pub const MFX_MAP_READ: u32 = 0x1;
 pub const MFX_MAP_WRITE: u32 = 0x2;
 
-// ===========================================================================================
-// Codec / format / rate-control enums (mfxstructures.h)
-// ===========================================================================================
+// codec, format and rate-control enums (mfxstructures.h)
 
 pub const MFX_FOURCC_NV12: u32 = make_fourcc(b'N', b'V', b'1', b'2');
 pub const MFX_FOURCC_RGB4: u32 = make_fourcc(b'R', b'G', b'B', b'4'); // BGRA32
@@ -116,18 +111,16 @@ pub const MFX_PROFILE_AVC_HIGH: u16 = 100;
 /// MFX_PROFILE_AVC_CONSTRAINT_SET1 = (0x100 << 1) = 0x200
 pub const MFX_PROFILE_AVC_CONSTRAINED_BASELINE: u16 = MFX_PROFILE_AVC_BASELINE + 0x200;
 
-// The rate-control enum is *not* densely packed and the gaps are reserved values, so these
-// have to be transcribed exactly. `MFX_RATECONTROL_LA` at 8 is lookahead, which buffers frames
-// and is the opposite of what this encoder wants; `intel_rate_control_values` pins them.
+// Not densely packed: the gaps are reserved values, so transcribe exactly. `MFX_RATECONTROL_LA`
+// (8) is lookahead, which buffers frames; `intel_rate_control_values` pins these.
 pub const MFX_RATECONTROL_CBR: u16 = 1;
 pub const MFX_RATECONTROL_VBR: u16 = 2;
 pub const MFX_RATECONTROL_CQP: u16 = 3;
 pub const MFX_RATECONTROL_AVBR: u16 = 4;
 pub const MFX_RATECONTROL_LA: u16 = 8;
 pub const MFX_RATECONTROL_ICQ: u16 = 9;
-/// Video Conferencing Mode. The only low-delay rate control in oneVPL's list for which
-/// `LowDelayBRC` and `MaxFrameSizeI`/`MaxFrameSizeP` are defined at all — under CBR the spec
-/// says they do not apply, which is why they were no-ops here.
+/// Video Conferencing Mode: the only low-delay rate control for which `LowDelayBRC` and
+/// `MaxFrameSizeI`/`MaxFrameSizeP` are defined. Under CBR the spec says they do not apply.
 pub const MFX_RATECONTROL_VCM: u16 = 10;
 pub const MFX_RATECONTROL_QVBR: u16 = 14;
 
@@ -169,9 +162,7 @@ pub const MFX_EXTBUFF_CODING_OPTION: u32 = make_fourcc(b'C', b'D', b'O', b'P');
 pub const MFX_EXTBUFF_CODING_OPTION2: u32 = make_fourcc(b'C', b'D', b'O', b'2');
 pub const MFX_EXTBUFF_CODING_OPTION3: u32 = make_fourcc(b'C', b'D', b'O', b'3');
 
-// ===========================================================================================
-// Common structs (mfxdefs.h, mfxcommon.h)
-// ===========================================================================================
+// common structs (mfxdefs.h, mfxcommon.h)
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -207,8 +198,8 @@ pub struct mfxExtBuffer {
     pub BufferSz: mfxU32,
 }
 
-/// mfxBitstream (mfxcommon.h, pack(8)). Leading union modeled as the `reserved[6]` variant; we
-/// only use Data/DataOffset/DataLength/MaxLength/PicStruct/FrameType.
+/// mfxBitstream (mfxcommon.h, pack(8)). Leading union modeled as the `reserved[6]` variant; only
+/// Data/DataOffset/DataLength/MaxLength/PicStruct/FrameType are used.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct mfxBitstream {
@@ -225,9 +216,7 @@ pub struct mfxBitstream {
     pub reserved2: mfxU16,
 }
 
-// ===========================================================================================
-// Frame structs (mfxstructures.h)
-// ===========================================================================================
+// frame structs (mfxstructures.h)
 
 /// mfxFrameId (pack(4)). Union {{DependencyId,QualityId}|{ViewId}} flattened (ViewId == DependencyId).
 #[repr(C)]
@@ -301,8 +290,10 @@ pub struct mfxFrameSurface1 {
 }
 
 /// mfxFrameSurfaceInterface vtable (mfxstructures.h). Only the entries up through `Synchronize`
-/// are called; the trailing entries are kept for slot-correct layout (offsets read from a
-/// runtime-owned pointer, so only the leading offsets must match — they do).
+/// are called. The tail is `OnComplete, QueryInterface, reserved2[2]` in the public header and
+/// `OnComplete, QueryInterface, Export, reserved2[1]` under `ONEVPL_EXPERIMENTAL`; both are 112
+/// bytes on x64, and slot 96 is modelled as the union of the two. Read only through a
+/// runtime-owned pointer, never allocated here.
 #[repr(C)]
 pub struct mfxFrameSurfaceInterface {
     pub Context: mfxHDL,
@@ -334,16 +325,14 @@ pub struct mfxFrameSurfaceInterface {
         Option<unsafe extern "C" fn(surface: *mut mfxFrameSurface1, wait: mfxU32) -> mfxStatus>,
     pub OnComplete: *mut c_void,
     pub QueryInterface: *mut c_void,
-    pub Export: *mut c_void,
-    pub reserved2: [mfxHDL; 2],
+    pub Export_or_reserved: *mut c_void,
+    pub reserved2: [mfxHDL; 1],
 }
 
-// ===========================================================================================
-// mfxInfoMFX / mfxInfoVPP / mfxVideoParam (mfxstructures.h)
-// ===========================================================================================
+// mfxInfoMFX, mfxInfoVPP, mfxVideoParam (mfxstructures.h)
 
 /// mfxInfoMFX (pack(4); 136 bytes). The big trailing union is modeled as its Encoding-Options
-/// variant (13 × u16 = 26 bytes, exactly the union size). Rate-control sub-unions are flattened:
+/// variant (13 x u16 = 26 bytes, exactly the union size). Rate-control sub-unions are flattened:
 /// `InitialDelayInKB`(=QPI), `TargetKbps`(=QPP/ICQQuality), `MaxKbps`(=QPB/Convergence).
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -356,7 +345,7 @@ pub struct mfxInfoMFX {
     pub CodecProfile: mfxU16,
     pub CodecLevel: mfxU16,
     pub NumThread: mfxU16,
-    // --- Encoding Options union variant ---
+    // the encoding-options union variant starts here
     pub TargetUsage: mfxU16,
     pub GopPicSize: mfxU16,
     pub GopRefDist: mfxU16,
@@ -404,10 +393,8 @@ pub struct mfxVideoParam {
     pub reserved2: mfxU16,
 }
 
-// ===========================================================================================
-// Coding-option ext buffers (mfxstructures.h). Field order reproduced verbatim; trailing
-// `reserved[]` make sizeof() match what the runtime validates against the BufferId.
-// ===========================================================================================
+// coding-option ext buffers (mfxstructures.h): field order verbatim, and the trailing
+// `reserved[]` make sizeof() match what the runtime validates against the BufferId
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -542,7 +529,10 @@ pub struct mfxExtCodingOption3 {
     pub reserved: [mfxU16; 161],
 }
 
-/// mfxEncodeCtrl (mfxstructures.h, pack(8)).
+/// mfxEncodeCtrl (mfxstructures.h, pack(8); 56 bytes on x64).
+///
+/// It ends with `mfxPayload **Payload`: without it the struct is 48 bytes and the runtime reads
+/// 8 bytes past the end of the control block on every forced IDR.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct mfxEncodeCtrl {
@@ -557,11 +547,10 @@ pub struct mfxEncodeCtrl {
     pub NumPayload: mfxU16,
     pub reserved2: mfxU16,
     pub ExtParam: *mut *mut mfxExtBuffer,
+    /// `mfxPayload **`. Never set here (`NumPayload` stays 0); it exists so the struct has the
+    /// size the runtime reads.
+    pub Payload: *mut *mut c_void,
 }
-
-// ===========================================================================================
-// Dynamic dispatcher loader (libvpl.dll)
-// ===========================================================================================
 
 type FnMFXLoad = unsafe extern "C" fn() -> mfxLoader;
 type FnMFXUnload = unsafe extern "C" fn(loader: mfxLoader);
@@ -612,8 +601,8 @@ type FnGetSurface =
     unsafe extern "C" fn(session: mfxSession, surface: *mut *mut mfxFrameSurface1) -> mfxStatus;
 type FnSessionOnly = unsafe extern "C" fn(session: mfxSession) -> mfxStatus;
 
-/// Resolved oneVPL dispatcher entry points. The `Library` is kept alive for the lifetime of the
-/// process (leaked via the field) so the function pointers stay valid.
+/// Resolved oneVPL dispatcher entry points. The struct owns the `Library`, so the function
+/// pointers are valid exactly as long as the `Vpl` is. Each `Encoder` loads its own.
 pub struct Vpl {
     _lib: libloading::Library,
     pub MFXLoad: FnMFXLoad,
@@ -648,8 +637,8 @@ unsafe impl Sync for Vpl {}
 
 macro_rules! resolve {
     ($lib:expr, $name:literal) => {{
-        // `Symbol` borrows the library; deref copies out the (Copy) fn pointer, which stays valid
-        // as long as the library is alive — and we move it into `_lib` below.
+        // deref copies the fn pointer out of the borrowing `Symbol`; it stays valid while the
+        // library is alive, and `load` moves that into `_lib`
         let sym: libloading::Symbol<_> = unsafe { $lib.get(concat!($name, "\0").as_bytes()) }
             .with_context(|| format!("resolving {} from libvpl.dll", $name))?;
         *sym
@@ -657,32 +646,22 @@ macro_rules! resolve {
 }
 
 /// The oneVPL dispatcher's file name. Only this one: the Media SDK dispatchers (`libmfx.dll`,
-/// `libmfxhw64.dll`) export no `MFXLoad` at all, and the runtime behind them is API 1.x, which
+/// `libmfxhw64.dll`) export no `MFXLoad`, and the runtime behind them is API 1.x, which
 /// `create_session`'s version gate refuses because this encoder needs 2.x internal surface
-/// allocation. Loading one could only turn a clean "no dispatcher" into a confusing
-/// "resolving MFXLoad failed".
+/// allocation.
 const VPL_NAME: &str = "libvpl.dll";
 
-/// Find the oneVPL dispatcher.
+/// Find the oneVPL dispatcher, OS search path first.
 ///
-/// The old code was `Library::new("libvpl.dll")` with no path search, so the error on a host
-/// without one was a bare load failure that `build_backend` turned into "Quick Sync unavailable,
-/// falling back to software x264" — a `teprintln!` nobody reads. This searches, and reports
-/// which file answered.
-///
-/// **Order matters, and it is the OS search path first.** Intel's guidance is that Xe (Gen12)
-/// and later drivers install the dispatcher themselves — measured on the dev box as
-/// `C:\Windows\System32\libvpl.dll`, oneVPL Dispatcher 2.7.0, Intel, WHQL-signed — and that copy
-/// is the one matched to the runtime the same driver package installed. An app-side copy found
-/// first would shadow it. So `resources/` and the exe directory are a *fallback* slot for a host
-/// that has a 2.x runtime but no dispatcher, not the preferred source. See
-/// `resources/PROVENANCE.md` for why nothing is shipped in that slot today.
+/// Xe (Gen12) and later drivers install the dispatcher themselves, as
+/// `C:\Windows\System32\libvpl.dll`, matched to the runtime from the same driver package, and an
+/// app-side copy found first would shadow it. So `resources/` and the exe directory are a
+/// fallback for a host that has a 2.x runtime but no dispatcher; nothing ships in that slot today.
 fn open_dispatcher() -> Result<(Library, std::path::PathBuf)> {
     let mut tried: Vec<String> = Vec::new();
 
-    // A dispatcher that cannot answer `MFXLoad` is not a dispatcher. Checking here lets the
-    // search move on to the next candidate instead of failing the whole load on the first file
-    // that happens to have the right name.
+    // a file with the right name but no `MFXLoad` is not a dispatcher: skip it so the search
+    // moves on to the next candidate
     let attempt = |candidate: std::path::PathBuf, tried: &mut Vec<String>| match unsafe {
         Library::new(&candidate)
     } {
@@ -705,8 +684,8 @@ fn open_dispatcher() -> Result<(Library, std::path::PathBuf)> {
     }
 
     if let Ok(exe) = std::env::current_exe() {
-        // The grandparent probe is for test binaries, which live in `target/<profile>/deps/`,
-        // one level below where cargo stages `resources/`.
+        // the grandparent is for test binaries, which live in `target/<profile>/deps/`, one level
+        // below where cargo stages `resources/`
         let dirs = exe
             .parent()
             .into_iter()
@@ -739,8 +718,7 @@ impl Vpl {
     pub fn load() -> Result<Self> {
         let (lib, path) = open_dispatcher()?;
 
-        // Resolve the symbols while the library is borrowed, then move the library into the struct.
-        // `Symbol::into_raw` keeps the pointer valid as long as the library is alive.
+        // resolve while the library is borrowed, then move it into the struct
         let v = Self {
             MFXLoad: resolve!(lib, "MFXLoad"),
             MFXUnload: resolve!(lib, "MFXUnload"),
@@ -774,7 +752,7 @@ impl Vpl {
 }
 
 /// The name oneVPL gives a positive status, for the log line. A warning is not a failure, but
-/// it is always the runtime telling us it did something other than what was asked.
+/// it always means the runtime did something other than what was asked.
 pub fn warning_name(status: mfxStatus) -> &'static str {
     match status {
         MFX_WRN_IN_EXECUTION => "MFX_WRN_IN_EXECUTION",
@@ -790,9 +768,8 @@ pub fn warning_name(status: mfxStatus) -> &'static str {
 
 /// The name for any `mfxStatus`, so a log line or an error says which failure it was.
 ///
-/// A bare `mfxStatus=-9` is unreadable, and it read as something it is not: the session-creation
-/// failure was reported as "no Intel hardware oneVPL implementation" when `MFX_ERR_NOT_FOUND`
-/// from `MFXCreateSession` is also what a *concurrent* create returns on a device that has one.
+/// `MFX_ERR_NOT_FOUND` (-9) from `MFXCreateSession` does not only mean "no Intel hardware oneVPL
+/// implementation": a *concurrent* create returns it on a device that has one.
 pub fn status_name(status: mfxStatus) -> &'static str {
     match status {
         MFX_ERR_NONE => "MFX_ERR_NONE",
@@ -806,6 +783,8 @@ pub fn status_name(status: mfxStatus) -> &'static str {
         MFX_ERR_NOT_FOUND => "MFX_ERR_NOT_FOUND",
         MFX_ERR_MORE_DATA => "MFX_ERR_MORE_DATA",
         MFX_ERR_MORE_SURFACE => "MFX_ERR_MORE_SURFACE",
+        MFX_ERR_ABORTED => "MFX_ERR_ABORTED",
+        MFX_ERR_GPU_HANG => "MFX_ERR_GPU_HANG",
         MFX_ERR_DEVICE_LOST => "MFX_ERR_DEVICE_LOST",
         MFX_ERR_INCOMPATIBLE_VIDEO_PARAM => "MFX_ERR_INCOMPATIBLE_VIDEO_PARAM",
         MFX_ERR_INVALID_VIDEO_PARAM => "MFX_ERR_INVALID_VIDEO_PARAM",
@@ -815,16 +794,14 @@ pub fn status_name(status: mfxStatus) -> &'static str {
     }
 }
 
-/// Map an `mfxStatus` to a `Result`, treating positive warnings as success — but saying so.
+/// Map an `mfxStatus` to a `Result`, treating positive warnings as success but logging them.
 ///
-/// The warnings this accepts are the ones that matter: `MFX_WRN_PARTIAL_ACCELERATION` means the
-/// runtime fell back to encoding on the CPU inside oneVPL, and
-/// `MFX_WRN_INCOMPATIBLE_VIDEO_PARAM` means it silently changed the parameters. Both used to be
-/// discarded, under an init log that then asserted the requested configuration as achieved fact.
+/// `MFX_WRN_PARTIAL_ACCELERATION` means the runtime fell back to encoding on the CPU inside
+/// oneVPL, and `MFX_WRN_INCOMPATIBLE_VIDEO_PARAM` means it silently changed the parameters.
 pub fn check(status: mfxStatus, what: &str) -> Result<()> {
     if status > MFX_ERR_NONE {
         teprintln!(
-            "oneVPL: {what} returned {} ({status}) — the runtime did not do exactly what was asked",
+            "oneVPL: {what} returned {} ({status}): the runtime did not do exactly what was asked",
             warning_name(status)
         );
         Ok(())
@@ -840,10 +817,9 @@ pub fn check(status: mfxStatus, what: &str) -> Result<()> {
 
 /// `check`, plus: a software fallback inside the runtime is treated as a hard failure.
 ///
-/// `MFX_WRN_PARTIAL_ACCELERATION` at `ENCODE_Init` means H.264 is being encoded on the CPU
-/// while the log says "Intel Quick Sync (oneVPL) H.264 encoder initialized" — the worst
-/// latency outcome, under the most reassuring label. Failing here lets `build_backend` move on
-/// to a backend that will say what it is.
+/// `MFX_WRN_PARTIAL_ACCELERATION` at `ENCODE_Init` means H.264 is being encoded on the CPU under
+/// a Quick Sync label. Failing here lets `build_backend` move on to a backend that will say what
+/// it is.
 pub fn check_no_software_fallback(status: mfxStatus, what: &str) -> Result<()> {
     if status == MFX_WRN_PARTIAL_ACCELERATION {
         anyhow::bail!(

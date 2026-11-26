@@ -1,13 +1,16 @@
 use std::ffi::{c_char, c_int};
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{bail, Context as _, Result};
 use rayon::prelude::*;
 
+use super::workers;
 use super::x264_sys::*;
 use crate::streamer::config::{Config, H264Profile};
 use crate::streamer::platform::BitrateApplied;
 use crate::windows_utils::streamer::nvidia::encoder::EncoderConfig;
+use crate::windows_utils::streamer::tune;
 
 const PRESET_ULTRAFAST: &[u8] = b"ultrafast\0";
 const TUNE_ZEROLATENCY: &[u8] = b"zerolatency\0";
@@ -15,9 +18,220 @@ const PROFILE_BASELINE: &[u8] = b"baseline\0";
 const PROFILE_MAIN: &[u8] = b"main\0";
 const PROFILE_HIGH: &[u8] = b"high\0";
 const MAX_ENCODE_THREADS: usize = 8;
+/// With `x264_slices_by_height`, the fewest macroblock rows a slice may be cut to.
+const MIN_MB_ROWS_PER_SLICE: usize = 8;
+
+/// The behaviour switches this encoder reads, asked once when it is built.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct X264Options {
+    /// `x264_worker_tuning` (candidate, off): find libx264's slice workers after
+    /// `x264_encoder_open` and give them HIGHEST priority, the EcoQoS opt-out and the creating
+    /// thread's P-core CPU sets, and hold the slice count to those P-cores. See `workers.rs`.
+    pub worker_tuning: bool,
+    /// `x264_slices_by_height` (candidate, off): no fewer than `MIN_MB_ROWS_PER_SLICE`
+    /// macroblock rows per slice, so a small frame is not cut into eight slivers.
+    pub slices_by_height: bool,
+    /// `x264_rate_by_delivered_fps` (candidate, off): hold the per-frame budget to the frame
+    /// rate actually being delivered when it runs above the nominal one. See [`RatePacer`].
+    pub rate_by_delivered_fps: bool,
+    /// `x264_negotiated_profile` (on): turn on the coding tools of the negotiated profile that
+    /// `ultrafast` turned off. See [`enable_profile_tools`].
+    pub negotiated_profile: bool,
+    /// A QP governor may move the constant QP: open CQP so that `set_qp` can reach 51.
+    pub wide_qp_clamp: bool,
+}
+
+impl X264Options {
+    pub(crate) fn from_switches() -> Self {
+        Self {
+            worker_tuning: tune::candidate("x264_worker_tuning"),
+            slices_by_height: tune::candidate("x264_slices_by_height"),
+            rate_by_delivered_fps: tune::candidate("x264_rate_by_delivered_fps"),
+            negotiated_profile: tune::on("x264_negotiated_profile"),
+            wide_qp_clamp: tune::candidate("link_governor")
+                || tune::candidate("qp_ceiling_governor"),
+        }
+    }
+}
+
+/// `ultrafast` turns CABAC and the 8x8 transform off and `param_apply_profile` only ever takes
+/// tools away, so without this a Main or High request comes out as constrained Baseline with
+/// CAVLC. Main gets CABAC, High also the 8x8 transform.
+pub(crate) fn enable_profile_tools(p: &mut x264_param_t, profile: H264Profile) {
+    match profile {
+        H264Profile::Baseline => {}
+        H264Profile::Main => p.b_cabac = 1,
+        H264Profile::High => {
+            p.b_cabac = 1;
+            p.analyse.b_transform_8x8 = 1;
+        }
+    }
+}
+
+/// The QP an encoder opened with `wide_qp_clamp` forces on every picture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WideQp {
+    /// The user's setting.
+    pub base: u8,
+    /// The keyframe QP libx264 gives that setting by default (`base - 6 log2 1.4`, rounded).
+    pub key: u8,
+    /// The highest QP reachable: 39 above `key`, at most 51.
+    pub top: u8,
+    /// The QP in force.
+    pub now: u8,
+}
+
+impl WideQp {
+    fn new(base: u8) -> Self {
+        // libx264's own rounding of the default I-frame offset, `(int)(qp - 6 log2 ip + 0.5)`
+        let key = (base as f32 - 6.0 * 1.4f32.log2() + 0.5).max(0.0) as u8;
+        WideQp {
+            base,
+            key,
+            top: (key + 39).min(51),
+            now: base,
+        }
+    }
+}
+
+/// Which retained buffer `encode_repeat` re-encodes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Retained {
+    /// Nothing usable: no frame yet, or the last frame came through
+    /// [`X264Encoder::encode_nv12_unretained`] and was never copied.
+    None,
+    I420,
+    Nv12,
+}
+
+/// One picture's planes as libx264 reads them. libx264 copies the picture inside
+/// `x264_encoder_encode` (`x264_frame_copy_picture`) and never writes through these pointers,
+/// so they may point into a caller's read-only buffer for the duration of that one call.
+#[derive(Clone, Copy)]
+struct Planes {
+    csp: c_int,
+    count: c_int,
+    ptr: [*mut u8; 3],
+    stride: [c_int; 3],
+}
+
+/// Validate a padded NV12 buffer for a `w`x`h` picture and return its planes. `caller` names
+/// the public entry point in the error.
+fn nv12_planes(caller: &str, data: &[u8], row_pitch: usize, w: usize, h: usize) -> Result<Planes> {
+    let rows = h + h / 2;
+    if row_pitch < w || data.len() < row_pitch * rows {
+        bail!(
+            "{caller}: need row_pitch >= {w} and >= {} bytes for {w}x{h} NV12 \
+             (got pitch {row_pitch}, {} bytes)",
+            row_pitch * rows,
+            data.len()
+        );
+    }
+    let base = data.as_ptr() as *mut u8;
+    Ok(Planes {
+        csp: X264_CSP_NV12,
+        count: 2,
+        // in bounds: `row_pitch * h <= data.len()` was just checked
+        ptr: [base, unsafe { base.add(row_pitch * h) }, ptr::null_mut()],
+        stride: [row_pitch as c_int, row_pitch as c_int, 0],
+    })
+}
+
+/// Holds the per-frame budget to the frame rate actually delivered (`x264_rate_by_delivered_fps`).
+///
+/// libx264's rate control charges every picture `1 / fps` of the bitrate, so a 60 fps session
+/// delivering ~113 fps through a pointer sweep (cursor frames skip the capture cadence gate)
+/// spends up to 1.9x its target. `b_vfr_input = 1` with real-time pts would charge each picture
+/// the interval it covers, but it holds every picture until the next one arrives: one frame of
+/// latency (`x264_vfr_input_holds_a_frame_back`). So the rate is corrected from outside: when
+/// the delivered rate runs above nominal, the pacer asks libx264 for
+/// `target * nominal / delivered` through `x264_encoder_reconfig`.
+///
+/// It never raises the per-frame budget above nominal: spending an idle stretch would turn the
+/// first frame after it into a burst.
+#[derive(Debug, Clone)]
+pub(crate) struct RatePacer {
+    nominal_fps: f64,
+    /// Exponentially weighted mean frame interval, seconds.
+    mean_interval: Option<f64>,
+    last_at: Option<std::time::Instant>,
+    /// The scale (0, 1] currently applied, and when it was last changed.
+    applied: f64,
+    applied_at: Option<std::time::Instant>,
+}
+
+impl RatePacer {
+    /// Weight of the newest interval in the mean: about a 16-frame memory.
+    const ALPHA: f64 = 1.0 / 16.0;
+    /// Do not reconfigure for a change smaller than this fraction of the current scale.
+    const HYSTERESIS: f64 = 0.10;
+    /// Nor more often than this.
+    const MIN_GAP: std::time::Duration = std::time::Duration::from_millis(250);
+    /// Never ask for less than this share of the target.
+    const FLOOR: f64 = 0.25;
+    /// An interval longer than this is an idle gap, not a rate, and resets the mean.
+    const IDLE_GAP: f64 = 0.25;
+
+    pub(crate) fn new(nominal_fps: u32) -> Self {
+        Self {
+            nominal_fps: nominal_fps.max(1) as f64,
+            mean_interval: None,
+            last_at: None,
+            applied: 1.0,
+            applied_at: None,
+        }
+    }
+
+    /// The bitrate scale the measured rate asks for: `nominal / delivered`, clamped to
+    /// `[FLOOR, 1]`.
+    pub(crate) fn wanted_scale(&self) -> f64 {
+        match self.mean_interval {
+            Some(m) if m > 0.0 => (m * self.nominal_fps).clamp(Self::FLOOR, 1.0),
+            _ => 1.0,
+        }
+    }
+
+    /// Note a frame submitted at `now`. Returns the new scale when the encoder should be
+    /// reconfigured, `None` when the current one stands.
+    pub(crate) fn note_frame(&mut self, now: std::time::Instant) -> Option<f64> {
+        if let Some(last) = self.last_at {
+            let dt = now.saturating_duration_since(last).as_secs_f64();
+            if dt > Self::IDLE_GAP {
+                self.mean_interval = None;
+            } else {
+                self.mean_interval = Some(match self.mean_interval {
+                    Some(m) => m + Self::ALPHA * (dt - m),
+                    None => dt,
+                });
+            }
+        }
+        self.last_at = Some(now);
+
+        let wanted = self.wanted_scale();
+        if (wanted - self.applied).abs() < Self::HYSTERESIS * self.applied {
+            return None;
+        }
+        if let Some(at) = self.applied_at {
+            if now.saturating_duration_since(at) < Self::MIN_GAP {
+                return None;
+            }
+        }
+        self.applied = wanted;
+        self.applied_at = Some(now);
+        Some(wanted)
+    }
+
+    pub(crate) fn applied(&self) -> f64 {
+        self.applied
+    }
+}
+
+/// Counted instead of asserted: the encode runs under a WGC callback where an unwind would
+/// cross `extern "system"` frames and abort the host.
+static REORDER_WARNED: AtomicBool = AtomicBool::new(false);
 
 pub struct X264Encoder {
-    api: X264Api,
+    api: &'static X264Api,
     handle: *mut x264_t,
     params: x264_param_t,
     config: EncoderConfig,
@@ -28,19 +242,41 @@ pub struct X264Encoder {
     /// `height / 2` rows of interleaved chroma. Empty until an NV12 frame arrives, so a host
     /// whose scaler stays on BGRA never allocates it.
     nv12: Vec<u8>,
-    /// Which of the two buffers holds the frame `encode_repeat` should re-encode.
-    input_csp: c_int,
+    retained: Retained,
     y_size: usize,
     c_size: usize,
-    have_frame: bool,
-    pts: i64,
+    /// Pictures submitted so far (also the next pts); 0 means nothing to repeat yet.
+    frames: u64,
+    /// Access units whose dts and pts differed. Cannot happen with 0 B-frames; counted so a
+    /// libx264 that ever did it is visible in a test rather than aborting a debug host.
+    reordered: u64,
+    pacer: Option<RatePacer>,
+    /// The bitrate the caller asked for, before any `RatePacer` scale.
+    target_kbps: c_int,
+    /// `x264_picture_t::i_qpplus1` for every picture: 0 leaves the QP to rate control.
+    qp_plus1: c_int,
+    /// The CQP range was widened for `set_qp`, so every picture carries its QP explicitly.
+    wide_qp: Option<WideQp>,
+    #[cfg(test)]
+    tuned_workers: Vec<u32>,
+    /// A test-driven clock for the pacer, so a delivered rate can be simulated exactly.
+    #[cfg(test)]
+    test_now: Option<std::time::Instant>,
 }
 
 unsafe impl Send for X264Encoder {}
 
+/// Serialises `x264_encoder_open` while worker tuning is on, so two first sessions opening at
+/// once do not each see the other's workers appear.
+static OPEN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 impl X264Encoder {
     pub fn new(config: EncoderConfig) -> Result<Self> {
-        let api = X264Api::load().context("loading libx264 for the software H.264 fallback")?;
+        Self::with_options(config, X264Options::from_switches())
+    }
+
+    pub(crate) fn with_options(config: EncoderConfig, options: X264Options) -> Result<Self> {
+        let api = X264Api::shared().context("loading libx264 for the software H.264 fallback")?;
 
         let width = config.width as usize;
         let height = config.height as usize;
@@ -65,26 +301,53 @@ impl X264Encoder {
         p.i_csp = X264_CSP_I420;
         p.i_width = width as c_int;
         p.i_height = height as c_int;
+        // not `b_vfr_input`: that holds every picture back until the next one arrives (see
+        // `RatePacer`)
         p.b_vfr_input = 0;
         p.i_fps_num = fps;
         p.i_fps_den = 1;
-        // frame-count timebase
         p.i_timebase_num = 1;
         p.i_timebase_den = fps;
+
+        // the building thread's own P-core masks (empty when it has none): the live paths build
+        // the encoder on a thread `tune_current_thread` already tuned
+        let worker_masks = if options.worker_tuning {
+            workers::current_thread_cpu_set_masks()
+        } else {
+            Vec::new()
+        };
 
         // latency-critical
         p.i_bframe = 0;
         p.b_sliced_threads = 1;
-        p.i_threads = encode_thread_count() as c_int;
+        p.i_threads = workers::slice_thread_count(
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4),
+            MAX_ENCODE_THREADS,
+            (!worker_masks.is_empty()).then(|| workers::logical_count(&worker_masks)),
+            height,
+            options.slices_by_height.then_some(MIN_MB_ROWS_PER_SLICE),
+        ) as c_int;
         p.rc.i_lookahead = 0;
         p.i_sync_lookahead = 0;
 
         // rate control
         let kbps = bitrate_kbps(config.bitrate_bps);
         if let Some(q) = config.qp {
-            // Explicit constant QP (the --qp probe flag): bitrate is not a control input.
+            // explicit constant QP (the --qp probe flag): bitrate is not a control input
             p.rc.i_rc_method = X264_RC_CQP;
             p.rc.i_qp_constant = q as c_int;
+            // CQP clamps a forced per-picture QP to [I constant, B constant], and libx264 holds
+            // each factor to 10 (19.9 QP) and rounds the top of the clamp up. Anchored at this
+            // setting's default keyframe QP, the range runs 39 up: the setting and its keyframe
+            // stay reachable. Each picture is forced (`WideQp`), so the centre is never coded.
+            if let Some(w) = options.wide_qp_clamp.then(|| WideQp::new(q)) {
+                let mid = (w.key + w.top) / 2;
+                p.rc.i_qp_constant = mid as c_int;
+                p.rc.f_ip_factor = 2f32.powf((mid - w.key) as f32 / 6.0);
+                p.rc.f_pb_factor = 2f32.powf((w.top - mid) as f32 / 6.0);
+            }
         } else {
             p.rc.i_rc_method = X264_RC_ABR;
             p.rc.i_bitrate = kbps;
@@ -98,9 +361,8 @@ impl X264Encoder {
         }
 
         // GOP / recovery. libx264 advances the intra-refresh column by `mb_width / i_keyint_max`
-        // macroblocks per frame, so keyint *is* the refresh period — leave it infinite and the
-        // wave moves ~1e-9 MB/frame and never sweeps. One sweep per second matches the Intel
-        // backend's `IntRefCycleSize = fps`.
+        // macroblocks per frame, so keyint is the refresh period: left infinite, the wave never
+        // sweeps. One sweep per second matches the Intel backend's `IntRefCycleSize = fps`.
         p.i_keyint_max = if config.intra_refresh {
             fps.clamp(2, i32::MAX as u32) as c_int
         } else {
@@ -114,15 +376,17 @@ impl X264Encoder {
         p.b_annexb = 1;
         p.i_log_level = X264_LOG_ERROR;
 
-        // Colour signalling. BT.709 limited range, which is what both input paths now carry:
-        // the CPU BGRA converter uses the BT.709 matrix, and the scaler's NV12 comes out of the
-        // D3D11 video processor in BT.709 limited. This used to say SMPTE 170M (BT.601, value 6)
-        // and was correct only while the CPU converter — which was BT.601 — was the only door in.
+        // Colour signalling: BT.709 limited range, for both inputs. The CPU BGRA converter below
+        // is BT.709, and the scaler's NV12 is BT.709 limited only while `scaler_bt709` is on (the
+        // D3D11 video processor's documented default matrix is BT.601).
         p.vui.b_fullrange = 0;
         p.vui.i_colorprim = 1; // BT.709
         p.vui.i_transfer = 1; // BT.709
         p.vui.i_colmatrix = 1; // BT.709
 
+        if options.negotiated_profile {
+            enable_profile_tools(&mut p, config.profile);
+        }
         let profile = match config.profile {
             H264Profile::Baseline => PROFILE_BASELINE,
             H264Profile::Main => PROFILE_MAIN,
@@ -136,37 +400,73 @@ impl X264Encoder {
             );
         }
 
-        // Input must be planar 4:2:0. libx264 does NOT convert RGB internally: any csp at or
-        // above X264_CSP_I444 maps to I444 in frame_internal_csp(), and x264_sps_init then
-        // forces PROFILE_HIGH444_PREDICTIVE regardless of what apply_profile asked for. A
-        // packed-BGRA fast path therefore emits profile_idc 244 / chroma_format_idc 3, which
-        // no browser WebRTC decoder accepts. `x264_profile_asserts_420` covers this.
-        let handle = unsafe { (api.encoder_open)(&mut p) };
+        // Input must be planar 4:2:0: libx264 does not convert RGB. Any csp at or above
+        // X264_CSP_I444 maps to I444 in frame_internal_csp(), and x264_sps_init then forces
+        // PROFILE_HIGH444_PREDICTIVE (profile_idc 244, chroma_format_idc 3) whatever
+        // apply_profile asked for, which no browser WebRTC decoder accepts.
+        // `x264_profile_asserts_420` covers this.
+        #[cfg(feature = "bench")]
+        crate::bench::win_hooks::x264(&mut p);
+        let (handle, worker_report) = if options.worker_tuning {
+            let _serial = OPEN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let before = workers::process_thread_ids();
+            let handle = unsafe { (api.encoder_open)(&mut p) };
+            let report = match (before, workers::process_thread_ids()) {
+                (Some(before), Some(after)) if !handle.is_null() => {
+                    workers::module_of(api.encoder_open as *const std::ffi::c_void).map(|lib| {
+                        let found = workers::select_new_workers(
+                            &before,
+                            &after,
+                            lib,
+                            workers::thread_start_module,
+                        );
+                        workers::tune_workers(&found, &worker_masks)
+                    })
+                }
+                _ => None,
+            };
+            (handle, report)
+        } else {
+            (unsafe { (api.encoder_open)(&mut p) }, None)
+        };
         if handle.is_null() {
             bail!("x264_encoder_open returned null (invalid params or libx264 build mismatch)");
         }
+
+        let pacer =
+            (options.rate_by_delivered_fps && config.qp.is_none()).then(|| RatePacer::new(fps));
 
         let y_size = width * height;
         let c_size = (width / 2) * (height / 2);
         let i420 = vec![0u8; y_size + 2 * c_size];
 
-        // Read back what libx264 settled on rather than reporting the request. `ultrafast` and
-        // `zerolatency` are a preset and a tune, both of which move fields, and
-        // `param_apply_profile` moves more — so printing `p` was printing what was asked for.
-        // Every latency-critical setting in this file is in the list because each one is a way
-        // for the encoder to be quietly buffering: a B frame, a lookahead, a frame-threaded
-        // pipeline, or an intra-refresh period that never sweeps.
-        let eff = read_back_params(&api, handle);
+        // Log what libx264 settled on, not the request: the preset, the tune and
+        // `param_apply_profile` all move fields. Each setting listed is a way for the encoder to
+        // buffer quietly: a B frame, a lookahead, frame threads, a refresh period that never
+        // sweeps.
+        let eff = read_back_params(api, handle);
+        let workers_note = match (&worker_report, options.worker_tuning) {
+            (Some(r), _) => format!(
+                "tuned {} slice workers (HIGHEST, EcoQoS off, {} P-core logical CPUs), {} refused",
+                r.tuned.len(),
+                r.masks,
+                r.failed
+            ),
+            (None, true) => "worker tuning on but the workers could not be identified".into(),
+            (None, false) => "workers untuned".into(),
+        };
         tprintln!(
             "pipeline: software x264 encoder ready ({width}x{height}@{fps}, {kbps} kbps, \
-             profile={:?}, lib={}, build={}). Effective: threads={}, sliced_threads={}, \
-             bframes={}, rc_lookahead={}, sync_lookahead={}, keyint={}, intra_refresh={}, \
-             scenecut={}, repeat_headers={}, annexb={}, nal_hrd={}, vbv_maxrate={}, \
-             vbv_bufsize={}, colmatrix={}, fullrange={}",
+             profile={:?}, lib={}, build={}). Effective: threads={}, lookahead_threads={}, \
+             sliced_threads={}, bframes={}, rc_lookahead={}, sync_lookahead={}, keyint={}, \
+             intra_refresh={}, scenecut={}, repeat_headers={}, annexb={}, nal_hrd={}, \
+             vbv_maxrate={}, vbv_bufsize={}, colmatrix={}, fullrange={}; {workers_note}; \
+             options={options:?}",
             config.profile,
             api.library_path().display(),
             api.build,
             eff.i_threads,
+            eff.i_lookahead_threads,
             eff.b_sliced_threads,
             eff.i_bframe,
             eff.rc.i_lookahead,
@@ -183,6 +483,7 @@ impl X264Encoder {
             eff.vui.b_fullrange,
         );
 
+        let wide_qp = config.qp.filter(|_| options.wide_qp_clamp).map(WideQp::new);
         Ok(Self {
             api,
             handle,
@@ -192,34 +493,65 @@ impl X264Encoder {
             height,
             i420,
             nv12: Vec::new(),
-            input_csp: X264_CSP_I420,
+            retained: Retained::None,
             y_size,
             c_size,
-            have_frame: false,
-            pts: 0,
+            frames: 0,
+            reordered: 0,
+            pacer,
+            target_kbps: kbps,
+            qp_plus1: 0,
+            wide_qp,
+            #[cfg(test)]
+            tuned_workers: worker_report.map(|r| r.tuned).unwrap_or_default(),
+            #[cfg(test)]
+            test_now: None,
         })
     }
 
-    /// The parameters libx264 actually settled on, after the preset, the tune,
-    /// `param_apply_profile` and its own validation have all had their say.
-    ///
-    /// `self.params` is the *request*. Everything this file claims about the encoder's
-    /// configuration — no B frames, no lookahead, sliced rather than frame threads, an
-    /// intra-refresh period that actually sweeps — was a claim about the request until this
-    /// existed. `x264_zerolatency_settings_were_accepted` asserts against this, not against `p`.
     /// The libx264 build number the loader accepted, for the init log and the tests.
     pub fn build(&self) -> i32 {
         self.api.build
     }
 
+    /// The parameters libx264 settled on, after the preset, the tune, `param_apply_profile` and
+    /// its own validation. `self.params` is only the request;
+    /// `x264_zerolatency_settings_were_accepted` asserts against this.
     pub fn effective_params(&self) -> x264_param_t {
-        read_back_params(&self.api, self.handle)
+        read_back_params(self.api, self.handle)
+    }
+
+    /// The slice workers `x264_worker_tuning` found and tuned.
+    #[cfg(test)]
+    pub(crate) fn tuned_workers(&self) -> &[u32] {
+        &self.tuned_workers
+    }
+
+    /// Access units whose dts differed from their pts (none are expected).
+    #[cfg(test)]
+    pub(crate) fn reordered(&self) -> u64 {
+        self.reordered
+    }
+
+    /// Drive the pacer's clock from the test: the next encode is taken to happen at `now`.
+    #[cfg(test)]
+    pub(crate) fn set_test_clock(&mut self, now: std::time::Instant) {
+        self.test_now = Some(now);
+    }
+
+    /// The bitrate scale the delivered-rate pacer has applied (1.0 when it is off).
+    #[cfg(test)]
+    pub(crate) fn rate_scale(&self) -> f64 {
+        self.pacer.as_ref().map_or(1.0, RatePacer::applied)
     }
 
     pub fn encode_bgra(&mut self, bgra: &[u8], force_idr: bool) -> Result<Vec<u8>> {
         self.encode_bgra_padded(bgra, (self.width * 4) as u32, force_idr)
     }
 
+    /// Encode a BGRA frame: the CPU converts it to I420 (BT.709 limited) into a buffer the
+    /// encoder keeps, which is also what `encode_repeat` re-encodes. Live whenever the scaler
+    /// falls back to BGRA (NV12 refused, or an odd size) and on every no-scaler readback.
     pub fn encode_bgra_padded(
         &mut self,
         data: &[u8],
@@ -227,23 +559,26 @@ impl X264Encoder {
         force_idr: bool,
     ) -> Result<Vec<u8>> {
         self.convert_bgra_to_i420(data, row_pitch as usize)?;
-        self.input_csp = X264_CSP_I420;
-        self.encode_converted(force_idr)
+        let planes = self.i420_planes();
+        let au = self.encode_planes(planes, force_idr)?;
+        // only a frame libx264 accepted becomes the repeat source
+        self.retained = Retained::I420;
+        Ok(au)
     }
 
     /// Encode a frame the GPU's video processor already converted to NV12.
     ///
-    /// This is the whole point of `ReadbackFormat::Nv12`: the scale and the colour conversion are
-    /// one `VideoProcessorBlt`, so asking for NV12 output costs the video engine nothing and
-    /// deletes the CPU colour-matrix pass entirely. What is left here is a row copy into a
-    /// tightly packed buffer — the mapped staging texture's pitch is not the picture width, and
-    /// `encode_repeat` needs the frame to outlive the map — and then libx264 does the NV12→I420
-    /// deinterleave itself, in SIMD, inside `x264_frame_copy_picture`.
+    /// The scale and the colour conversion are one `VideoProcessorBlt`, so NV12 output removes
+    /// the CPU colour-matrix pass. What is left here is a row copy into a tightly packed buffer
+    /// the encoder keeps for `encode_repeat` (the caller's buffer does not outlive this call);
+    /// libx264 does the NV12 to I420 deinterleave itself inside `x264_frame_copy_picture`.
+    /// [`Self::encode_nv12_unretained`] is the same encode without that copy, for a caller that
+    /// keeps the frame itself.
     ///
     /// The picture csp differs from `param.i_csp` here, which is allowed: `frame_internal_csp`
-    /// maps NV12 to I420, the same internal format the parameters opened with, so the SPS is
-    /// unaffected. That is the difference from the BGRA fast path this replaces, which mapped to
-    /// I444 and forced High 4:4:4 (`x264_profile_asserts_420`).
+    /// maps NV12 to I420, the internal format the parameters opened with, so the SPS is
+    /// unaffected. A packed BGRA picture would map to I444 and force High 4:4:4
+    /// (`x264_profile_asserts_420`).
     pub fn encode_nv12_padded(
         &mut self,
         data: &[u8],
@@ -252,15 +587,9 @@ impl X264Encoder {
     ) -> Result<Vec<u8>> {
         let row_pitch = row_pitch as usize;
         let (w, h) = (self.width, self.height);
+        // validates the geometry before anything is copied
+        nv12_planes("encode_nv12_padded", data, row_pitch, w, h)?;
         let rows = h + h / 2;
-        if row_pitch < w || data.len() < row_pitch * rows {
-            bail!(
-                "encode_nv12_padded: need row_pitch >= {w} and >= {} bytes for {w}x{h} NV12 \
-                 (got pitch {row_pitch}, {} bytes)",
-                row_pitch * rows,
-                data.len()
-            );
-        }
 
         if self.nv12.len() != w * rows {
             self.nv12 = vec![0u8; w * rows];
@@ -277,34 +606,91 @@ impl X264Encoder {
             }
         }
 
-        self.input_csp = X264_CSP_NV12;
-        self.encode_converted(force_idr)
+        let planes = self.nv12_retained_planes();
+        let au = self.encode_planes(planes, force_idr)?;
+        self.retained = Retained::Nv12;
+        Ok(au)
     }
 
-    /// Re-encode the already-converted I420 planes. No BGRA copy is retained, so a repeat can
-    /// never disagree with the source frame's stride.
+    /// Encode an NV12 frame straight from the caller's buffer, at the caller's pitch, with no
+    /// copy. libx264 copies the picture into its own frame inside the call either way.
+    ///
+    /// Nothing is retained, so a later plain [`Self::encode_repeat`] returns an error rather than
+    /// repeat a stale picture. A caller that uses this must also supply its repeats through this
+    /// method, from the buffer it kept (in the pipeline, the scaler's own `readback`, which
+    /// outlives the map).
+    pub fn encode_nv12_unretained(
+        &mut self,
+        data: &[u8],
+        row_pitch: u32,
+        force_idr: bool,
+    ) -> Result<Vec<u8>> {
+        let planes = nv12_planes(
+            "encode_nv12_unretained",
+            data,
+            row_pitch as usize,
+            self.width,
+            self.height,
+        )?;
+        self.retained = Retained::None;
+        self.encode_planes(planes, force_idr)
+    }
+
+    /// Re-encode the frame the encoder retained: the I420 planes of a BGRA frame, or the packed
+    /// copy of an NV12 one. Empty (not an error) before the first frame. No source stride is
+    /// retained, so a repeat can never disagree with the frame it repeats.
     pub fn encode_repeat(&mut self, force_idr: bool) -> Result<Vec<u8>> {
-        if !self.have_frame {
-            return Ok(Vec::new());
-        }
-        self.encode_converted(force_idr)
+        let planes = match self.retained {
+            Retained::I420 => self.i420_planes(),
+            Retained::Nv12 => self.nv12_retained_planes(),
+            Retained::None if self.frames == 0 => return Ok(Vec::new()),
+            Retained::None => bail!(
+                "x264 repeat: the last frame was encoded unretained, so the caller must supply \
+                 the repeat through encode_nv12_unretained"
+            ),
+        };
+        self.encode_planes(planes, force_idr)
     }
 
-    /// Advance the periodic intra-refresh wave immediately (loss repair without an IDR).
-    /// A no-op unless the encoder was opened with `intra_refresh`.
-    pub fn intra_refresh(&mut self) {
-        if self.config.intra_refresh {
-            unsafe { (self.api.encoder_intra_refresh)(self.handle) };
+    /// Change the constant QP from the next picture: a forced per-picture quantiser
+    /// (`i_qpplus1`), which libx264 honours ahead of its CQP table and which neither resets the
+    /// encoder nor forces a keyframe. On an encoder opened with `wide_qp_clamp` it reaches
+    /// [`WideQp::top`] (51 for a setting of 15 or more); otherwise libx264 clamps it to its own
+    /// CQP range. `Ok(false)` outside CQP.
+    pub fn set_qp(&mut self, qp: u8) -> Result<bool> {
+        let Some(base) = self.config.qp else {
+            return Ok(false);
+        };
+        let q = qp.clamp(1, 51);
+        if let Some(w) = self.wide_qp.as_mut() {
+            w.now = q.min(w.top);
+            return Ok(true);
         }
+        self.qp_plus1 = if q == base { 0 } else { q as c_int + 1 };
+        Ok(true)
+    }
+
+    /// The QP range `set_qp` can reach on this encoder: `(keyframe QP at the user's setting,
+    /// highest)`, or `None` when it was not opened widened.
+    pub fn qp_range(&self) -> Option<(u8, u8)> {
+        self.wide_qp.map(|w| (w.key, w.top))
     }
 
     pub fn set_bitrate(&mut self, bps: u32) -> Result<BitrateApplied> {
         if self.config.qp.is_some() {
             return Ok(BitrateApplied::IgnoredConstantQp);
         }
-        let kbps = bitrate_kbps(bps);
         self.config.bitrate_bps = bps;
         self.config.max_bitrate_bps = bps;
+        self.target_kbps = bitrate_kbps(bps);
+        let scale = self.pacer.as_ref().map_or(1.0, RatePacer::applied);
+        self.reconfigure_rate(scale)?;
+        Ok(BitrateApplied::Applied)
+    }
+
+    /// Push `target_kbps * scale` into libx264's ABR and VBV.
+    fn reconfigure_rate(&mut self, scale: f64) -> Result<()> {
+        let kbps = scaled_kbps(self.target_kbps, scale);
         self.params.rc.i_bitrate = kbps;
         self.params.rc.i_vbv_max_bitrate = kbps;
         self.params.rc.i_vbv_buffer_size = vbv_buffer_kbit(kbps, self.config.fps.max(1));
@@ -312,37 +698,81 @@ impl X264Encoder {
         if rv < 0 {
             bail!("x264_encoder_reconfig failed ({rv})");
         }
-        Ok(BitrateApplied::Applied)
+        Ok(())
     }
 
-    fn encode_converted(&mut self, force_idr: bool) -> Result<Vec<u8>> {
+    fn now(&self) -> std::time::Instant {
+        #[cfg(test)]
+        if let Some(now) = self.test_now {
+            return now;
+        }
+
+        std::time::Instant::now()
+    }
+
+    fn i420_planes(&mut self) -> Planes {
+        let (y, rest) = self.i420.split_at_mut(self.y_size);
+        let (u, v) = rest.split_at_mut(self.c_size);
+        Planes {
+            csp: X264_CSP_I420,
+            count: 3,
+            ptr: [y.as_mut_ptr(), u.as_mut_ptr(), v.as_mut_ptr()],
+            stride: [
+                self.width as c_int,
+                (self.width / 2) as c_int,
+                (self.width / 2) as c_int,
+            ],
+        }
+    }
+
+    fn nv12_retained_planes(&mut self) -> Planes {
+        let (y, uv) = self.nv12.split_at_mut(self.y_size);
+        Planes {
+            csp: X264_CSP_NV12,
+            count: 2,
+            ptr: [y.as_mut_ptr(), uv.as_mut_ptr(), ptr::null_mut()],
+            stride: [self.width as c_int, self.width as c_int, 0],
+        }
+    }
+
+    fn encode_planes(&mut self, planes: Planes, force_idr: bool) -> Result<Vec<u8>> {
+        if self.pacer.is_some() {
+            let now = self.now();
+            if let Some(scale) = self.pacer.as_mut().and_then(|p| p.note_frame(now)) {
+                // a refused reconfigure leaves the previous rate in force; not a reason to drop
+                // the frame
+                if let Err(e) = self.reconfigure_rate(scale) {
+                    teprintln!("x264: delivered-rate reconfigure to {scale:.2}x failed: {e:?}");
+                }
+            }
+        }
+
         let mut pic_in: x264_picture_t = unsafe { std::mem::zeroed() };
         unsafe { (self.api.picture_init)(&mut pic_in) };
-        if self.input_csp == X264_CSP_NV12 {
-            let (y, uv) = self.nv12.split_at_mut(self.y_size);
-            pic_in.img.i_csp = X264_CSP_NV12;
-            pic_in.img.i_plane = 2;
-            pic_in.img.plane[0] = y.as_mut_ptr();
-            pic_in.img.plane[1] = uv.as_mut_ptr();
-            pic_in.img.i_stride[0] = self.width as c_int;
-            pic_in.img.i_stride[1] = self.width as c_int;
-        } else {
-            let (y, rest) = self.i420.split_at_mut(self.y_size);
-            let (u, v) = rest.split_at_mut(self.c_size);
-            pic_in.img.i_csp = X264_CSP_I420;
-            pic_in.img.i_plane = 3;
-            pic_in.img.plane[0] = y.as_mut_ptr();
-            pic_in.img.plane[1] = u.as_mut_ptr();
-            pic_in.img.plane[2] = v.as_mut_ptr();
-            pic_in.img.i_stride[0] = self.width as c_int;
-            pic_in.img.i_stride[1] = (self.width / 2) as c_int;
-            pic_in.img.i_stride[2] = (self.width / 2) as c_int;
+        pic_in.img.i_csp = planes.csp;
+        pic_in.img.i_plane = planes.count;
+        for i in 0..3 {
+            pic_in.img.plane[i] = planes.ptr[i];
+            pic_in.img.i_stride[i] = planes.stride[i];
         }
-        pic_in.i_pts = self.pts;
+        pic_in.i_pts = self.frames as i64;
         pic_in.i_type = if force_idr {
             X264_TYPE_IDR
         } else {
             X264_TYPE_AUTO
+        };
+        pic_in.i_qpplus1 = match self.wide_qp {
+            // at the user's QP a keyframe keeps the finer QP libx264 would have given it
+            Some(w) => {
+                let keyframe = force_idr || self.frames == 0;
+                let q = if keyframe && w.now == w.base {
+                    w.key
+                } else {
+                    w.now
+                };
+                q as c_int + 1
+            }
+            None => self.qp_plus1,
         };
 
         let mut nals: *mut x264_nal_t = ptr::null_mut();
@@ -360,16 +790,22 @@ impl X264Encoder {
         if size < 0 {
             bail!("x264_encoder_encode failed ({size})");
         }
-        self.pts += 1;
-        self.have_frame = true;
+        self.frames += 1;
 
         if size == 0 || n_nal == 0 || nals.is_null() {
             return Ok(Vec::new());
         }
-        debug_assert_eq!(
-            pic_out.i_dts, pic_out.i_pts,
-            "0 B-frames must keep dts == pts (no reordering)"
-        );
+        if pic_out.i_dts != pic_out.i_pts {
+            self.reordered += 1;
+            if !REORDER_WARNED.swap(true, Ordering::Relaxed) {
+                teprintln!(
+                    "x264: an access unit came out with dts {} != pts {} although B-frames are \
+                     off; counted, not asserted (this runs under a WGC callback)",
+                    pic_out.i_dts,
+                    pic_out.i_pts
+                );
+            }
+        }
 
         let out = unsafe { std::slice::from_raw_parts((*nals).p_payload, size as usize).to_vec() };
         Ok(out)
@@ -441,8 +877,8 @@ impl Drop for X264Encoder {
 /// oversubscribes those hot threads and adds latency under CPU contention.
 static CONVERT_POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
 
-/// Workers are nonetheless raised to ABOVE_NORMAL so the TIME_CRITICAL encode thread, which is
-/// blocked inside `install()` while they run, is not stalled by lower-priority system work.
+/// Workers run at ABOVE_NORMAL so the TIME_CRITICAL encode thread, blocked inside `install()`
+/// while they run, is not stalled behind lower-priority system work.
 fn build_convert_pool() -> rayon::ThreadPool {
     let n = std::thread::available_parallelism()
         .map(|c| (c.get() / 2).clamp(1, 4))
@@ -465,13 +901,6 @@ fn build_convert_pool() -> rayon::ThreadPool {
         })
 }
 
-fn encode_thread_count() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .clamp(1, MAX_ENCODE_THREADS)
-}
-
 /// `x264_encoder_parameters` into a zeroed struct. Separate from the method because the init
 /// log needs it before there is a `Self` to call it on.
 fn read_back_params(api: &X264Api, handle: *mut x264_t) -> x264_param_t {
@@ -482,6 +911,12 @@ fn read_back_params(api: &X264Api, handle: *mut x264_t) -> x264_param_t {
 
 fn bitrate_kbps(bps: u32) -> c_int {
     (bps / 1000).max(64) as c_int
+}
+
+/// `target` scaled by the delivered-rate pacer, never below the 64 kbps floor `bitrate_kbps`
+/// already applies.
+fn scaled_kbps(target: c_int, scale: f64) -> c_int {
+    ((target as f64 * scale.clamp(0.0, 1.0)).round() as c_int).max(64)
 }
 
 fn vbv_buffer_kbit(kbps: c_int, fps: u32) -> c_int {
@@ -518,14 +953,8 @@ fn convert_row_pair(row0: &[u8], row1: &[u8], y2: &mut [u8], u: &mut [u8], v: &m
     }
 }
 
-// BT.709 limited range, 8-bit, in the usual >> 8 integer form.
-//
-// These were BT.601 (`66/129/25`, `-38/-74/112`, `112/-94/-18`), matching a BT.601 VUI, which was
-// self-consistent as long as this CPU conversion was the only way in. It is not any more: the
-// scaler's NV12 output comes from the D3D11 video processor, whose default output space is
-// BT.709 limited on every driver observed, and there is one VUI for both. So the CPU path moves
-// to BT.709 rather than the signalling moving to a lie. It also matches what the NVENC path has
-// always written into its own VUI.
+// BT.709 limited range, 8-bit, in the usual >> 8 integer form. It has to match the VUI, which
+// also covers the scaler's NV12 output (BT.709 limited under `scaler_bt709`).
 
 #[inline(always)]
 fn bt709_y(r: i32, g: i32, b: i32) -> u8 {
@@ -560,17 +989,26 @@ pub fn probe_encode(config: &Config, path: &str) -> Result<()> {
         "x264: encoding synthetic pattern to Annex-B: path={path}, {WIDTH}x{HEIGHT}@{FPS}, {FRAMES} frames"
     );
 
-    let mut encoder = X264Encoder::new(EncoderConfig {
-        width: WIDTH,
-        height: HEIGHT,
-        fps: FPS,
-        bitrate_bps: BITRATE,
-        max_bitrate_bps: BITRATE,
-        profile: config.h264_profile,
-        qp: config.qp,
-        min_qp: config.quality_qp,
-        intra_refresh: config.intra_refresh,
-    })?;
+    // a file encode runs faster than real time, so the delivered-rate pacer would read it as a
+    // very fast stream and starve it
+    let options = X264Options {
+        rate_by_delivered_fps: false,
+        ..X264Options::from_switches()
+    };
+    let mut encoder = X264Encoder::with_options(
+        EncoderConfig {
+            width: WIDTH,
+            height: HEIGHT,
+            fps: FPS,
+            bitrate_bps: BITRATE,
+            max_bitrate_bps: BITRATE,
+            profile: config.h264_profile,
+            qp: config.qp,
+            min_qp: config.quality_qp,
+            intra_refresh: config.intra_refresh,
+        },
+        options,
+    )?;
 
     let mut file =
         std::fs::File::create(path).with_context(|| format!("creating output file {path}"))?;

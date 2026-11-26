@@ -1,9 +1,9 @@
-//! Linux injection backend — a stub. It compiles and reports `Unsupported`; nothing is injected.
+//! Linux injection backend stub: compiles and reports `Unsupported`, injects nothing.
 //!
 //! TODO: open /dev/uinput via `input-linux` or `uinput` crate.
 //!   - Mouse/keyboard: EV_KEY / EV_REL / EV_ABS on a virtual device.
 //!   - Multi-touch: create a MT type-B device (ABS_MT_SLOT, ABS_MT_TRACKING_ID,
-//!     ABS_MT_POSITION_X/Y, ABS_MT_PRESSURE) and emit one SYN_REPORT per frame —
+//!     ABS_MT_POSITION_X/Y, ABS_MT_PRESSURE) and emit one SYN_REPORT per frame:
 //!     one syscall per contact update, one SYN to commit, matching the touch model.
 //!   - Pen: ABS_PRESSURE + ABS_TILT_X/Y on a tablet-style device.
 //!   - Prefer direct uinput over shelling out to xdotool/ydotool (per-call process

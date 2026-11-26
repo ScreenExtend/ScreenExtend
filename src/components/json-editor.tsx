@@ -195,9 +195,8 @@ const JsonEditorBase = forwardRef<JsonEditorHandle, JsonEditorProps>(
     }, [schema, name]);
 
     // Monaco idles its language workers out, and the first keystroke after that stalls on
-    // the respawn. The keep-alive is a property of the shared worker, not of an editor, so
-    // it is refcounted: a save conflict mounts three JsonEditors at once and they were
-    // running three intervals against the same worker.
+    // the respawn. The keep-alive is refcounted because the worker is shared: a save
+    // conflict mounts three JsonEditors at once.
     useEffect(() => acquireWorkerKeepAlive(), []);
 
     useEffect(() => {
@@ -319,8 +318,7 @@ const JsonEditorBase = forwardRef<JsonEditorHandle, JsonEditorProps>(
         try {
           replaceAll(JSON.stringify(JSON.parse(current)), false);
         } catch (e) {
-          // the document is not valid JSON, so there is nothing to minify; the markers
-          // in the gutter already say so
+          // nothing to minify; the gutter markers already say why
           console.error("minify skipped: the document is not valid JSON", e);
         }
       },

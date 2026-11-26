@@ -5,7 +5,7 @@
 #
 # Usage:
 #   ./scripts/build.sh                                        # build the .driver first
-#   SE_INSTALLER_IDENTITY="Developer ID Installer: …" ./scripts/package.sh
+#   SE_INSTALLER_IDENTITY="Developer ID Installer: ..." ./scripts/package.sh
 #   SE_ALLOW_UNSIGNED=1 ./scripts/package.sh                   # dev only, see below
 set -euo pipefail
 
@@ -15,9 +15,9 @@ DRIVER="${BUILD}/ScreenExtendAudio.driver"
 
 die() { echo "error: $*" >&2; exit 1; }
 
-[ -d "${DRIVER}" ] || die "${DRIVER} not found — run scripts/build.sh first"
+[ -d "${DRIVER}" ] || die "${DRIVER} not found: run scripts/build.sh first"
 [ -x /usr/libexec/PlistBuddy ] || die "/usr/libexec/PlistBuddy is missing"
-command -v pkgbuild >/dev/null 2>&1 || die "pkgbuild is not on PATH — install the Command Line Tools"
+command -v pkgbuild >/dev/null 2>&1 || die "pkgbuild is not on PATH: install the Command Line Tools"
 command -v productbuild >/dev/null 2>&1 || die "productbuild is not on PATH"
 
 VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "${HERE}/Info.plist")"
@@ -26,7 +26,7 @@ PKG="${BUILD}/ScreenExtendAudio-${VERSION}.pkg"
 INSTALLER_IDENTITY="${SE_INSTALLER_IDENTITY:-${INSTALLER_ID:-}}"
 if [ -z "${INSTALLER_IDENTITY}" ] && [ -z "${SE_ALLOW_UNSIGNED:-}" ]; then
   die "no installer identity. Set SE_INSTALLER_IDENTITY, or SE_ALLOW_UNSIGNED=1 for a local
-       build — an unsigned, unnotarized HAL plug-in only loads on a Mac with SIP disabled."
+       build: an unsigned, unnotarized HAL plug-in only loads on a Mac with SIP disabled."
 fi
 
 # staging root mirrors the on-disk install layout

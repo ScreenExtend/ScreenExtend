@@ -4,6 +4,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { pidAlive } from './slots.mjs';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -23,7 +24,7 @@ export function probeBuild(exe) {
     isolationSwitch: has('SCREENEXTEND_DATA_DIR'),
     envCredentials: has('SCREENEXTEND_OTP') && has('SCREENEXTEND_SESSION_ID'),
     controlStats: has('STATS') && has('telemetry'),
-    // The client page is compiled in; these tell which page generation it is.
+    // the client page is compiled in; these tell which page generation it is
     pageHasSEVideo: has('window.SEVideo'),
     pageHasJoinId: has('X-Join-Id'),
     dlls: { 'libopus.dll': fs.existsSync(path.join(dir, 'libopus.dll')), 'libx264-164.dll': fs.existsSync(path.join(dir, 'libx264-164.dll')) },
@@ -59,19 +60,26 @@ export async function startHost(o) {
   if (o.envCredentials) { env.SCREENEXTEND_SESSION_ID = o.sessionId; env.SCREENEXTEND_OTP = o.otp; credentialsVia = 'environment'; }
   else { args.push('--session-id', o.sessionId, '--otp', o.otp); credentialsVia = 'argv (this build reads no credential environment variables)'; }
   args.push(...(o.extraArgs || []));
-  // Every line is prefixed with the system clock as it reaches us ("[epoch-ms] "), so the host's
-  // log can be laid against the browser's network log: `serve` prints no times of its own. The
-  // prefix is when the handler read the line (a pipe, read on the event loop), which trails the
-  // host's write by well under a millisecond on an idle loop and by a few ms on a busy one.
+  // Every line gets a "[epoch-ms] " prefix (`serve` prints no times of its own), so the host's
+  // log can be laid against the browser's network log. It is when the handler read the line off
+  // the pipe: well under 1 ms after the host's write on an idle event loop, a few ms on a busy one.
   const out = fs.openSync(o.logFile, 'a');
-  // Startup phases, all from the spawn call on the handler's clock: first byte of output, the
-  // banner's "Host is running" line, and the first `/health` that answered. `startupMs` below is
-  // the same span as `healthMs`, kept for older readers.
+  // startup phases, in ms from the spawn call on the handler's clock; `startupMs` below is the
+  // same span as `healthMs`, kept for older readers
   const phases = { firstOutputMs: null, runningLineMs: null, healthMs: null };
   const tSpawn = Date.now();
   try { fs.writeSync(out, `[${tSpawn}] (handler) spawned ${path.basename(o.exe)}\n`); } catch { /* best effort */ }
-  const proc = spawn(o.exe, args, { env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
-  for (const s of [proc.stdout, proc.stderr]) {
+  // logRelay: a separate process reads the host's output, so this event loop stalling cannot
+  // block the host's own writes (verbose `serve` writes every log line to stdout synchronously)
+  let relayed = null;
+  if (o.logRelay) {
+    try { fs.closeSync(out); } catch { /* reopened below */ }
+    const w = spawn(process.execPath, [fileURLToPath(new URL('./tslog.mjs', import.meta.url)), o.logFile, o.exe, ...args], { env, stdio: ['ignore', 'pipe', 'inherit'], windowsHide: true });
+    const pid = await new Promise((res) => { let b = ''; w.stdout.on('data', (d) => { b += d; const m = /\{"pid":(\d+)\}/.exec(b); if (m) res(Number(m[1])); }); w.on('exit', () => res(null)); setTimeout(() => res(null), 15000); });
+    relayed = { wrapper: w, pid };
+  }
+  const proc = relayed ? relayed.wrapper : spawn(o.exe, args, { env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+  for (const s of relayed ? [] : [proc.stdout, proc.stderr]) {
     let tail = '';
     s.setEncoding('utf8');
     s.on('data', (d) => {
@@ -83,24 +91,27 @@ export async function startHost(o) {
     });
     s.on('end', () => { if (tail) { try { fs.writeSync(out, `[${Date.now()}] ${tail}\n`); } catch { /* closed */ } } });
   }
-  proc.on('close', () => { try { fs.closeSync(out); } catch { /* already */ } });
+  if (!relayed) proc.on('close', () => { try { fs.closeSync(out); } catch { /* already */ } });
   let exited = null; proc.on('exit', (code) => { exited = { code }; });
   const shownArgs = args.map((a, i) => (args[i - 1] === '--otp' ? '<otp>' : args[i - 1] === '--session-id' ? '<session>' : a));
   const t0 = Date.now(); let ip = null; let log = '';
   const portRe = new RegExp(`https?://(\\d+\\.\\d+\\.\\d+\\.\\d+):(?:${o.httpsPort}|${o.httpPort})`);
   while (Date.now() - t0 < 40000) {
-    // 25 ms rather than 300: the poll interval was the resolution of `startupMs`, and startup is
-    // itself under a second.
+    // 25 ms: the poll interval is the resolution of `startupMs`, and startup is under a second
     await sleep(25);
     try { log = fs.readFileSync(o.logFile, 'utf8'); } catch { /* not yet */ }
     if (!ip) { const m = log.match(portRe); if (m) ip = m[1]; }
+    if (relayed && phases.firstOutputMs == null && log.length > 200) phases.firstOutputMs = Date.now() - tSpawn;
+    if (phases.runningLineMs == null && /Host is running/.test(log)) phases.runningLineMs = Date.now() - tSpawn;
     if (ip) {
       try { const r = await fetch(`http://${ip}:${o.httpPort}/health`, { signal: AbortSignal.timeout(1500) }); if (r.ok) { phases.healthMs = Date.now() - tSpawn; break; } } catch { /* not up */ }
     }
     if (exited) break;
   }
   const up = !!ip && !exited;
-  return { proc, pid: proc.pid, args: shownArgs, credentialsVia, ip, up, startupMs: Date.now() - t0, startup: phases, exited: () => exited, logTail: up ? null : log.slice(-3000) };
+  // stops reading the host's output for `ms` (pipe mode only): what a stalled reader does to it
+  const pauseReader = (ms) => { if (relayed) return false; proc.stdout.pause(); proc.stderr.pause(); setTimeout(() => { proc.stdout.resume(); proc.stderr.resume(); }, ms); return true; };
+  return { proc, pid: relayed ? relayed.pid : proc.pid, logRelay: !!relayed, pauseReader, args: shownArgs, credentialsVia, ip, up, startupMs: Date.now() - t0, startup: phases, exited: () => exited, logTail: up ? null : log.slice(-3000) };
 }
 
 /** Stop a host: the `stop` verb where the build can be reached by it, else by PID. */

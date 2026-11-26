@@ -1,14 +1,13 @@
 #!/usr/bin/env node
 // The startup gate's decision table: `pnpm test:gate`.
 //
-// No runner and no devDependency, the same rule the client-page harnesses follow. Node strips
-// the types out of `src/lib/startup-gate.ts` on import (it is erasable-syntax-only and its one
-// import is `import type`), so the function under test is the one the app ships rather than a
-// copy that can drift from it.
+// No runner and no devDependency. Node strips the types out of `src/lib/startup-gate.ts` on
+// import (it is erasable-syntax-only and its one import is `import type`), so the function
+// under test is the one the app ships, not a copy that can drift from it.
 //
-// What it pins is the owner's rule: a host that can create a display and send video starts,
-// whatever else is missing, and only a host that cannot — after the app has tried to install
-// what it can install — loses "Continue anyway".
+// What it pins: a host that can create a display and send video starts, whatever else is
+// missing; only a host that cannot, after the app has tried to install what it can, loses
+// "Continue anyway".
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import {
@@ -84,7 +83,7 @@ test('every optional fault gets "Continue anyway", never a block', () => {
     const gate = classifyCompat(report([one]), fresh);
     assert.equal(gate.kind, 'warn', one.key + ' produced ' + gate.kind);
   }
-  // And all of them at once is still a host that streams.
+  // all of them at once is still a host that streams
   assert.equal(classifyCompat(report(optional), fresh).kind, 'warn');
 });
 
@@ -124,7 +123,7 @@ test('an installable row that survives remediation is the one dead end', () => {
     dontShowAgain: false,
   });
   assert.equal(gate.kind, 'blocked');
-  // The user is shown the row this time; while it was still ours to fix, it was hidden.
+  // the row is shown this time; while it was still ours to fix, it was hidden
   assert.deepEqual(gate.rows.map(r => r.key), ['display-driver']);
 });
 
@@ -155,8 +154,8 @@ test('a busy driver gets its own gate, not a repair and not a block', () => {
 });
 
 test('a busy driver is never installable, so "Install drivers" is not offered', () => {
-  // `display-driver-busy` starts with `display-driver`, which is exactly the prefix the install
-  // control matches on -- the severity is the only thing keeping it out.
+  // `display-driver-busy` starts with `display-driver`, the prefix the install control matches
+  // on: the severity is the only thing keeping it out
   assert.equal(offersDriverInstall(report([busy()])), false);
   assert.equal(driverRemediation([busy()]), null);
 });
@@ -164,8 +163,8 @@ test('a busy driver is never installable, so "Install drivers" is not offered', 
 test('a busy driver outranks the optional faults underneath it', () => {
   const gate = classifyCompat(report([row('audio', 'optional'), busy()]), fresh);
   assert.equal(gate.kind, 'busy');
-  // And it survives "do not show again", which is a preference about a degraded host, not
-  // about a host that has not been established yet.
+  // it survives "do not show again", which is a preference about a degraded host, not about
+  // one that has not been established yet
   assert.equal(
     classifyCompat(report([busy()]), { remediated: false, dontShowAgain: true }).kind,
     'busy'
@@ -201,17 +200,17 @@ test('spending one attempt does not spend the others', () => {
 
 test('a restart clears the budget, and nothing else does', () => {
   const spent = { boot: 'b1', install: 1, reinstall: 1, relaunch: 1 };
-  // Same boot: the counts stand, which is what stops the second elevation prompt.
+  // same boot: the counts stand, which is what stops the second elevation prompt
   assert.deepEqual(repairForBoot(spent, 'b1'), spent);
   assert.equal(mayAttempt(repairForBoot(spent, 'b1'), 'install'), false);
-  // A different boot id is a machine that has restarted, which is the advice the modal gives.
+  // a different boot id is a machine that has restarted, which is the advice the modal gives
   assert.equal(mayAttempt(repairForBoot(spent, 'b2'), 'install'), true);
 });
 
 test('a record with no boot id, or a partial one, still bounds the launch', () => {
-  // Every platform but Windows reports no boot id; the budget must still hold within a launch.
+  // every platform but Windows reports no boot id; the budget must still hold within a launch
   assert.equal(mayAttempt(repairForBoot({ boot: '', install: 1, reinstall: 0, relaunch: 0 }, ''), 'install'), false);
-  // A config hand-edited down to nothing must not read as "already attempted".
+  // a config hand-edited down to nothing must not read as "already attempted"
   const partial = repairForBoot({ boot: 'b1' }, 'b1');
   assert.deepEqual(partial, { boot: 'b1', install: 0, reinstall: 0, relaunch: 0 });
 });
@@ -221,7 +220,7 @@ console.log('=== driver remediation ===');
 test('a silent driver is reinstalled, a missing one installed', () => {
   assert.equal(driverRemediation([row('display-driver-unresponsive', 'installable')]), 'reinstall');
   assert.equal(driverRemediation([row('display-driver', 'installable')]), 'install');
-  // Both at once cannot happen today, but reinstall is the superset if it ever does.
+  // both at once cannot happen today, but reinstall is the superset if it ever does
   assert.equal(
     driverRemediation([row('display-driver', 'installable'), row('display-driver-unresponsive', 'installable')]),
     'reinstall'
@@ -233,7 +232,7 @@ test('a silent driver is reinstalled, a missing one installed', () => {
 test('"Install drivers" is offered only where there is a driver to install', () => {
   assert.equal(offersDriverInstall(null), false);
   assert.equal(offersDriverInstall(report([])), false);
-  // A macOS report: no driver rows at all, so the control is not shown -- the bug item 7 named.
+  // a macOS report: no driver rows at all, so the control is not shown
   assert.equal(offersDriverInstall(report([row('input-accessibility', 'optional')])), false);
   assert.equal(offersDriverInstall(report([row('display-driver', 'installable')])), true);
   assert.equal(offersDriverInstall(report([row('display-driver-unresponsive', 'installable')])), true);
@@ -241,11 +240,8 @@ test('"Install drivers" is offered only where there is a driver to install', () 
 
 console.log('=== what the Setup Error dialog blames ===');
 
-// The defect: `config.json` held `"devices": {"0": {"refreshRate": 30}}`, the bootstrap's replay
-// did `for (const d of config.devices ?? [])`, and the `TypeError: object is not iterable` was
-// caught as a setup failure. The owner was shown "this often occurs due to core drivers or
-// libraries not being installed" about a machine whose drivers were fine, and the dialog's other
-// button offered to install them again.
+// A malformed config.json (`"devices": {"0": {...}}`, an object where the replay iterates an
+// array) throws in the bootstrap; that must not be reported as a driver problem.
 
 test('a failing setup() still blames the drivers, and may still offer them', () => {
   const failure = classifySetupFailure({ setupFailed: true, settingsFailed: false });
@@ -258,9 +254,8 @@ test('a malformed config is named as settings, never as drivers', () => {
   const failure = classifySetupFailure({ setupFailed: false, settingsFailed: true });
   assert.equal(failure, 'settings');
   assert.equal(setupErrorBodyKey(failure), 'bootstrap.setupError.settingsBody');
-  // The one that matters: no elevation prompt is offered over a configuration file. A driver
-  // install cannot repair a JSON document, and this host carries a driver row that would have
-  // made the button appear under the old, report-only rule.
+  // the one that matters: no elevation prompt over a configuration file, even on a host whose
+  // report carries a driver row (a driver install cannot repair a JSON document)
   assert.equal(offersDriverInstall(report([row('display-driver', 'installable')])), true);
   assert.equal(offersDriverInstallFor(failure, report([row('display-driver', 'installable')])), false);
 });
@@ -285,11 +280,11 @@ test('every class has its own sentence, and en.json carries all three', () => {
     assert.equal(typeof at(key), 'string', key + ' is missing from en.json');
     assert.ok(at(key).length > 0, key + ' is empty');
   }
-  // The two new ones say the drivers are not the problem, which is the whole point of them.
+  // these two must say the drivers are not the problem
   for (const key of ['bootstrap.setupError.settingsBody', 'bootstrap.setupError.internalBody']) {
     assert.match(at(key), /not a problem with your drivers/i, key);
   }
-  // And the toast the bootstrap raises when it starts anyway.
+  // the toast the bootstrap raises when it starts anyway
   assert.equal(typeof at('toasts.savedSettings.replayFailedTitle'), 'string');
   assert.equal(typeof at('toasts.savedSettings.replayFailedDescription'), 'string');
 });
@@ -323,7 +318,7 @@ test('a host under its threshold starts with no dialog', () => {
 
 test('a failed read or a platform with no driver never stops anyone', () => {
   assert.equal(classifyDriverHealth(null).kind, 'ok');
-  // macOS and Linux report `supported: false`; even a stray `needs_restart` there is ignored.
+  // macOS and Linux report `supported: false`; even a stray `needs_restart` there is ignored
   assert.equal(classifyDriverHealth(health({ supported: false, needs_restart: true })).kind, 'ok');
 });
 
@@ -337,7 +332,7 @@ test('every restart failure has its own sentence, and an unknown one falls back'
   }
   assert.equal(restartFailureKey(null), 'bootstrap.driverRestart.failure.failed');
   assert.equal(restartFailureKey({ reason: 'somethingNew' }), 'bootstrap.driverRestart.failure.failed');
-  // The modal's own copy: a title, the body, and exactly two actions.
+  // the modal's own copy: a title, the body, and exactly two actions
   for (const key of ['title', 'body', 'usage', 'restarting', 'restart', 'exit']) {
     assert.equal(typeof at(`bootstrap.driverRestart.${key}`), 'string', key);
   }

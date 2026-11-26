@@ -41,7 +41,7 @@ pub type ControlReceiver = tokio::sync::mpsc::UnboundedReceiver<ControlMsg>;
 pub struct DeviceInfo {
     /// The session this row is. One per browser tab; a device with two tabs open produces two.
     pub join_id: String,
-    /// Where the device was when it joined. A label — it may change under a live session and it
+    /// Where the device was when it joined. A label: it may change under a live session and it
     /// is recycled between devices, so nothing addresses it.
     pub ip: String,
     /// The device this join belongs to, and the key every per-device setting is stored under.
@@ -69,19 +69,16 @@ pub struct DeviceOverride {
     pub pointer_scope: crate::streamer::input::PointerScope,
     /// Whether the pipeline may drop below `refresh_rate` on its own.
     ///
-    /// Off — the default — means `refresh_rate` is a promise, not a ceiling: the stream is
-    /// delivered at exactly the rate the user picked, an unchanged frame is repeated at that
-    /// cadence rather than skipped, and no controller may lower it. On, the pipeline is free to
-    /// let the rate fall (a static screen costs nothing to leave alone; a congested link is
-    /// better served by fewer, better frames). The user asked for a fixed rate to be fixed, so
-    /// the adaptive behaviour is opt-in per device.
+    /// Off (the default), `refresh_rate` is a promise, not a ceiling: an unchanged frame is
+    /// repeated at that cadence rather than skipped, and no controller may lower it. On, the
+    /// rate may fall on a static screen or a congested link.
     ///
     /// Read by `windows_utils::streamer::pipeline` through `Config::auto_frame_rate`, which
     /// `server.rs` copies out of this at join.
     pub auto_frame_rate: bool,
-    /// Quality: off (the default) codes every picture at `video_quality` as a constant QP, which
-    /// is what shipped; on, the slider is a QP *floor* under CBR and the loss controller owns the
-    /// bitrate. Read by `server.rs` at join.
+    /// Quality: off (the default) codes every picture at `video_quality` as a constant QP; on,
+    /// the slider is a QP *floor* under CBR and the loss controller owns the bitrate. Read by
+    /// `server.rs` at join.
     pub adaptive_quality: bool,
     /// Pixel ratio: off renders at `dpr`; on (the default), at whatever ratio the device reports
     /// on each join, so a browser zoom or a different screen is followed rather than pinned.
@@ -94,24 +91,22 @@ pub struct DeviceOverride {
 
 /// What one settings edit costs the stream the device is already watching.
 ///
-/// The desktop UI writes the whole override on every save, so the interesting question is never
-/// "was `set_device_override` called" but "did any field that the live pipeline reads actually
-/// move". Each variant names a class of field, and the variants are ordered by how much of the
-/// session they disturb so a run of fields folds with `max`.
+/// The desktop UI writes the whole override on every save, so the question is whether any field
+/// the live pipeline reads moved. Each variant names a class of field, ordered by how much of the
+/// session it disturbs, so a run of fields folds with `max`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ReconfigAction {
     /// Classes (a), (b) and (c): the name and its labels, remote control, the pointer scope,
-    /// system audio on/off and the output device. None of them is an encoder-session parameter —
-    /// the injector and the audio fan-out read them live — so the stream is told nothing at all.
+    /// system audio on/off and the output device. None is an encoder-session parameter (the
+    /// injector and the audio fan-out read them live), so the stream is told nothing.
     #[default]
     Nothing,
     /// Display scale alone. The extended desktop's DPI changes under a stream whose geometry is
-    /// already right, so the host applies it to the live display and the client never hears about
-    /// it.
+    /// already right, so the host applies it to the live display and the client is told nothing.
     ScaleLive,
     /// Classes (d) and the rest of (e): geometry, refresh rate, DPR, the encoder's input scale
     /// and its quality target. These are fixed when the encoder session is built, so the pipeline
-    /// restarts at the new mode and the client renegotiates **in place** — same join id, same
+    /// restarts at the new mode and the client renegotiates **in place**: same join id, same
     /// display, the last frame held until the new one paints.
     Rebuild,
 }
@@ -119,15 +114,12 @@ pub enum ReconfigAction {
 impl DeviceOverride {
     /// Which class the difference between two saved overrides falls into.
     ///
-    /// This is the whole rule in one place, and the unit test beside it is the field→action
-    /// table. Anything not named here is cosmetic by construction: adding a field to
-    /// `DeviceOverride` without adding it to this match means "changing it does nothing to the
-    /// stream", which is the safe default and the one the caller can see.
+    /// The whole rule lives here, and the unit test beside it is the field-to-action table. A
+    /// field of `DeviceOverride` not named in this match is cosmetic by construction: changing it
+    /// does nothing to the stream.
     pub fn reconfig_action(old: &Self, new: &Self) -> ReconfigAction {
-        // With `auto_orientation` on the join path believes the device and ignores the saved
-        // orientation, so moving it rebuilt the stream for nothing (a ~0.4 s gap), and only in
-        // one direction: the join wrote the device's own orientation back, so the edit that put
-        // it back compared equal.
+        // with `auto_orientation` on, the join path believes the device and ignores the saved
+        // orientation, so moving it must not rebuild the stream (a ~0.4 s gap for nothing)
         let orientation_moved =
             old.orientation_portrait != new.orientation_portrait && !new.auto_orientation;
         let rebuild = orientation_moved
@@ -178,18 +170,17 @@ pub struct AudioOutput {
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, specta::Type)]
 pub struct AudioOutputsReport {
-    // `false` only when the device's page said its browser has no way to move audio off the
-    // default output. The desktop UI shows "can't switch speakers" for exactly that value, so
-    // "this device has not reported" must not be `false`: it is `true` with no outputs, which
-    // the UI shows as waiting for the device. (A line comment, not a doc comment: specta copies
-    // doc comments into the generated `bindings.ts`.)
+    // `false` only when the device's page said its browser cannot move audio off the default
+    // output: the desktop UI shows "can't switch speakers" for exactly that value. "Not reported
+    // yet" is `true` with no outputs, which the UI shows as waiting for the device. (A line
+    // comment, not a doc comment: specta copies doc comments into the generated `bindings.ts`.)
     pub supported: bool,
     pub outputs: Vec<AudioOutput>,
     /// What the host last asked this device to play on.
     pub selected: String,
     /// What the device reports it is *actually* playing on. The two diverge the moment the
     /// user changes the output in the browser's own UI, which only the client can see.
-    /// `None` means this client never said — an older one, or one that has not posted yet —
+    /// `None` means this client never said (an older one, or one that has not posted yet),
     /// which is a different answer from `Some("")`, the device's default output.
     pub current: Option<String>,
     /// Whether the labels beside the ids above are the operating system's or this page's own.
@@ -198,9 +189,9 @@ pub struct AudioOutputsReport {
     /// not be presented as device names. `None` means the client never said.
     pub labelled: Option<bool>,
     // What each output-discovery API answered at the join, keyed by API (`selectAudioOutput`,
-    // `enumerateDevices`, `getUserMedia`, …) with `ok` / `unsupported` / `denied` / `empty` /
-    // `error` / `timeout` (docs/TELEMETRY.md). `None` from a page that predates it. Not part of
-    // the desktop UI's type (`specta(skip)`): the sheet does not read it, `status --json` does.
+    // `enumerateDevices`, `getUserMedia`, ...) with `ok` / `unsupported` / `denied` / `empty` /
+    // `error` / `timeout`. `None` from a page that predates it. Not part of the desktop UI's
+    // type (`specta(skip)`): the sheet does not read it, `status --json` does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[specta(skip)]
     pub discovery: Option<BTreeMap<String, String>>,
@@ -223,15 +214,13 @@ pub trait DeviceReporter: Send + Sync + std::fmt::Debug {
     fn report_join(&self, device: DeviceInfo);
     /// The *same* join, offering again after a display change.
     ///
-    /// A renegotiation is not an arrival: the row is already on the dashboard, the display is
-    /// still up and the user did nothing but change a setting. Reporting it as a join made the
-    /// desktop app raise "a device joined" every time a refresh rate or a DPR moved, which is the
-    /// shape of noise the whole reuse path exists to remove. The default forwards, so a reporter
-    /// that does not care about the distinction keeps its old behaviour.
+    /// A renegotiation is not an arrival: the row is already on the dashboard and the display is
+    /// still up. Reported as a join, it raises "a device joined" every time a refresh rate or a
+    /// DPR moves. The default forwards, for a reporter that does not care about the distinction.
     fn report_modify(&self, device: DeviceInfo) {
         self.report_join(device);
     }
-    /// One join ended. The join id is the identity — the device may still hold other joins, and
+    /// One join ended. The join id is the identity: the device may still hold other joins, and
     /// its IP is only ever a label.
     fn report_remove(&self, join_id: String, token: String);
     fn report_join_attempts_paused(&self, _retry_after_secs: u64) {}
@@ -240,12 +229,12 @@ pub trait DeviceReporter: Send + Sync + std::fmt::Debug {
 
 pub type SharedDeviceReporter = Arc<dyn DeviceReporter>;
 
-/// Per-device settings, keyed by the device **token** — never the IP.
+/// Per-device settings, keyed by the device **token**, never the IP.
 ///
 /// An address is recycled: a phone that leaves and a laptop that picks up its DHCP lease are the
-/// same string and a different device, and the settings of the first must not land on the second.
-/// The token is minted once per device on its first successful OTP join and presented on every
-/// join after that, so it survives a roam, a lease renewal and a NAT rebind.
+/// same string and a different device. The token is minted once per device on its first
+/// successful OTP join and presented on every join after that, so it survives a roam, a lease
+/// renewal and a NAT rebind.
 pub type SharedDeviceOverrides = Arc<Mutex<HashMap<String, DeviceOverride>>>;
 
 /// The audio output the host has asked a device to play on, keyed by device token.
@@ -292,14 +281,13 @@ pub fn mint_device_token() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// The identity of one live session — one browser tab — minted by the host at `POST /whep` and
+/// The identity of one live session (one browser tab), minted by the host at `POST /whep` and
 /// handed back as the WHEP resource id.
 ///
 /// 128 bits from the same source as the device token, because it is the capability that
 /// `PATCH`/`DELETE /whep/{id}`, `/reconfig`, `/leave` and `/audio-outputs` are addressed by. It
-/// deliberately carries nothing about the peer: an address changes under a session (a Wi-Fi roam,
-/// a DHCP renewal, a NAT rebind) and is recycled between devices, so it can be a label and never
-/// a name.
+/// carries nothing about the peer: an address moves under a session and is recycled between
+/// devices, so it can be a label and never a name.
 pub fn mint_join_id() -> String {
     let bytes: [u8; 16] = rand::random();
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -313,11 +301,9 @@ pub fn new_shared_banned_devices() -> SharedBannedDevices {
 
 /// Whether this **device** is banned.
 ///
-/// By token only. An IP ban used to be honoured too, and it is the one shape of ban that can hit
-/// the wrong machine: the address a banned phone had this morning is the address the owner's
-/// laptop gets this afternoon, and the laptop is then locked out with nothing in the UI to
-/// explain it. A device that has never completed an OTP join has no token, and there is nothing
-/// to ban it by — it has never been seen.
+/// By token only, never by IP: the address a banned phone had this morning is the address the
+/// owner's laptop gets this afternoon. A device that has never completed an OTP join has no
+/// token, so there is nothing to ban it by.
 pub fn is_device_banned(banned: &SharedBannedDevices, token: &str) -> bool {
     !token.is_empty() && banned.lock_recover().contains(token)
 }
@@ -334,17 +320,14 @@ pub fn is_device_approved(approved: &SharedApprovedDevices, token: &str) -> bool
 
 /// Whether a token the client presented is one **this host already keeps settings under**.
 ///
-/// The join path mints a fresh token on every successful OTP, which is right for a device the
-/// host has never seen and wrong for one it has: a per-device setting is keyed by the token, so
-/// re-minting renames the device and orphans the row that was just written for it. That is what a
-/// settings change looks like from the client — the epoch bumps, the session rebuilds, the rejoin
-/// is handed a new name, and the display comes back with the *defaults* the user had just
-/// changed. Under `serve` it happens on every single reconfigure, because nothing there ever
-/// writes the approval the desktop UI writes from its `deviceJoin` handler.
+/// The join path mints a fresh token on every successful OTP, which is wrong for a device the
+/// host already knows: per-device settings are keyed by the token, so re-minting orphans the row
+/// just written and a reconfigure comes back with the *defaults*. Under `serve` nothing else
+/// vouches for the device, because only the desktop UI writes an approval.
 ///
-/// Continuity is granted only for a token the host itself issued and still has state for —
-/// never for an arbitrary string a client offers, because the trust maps are keyed by this value
-/// and a device that could choose its own name could choose one that is already approved.
+/// Continuity is granted only for a token the host itself issued and still has state for, never
+/// for an arbitrary string a client offers: the trust maps are keyed by this value, and a device
+/// that could choose its own name could choose one that is already approved.
 pub fn is_known_device(overrides: &SharedDeviceOverrides, token: &str) -> bool {
     is_device_token(token) && overrides.lock_recover().contains_key(token)
 }
@@ -352,13 +335,10 @@ pub fn is_known_device(overrides: &SharedDeviceOverrides, token: &str) -> bool {
 /// Devices whose override row the join path wrote and nobody has saved since.
 ///
 /// The join path seeds a row for a device the host holds no settings for, so the sheet's first
-/// save has something to compare against (`DeviceOverride::reconfig_action`). That row records
-/// the refresh rate the client reported *at that join*, and every later join read it back as the
-/// device's setting: a device that first joined at 60 Hz streamed at 60 for the rest of the
-/// host's life whatever it reported afterwards — a 120 Hz screen, or a first measurement the page
-/// took while throttled. Before the seed existed a device nobody had configured got the rate it
-/// reported on every join, which is what this restores: a seeded rate is a detection, not a
-/// setting, until a save makes it one.
+/// save has something to compare against (`DeviceOverride::reconfig_action`). The refresh rate in
+/// a seeded row is what the client reported *at that join*: a detection, not a setting, until a
+/// save makes it one. Read back as a setting, it pins a device that first joined at 60 Hz to 60
+/// whatever it reports afterwards.
 static JOIN_SEEDED: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
 
 pub fn mark_join_seeded(token: &str) {
@@ -451,11 +431,8 @@ pub fn new_shared_turn_config() -> SharedTurnConfig {
 
 /// The STUN servers offered to a peer that is not already known to be on this subnet.
 ///
-/// `DEFAULT_STUN_URL` was a compile-time constant with no way to change or disable it, and the
-/// only writer outside `Config::default` was `--stun` in the developer probe harness, which is not
-/// wired into the shipping binary. A same-subnet peer is no longer offered STUN at all, so the
-/// common case costs nothing — but a cross-network or unclassified join still contacted a Google
-/// endpoint, with no setting and no way to point it at a private server.
+/// A same-subnet peer is offered none. This is a setting so that a cross-network or unclassified
+/// join can be pointed at a private server, or at nothing, instead of the default Google endpoint.
 pub type SharedStunConfig = Arc<Mutex<Vec<String>>>;
 
 pub fn new_shared_stun_config() -> SharedStunConfig {
@@ -483,7 +460,7 @@ pub struct LiveDisplay {
     /// The OS's stable name for the *monitor*, as opposed to the slot it occupies.
     ///
     /// On Windows `device_name` is a `\\.\DISPLAYn`, which the OS hands straight back out to the
-    /// next display to attach — so a name recorded when this display was created can address a
+    /// next display to attach, so a name recorded when this display was created can address a
     /// different monitor, a physical one included, by the time a reconfigure writes a mode or a
     /// DPI to it. This is the monitor's device-interface path, and every write re-derives the
     /// name from it. Empty means "the backend has no such identity", which on Windows refuses
@@ -530,12 +507,11 @@ pub type CaptureStopper = Box<dyn FnOnce() + Send>;
 
 /// Everything one live join owns.
 ///
-/// The map this lives in is keyed by the **join id**, so two tabs of one browser — same device,
-/// same token, same address — are two entries with two displays, and neither can reach the
-/// other's. `device_token` is the device this join belongs to, and it is what every per-device
-/// lookup (settings, trust, the audio sink) is keyed by. `ip` is a label for the UI and the
-/// logs: it is refreshed from whichever request arrives last, and nothing is ever addressed by
-/// it.
+/// The map this lives in is keyed by the **join id**, so two tabs of one browser (same device,
+/// same token, same address) are two entries with two displays, and neither can reach the
+/// other's. `device_token` is what every per-device lookup (settings, trust, the audio sink) is
+/// keyed by. `ip` is a label for the UI and the logs: it is refreshed from whichever request
+/// arrives last, and nothing is ever addressed by it.
 #[derive(Default)]
 pub struct DeviceSessionState {
     pub device_token: String,
@@ -572,6 +548,9 @@ pub struct DeviceSessionState {
     /// Whether any picture has ever reached this join's client. A join that never connected
     /// is the one a lost answer leaves behind, and the only kind an `attemptId` may take over.
     pub ever_connected: bool,
+    /// Whether the dashboard has been told this join arrived. A retry that adopts a join whose
+    /// first attempt never got that far reports the arrival, not a change.
+    pub join_reported: bool,
 }
 
 impl std::fmt::Debug for DeviceSessionState {
@@ -598,9 +577,8 @@ pub type SharedSessions = Arc<Mutex<HashMap<String, DeviceSessionState>>>;
 
 /// Open the session for `join`, creating it if the join is new.
 ///
-/// Every write below goes through this rather than `entry().or_default()` on its own, so a state
-/// that a settings command creates before the client has connected still carries the device it
-/// belongs to.
+/// Every write goes through this, never a bare `entry().or_default()`, so a state a settings
+/// command creates before the client connects still carries the device it belongs to.
 pub fn open_session(sessions: &SharedSessions, join: &str, token: &str, ip: &str) {
     open_session_via(sessions, join, token, ip, None)
 }
@@ -638,11 +616,9 @@ pub fn joins_for_relay_client(sessions: &SharedSessions, client_id: &str) -> Vec
 /// The join a relay client is streaming on right now.
 ///
 /// A relayed page that predates join ids names nothing, so the relay's `client_id` is all there
-/// is to go on — and one client can have two joins in the map at once: the one it is watching,
-/// and an older one still waiting out its disconnect grace after a renegotiation. Picking either
-/// at random (`.next()` over a `HashMap`) answered the page with the dead join's epoch half the
-/// time, which it reads as another reconfigure. The live one is the join whose capture is
-/// running; failing that, the one with a display; failing that, any.
+/// is, and one client can hold two joins: the one it watches, and after a renegotiation an older
+/// one waiting out its disconnect grace. The page would read the dead join's epoch as another
+/// reconfigure, so prefer the join whose capture is running, then one with a display, then any.
 pub fn live_join_for_relay_client(sessions: &SharedSessions, client_id: &str) -> Option<String> {
     let map = sessions.lock_recover();
     let mine = || {
@@ -677,8 +653,8 @@ pub fn mark_session_connected(sessions: &SharedSessions, join: &str) {
 ///
 /// The lost-answer case: the host answered, the page never saw the answer, gave up after its
 /// timeout and offered again from the same page load with no join id and (on a first join) no
-/// device token. Without this the retry was a second session and a second display beside the
-/// first. Only a join that **never connected** and already has its display qualifies, and only
+/// device token. Adopting the join keeps the retry from being a second session and a second
+/// display. Only a join that **never connected** and already has its display qualifies, and only
 /// for the same device when the retry presents a token at all: an attempt id can never reach a
 /// session somebody is watching, or another device's.
 pub fn pending_join_for_attempt(
@@ -700,6 +676,37 @@ pub fn pending_join_for_attempt(
                 && (presented_token.is_empty() || presented_token == s.device_token)
         })
         .map(|(join, s)| (join.clone(), s.device_token.clone()))
+}
+
+/// Whether a join opened from this page load is still being built: same attempt, never
+/// connected, no display recorded yet, and (when the retry presents one) the same device.
+///
+/// A retry that arrives while the first attempt is still creating its display has to wait for
+/// it rather than start a second display beside it.
+pub fn attempt_in_flight(sessions: &SharedSessions, attempt: &str, presented_token: &str) -> bool {
+    if !is_device_token(attempt) {
+        return false;
+    }
+    sessions.lock_recover().values().any(|s| {
+        s.attempt_id == attempt
+            && !s.ever_connected
+            && s.live_display.is_none()
+            && (presented_token.is_empty()
+                || s.device_token.is_empty()
+                || presented_token == s.device_token)
+    })
+}
+
+/// Bump one join's reconfig epoch only while `seq` is still its current attempt. Never creates
+/// an entry: a session removed meanwhile stays removed.
+pub fn bump_reconfig_epoch_if_current(sessions: &SharedSessions, join: &str, seq: u64) -> bool {
+    match sessions.lock_recover().get_mut(join) {
+        Some(state) if state.session_seq == seq => {
+            state.reconfig_epoch += 1;
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Record what the UI shows beside a join: the name the client chose and the size it asked for.
@@ -728,9 +735,7 @@ pub fn note_session_ip(sessions: &SharedSessions, join: &str, ip: &str) {
 
 /// Forget a join entirely. Called once, when its display is gone for good.
 ///
-/// The map used to be keyed by address, so it was bounded by the number of devices that had ever
-/// connected and nothing had to clean up. Keyed by join, every tab that is ever opened is an
-/// entry, so one has to.
+/// Keyed by join, the map gains an entry for every tab ever opened, so each has to be removed.
 pub fn remove_session(sessions: &SharedSessions, join: &str) {
     sessions.lock_recover().remove(join);
 }
@@ -803,6 +808,31 @@ pub fn signal_leave(sessions: &SharedSessions, join: &str) {
     if let Some(s) = signal {
         s.left.store(true, Ordering::SeqCst);
         s.notify.notify_waiters();
+    }
+}
+
+/// Register a join's control channel and leave signal, only while `seq` still owns it, in the one
+/// lock that checks it: an attempt overtaken in between cannot overwrite the newer attempt's.
+/// `None` when it no longer owns the join.
+pub fn register_attempt(
+    sessions: &SharedSessions,
+    join: &str,
+    seq: u64,
+    tx: ControlSender,
+) -> Option<Arc<LeaveSignal>> {
+    let mut map = sessions.lock_recover();
+    let state = map.get_mut(join).filter(|s| s.session_seq == seq)?;
+    let signal = Arc::new(LeaveSignal::default());
+    state.leave = Some(signal.clone());
+    state.control = Some(tx);
+    Some(signal)
+}
+
+/// Whether this join's arrival has yet to be reported, marking it reported.
+pub fn take_join_report(sessions: &SharedSessions, join: &str) -> bool {
+    match sessions.lock_recover().get_mut(join) {
+        Some(state) => !std::mem::replace(&mut state.join_reported, true),
+        None => true,
     }
 }
 
@@ -933,8 +963,8 @@ pub fn bump_reconfig_epoch(sessions: &SharedSessions, join: &str) {
     map.entry(join.to_string()).or_default().reconfig_epoch += 1;
 }
 
-/// Bump every live join of one device. What a per-device settings change means, now that a
-/// device can hold more than one.
+/// Bump every live join of one device: a per-device settings change, and a device can hold more
+/// than one join.
 pub fn bump_reconfig_epoch_for_device(sessions: &SharedSessions, token: &str) -> usize {
     let joins = joins_for_token(sessions, token);
     for join in &joins {
@@ -1048,13 +1078,13 @@ pub fn set_audio_outputs(
 ) {
     let mut map = sessions.lock_recover();
     let entry = map.entry(join.to_string()).or_default();
-    // A body without the field says nothing about the browser; it must not turn a join that
-    // did say into "cannot switch".
+    // a body without the field says nothing about the browser: it must not turn a join that
+    // did say into "cannot switch"
     if supported.is_some() {
         entry.audio_outputs_supported = supported;
     }
     entry.audio_outputs = outputs;
-    // A client that does not report one must not erase what a newer one did.
+    // a client that does not report one must not erase what a newer one did
     if current.is_some() {
         entry.current_audio_output = current;
     }
@@ -1097,7 +1127,7 @@ pub fn audio_outputs_report(
 /// Two tabs of one browser enumerate the same speakers, so the first join that answered is as
 /// good as any; a join that never reported ranks below one that did, so it cannot mask it. With
 /// no join at all (the device is offline, or every join is relayed) the answer is "not reported"
-/// — `supported: true` with no outputs — never "cannot switch".
+/// (`supported: true` with no outputs), never "cannot switch".
 pub fn device_audio_outputs_report(
     sessions: &SharedSessions,
     sinks: &SharedAudioSinks,
@@ -1326,15 +1356,11 @@ pub trait VirtualDisplayController: Send + Sync + std::fmt::Debug {
 
     /// The geometry the backend actually landed on, when it knows it.
     ///
-    /// `create_display` returns a display id and nothing else, so the server always follows a
-    /// successful create with a forced `set_display_mode` and a settle poll — a whole extra
-    /// reconfiguration on a path that has already done several. That is unavoidable on a backend
-    /// that is *commanded* (the Windows IDD registers a mode list and the OS picks from it, so it
-    /// genuinely does not know), but wrong on one that *negotiates*: the macOS AirPlay tier
-    /// computes the closest mode from the ladder macOS published and then discards the answer, and
-    /// the forced set is guaranteed to fail whenever the requested size is off that ladder.
-    ///
-    /// Returning `None` means "ask the OS", which is the old behaviour and the default.
+    /// `None` (the default) means "ask the OS": the server follows the create with a forced
+    /// `set_display_mode` and a settle poll. That is unavoidable on a backend that is *commanded*
+    /// (the Windows IDD registers a mode list and the OS picks from it), but wrong on one that
+    /// *negotiates*: the macOS AirPlay tier has already picked the closest mode from the ladder
+    /// macOS published, and a forced set fails whenever the requested size is off that ladder.
     fn created_geometry(&self, id: u32) -> Option<(u32, u32)> {
         let _ = id;
         None
@@ -1349,15 +1375,12 @@ pub trait VirtualDisplayController: Send + Sync + std::fmt::Debug {
     }
 }
 
-/// The only capped display backend in the product is the macOS AirPlay tier, which macOS itself
-/// limits to one display because macOS owns that display. Every other backend is uncapped, and
-/// the product rule is that a host is never told it is full: it never evicts a connected device,
-/// and it never serves `at-capacity.html`.
+/// The one place the display cap is read. Only the macOS AirPlay tier is capped (macOS owns that
+/// display and allows one); every other backend is uncapped, never evicts a connected device and
+/// never serves `at-capacity.html`.
 ///
-/// So this is the one place the cap is read, and it recognises exactly one value. A backend that
-/// reports any other finite number is a bug — a capacity nobody designed, arriving as a refusal
-/// the user cannot act on — so it is logged once and treated as uncapped, and the join that
-/// would have been turned away proceeds and reports whatever really goes wrong.
+/// Only `Some(1)` is recognised. Any other finite number is a bug in the backend, so it is
+/// logged once and treated as uncapped.
 pub fn concurrent_display_cap(client: &dyn VirtualDisplayController) -> Option<usize> {
     match client.max_concurrent_displays() {
         None => None,
@@ -1375,7 +1398,7 @@ pub fn concurrent_display_cap(client: &dyn VirtualDisplayController) -> Option<u
     }
 }
 
-/// [`concurrent_display_cap`] for the shared handle the host actually carries.
+/// [`concurrent_display_cap`] for the shared handle the host carries.
 pub fn shared_display_cap(client: &SharedVirtualDisplay) -> Option<usize> {
     concurrent_display_cap(client.as_ref())
 }
@@ -1409,7 +1432,7 @@ pub fn live_displays_except(sessions: &SharedSessions, join: &str) -> Vec<LiveDi
 ///
 /// The one place that can answer "has anything actually associated to our hosted network and
 /// joined?", which is the difference between an AP that is advertised and an AP that works. It
-/// reads the label each session carries, not the map's keys — those are join ids now.
+/// reads the label each session carries, not the map's keys, which are join ids.
 pub fn client_ips(sessions: &SharedSessions) -> Vec<String> {
     let mut ips: Vec<String> = sessions
         .lock_recover()
@@ -1483,12 +1506,12 @@ mod tests {
         let token = "tok-a";
         let none = |j: &str| audio_outputs_report(&sessions, &sinks, j);
 
-        // Nothing connected at all.
+        // nothing connected at all
         assert!(AudioOutputsReport::default().supported);
         assert!(device_audio_outputs_report(&sessions, &sinks, token).supported);
         assert!(none("missing").supported);
 
-        // A join that exists and has never posted.
+        // a join that exists and has never posted
         {
             let mut map = sessions.lock_recover();
             map.entry("j1".into()).or_default().device_token = token.into();
@@ -1498,20 +1521,20 @@ mod tests {
         let r = device_audio_outputs_report(&sessions, &sinks, token);
         assert!(r.supported && r.outputs.is_empty());
 
-        // A body without the field leaves it unsaid.
+        // a body without the field leaves it unsaid
         set_audio_outputs(&sessions, "j1", None, vec![], None, None, None);
         assert!(none("j1").supported);
 
-        // A page that says its browser cannot route: the one legitimate `false`, and it outranks
-        // a sibling join that never said.
+        // a page that says its browser cannot route: the one legitimate `false`, and it outranks
+        // a sibling join that never said
         set_audio_outputs(&sessions, "j1", Some(false), vec![], None, None, None);
         assert!(!none("j1").supported);
         assert!(!device_audio_outputs_report(&sessions, &sinks, token).supported);
-        // ...and a later body without the field does not erase it.
+        // and a later body without the field does not erase it
         set_audio_outputs(&sessions, "j1", None, vec![], None, None, None);
         assert!(!none("j1").supported);
 
-        // A join that reported a usable browser wins over one that reported none.
+        // a join that reported a usable browser wins over one that reported none
         let speakers = AudioOutput {
             id: "abc".into(),
             label: "Speakers (Boom Audio)".into(),
@@ -1529,11 +1552,11 @@ mod tests {
         assert!(r.supported);
         assert_eq!(r.outputs.len(), 1);
 
-        // A later post from the same join replaces an earlier one, in either direction.
+        // a later post from the same join replaces an earlier one, in either direction
         set_audio_outputs(&sessions, "j1", Some(true), vec![], None, None, None);
         assert!(none("j1").supported);
 
-        // The per-API discovery results ride along, and a body without them keeps the last.
+        // the per-API discovery results ride along, and a body without them keeps the last
         let mut d = BTreeMap::new();
         d.insert("enumerateDevices".to_string(), "empty".to_string());
         set_audio_outputs(&sessions, "j1", Some(true), vec![], None, None, Some(d));
@@ -1546,12 +1569,11 @@ mod tests {
                 .map(String::as_str),
             Some("empty")
         );
-        // The desktop UI's type does not carry it, and an absent map is not serialised.
+        // the desktop UI's type does not carry it, and an absent map is not serialised
         let v = serde_json::to_value(AudioOutputsReport::default()).unwrap();
         assert!(v.get("discovery").is_none());
     }
 
-    /// A row the join path seeded is a detection until a save makes it a setting.
     #[test]
     fn a_seeded_refresh_rate_is_a_detection_until_saved() {
         let token = mint_device_token();
@@ -1645,12 +1667,10 @@ mod tests {
         assert!(lim.global_paused().is_none());
     }
 
-    // ---- device trust: keyed on the minted token, never the IP -----------------------
-
     #[test]
     fn a_minted_device_token_is_128_bits_of_lowercase_hex() {
-        // The token is the whole device-trust key: a short or predictable one is an auto-join
-        // for anyone who guesses it.
+        // the token is the whole device-trust key: a short or predictable one is an auto-join
+        // for anyone who guesses it
         let a = mint_device_token();
         let b = mint_device_token();
         assert_eq!(a.len(), 32, "128 bits as hex");
@@ -1662,9 +1682,7 @@ mod tests {
 
     #[test]
     fn approval_is_by_token_and_an_empty_token_is_never_approved() {
-        // The IP is a display hint. A device that presents no token has never completed an OTP
-        // join, so it must go through one — an empty token matching an empty entry would hand
-        // every unknown device an auto-join.
+        // an empty token matching an empty entry would hand every unknown device an auto-join
         let approved = new_shared_approved_devices();
         let token = mint_device_token();
         assert!(!is_device_approved(&approved, &token));
@@ -1680,9 +1698,7 @@ mod tests {
 
     #[test]
     fn a_ban_holds_by_token_and_never_by_address() {
-        // An address is recycled. Honouring an IP ban locks out whichever device picks up the
-        // banned one's lease next, with nothing in the UI to explain it — the exact failure the
-        // token exists to prevent.
+        // an IP ban would lock out whichever device picks up the banned one's lease next
         let banned = new_shared_banned_devices();
         let token = mint_device_token();
         assert!(!is_device_banned(&banned, &token));
@@ -1696,12 +1712,10 @@ mod tests {
         );
     }
 
-    // ---- epoch bookkeeping: how a live settings change reaches the client -------------
-
     #[test]
     fn an_unknown_join_reads_epoch_zero_rather_than_failing() {
-        // The client adopts whatever the first `/reconfig` returns, so a join the host has no
-        // state for must read a stable 0 and not a value that moves on its own.
+        // the client adopts whatever the first `/reconfig` returns, so a join the host has no
+        // state for must read a stable 0
         let sessions: SharedSessions = Arc::new(Mutex::new(HashMap::new()));
         assert_eq!(reconfig_epoch(&sessions, "join-a"), 0);
         assert_eq!(kick_epoch(&sessions, "join-a"), 0);
@@ -1710,9 +1724,8 @@ mod tests {
 
     #[test]
     fn each_bump_is_visible_exactly_once_and_only_to_that_join() {
-        // The client compares the epoch it holds against the one it polls. A bump that moved two
-        // joins would rebuild a session nobody changed; a bump that never landed leaves a tab on
-        // the old settings forever.
+        // a bump that moved two joins would rebuild a session nobody changed, and one that
+        // never landed leaves a tab on the old settings forever
         let sessions: SharedSessions = Arc::new(Mutex::new(HashMap::new()));
         bump_reconfig_epoch(&sessions, "join-a");
         assert_eq!(reconfig_epoch(&sessions, "join-a"), 1);
@@ -1725,8 +1738,6 @@ mod tests {
 
     #[test]
     fn a_per_device_change_reaches_every_tab_that_device_has_open() {
-        // Two tabs of one browser share a device token and therefore share every setting. A
-        // change made once in the UI has to land on both, and on nobody else's.
         let sessions: SharedSessions = Arc::new(Mutex::new(HashMap::new()));
         let mine = mint_device_token();
         let theirs = mint_device_token();
@@ -1746,8 +1757,8 @@ mod tests {
 
     #[test]
     fn the_two_epochs_are_independent() {
-        // A settings change must not read as a kick: the client tears the session down and shows
-        // "you have been removed" on a kick, and silently rebuilds on a reconfig.
+        // a settings change must not read as a kick: the client tears the session down and shows
+        // "you have been removed" on a kick, and silently rebuilds on a reconfig
         let sessions: SharedSessions = Arc::new(Mutex::new(HashMap::new()));
         bump_reconfig_epoch(&sessions, "join-a");
         bump_reconfig_epoch(&sessions, "join-a");
@@ -1765,12 +1776,10 @@ mod tests {
         );
     }
 
-    // ---- identity: the address is a label, never a name -------------------------------
-
     #[test]
     fn a_device_that_inherits_a_disconnected_devices_address_inherits_nothing_else() {
-        // The owner's case: a phone leaves, the router hands its address to a laptop. Keyed by
-        // address the laptop would have walked into the phone's session and its settings.
+        // a phone leaves and the router hands its address to a laptop: keyed by address, the
+        // laptop would walk into the phone's session and its settings
         let sessions: SharedSessions = Arc::new(Mutex::new(HashMap::new()));
         let overrides: SharedDeviceOverrides = Arc::new(Mutex::new(HashMap::new()));
         let banned = new_shared_banned_devices();
@@ -1790,10 +1799,8 @@ mod tests {
         banned.lock_recover().insert(phone.clone());
         bump_kick_epoch(&sessions, &phone_join);
 
-        // The phone goes away and its session is forgotten.
         remove_session(&sessions, &phone_join);
 
-        // The laptop arrives on the same address with its own token.
         let laptop = mint_device_token();
         let laptop_join = mint_join_id();
         open_session(&sessions, &laptop_join, &laptop, "192.168.1.42");
@@ -1823,8 +1830,8 @@ mod tests {
 
     #[test]
     fn a_session_survives_its_peer_changing_address() {
-        // A roam or a DHCP renewal moves the peer; the session is named by its join id, so the
-        // only thing that changes is the label the dashboard shows.
+        // a roam or a DHCP renewal moves the peer: the session is named by its join id, so the
+        // only thing that changes is the label the dashboard shows
         let sessions: SharedSessions = Arc::new(Mutex::new(HashMap::new()));
         let token = mint_device_token();
         let join = mint_join_id();
@@ -1842,8 +1849,8 @@ mod tests {
 
     #[test]
     fn an_address_resolves_to_a_device_only_while_it_is_unambiguous() {
-        // The CLI convenience lookup. One device there resolves; two do not, because an address
-        // is a place and the answer would be a coin toss.
+        // the CLI convenience lookup: one device there resolves, two do not, because an address
+        // is a place and the answer would be a coin toss
         let sessions: SharedSessions = Arc::new(Mutex::new(HashMap::new()));
         let a = mint_device_token();
         let b = mint_device_token();
@@ -1861,21 +1868,18 @@ mod tests {
 
     #[test]
     fn a_bump_creates_the_session_entry_rather_than_being_dropped() {
-        // Settings can be changed before the device has ever connected — the CLI's `devices set`
-        // writes through the same path — and a bump that landed nowhere would be silently lost.
+        // settings can be changed before the device has ever connected (the CLI's `devices set`
+        // writes through the same path), and a bump that landed nowhere would be silently lost
         let sessions: SharedSessions = Arc::new(Mutex::new(HashMap::new()));
         bump_kick_epoch(&sessions, "join-7");
         assert!(sessions.lock().unwrap().contains_key("join-7"));
         assert_eq!(kick_epoch(&sessions, "join-7"), 1);
     }
 
-    // ---- session sequence numbers: which capture owns the display ---------------------
-
     #[test]
     fn a_stale_session_never_stops_the_capture_that_replaced_it() {
-        // A reconnect on the same join id mints a new sequence; the old session's teardown then
-        // runs and must not stop the capture the new one just started. That is what the
-        // conditional take is for.
+        // a reconnect on the same join id mints a new sequence, and the old session's teardown
+        // must not stop the capture the new one just started: hence the conditional take
         let sessions: SharedSessions = Arc::new(Mutex::new(HashMap::new()));
         let first = next_session_seq(&sessions, "join-3");
         let second = next_session_seq(&sessions, "join-3");
@@ -1901,8 +1905,7 @@ mod tests {
 
     #[test]
     fn two_tabs_of_one_device_hold_two_independent_displays() {
-        // The owner's report: two tabs on one machine used to collapse into one session, so the
-        // first froze and was replaced by the second.
+        // keyed by anything coarser than the join id, the second tab would replace the first
         let sessions: SharedSessions = Arc::new(Mutex::new(HashMap::new()));
         let token = mint_device_token();
         let (a, b) = (mint_join_id(), mint_join_id());
@@ -1926,28 +1929,65 @@ mod tests {
         assert_eq!(get_live_display(&sessions, &b).unwrap().display_id, 5);
         assert_eq!(joins_for_token(&sessions, &token).len(), 2);
 
-        // One tab closes; the other keeps its display.
+        // one tab closes, the other keeps its display
         let _ = take_live_display(&sessions, &a);
         remove_session(&sessions, &a);
         assert_eq!(live_display_count(&sessions), 1);
         assert_eq!(get_live_display(&sessions, &b).unwrap().display_id, 5);
     }
 
-    // ---- disconnect grace --------------------------------------------------------------
-
     #[test]
     fn the_disconnect_grace_default_sits_inside_its_own_range() {
-        // The UI and the CLI both clamp to this range; a default outside it would be unreachable
-        // from either. Compared through a runtime binding so clippy sees a comparison rather
-        // than a constant it can fold — the point is that the three constants agree, and a
-        // future edit that broke it would be a compile-time-visible fact only by accident.
+        // the UI and the CLI both clamp to this range, so a default outside it would be
+        // unreachable from either; compared through a runtime binding so clippy sees a
+        // comparison rather than a constant it can fold
         let (lo, hi) = (MIN_DISCONNECT_GRACE_SECS, MAX_DISCONNECT_GRACE_SECS);
         assert!((lo..=hi).contains(&DEFAULT_DISCONNECT_GRACE_SECS));
         let grace = new_shared_disconnect_grace();
         assert_eq!(grace.load(Ordering::Relaxed), DEFAULT_DISCONNECT_GRACE_SECS);
     }
 
-    // ---- display geometry --------------------------------------------------------------
+    #[test]
+    fn an_overtaken_attempt_cannot_register_over_the_newer_one() {
+        let sessions: SharedSessions = Default::default();
+        let join = mint_join_id();
+        open_session(&sessions, &join, "tok", "10.0.0.5");
+        let first = next_session_seq(&sessions, &join);
+        let second = next_session_seq(&sessions, &join);
+        let (newer, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let newer_leave = register_attempt(&sessions, &join, second, newer.clone()).expect("owner");
+        let (older, _rx2) = tokio::sync::mpsc::unbounded_channel();
+        assert!(register_attempt(&sessions, &join, first, older).is_none());
+        let map = sessions.lock_recover();
+        let state = map.get(&join).unwrap();
+        assert!(state.control.as_ref().unwrap().same_channel(&newer));
+        assert!(Arc::ptr_eq(state.leave.as_ref().unwrap(), &newer_leave));
+        drop(map);
+        assert!(register_attempt(&sessions, &mint_join_id(), 1, newer).is_none());
+        assert_eq!(
+            sessions.lock_recover().len(),
+            1,
+            "no entry made for an unknown join"
+        );
+    }
+
+    #[test]
+    fn a_join_is_reported_as_arriving_once() {
+        let sessions: SharedSessions = Default::default();
+        let join = mint_join_id();
+        open_session(&sessions, &join, "tok", "10.0.0.5");
+        assert!(
+            take_join_report(&sessions, &join),
+            "the first report is the arrival"
+        );
+        assert!(
+            !take_join_report(&sessions, &join),
+            "every later one is a change"
+        );
+        let other = mint_join_id();
+        open_session(&sessions, &other, "tok", "10.0.0.5");
+        assert!(take_join_report(&sessions, &other));
+    }
 
     #[test]
     fn display_params_report_what_was_recorded() {
@@ -1964,16 +2004,9 @@ mod tests {
         assert_eq!(d.display_params(), (1920, 1080, 120, 150, false));
     }
 
-    // ---- device identity across a settings change ---------------------------------------
-
-    /// The reconfigure a settings change triggers must not rename the device.
-    ///
-    /// This is the shape of the reported fault: the user changes the refresh rate and the pixel
-    /// ratio, the host writes the override under the device's token and bumps the reconfig
-    /// epoch, the client tears its session down and joins again — presenting the same token and,
-    /// because the page still holds them, the same credentials. If the OTP path mints here, the
-    /// rejoin is a *different* device, the override that was just written belongs to nobody, and
-    /// the display comes back at the settings the user had just changed away from.
+    /// The reconfigure a settings change triggers must not rename the device: if the OTP path
+    /// mints a token for the rejoin, the override just written belongs to nobody and the display
+    /// comes back at the settings the user had just changed away from.
     #[test]
     fn a_device_the_host_has_settings_for_keeps_its_token() {
         let overrides: SharedDeviceOverrides = Arc::new(Mutex::new(HashMap::new()));
@@ -1999,8 +2032,8 @@ mod tests {
         assert!(!is_known_device(&overrides, &stranger));
         assert!(!is_known_device(&overrides, ""));
 
-        // Even present in the map, a string this host could not have minted is refused: the
-        // parse runs first, so a row planted by a corrupt config cannot become an identity.
+        // even present in the map, a string this host could not have minted is refused: the
+        // parse runs first, so a row planted by a corrupt config cannot become an identity
         for bogus in ["../../etc", "NOTHEX", &"a".repeat(64), &"g".repeat(32)] {
             overrides
                 .lock_recover()
@@ -2027,19 +2060,15 @@ mod tests {
         );
     }
 
-    /// The field → action table, as one test.
-    ///
-    /// The owner's report was that editing something as inert as a device name disconnected the
-    /// client. The cause was that the desktop UI writes the *whole* override on every save and
-    /// the host read "a save happened" as "something changed", so every field was effectively in
-    /// the most expensive class. This asserts the classes are what the classes say they are, one
-    /// field at a time: move exactly one, and the verdict is exactly its class.
+    /// The field-to-action table, as one test: move exactly one field, and the verdict is exactly
+    /// its class. The desktop UI writes the *whole* override on every save, so "a save happened"
+    /// must never be read as "something changed".
     #[test]
     fn each_field_costs_the_stream_what_its_class_costs() {
         use crate::streamer::input::PointerScope;
         let base = DeviceOverride::join_defaults();
         let cases: &[(&str, DeviceOverride, ReconfigAction)] = &[
-            // (a)/(b)/(c): nothing the pipeline or the client reads.
+            // (a)/(b)/(c): nothing the pipeline or the client reads
             (
                 "remote control",
                 DeviceOverride {
@@ -2065,7 +2094,7 @@ mod tests {
                 ReconfigAction::Nothing,
             ),
             ("nothing at all", base, ReconfigAction::Nothing),
-            // (e) display scale: applied to the live display, the client is never told.
+            // (e) display scale: applied to the live display, the client is never told
             (
                 "display scale",
                 DeviceOverride {
@@ -2074,8 +2103,8 @@ mod tests {
                 },
                 ReconfigAction::ScaleLive,
             ),
-            // (d) stream parameters and the rest of (e): an encoder session is built from these.
-            // Orientation is a stream parameter only while the device is not followed.
+            // (d) stream parameters and the rest of (e): an encoder session is built from these
+            // (orientation only while the device is not followed)
             (
                 "orientation (auto-orientation on)",
                 DeviceOverride {
@@ -2156,7 +2185,7 @@ mod tests {
                 "moving {what} should cost the stream {want:?}"
             );
         }
-        // With the device not followed, the saved orientation is what the display is built at.
+        // with the device not followed, the saved orientation is what the display is built at
         let fixed = DeviceOverride {
             auto_orientation: false,
             ..base
@@ -2194,9 +2223,8 @@ mod tests {
         );
     }
 
-    /// The owner's own reproduction. The name is not on `DeviceOverride` at all, so a save that
-    /// only moved it submits an identical row — and the session, its epochs and its display must
-    /// all come out the other side untouched.
+    /// The name is not on `DeviceOverride` at all, so a save that only moved it submits an
+    /// identical row, and the session, its epochs and its display must all come out untouched.
     #[test]
     fn a_rename_moves_no_epoch_and_ends_no_session() {
         let sessions: SharedSessions = Arc::new(Mutex::new(HashMap::new()));
@@ -2220,7 +2248,7 @@ mod tests {
         set_session_labels(&sessions, &join, "old name", "1920x1080");
         let before = reconfig_epoch(&sessions, &join);
 
-        // What the desktop sheet submits when only the name was edited: the same row back.
+        // what the desktop sheet submits when only the name was edited: the same row back
         let saved = DeviceOverride::join_defaults();
         let submitted = saved;
         assert_eq!(

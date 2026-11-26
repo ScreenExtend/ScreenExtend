@@ -1,15 +1,10 @@
 // The startup gate: what the compatibility report means for whether ScreenExtend may start.
+// A module of its own so `scripts/test-startup-gate.mjs` can run the policy directly, and
+// because a component file that also exports plain functions loses fast refresh.
 //
-// Its own module rather than three functions inside `bootstrap.tsx` for two reasons. It is a
-// policy, and a policy that is only exercised by launching the app on a broken machine is a
-// policy nobody has checked — `scripts/test-startup-gate.mjs` runs it directly. And a component
-// file that also exports plain functions loses fast refresh for the whole file.
-//
-// The rule, from the owner: never stop the user unless it is genuinely impossible. A host that
-// can create one virtual display and send video is fine, whatever else is missing — no hosted
-// network, no audio, no Accessibility, no hardware encoder — and gets "Continue anyway". Only a
-// host that cannot do the bare minimum is stopped, and only after the app has tried to fix
-// whatever it can fix itself.
+// The rule: never stop the user unless starting is impossible. A host that can create one
+// virtual display and send video gets "Continue anyway" whatever else is missing; only a
+// host that cannot is stopped, and only after the app has tried to fix what it can.
 
 import type {
   CompatibilityReport,
@@ -18,41 +13,35 @@ import type {
   UnsupportedApi,
 } from "./bindings";
 
-// The severities the host classifies each missing capability with. `blocking` is the only one
-// that means "this machine cannot stream at all"; `installable` is a row the app can fix itself.
-// They are `lib.rs`'s `SEVERITY_*` constants.
+// `lib.rs`'s `SEVERITY_*` constants. `blocking`: this machine cannot stream at all.
+// `installable`: a row the app can fix itself.
 export const SEVERITY_BLOCKING = "blocking";
 export const SEVERITY_INSTALLABLE = "installable";
 
-// `api_key::DISPLAY_DRIVER*` from `lib.rs`. Matching on these rather than on the prose means
-// the copy can be reworded without silently turning the remediation off.
+// `api_key::DISPLAY_DRIVER*` from `lib.rs`. Matched by key, not by prose, so rewording the
+// copy cannot silently turn the remediation off.
 export const DRIVER_KEY = "display-driver";
 export const DRIVER_UNRESPONSIVE_KEY = "display-driver-unresponsive";
 export const DRIVER_BUSY_KEY = "display-driver-busy";
 
 export type CompatGate =
-  // Nothing in the way; start.
   | { kind: "ok" }
-  // Another ScreenExtend process has the display driver. Nothing is broken and nothing may be
-  // installed; the only way on is for that process to go.
+  // another ScreenExtend process holds the display driver: nothing is broken or installable
   | { kind: "busy"; rows: UnsupportedApi[] }
-  // Rows the app can fix by itself. Fix them, re-probe, then decide.
+  // rows the app can fix itself: fix, re-probe, then decide
   | { kind: "remediate"; rows: UnsupportedApi[] }
-  // The host cannot create a display or send video by any route, and remediation has already
-  // been tried. This is the only state with no way past it.
+  // cannot create a display or send video, remediation already tried: no way past this one
   | { kind: "blocked"; rows: UnsupportedApi[] }
-  // Something is missing and the host still streams. Say so, offer "Continue anyway".
+  // something is missing but the host still streams: offer "Continue anyway"
   | { kind: "warn"; rows: UnsupportedApi[] };
 
 export function classifyCompat(
   report: CompatibilityReport,
   opts: { remediated: boolean; dontShowAgain: boolean }
 ): CompatGate {
-  // Before anything else, and before any remediation. A driver held by one of our own processes
-  // is not a fault, is not installable and cannot be fixed by installing anything — the old flow
-  // read it as an unresponsive driver, reinstalled a healthy one behind a UAC prompt, re-probed
-  // into the same state and went round. It outranks the optional rows underneath it because
-  // until the other instance is gone nothing else about this host can be established.
+  // first, before any remediation: a driver held by another ScreenExtend process is not a
+  // fault and must not be reinstalled, and nothing else about this host can be established
+  // until that instance is gone
   const busy = report.unsupported_apis.filter(a => a.key === DRIVER_BUSY_KEY);
   if (busy.length > 0 && report.os_supported) return { kind: "busy", rows: busy };
 
@@ -60,13 +49,11 @@ export function classifyCompat(
   if (installable.length > 0 && !opts.remediated) {
     return { kind: "remediate", rows: installable };
   }
-  // Installable rows are not shown while they are still the app's problem to solve; once
-  // remediation has been tried they are exactly what the user needs to see.
+  // installable rows are hidden while the app can still fix them, shown once it has tried
   const visible = opts.remediated
     ? report.unsupported_apis
     : report.unsupported_apis.filter(a => a.severity !== SEVERITY_INSTALLABLE);
-  // An installable row that survived its own remediation is what "we tried and it still does
-  // not work" looks like — the one case the owner named for a modal with no way past it.
+  // an installable row that survived its own remediation blocks: tried, and it still fails
   const blocked =
     !report.os_supported ||
     visible.some(a => a.severity === SEVERITY_BLOCKING) ||
@@ -77,11 +64,11 @@ export function classifyCompat(
 }
 
 /// Which rows this launch can act on, and how. A driver that is installed but not answering is
-/// removed before it is installed again — installing over a driver that is already there is
-/// what the old flow did, and it changed nothing.
+/// removed before it is installed again: installing over one that is already there changes
+/// nothing.
 ///
-/// A busy driver is deliberately absent: it has its own key and its own gate kind, and nothing
-/// here may ever reach for the elevated installer on account of it.
+/// A busy driver is deliberately absent: it has its own gate kind, and nothing here may reach
+/// for the elevated installer on account of it.
 export function driverRemediation(rows: UnsupportedApi[]): "reinstall" | "install" | null {
   if (rows.some(a => a.key === DRIVER_UNRESPONSIVE_KEY)) return "reinstall";
   if (rows.some(a => a.key === DRIVER_KEY)) return "install";
@@ -92,10 +79,9 @@ export function driverRemediation(rows: UnsupportedApi[]): "reinstall" | "instal
 /// been installed) and before `setup()` (so no display of ours exists yet to be taken away).
 ///
 /// The bundled display driver leaks memory into its host process with every display it creates
-/// and only a device restart gives it back; past a threshold the host offers that restart with
-/// exactly two ways out — restart, or exit. There is deliberately no "continue anyway": the
-/// failure it heads off is every join timing out, which is worse than not starting. A health
-/// read that failed, or a platform with no such driver, is not a reason to stop anyone.
+/// and only a device restart frees it. Past a threshold the only ways out are restart or exit:
+/// there is deliberately no "continue anyway", because the alternative is every join timing
+/// out. A failed health read, or a platform with no such driver, stops nobody.
 export type DriverHealthGate =
   | { kind: "ok" }
   | { kind: "restart"; commitMb: number; threads: number };
@@ -125,11 +111,10 @@ export function restartFailureKey(outcome: DriverRestartOutcome | null): string 
 
 /// What this machine has already tried to do about the display driver since it last booted.
 ///
-/// Every field is a count, and the budget for each is one. That is the whole design: an
-/// elevation prompt the user did not ask for is expensive, a *second* one for the same fault is
-/// worse than doing nothing, and a relaunch that does not fix the driver relaunches again on the
-/// next launch forever. Scoped to `boot` because "restart this machine" is the advice given when
-/// the budget runs out, so restarting has to be what restores it.
+/// Every field is a count with a budget of one: a second unrequested elevation prompt for the
+/// same fault is worse than doing nothing, and a relaunch that does not fix the driver would
+/// repeat on every launch. Scoped to `boot` because restarting the machine is the advice given
+/// when the budget runs out, so a restart has to restore it.
 export type DriverRepair = {
   boot: string;
   install: number;
@@ -143,9 +128,9 @@ export const NO_REPAIRS: DriverRepair = { boot: "", install: 0, reinstall: 0, re
 
 /// The saved record, or a fresh one if it belongs to a previous boot.
 ///
-/// An empty `boot` — every platform but Windows, and Windows if the derivation ever fails — is
-/// treated as "this boot", so the budget still holds within a launch. It cannot survive a
-/// restart there, which costs nothing: no other platform has a driver to install.
+/// An empty `boot` (every platform but Windows, or a failed derivation there) is treated as
+/// "this boot", so the budget still holds within a launch. A restart does not reset it there,
+/// which costs nothing: no other platform has a driver to install.
 export function repairForBoot(saved: DriverRepair | null | undefined, boot: string): DriverRepair {
   if (!saved || saved.boot !== boot) return { ...NO_REPAIRS, boot };
   return {
@@ -164,19 +149,13 @@ export function recordAttempt(repair: DriverRepair, what: RepairAttempt): Driver
   return { ...repair, [what]: repair[what] + 1 };
 }
 
-/// Why startup stopped, when it stopped — which decides what the Setup Error dialog says.
+/// Why startup stopped, which decides what the Setup Error dialog says.
 ///
-/// It used to say one thing: "this often occurs due to core drivers or libraries not being
-/// installed". That sentence was shown for every throw anywhere in the bootstrap, and the one
-/// that reached the owner was `TypeError: object is not iterable` out of the saved-settings
-/// replay, reading a `config.json` whose `devices` key held an object. The machine's drivers
-/// were fine; the dialog sent him to reinstall them.
-///
-/// - `setup` — the Rust `setup` command returned false or threw. Drivers, capture or the
-///   encoder: the original text, and the only class that may offer "Install Drivers".
-/// - `settings` — the saved configuration could not be read or replayed. Nothing is wrong with
+/// - `setup`: the Rust `setup` command returned false or threw. Drivers, capture or the
+///   encoder, and the only class that may offer "Install Drivers".
+/// - `settings`: the saved configuration could not be read or replayed. Nothing is wrong with
 ///   the host.
-/// - `internal` — anything else in the bootstrap itself. Not a verdict on the machine either.
+/// - `internal`: anything else in the bootstrap itself. Not a verdict on the machine either.
 export type SetupFailure = "setup" | "settings" | "internal";
 
 export function classifySetupFailure(what: {
@@ -184,15 +163,12 @@ export function classifySetupFailure(what: {
   settingsFailed: boolean;
 }): SetupFailure {
   // `setup` outranks the rest: with no virtual display nothing downstream could have worked
-  // anyway, so blaming the settings for the failure that followed would be the same mistake in
-  // the other direction.
   if (what.setupFailed) return "setup";
   if (what.settingsFailed) return "settings";
   return "internal";
 }
 
-/// The i18n key for the dialog's leading sentence. The rest of the body — the support address
-/// and its punctuation — is shared, so only this part moves.
+/// The i18n key for the dialog's leading sentence; the rest of the body is shared.
 export function setupErrorBodyKey(failure: SetupFailure): string {
   switch (failure) {
     case "settings":
@@ -206,9 +182,8 @@ export function setupErrorBodyKey(failure: SetupFailure): string {
 
 /// Whether this failure may offer to install the display driver.
 ///
-/// Only a failing `setup()` may: a JavaScript error in the bootstrap and a malformed settings
-/// file are both states an elevated driver install cannot improve, and offering it there is how
-/// a config typo turns into a UAC prompt.
+/// Only a failing `setup()` may: an elevated driver install cannot improve a JavaScript error
+/// or a malformed settings file, and offering it there turns a config typo into a UAC prompt.
 export function offersDriverInstallFor(
   failure: SetupFailure,
   report: CompatibilityReport | null
@@ -216,11 +191,8 @@ export function offersDriverInstallFor(
   return failure === "setup" && offersDriverInstall(report);
 }
 
-/// Whether the "Install drivers" control has anything to install.
-///
-/// It used to be offered on every platform, including macOS, where `install_drivers` returns
-/// `true` without doing anything — so the dialog told the user to press a button that could not
-/// help. The report knows: only a host carrying an installable display-driver row has a driver.
+/// Whether the "Install drivers" control has anything to install: only a host carrying an
+/// installable display-driver row has a driver (on macOS `install_drivers` does nothing).
 export function offersDriverInstall(report: CompatibilityReport | null): boolean {
   return (report?.unsupported_apis ?? []).some(
     a => a.severity === SEVERITY_INSTALLABLE && a.key.startsWith(DRIVER_KEY)

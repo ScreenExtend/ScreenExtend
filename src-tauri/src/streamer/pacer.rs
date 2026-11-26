@@ -1,28 +1,22 @@
 //! A send pacer for the per-viewer RTP writer.
 //!
-//! webrtc-rs has no pacer — `interceptor-0.17.1` ships nack, twcc, report and stats and nothing
-//! else — so the writer hands a whole access unit to the socket in one tight loop. A 40 KB IDR is
-//! ~35 back-to-back datagrams; a screen-change frame is more. That microburst lands in a single
-//! 802.11 TXOP and in one AP queue, which is how a link with spare average capacity still drops
-//! packets and builds standing delay.
+//! webrtc-rs has no pacer (`interceptor-0.17.1` ships nack, twcc, report and stats only), so an
+//! unpaced writer sends a whole access unit as one burst. A 40 KB IDR is ~35 back-to-back
+//! datagrams in a single 802.11 TXOP and one AP queue: a link with spare average capacity still
+//! drops packets and builds standing delay. [`PacingMode::Full`] is calibrated to libwebrtc's
+//! 2.5x the estimated bitrate and to Stadia's measured ~2 ms clusters of 7-9 packets.
 //!
-//! libwebrtc paces at 2.5x the estimated bitrate for exactly this reason ("video encoders
-//! overshoot the target frame size in case of sudden movement especially when dealing with
-//! screensharing"). Stadia was measured on the wire doing the same shape: packets arrive in
-//! per-frame batches, and *within* a frame period they are grouped into ~2 ms clusters of 7-9
-//! packets. Those two numbers are what [`PacingMode::Full`] is calibrated to.
-//!
-//! The pacer is a pure leaky bucket with no clock of its own: [`Pacer::schedule`] takes the
-//! current instant and returns how long the caller should sleep before putting this packet on
-//! the wire, so the whole policy is testable without a network.
+//! A pure leaky bucket with no clock of its own: [`Pacer::schedule`] takes the current instant
+//! and returns how long to sleep before sending, so the policy is testable without a network.
 
 use std::time::{Duration, Instant};
 
-/// libwebrtc's `kDefaultPaceMultiplier`.
+/// libwebrtc's `kDefaultPaceMultiplier`: headroom for an encoder that overshoots its target
+/// frame size on sudden screen changes.
 pub const PACING_FACTOR: f64 = 2.5;
 
-/// A relayed or lossy path still gets to send at least this much, so a collapsed bitrate
-/// estimate cannot pace the session into a stall it can never recover from.
+/// Pacing-rate floor, so a collapsed bitrate estimate cannot pace the session into a stall it
+/// can never recover from.
 pub const MIN_PACING_RATE_BPS: u64 = 2_000_000;
 
 /// Packets allowed out back-to-back before the bucket starts holding them. Stadia's measured
@@ -37,7 +31,7 @@ const FRAME_BUDGET: f64 = 0.75;
 /// on a clean same-subnet hop the burst costs nothing and spacing it only adds delay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PacingMode {
-    /// Same-subnet, no loss seen yet. The writer behaves exactly as it did before the pacer.
+    /// Same-subnet, no loss seen yet. Nothing is held.
     Off,
     /// Same-subnet with observed loss, or an unclassified path. Wide bucket, high multiplier.
     Light,
@@ -96,8 +90,7 @@ impl Pacer {
     pub fn set_mode(&mut self, mode: PacingMode) {
         if mode != self.mode {
             self.mode = mode;
-            // A mode change resets the bucket rather than inheriting a debt accrued under a
-            // different rate; the two are not comparable.
+            // a debt accrued under another rate is not comparable, so start clean
             self.budget_bytes = 0.0;
         }
     }
@@ -167,9 +160,8 @@ impl Pacer {
         let wait = Duration::from_secs_f64((-self.budget_bytes / rate).min(1.0));
         let cap = self.frame_interval.mul_f64(FRAME_BUDGET);
         if self.frame_waited + wait > cap {
-            // Holding this packet any longer would cost more latency than the burst it is
-            // smoothing. Send it, forgive the debt so the next frame starts clean, and count it:
-            // a pacer that silently grows unbounded is worse than no pacer.
+            // holding it longer costs more latency than the burst it smooths: send it, forgive
+            // the debt so the next frame starts clean, and count the miss
             let allowed = cap.saturating_sub(self.frame_waited);
             self.frame_waited = cap;
             self.budget_bytes = 0.0;
@@ -210,7 +202,7 @@ mod tests {
         let mut p = full(20_000_000);
         let t = Instant::now();
         p.begin_frame();
-        // Four packets is a typical P-frame at 20 Mbps / 60 fps, well inside the burst.
+        // four packets: a typical P-frame at 20 Mbps / 60 fps, well inside the burst
         for _ in 0..4 {
             assert_eq!(p.schedule(MTU, t), Duration::ZERO);
         }
@@ -221,7 +213,7 @@ mod tests {
         let mut p = full(8_000_000);
         let t = Instant::now();
         p.begin_frame();
-        // ~35 packets: a 40 KB IDR.
+        // ~35 packets: a 40 KB IDR
         let mut total = Duration::ZERO;
         for _ in 0..35 {
             total += p.schedule(MTU, t + total);
@@ -244,15 +236,14 @@ mod tests {
         }
         assert!(p.deadline_misses() > 0, "an oversized frame must give up");
         p.begin_frame();
-        // A fresh frame one interval later starts with its own budget, not the exhausted one.
+        // a frame one interval later gets its own budget, not the exhausted one
         let next = p.schedule(MTU, t + spent + FRAME);
         assert!(next <= FRAME.mul_f64(FRAME_BUDGET));
     }
 
     #[test]
     fn the_long_run_rate_follows_the_target() {
-        // 10 Mbps target paced at 2.5x is 25 Mbps of instantaneous allowance; over many frames
-        // the bucket must not let a 40 Mbps stream through.
+        // 10 Mbps paced at 2.5x allows 25 Mbps: the bucket must not pass a 40 Mbps stream
         let mut p = full(10_000_000);
         let start = Instant::now();
         let mut now = start;
@@ -275,8 +266,8 @@ mod tests {
 
     #[test]
     fn a_collapsed_estimate_still_gets_a_floor() {
-        // The bitrate controller bottoming out at its 1 Mbps floor must not pace the session
-        // into a stall: the floor rate keeps a keyframe moving.
+        // a bitrate estimate at its 1 Mbps floor must not stall the session: the pacing floor
+        // keeps a keyframe moving
         let mut p = full(100);
         let t = Instant::now();
         p.begin_frame();

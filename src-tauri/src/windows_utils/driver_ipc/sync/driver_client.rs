@@ -1,45 +1,90 @@
 use super::{client::EventsSubscription, RUNTIME};
 use crate::driver_ipc::{
-    driver_client::error, DriverClient as AsyncDriverClient, EventCommand, Id, Mode, Monitor,
+    driver_client::error, v2, ClosedWatch, DriverClient as AsyncDriverClient, EventCommand,
+    Handshake, Id, Mode, Monitor,
 };
 
-/// Abstraction layer over [Client].
+/// Synchronous wrapper over [AsyncDriverClient], blocking on this module's tokio runtime.
 ///
-/// It manages its own state. Changing this state does not affect the driver
-/// directly. You must call [DriverClient::notify] to send changes to the
-/// driver. To make your changes persistent across reboots, call
-/// [DriverClient::persist]. To synchronize this object with the driver, you
-/// must call [DriverClient::refresh_state]. The state will not be updated
-/// automatically.
+/// It keeps its own copy of the monitor list (the local state). Edits change only the local
+/// state: [DriverClient::notify] sends it to the driver and [DriverClient::persist] saves it
+/// across reboots. It can be stale, and is brought up to date with the driver only by
+/// [DriverClient::refresh_state].
 #[derive(Debug)]
 pub struct DriverClient(AsyncDriverClient);
 
 impl DriverClient {
-    /// Connect to driver on pipe with default name.
-    ///
-    /// The default name is [DEFAULT_PIPE_NAME]
+    /// Connect on the default pipe name, `DEFAULT_PIPE_NAME`.
     pub fn new() -> Result<Self, error::InitError> {
         let client = RUNTIME.block_on(AsyncDriverClient::new());
         client.map(Self)
     }
 
-    /// Connect to driver on pipe with specified name.
-    ///
-    /// `name` is ONLY the {name} portion of \\.\pipe\{name}.
+    /// Connect on the named pipe. `name` is ONLY the {name} portion of \\.\pipe\{name}.
     pub fn new_with(name: &str) -> Result<Self, error::InitError> {
         let client = RUNTIME.block_on(AsyncDriverClient::new_with(name));
         client.map(Self)
     }
 
-    /// Get the ID of a monitor using a query.
+    /// See the async [`AsyncDriverClient::new_host`].
+    pub fn new_host(
+        name: &str,
+        hello: Option<&v2::Hello>,
+        how: Handshake,
+    ) -> Result<Self, error::InitError> {
+        RUNTIME
+            .block_on(AsyncDriverClient::new_host(name, hello, how))
+            .map(Self)
+    }
+
+    pub fn closed_watch(&self) -> ClosedWatch {
+        self.0.closed_watch()
+    }
+
+    /// Wait up to `max` for the connection `watch` was taken from to end. `true` if it has.
+    pub fn wait_closed(watch: &mut ClosedWatch, max: std::time::Duration) -> bool {
+        RUNTIME.block_on(async { tokio::time::timeout(max, watch.closed()).await.is_ok() })
+    }
+
+    /// What this connection agreed with the driver.
+    pub fn negotiated(&self) -> &v2::Negotiated {
+        self.0.negotiated()
+    }
+
+    pub fn diagnostics(
+        &self,
+    ) -> Result<serde_json::Map<String, serde_json::Value>, error::V2Error> {
+        RUNTIME.block_on(self.0.diagnostics())
+    }
+
+    pub fn set_render_adapter(
+        &self,
+        luid: Option<v2::Luid>,
+    ) -> Result<v2::RenderAdapterReply, error::V2Error> {
+        RUNTIME.block_on(self.0.set_render_adapter(luid))
+    }
+
+    pub fn set_render_adapter_within(
+        &self,
+        luid: Option<v2::Luid>,
+        wait: std::time::Duration,
+    ) -> Result<v2::RenderAdapterReply, error::V2Error> {
+        RUNTIME.block_on(self.0.set_render_adapter_within(luid, wait))
+    }
+
+    pub fn is_dead(&self) -> bool {
+        self.0.is_dead()
+    }
+
+    /// Block until this connection has ended (see the async `closed`). The wait holds no
+    /// reference to the connection.
+    pub fn closed_waiter(&self) -> impl FnOnce() + Send + 'static {
+        let closed = self.0.closed();
+        move || RUNTIME.block_on(closed)
+    }
+
+    /// ID of the monitor matching `query`: a monitor name or an ID, the name taking precedence.
     ///
-    /// ## Query syntax
-    ///
-    /// The query can either be a monitor name or an ID.
-    ///
-    /// The name has precedence over the ID.
-    ///
-    /// ### Example
     /// ```ignore
     /// // Monitors are:
     /// //   { id: 0, name: Some("foo") }
@@ -61,22 +106,13 @@ impl DriverClient {
         self.0.refresh_state()
     }
 
-    /// Add an event receiver to receive continuous events from the driver.
+    /// Call `cb` with every event the driver sends, whichever process caused the change. The
+    /// returned object cancels the subscription.
     ///
-    /// This receiver will always reflect the real state of the driver,
-    /// regardless of who changed its state. This means, if it is changed by
-    /// another process, this receiver will still be updated.
+    /// `cb` runs on the library's tokio runtime and delays every other library event until it
+    /// returns, so it must return quickly.
     ///
-    /// Returns an object that can be used to cancel the subscription.
-    ///
-    /// Note: The callback should return as soon as possible. It is called from
-    /// the library's tokio runtime and blocks all other operations. In
-    /// consequence, all other library events will be delayed until the callback
-    /// returns.
-    ///
-    /// Note: If multiple copies of this client exist (using
-    /// [DriverClient::duplicate]), the returned stream will only be closed
-    /// after all copies are dropped.
+    /// The receiver closes only after every copy made by [DriverClient::duplicate] is dropped.
     pub fn add_event_receiver(
         &self,
         cb: impl FnMut(Result<EventCommand, error::ReceiveError>)
@@ -88,39 +124,22 @@ impl DriverClient {
         EventsSubscription::start_subscriber(cb, stream)
     }
 
-    /// Get the current monitor state stored inside this client.
-    ///
-    /// Note: Client state might be stale. To synchronize with the driver,
-    /// manually call [DriverClient::refresh_state].
+    /// The monitors in the local state.
     pub fn monitors(&self) -> &[Monitor] {
         self.0.monitors()
     }
 
-    /// Replace all monitors.
-    ///
-    /// Note: This does not affect the driver. Manually call
-    /// [DriverClient::notify] to send these changes to the driver.
+    /// Replace all monitors in the local state.
     pub fn set_monitors(&mut self, monitors: &[Monitor]) -> Result<(), error::DuplicateError> {
         self.0.set_monitors(monitors)
     }
 
-    /// Replace an existing monitor. The monitor is identified by its ID.
-    ///
-    /// Returns an error if the monitor does not exist.
-    ///
-    /// Note: This does not affect the driver. Manually call
-    /// [DriverClient::notify] to send these changes to the driver.
-    ///
-    /// Note: Client state might be stale. To synchronize with the driver,
-    /// manually call [DriverClient::refresh_state].
+    /// Replace the local monitor that has the same ID. Errors if there is none.
     pub fn replace_monitor(&mut self, monitor: Monitor) -> Result<(), error::MonNotFound> {
         self.0.replace_monitor(monitor)
     }
 
-    /// Send the current client state to the driver.
-    ///
-    /// State changes of the client are not automatically sent to the driver.
-    /// You must manually call this method to send changes to the driver.
+    /// Send the local state to the driver. Nothing reaches the driver until this is called.
     pub fn notify(&mut self) -> Result<(), error::SendError> {
         RUNTIME.block_on(self.0.notify())
     }
@@ -131,56 +150,29 @@ impl DriverClient {
     }
 
     /// Find the monitor with the given ID.
-    ///
-    /// Note: Client state might be stale. To synchronize with the driver,
-    /// manually call [DriverClient::refresh_state].
     pub fn find_monitor(&self, id: Id) -> Option<&Monitor> {
         self.0.find_monitor(id)
     }
 
     /// Find the monitor matched by the given query.
-    ///
-    /// Note: Client state might be stale. To synchronize with the driver,
-    /// manually call [DriverClient::refresh_state].
     pub fn find_monitor_query(&self, query: &str) -> Option<&Monitor> {
         self.0.find_monitor_query(query)
     }
 
     /// Find a monitor by ID and call `cb` with a mutable reference to it.
-    ///
-    /// Note: Any changes do not affect the driver. Manually call
-    /// [DriverClient::notify] to send these changes to the driver.
-    ///
-    /// Note: Client state might be stale. To synchronize with the driver,
-    /// manually call [DriverClient::refresh_state].
     pub fn find_monitor_mut<R>(&mut self, id: Id, cb: impl FnOnce(&mut Monitor) -> R) -> Option<R> {
         self.0.find_monitor_mut(id, cb)
     }
 
     /// Find a monitor by ID and return a mutable reference to it.
     ///
-    /// Does not check for duplicates (since this is not easy when returning a
-    /// mut reference) Caller agrees they will make sure there are no duplicates.
-    ///
-    /// Despite the "unchecked" part of this name, this is a safe method.
-    ///
-    /// Note: Any changes do not affect the driver. Manually call
-    /// [DriverClient::notify] to send these changes to the driver.
-    ///
-    /// Note: Client state might be stale. To synchronize with the driver,
-    /// manually call [DriverClient::refresh_state].
+    /// "Unchecked" means duplicates are not checked (the caller must not introduce any), not
+    /// that the method is unsafe.
     pub fn find_monitor_mut_unchecked(&mut self, id: Id) -> Option<&mut Monitor> {
         self.0.find_monitor_mut_unchecked(id)
     }
 
-    /// Find the monitor matched by the given query and call `cb` with a mutable
-    /// reference to it.
-    ///
-    /// Note: Any changes do not affect the driver. Manually call
-    /// [DriverClient::notify] to send these changes to the driver.
-    ///
-    /// Note: Client state might be stale. To synchronize with the driver,
-    /// manually call [DriverClient::refresh_state].
+    /// Find the monitor matched by the given query and call `cb` with a mutable reference to it.
     pub fn find_monitor_mut_query<R>(
         &mut self,
         query: &str,
@@ -189,63 +181,31 @@ impl DriverClient {
         self.0.find_monitor_mut_query(query, cb)
     }
 
-    /// Find the monitor matching the given query.
-    ///
-    /// Does not check for duplicates (since this is not easy when returning a
-    /// mut reference) Caller agrees they will make sure there are no duplicates.
-    ///
-    /// Despite the "unchecked" part of this name, this is a safe method.
-    ///
-    /// Note: Any changes do not affect the driver. Manually call
-    /// [DriverClient::notify] to send these changes to the driver.
-    ///
-    /// Note: Client state might be stale. To synchronize with the driver,
-    /// manually call [DriverClient::refresh_state].
+    /// [DriverClient::find_monitor_mut_unchecked], with the monitor matched by the given query.
     pub fn find_monitor_mut_query_unchecked(&mut self, query: &str) -> Option<&mut Monitor> {
         self.0.find_monitor_mut_query_unchecked(query)
     }
 
-    /// Write client state to the registry for current user.
-    ///
-    /// Next time the driver is started, it will load this state from the
-    /// registry. This might be after a reboot or a driver restart.
+    /// Write the local state to the current user's registry, where the driver loads it the
+    /// next time it starts (a reboot or a driver restart).
     pub fn persist(&self) -> Result<(), error::PersistError> {
         self.0.persist()
     }
 
     /// Get the closest available free ID.
     ///
-    /// Note: Client state might be stale. To synchronize with the driver,
-    /// manually call [DriverClient::refresh_state].
-    ///
-    /// Note: Duplicate monitors are ignored when send to the Driver using
-    /// [DriverClient::notify].
+    /// The driver ignores duplicate monitors sent with [DriverClient::notify].
     pub fn new_id(&self, preferred_id: Option<Id>) -> Option<Id> {
         self.0.new_id(preferred_id)
     }
 
-    /// Remove monitors by id.
-    ///
-    /// Silently skips IDs that do not exist.
-    ///
-    /// Note: This does not affect the driver. Manually call
-    /// [DriverClient::notify] to send these changes to the driver.
-    ///
-    /// Note: Client state might be stale. To synchronize with the driver,
-    /// manually call [DriverClient::refresh_state].
+    /// Remove monitors from the local state by ID, silently skipping IDs that do not exist.
     pub fn remove(&mut self, ids: &[Id]) {
         self.0.remove(ids)
     }
 
-    /// Remove all monitors matched by the given queries.
-    ///
-    /// Returns an error if a query does not match any monitor.
-    ///
-    /// Note: This does not affect the driver. Manually call
-    /// [DriverClient::notify] to send these changes to the driver.
-    ///
-    /// Note: Client state might be stale. To synchronize with the driver,
-    /// manually call [DriverClient::refresh_state].
+    /// Remove the monitors matched by the given queries from the local state. Errors if a query
+    /// matches no monitor.
     pub fn remove_query(
         &mut self,
         queries: &[impl AsRef<str>],
@@ -253,51 +213,27 @@ impl DriverClient {
         self.0.remove_query(queries)
     }
 
-    /// Remove all monitors.
-    ///
-    /// Note: This does not affect the driver. Manually call
-    /// [DriverClient::notify] to send these changes to the driver.
+    /// Remove all monitors from the local state.
     pub fn remove_all(&mut self) {
         self.0.remove_all()
     }
 
-    /// Add a new monitor.
+    /// Add a monitor to the local state.
     ///
-    /// Returns an error if a monitor with this ID already exists, or if the
-    /// monitor is invalid. A monitor is invalid if it has duplicate modes, or
-    /// if any of its modes has duplicate refresh rates.
-    ///
-    /// Note: This does not affect the driver. Manually call
-    /// [DriverClient::notify] to send these changes to the driver.
-    ///
-    /// Note: Client state might be stale. To synchronize with the driver,
-    /// manually call [DriverClient::refresh_state].
+    /// Errors if the ID is taken, or if the monitor has duplicate modes or a mode with duplicate
+    /// refresh rates.
     pub fn add(&mut self, monitor: Monitor) -> Result<(), error::DuplicateError> {
         self.0.add(monitor)
     }
 
-    /// Set enabled state of all monitors with the given IDs.
-    ///
-    /// Silently skips incorrect IDs.
-    ///
-    /// Note: This does not affect the driver. Manually call
-    /// [DriverClient::notify] to send these changes to the driver.
-    ///
-    /// Note: Client state might be stale. To synchronize with the driver,
-    /// manually call [DriverClient::refresh_state].
+    /// Set the enabled flag of the local monitors with the given IDs, silently skipping unknown
+    /// IDs.
     pub fn set_enabled(&mut self, ids: &[Id], enabled: bool) {
         self.0.set_enabled(ids, enabled)
     }
 
-    /// Set enabled state of all monitors matched by the given queries.
-    ///
-    /// Returns an error if a query does not match any monitor.
-    ///
-    /// Note: This does not affect the driver. Manually call
-    /// [DriverClient::notify] to send these changes to the driver.
-    ///
-    /// Note: Client state might be stale. To synchronize with the driver,
-    /// manually call [DriverClient::refresh_state].
+    /// Set the enabled flag of the local monitors matched by the given queries. Errors if a
+    /// query matches no monitor.
     pub fn set_enabled_query(
         &mut self,
         queries: &[impl AsRef<str>],
@@ -306,32 +242,18 @@ impl DriverClient {
         self.0.set_enabled_query(queries, enabled)
     }
 
-    /// Add a mode to the monitor with the given ID.
+    /// Add a mode to the local monitor with the given ID.
     ///
-    /// Returns an error if the monitor does not exist, or if the mode already
-    /// exists on that monitor, or if the mode is invalid. A mode is invalid if
-    /// it has duplicate refresh rates.
-    ///
-    /// Note: This does not affect the driver. Manually call
-    /// [DriverClient::notify] to send these changes to the driver.
-    ///
-    /// Note: Client state might be stale. To synchronize with the driver,
-    /// manually call [DriverClient::refresh_state].
+    /// Errors if the monitor does not exist, already has the mode, or the mode has duplicate
+    /// refresh rates.
     pub fn add_mode(&mut self, id: Id, mode: Mode) -> Result<(), error::AddModeError> {
         self.0.add_mode(id, mode)
     }
 
-    /// Add a mode to the a monitor matched by the given query.
+    /// Add a mode to the local monitor matched by the given query.
     ///
-    /// Returns an error if the monitor cannot be found, or if the mode already
-    /// exists on that monitor, or if the mode is invalid. A mode is invalid if
-    /// it has duplicate refresh rates.
-    ///
-    /// Note: This does not affect the driver. Manually call
-    /// [DriverClient::notify] to send these changes to the driver.
-    ///
-    /// Note: Client state might be stale. To synchronize with the driver,
-    /// manually call [DriverClient::refresh_state].
+    /// Errors if no monitor matches, the monitor already has the mode, or the mode has
+    /// duplicate refresh rates.
     pub fn add_mode_query(
         &mut self,
         query: &str,
@@ -340,16 +262,8 @@ impl DriverClient {
         self.0.add_mode_query(query, mode)
     }
 
-    /// Remove a mode from the monitor with the given ID.
-    ///
-    /// Returns an error if the monitor does not exist. If the mode does not
-    /// exist, it is silently skipped.
-    ///
-    /// Note: This does not affect the driver. Manually call
-    /// [DriverClient::notify] to send these changes to the driver.
-    ///
-    /// Note: Client state might be stale. To synchronize with the driver,
-    /// manually call [DriverClient::refresh_state].
+    /// Remove a mode from the local monitor with the given ID. Errors if the monitor does not
+    /// exist; a mode that does not exist is silently skipped.
     pub fn remove_mode(
         &mut self,
         id: Id,
@@ -358,16 +272,8 @@ impl DriverClient {
         self.0.remove_mode(id, resolution)
     }
 
-    /// Remove a mode from a monitor matched by the given query.
-    ///
-    /// Returns an error if the monitor cannot be found. If the mode does not
-    /// exist, it is silently skipped.
-    ///
-    /// Note: This does not affect the driver. Manually call
-    /// [DriverClient::notify] to send these changes to the driver.
-    ///
-    /// Note: Client state might be stale. To synchronize with the driver,
-    /// manually call [DriverClient::refresh_state].
+    /// Remove a mode from the local monitor matched by the given query. Errors if no monitor
+    /// matches; a mode that does not exist is silently skipped.
     pub fn remove_mode_query(
         &mut self,
         query: &str,
@@ -376,13 +282,8 @@ impl DriverClient {
         self.0.remove_mode_query(query, resolution)
     }
 
-    /// Returns a copy of this client with it's own independent state.
-    ///
-    /// Changes to one client will not affect the other.
-    ///
-    /// Note: Event receivers created with [DriverClient::add_event_receiver] will
-    /// only be closed after all copies are dropped, regardless of which client
-    /// was used to create the receiver.
+    /// A copy of this client with its own local state, sharing the connection. Event receivers
+    /// from [DriverClient::add_event_receiver] close only after every copy is dropped.
     pub fn duplicate(&self) -> Self {
         Self(self.0.duplicate())
     }

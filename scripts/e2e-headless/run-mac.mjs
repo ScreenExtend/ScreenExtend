@@ -62,7 +62,7 @@
 //                              the video receiver, in the same task as addTransceiver
 //   --no-script-transform      hide RTCRtpScriptTransform so the page takes createEncodedStreams
 //   --window-state normal|minimized   (headed) the Chrome window's state during the window
-//   --dc-ping <n>              during the window, send n PINGs (0x60, docs/INPUT-PROTOCOL.md) on the
+//   --dc-ping <n>              during the window, send n PINGs (opcode 0x60) on the
 //                              page's own 'reliable' DataChannel at random gaps of 20-120 ms and time
 //                              each round trip to its PONG; reports the RTT distribution and the
 //                              phase lock of PONG handling against 64 Hz and 60 Hz (R.dc_ping)
@@ -85,17 +85,14 @@
 //                              when Chrome cannot reach the host's LAN address, see below; `on`
 //                              forces it, also in front of a local host)
 //
-// The relay. macOS Local Network privacy is per app: a Chrome that has never been granted it gets
-// net::ERR_ADDRESS_UNREACHABLE for every LAN address but this Mac's own, while node and curl from
-// the same shell are allowed. Rather than raise that prompt, `auto` detects the refusal and puts a
-// relay in node: HTTPS is a TCP pipe on 127.0.0.1:<https-port>, and the WHEP answer's host
-// candidates are rewritten (CDP Fetch) to 127.0.0.1:<port> with a UDP pipe per port to the host.
-// The UDP half runs on its own worker thread (so nothing the harness does on its main thread can
-// stall it), with 8 MB socket buffers and no pacing, and counts per direction: packets in,
-// forwarded, send errors, and the largest burst seen in any 10 ms window.
-// Media then crosses one extra loopback hop in this process; the document records `relay` so a
-// number taken through it is never mistaken for a direct one. Granting Chrome "Local Network" in
-// System Settings › Privacy & Security removes the need for it.
+// The relay. macOS Local Network privacy is per app: a Chrome never granted it gets
+// net::ERR_ADDRESS_UNREACHABLE for every LAN address but this Mac's own, while node and curl
+// are allowed. `auto` detects the refusal and relays in node: HTTPS is a TCP pipe on
+// 127.0.0.1:<https-port>, and the WHEP answer's host candidates are rewritten (CDP Fetch) to
+// 127.0.0.1:<port> with a UDP pipe per port to the host (8 MB socket buffers, no pacing, on
+// its own worker thread so the harness's main thread cannot stall it). The result records
+// `relay`, so a number taken through the extra hop is never mistaken for a direct one.
+// Granting Chrome "Local Network" in System Settings > Privacy & Security removes the need.
 //
 // Exit: 0 pass; 1 harness/join failure; 2 the session ran but a pass criterion failed (no frame
 // painted, decode errors > 0, encoder_rate_drops > 0, display size != requested, a requested
@@ -123,7 +120,6 @@ const CHROME = process.env.CHROME || '/Applications/Google Chrome.app/Contents/M
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const now = () => new Date().toISOString();
 
-// ---------------------------------------------------------------- arguments
 const argv = process.argv.slice(2);
 const opt = (k, d) => { const i = argv.indexOf('--' + k); return i >= 0 && i + 1 < argv.length ? argv[i + 1] : d; };
 const flag = (k) => argv.includes('--' + k);
@@ -178,7 +174,7 @@ argv.forEach((a, i) => {
 });
 argv.forEach((a, i) => { if (a === '--host-env' && i + 1 < argv.length) { const kvp = argv[i + 1]; const m = /^(SE_[A-Z0-9_]+)=([^\s'"]*)$/.exec(kvp); if (!m) { console.error(`--host-env ${kvp}: expected SE_NAME=value (no spaces or quotes)`); process.exit(64); } HOST_ENV[m[1]] = m[2]; } });
 const EXPECT_FPS = Number(opt('expect-fps', 60));
-// The device name the page joins with; it is part of the virtual display's identity.
+// the device name the page joins with; it is part of the virtual display's identity
 const DEVICE_NAME = opt('device-name', 'MacE2E');
 if (!/^\d+x\d+$/.test(SIZE) || !(SIZE_W >= 320 && SIZE_H >= 240)) { console.error('--size must be WxH, e.g. 1920x1080'); process.exit(64); }
 if (QUALITY != null && !(/^\d+$/.test(QUALITY) && +QUALITY >= 1 && +QUALITY <= 51)) { console.error('--quality must be 1..51'); process.exit(64); }
@@ -188,8 +184,8 @@ const BENCH_DIR = opt('bench-dir', LOCAL ? null : path.posix.dirname(BIN));
 const WAIT_REMOTE = Number(opt('wait-remote', 3600));
 const DONE_FILE = opt('done-file', BENCH_DIR ? BENCH_DIR + '/all.log' : null);
 if (DONE_FILE && /['\s]/.test(DONE_FILE)) { console.error('--done-file: no quotes or spaces'); process.exit(64); }
-// A stall is induced inside the relay, so asking for one forces the relay: under `auto` a Chrome
-// that can reach the LAN directly never used it, and the run silently measured no stall at all.
+// a stall is induced inside the relay, so asking for one forces the relay: under `auto` a
+// Chrome that reaches the LAN directly bypasses it and the run measures no stall at all
 const RELAY = CLIENT ? 'off' : opt('relay', argv.includes('--relay-stall') ? 'on' : 'auto');
 const MOTION_LAUNCH = opt('motion-launch', 'auto');
 if (CLIENT && HOST !== 'local' && CLIENT !== HOST) { console.error('--client needs a local host, or the same Mac as --host'); process.exit(64); }
@@ -206,23 +202,21 @@ const RELAY_STALL = (() => {
 })();
 if (RELAY_STALL && RELAY === 'off') { console.error('--relay-stall needs the relay (--relay on, or auto on a host Chrome cannot reach)'); process.exit(64); }
 if (!(DURATION > 0)) { console.error('--duration must be positive'); process.exit(64); }
-// E2E_ALLOW_LONG=1 lifts the cap for a soak, when nothing else needs the encoder lock.
+// E2E_ALLOW_LONG=1 lifts the cap for a soak, when nothing else needs the encoder lock
 const ALLOW_LONG = process.env.E2E_ALLOW_LONG === '1';
 if (LOCAL && DURATION > 50 && !ALLOW_LONG) { console.error('local runs hold the encoder lock; keep --duration <= 50 (or set E2E_ALLOW_LONG=1)'); process.exit(64); }
 for (const v of [BIN, HOST]) if (/\s/.test(v)) { console.error('no whitespace allowed in --bin/--host'); process.exit(64); }
 
-// Every run uses this Mac (its host, its Chrome, or both), so every run holds the shared
-// encoder lock while it runs: main() re-execs itself under lockf — after waiting for a busy
-// remote host, so the lock is never held while idle.
+// every run uses this Mac (its host, its Chrome, or both), so it holds the shared encoder
+// lock: main() re-execs itself under lockf, after waiting for a busy remote host so the
+// lock is never held while idle
 const IN_LOCK = !!process.env.E2E_RUNMAC_IN_LOCK;
 const T_START = Date.now();
-// A local host creates a virtual display on this Mac and reflows whatever its user has open, so it
-// has to be allowed explicitly.
+// opt-in only: a local host creates a virtual display on this Mac and reflows its user's windows
 if (LOCAL && process.env.E2E_ALLOW_LOCAL_DISPLAY !== '1') { console.error('refusing --host local: it creates a virtual display on this Mac. Set E2E_ALLOW_LOCAL_DISPLAY=1 only when its user has agreed.'); process.exit(65); }
-// Hard ceiling on the time the lock is held: abort (and clean up) at 85 s.
+// hard ceiling on the time the lock is held: abort (and clean up) at 85 s
 const DEADLINE_MS = LOCAL ? (ALLOW_LONG ? (DURATION + 60) * 1000 : 85_000) : Math.max(10 * 60_000, (DURATION + 120) * 1000);
 
-// ---------------------------------------------------------------- result document
 const SID = Array.from(crypto.randomBytes(12), (b) => 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'[b % 32]).join('');
 const OTP = String(crypto.randomInt(0, 1_000_000)).padStart(6, '0');
 const hostIp = LOCAL ? lanIp() : HOST.split('@').pop();
@@ -248,9 +242,8 @@ function lanIp() {
   throw new Error('no LAN IPv4 address on an en* interface');
 }
 
-// ---------------------------------------------------------------- running things on the host
-// Every host action goes through mac-host.sh, locally or as `ssh <host> bash -s -- …` with the
-// script on stdin. Credentials, when needed, are exported at the top of that stdin, never in argv.
+// every host action goes through mac-host.sh, locally or as `ssh <host> bash -s -- ...` with
+// the script on stdin. Credentials are exported at the top of that stdin, never in argv
 function hostRun(args, { env = null, timeoutMs = 60_000 } = {}) {
   return new Promise((resolve) => {
     let child;
@@ -274,12 +267,11 @@ const kv = (text) => Object.fromEntries(text.split('\n').filter((l) => /^[A-Z_]+
 function sh(cmd, args, input) { const r = spawnSync(cmd, args, { input, encoding: 'utf8', timeout: 60_000 }); return { code: r.status, out: r.stdout || '', err: r.stderr || '' }; }
 const ssh = (cmd) => sh('ssh', ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', HOST, cmd]);
 const sshC = (cmd) => sh('ssh', ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', CLIENT, cmd]);
-// The asynchronous form, for anything that runs while a session is live.
+// the asynchronous form, for anything that runs while a session is live
 function shA(cmd, args) {
   return new Promise((res) => { const c = spawn(cmd, args); let out = '', err = ''; c.stdout.on('data', (x) => { out += x; }); c.stderr.on('data', (x) => { err += x; }); c.on('close', (code) => res({ code, out, err })); c.stdin.end(); });
 }
 
-// ---------------------------------------------------------------- remote: wait until free
 async function waitRemoteFree() {
   const until = Date.now() + WAIT_REMOTE * 1000;
   for (;;) {
@@ -297,7 +289,6 @@ async function waitRemoteFree() {
   }
 }
 
-// ---------------------------------------------------------------- the cursor mover
 function ensureLocalMover() {
   if (fs.existsSync(LOCAL_MOVER) && fs.statSync(LOCAL_MOVER).mtimeMs >= fs.statSync(MOVER_SRC).mtimeMs) return LOCAL_MOVER;
   fs.mkdirSync(path.dirname(LOCAL_MOVER), { recursive: true });
@@ -312,8 +303,8 @@ function ensureLocalMotionWin() {
   if (r.code !== 0) throw new Error('motion-window build failed: ' + r.err);
   return LOCAL_MOTION_WIN;
 }
-// Copy a helper to the remote by serving it from this Mac: a short-lived http.server bound to the
-// LAN address, in a directory holding only that file, fetched with curl over SSH, then stopped.
+// copy a helper to the remote by serving it from this Mac: a short-lived http.server bound to the
+// LAN address, in a directory holding only that file, fetched with curl over SSH, then stopped
 async function ensureRemoteBin(local, name) {
   const sum = crypto.createHash('sha256').update(fs.readFileSync(local)).digest('hex');
   const remote = `$HOME/${REMOTE_MOVER_DIR}/${name}`;
@@ -341,8 +332,6 @@ function freePort() {
   return new Promise((res, rej) => { const s = net.createServer(); s.listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => res(p)); }); s.on('error', rej); });
 }
 
-
-// ---------------------------------------------------------------- loopback relay (see header)
 const RELAY_BUF = 8 * 1024 * 1024; // kern.ipc.maxsockbuf on the M1
 const RELAY_WORKER = `
 const { parentPort, workerData } = require('node:worker_threads');
@@ -425,7 +414,7 @@ function relayCall(msg) {
   const id = ++relay.seq;
   return new Promise((res) => { relay.waits.set(id, res); relay.worker.postMessage({ ...msg, id }); setTimeout(() => { if (relay.waits.delete(id)) res(null); }, 5000); });
 }
-// TCP (HTTPS) pipe on 127.0.0.1:<port>, or a free port when the host itself listens there.
+// TCP (HTTPS) pipe on 127.0.0.1:<port>, or a free port when the host itself listens there
 async function startTcpRelay(port) {
   relay.tcp = net.createServer((c) => {
     const u = net.connect(port, hostIp);
@@ -438,8 +427,8 @@ async function startTcpRelay(port) {
   return relay.tcp_port;
 }
 const udpRelayFor = (hostPort) => relayCall({ type: 'port', hostPort });
-// Host candidates on the host's address -> loopback relay ports; every other candidate is dropped,
-// so Chrome can only take the relayed pair.
+// host candidates on the host's address -> loopback relay ports; every other candidate is dropped,
+// so Chrome can only take the relayed pair
 async function rewriteAnswer(sdp) {
   const eol = sdp.includes('\r\n') ? '\r\n' : '\n';
   const out = [];
@@ -457,7 +446,6 @@ async function stopRelay() {
   return null;
 }
 
-// ---------------------------------------------------------------- CDP
 async function cdp(wsUrl) {
   const ws = new WebSocket(wsUrl);
   await new Promise((res, rej) => { ws.onopen = res; ws.onerror = rej; });
@@ -475,9 +463,8 @@ async function cdp(wsUrl) {
   };
 }
 
-// ---------------------------------------------------------------- telemetry extraction
-// `status --json` → { …, telemetry: { sessions: { <join>: {…} }, live_transport_sessions } }.
-// Kept whole in the document; this picks out the numbers the summary table and the verdict use.
+// `status --json` -> { ..., telemetry: { sessions: { <join>: {...} }, live_transport_sessions } }.
+// Kept whole in the document; this picks out the numbers the summary table and the verdict use
 function sessionsOf(status) {
   const t = status && (status.telemetry || status);
   const s = t && t.sessions;
@@ -487,23 +474,19 @@ function mainSession(status, joinId) {
   const all = sessionsOf(status);
   return (joinId && all.find((x) => x.key === joinId)) || all.sort((a, b) => (b.frames_encoded || 0) - (a.frames_encoded || 0))[0] || null;
 }
-// Our join in `status --json` → telemetry.joins[] (name MacE2E): token, joinId, display geometry.
+// our join in `status --json`: telemetry.joins[] by device name gives token, joinId, display geometry
 function ourJoin(status) {
   const j = ((status && status.telemetry && status.telemetry.joins) || []).filter((x) => x.name === DEVICE_NAME);
   return j[j.length - 1] || null;
 }
 
 // Paint timing inside the video worker: every canvas paint is one drawImage on the worker's
-// OffscreenCanvas, so wrapping it gives the exact interval between paints. Installed through CDP
-// before the worker's first line runs; it records only while armed by the harness.
-//
-// The same hook also reads each encoded frame as the worker's pump reads it (by wrapping
-// ReadableStreamDefaultReader.read in the worker), records `getMetadata()` — which fields this
-// Chrome exposes, and `receiveTime` (reception of the frame's last packet) when it does — plus
-// the host capture time the worker itself derives from the RTP stamp and the page's clock offset,
-// and matches each to its paint. That splits host-capture->paint per frame into
-// capture->receive (host pipeline + network, through the clock offset), receive->arrival (inside
-// Chrome, before the worker sees it) and arrival->paint (decode + paint).
+// OffscreenCanvas, so wrapping it gives the exact interval between paints. Installed through
+// CDP before the worker's first line runs; records only while armed.
+// It also wraps ReadableStreamDefaultReader.read to stamp each encoded frame as the pump reads
+// it (`getMetadata().receiveTime` = reception of its last packet, where Chrome exposes it),
+// which splits capture->paint into capture->receive (host pipeline + network, through the
+// page's clock offset), receive->arrival (inside Chrome) and arrival->paint (decode + paint).
 const PAINT_HOOK = `(() => { if (self.__sePaint) return 'present';
   const N = 1 << 15;
   const g = self.__sePaint = { n: 0, last: 0, on: false, max: 0, iv: new Float32Array(1 << 16), k: 0, start: 0,
@@ -570,7 +553,6 @@ const PAINT_READ = `(() => { const g = self.__sePaint; if (!g || !g.on) return n
   return { paints: g.n, window_ms: r2(t - g.start), fps: r2(g.n / ((t - g.start) / 1000)), interval_p50_ms: r2(q(0.5)), interval_p90_ms: r2(q(0.9)), interval_p99_ms: r2(q(0.99)),
     longest_gap_ms: r2(Math.max(g.max, tail)), trailing_gap_ms: r2(tail), gaps_over_50ms: a.filter((x) => x > 50).length, gaps_over_100ms: a.filter((x) => x > 100).length, gaps_over_250ms: a.filter((x) => x > 250).length }; })()`;
 
-// ---------------------------------------------------------------- --tick analysis
 async function collectTick(ev, inWorkers) {
   const page = await ev('window.__seTick ? (window.__seTick.on = false, { vs: window.__seTick.vs, rvfc: window.__seTick.rvfc, mdraw: window.__seTick.mdraw, hooked: window.__seTick.hooked, desync: window.__seTick.desyncApplied, err: window.__seTick.err || null, jbt: window.__seJbt || null, visibility: document.visibilityState }) : null').catch((e) => ({ error: e.message }));
   const ws = (await inWorkers('self.__sePaint ? { reads: self.__sePaint.reads, draws: self.__sePaint.draws } : null')).map((x) => x.value).filter((v) => v && v.reads).sort((a, b) => b.reads.length - a.reads.length)[0] || { reads: [], draws: [] };
@@ -594,12 +576,12 @@ async function collectTick(ev, inWorkers) {
     if (dr != null) { r2draw.push(dr - rcv); const nv = nextV(dr); if (nv != null) r2disp.push(nv - rcv); const pd = prevV(dr); if (pd != null) drawPhase.push(dr - pd); }
     const v = rv.get(ts); if (v) r2dispRvfc.push(v[1] - rcv);
   }
-  // rVFC on a <video> fed by WebRTC itself carries its own receiveTime.
+  // rVFC on a <video> fed by WebRTC itself carries its own receiveTime
   const rvfcOwn = [];
   for (const r of (page && page.rvfc) || []) if (r[3] > 0) rvfcOwn.push(r[1] - r[3]);
   const iv = []; for (let i = 1; i < vs.length; i++) iv.push(vs[i] - vs[i - 1]);
-  // Is the worker's read locked to a periodic clock? Mean resultant length of the read instants
-  // folded onto each candidate period: ~1 = every read at the same phase of that clock, ~0 = none.
+  // is the worker's read locked to a periodic clock? Mean resultant length of the read instants
+  // folded onto each candidate period: ~1 = every read at the same phase of that clock, ~0 = none
   const readsAbs = [...read.values()];
   const lockTo = (P) => { if (!readsAbs.length) return null; let c = 0, sn = 0; for (const t of readsAbs) { const a = (2 * Math.PI * (t % P)) / P; c += Math.cos(a); sn += Math.sin(a); } return +(Math.hypot(c, sn) / readsAbs.length).toFixed(3); };
   const recvAbs = [...recv.values()];
@@ -615,14 +597,13 @@ async function collectTick(ev, inWorkers) {
     receive_to_next_vsync_after_draw_ms: pct(r2disp),
     receive_to_expected_display_rvfc_ms: pct(r2dispRvfc),
     rvfc_own_receive_to_expected_display_ms: pct(rvfcOwn),
-    // Where in the refresh interval things happen: time since the last rAF timestamp. A read
-    // locked to the page's frame clock shows up as a narrow band here.
+    // where in the refresh interval things happen: time since the last rAF timestamp. A read
+    // locked to the page's frame clock shows up as a narrow band here
     phase_lock: Object.fromEntries(periods.map((P) => [P.toFixed(3) + 'ms', { read: lockTo(P), receive: lockRecv(P) }])),
     phase_after_vsync_ms: { receive: pct(recvPhase), read: pct(readPhase), draw: pct(drawPhase), read_within_0_3ms: within(readPhase, 0, 3), receive_within_0_3ms: within(recvPhase, 0, 3) },
   };
 }
 
-// ---------------------------------------------------------------- main
 let chrome = null, chromeExited = true, profile = null, hostStarted = false, dataDir = null, mover = null;
 let remoteChrome = null; // { profile, port, tunnel } when --client
 let cleaned = false;
@@ -648,7 +629,7 @@ async function cleanup(reason) {
     const r = await hostRun(['stop', BIN, dataDir, String(HTTP_PORT), String(HTTPS_PORT)], { timeoutMs: 45_000 });
     const s = kv(r.out);
     R.host.stop = { stop_exit: s.STOP_EXIT, stop_ms: Number(s.STOP_MS), stopped_by: s.STOPPED_BY, left_pid: s.LEFT_PID || null, left_listeners: (s.LEFT_LISTENERS || '').trim() || null, left_procs: (s.LEFT_PROCS || '').trim() || null, stop_output: s.STOP_OUT };
-    // Keep the host log (OTP redacted), then remove the isolated data dir.
+    // keep the host log (OTP redacted) before removing the isolated data dir
     const log = LOCAL ? sh('cat', [path.join(dataDir, 'serve.log')]).out : ssh(`cat '${dataDir}/serve.log'`).out;
     const red = log.split(OTP).join('######');
     const logPath = OUT.replace(/\.json$/, '.serve.log');
@@ -686,13 +667,12 @@ async function main() {
     process.exit(r.status == null ? 1 : r.status);
   }
   if (!LOCAL) await waitRemoteFree();
-  // Armed after the wait for a free remote host, so only the test itself is on the clock.
+  // armed after the wait for a free remote host, so only the test itself is on the clock
   const deadline = setTimeout(() => { R.failures.push(`deadline ${DEADLINE_MS / 1000}s exceeded`); finish(1, 'deadline'); }, LOCAL ? DEADLINE_MS - (Date.now() - T_START) : DEADLINE_MS);
   deadline.unref();
   mover = LOCAL ? ensureLocalMover() : await ensureRemoteMover();
   const motionWin = MOTION_ARG && MOTION_ARG.kind === 'window' ? (LOCAL ? ensureLocalMotionWin() : await ensureRemoteBin(ensureLocalMotionWin(), 'motion-window')) : null;
 
-  // ---- host preflight + start
   const pre = kv((await hostRun(['probe', mover])).out);
   R.host.os = pre.OS;
   R.host.power_source = { start: pre.POWER_SOURCE || null };
@@ -715,7 +695,7 @@ async function main() {
   if (s.READY !== '1') { R.host.start_output = st.out.split(OTP).join('######'); throw new Error('host did not start: ' + (s.ERROR || st.err.trim())); }
   step('host-ready', { pid: R.host.pid, startup_ms: R.host.startup_ms, locked: s.LOCKED_AT_START === '1' });
 
-  // ---- Chrome: fresh profile, nothing of the user's
+  // fresh Chrome profile: nothing of the user's
   const chromeArgs = (port, prof) => [
     ...(flag('headed') && !CLIENT ? [] : ['--headless=new']), `--remote-debugging-port=${port}`, `--user-data-dir=${prof}`,
     '--ignore-certificate-errors', '--autoplay-policy=no-user-gesture-required', '--use-fake-device-for-media-stream',
@@ -729,7 +709,7 @@ async function main() {
   if (CLIENT) {
     const busy = sshC('pgrep -f "ScreenExtend-bench[^ ]* bench" | tr "\\n" " "').out.trim();
     if (busy) throw new Error('the client Mac is busy (ScreenExtend-bench pids ' + busy + ')');
-    // Chrome on the client Mac, headless, its own temp profile there; CDP over an SSH forward.
+    // Chrome on the client Mac, headless, its own temp profile there; CDP over an SSH forward
     const info = sshC(`sw_vers -productVersion; uname -m; '${REMOTE_CHROME}' --version`).out.trim().split('\n');
     R.client.machine = `${CLIENT.split('@').pop()} ${info[1] || ''} macOS ${info[0] || ''}`;
     const rprof = sshC('mktemp -d /tmp/se-e2e-chrome.XXXXXX').out.trim();
@@ -763,7 +743,7 @@ async function main() {
     if (r.exceptionDetails) throw new Error('page threw: ' + JSON.stringify(r.exceptionDetails.exception || r.exceptionDetails.text));
     return r.result.value;
   };
-  // Observation only: keep the peer connections where the harness can read getStats().
+  // observation only: keep the peer connections where the harness can read getStats()
   await page.send('Page.addScriptToEvaluateOnNewDocument', { source: `(() => {
     const P = window.RTCPeerConnection; if (!P) return; window.__pcs = [];
     window.RTCPeerConnection = function (c) { const pc = new P(c); window.__pcs.push(pc); return pc; };
@@ -772,8 +752,8 @@ async function main() {
   })();` });
   if (NO_SCRIPT_TRANSFORM) await page.send('Page.addScriptToEvaluateOnNewDocument', { source: 'try { delete window.RTCRtpScriptTransform; } catch (_) {}' });
   if (JBT0) {
-    // Set in the same task as addTransceiver('video') returns, so nothing yields before the
-    // page installs its transform (which must also happen in that task).
+    // set in the same task as addTransceiver('video') returns, so nothing yields before the
+    // page installs its transform (which must also happen in that task)
     await page.send('Page.addScriptToEvaluateOnNewDocument', { source: `(() => {
       const A = RTCPeerConnection.prototype.addTransceiver;
       window.__seJbt = [];
@@ -819,9 +799,9 @@ async function main() {
     })();` });
   }
   if (TICK) {
-    // Page side of the per-frame timeline: every rAF timestamp (the frame's vsync-aligned begin
+    // page side of the per-frame timeline: every rAF timestamp (the frame's vsync-aligned begin
     // time), rVFC on any <video> the page shows, and a main-thread presenter for a test worker
-    // variant that posts its decoded frames here ({type:'sevf'}) instead of painting them.
+    // variant that posts its decoded frames here ({type:'sevf'}) instead of painting them
     await page.send('Page.addScriptToEvaluateOnNewDocument', { source: `(() => {
       const T = window.__seTick = { on: false, vs: [], rvfc: [], mdraw: [], hooked: 0 };
       const raf = function (ts) { if (T.on && T.vs.length < 40000) T.vs.push(performance.timeOrigin + ts); requestAnimationFrame(raf); };
@@ -864,11 +844,11 @@ async function main() {
       window.Worker.prototype = W.prototype;
     })();` });
   }
-  // The page sizes its display from screen.width/height and devicePixelRatio: pin all three.
+  // the page sizes its display from screen.width/height and devicePixelRatio: pin all three
   await page.send('Emulation.setDeviceMetricsOverride', { width: SIZE_W, height: SIZE_H, deviceScaleFactor: 1, mobile: false, screenWidth: SIZE_W, screenHeight: SIZE_H });
-  // Workers start paused so the paint hook is in place before the video worker's first line.
+  // workers start paused so the paint hook is in place before the video worker's first line.
   // The video worker may be started from a blob: URL, so every dedicated worker gets the hook;
-  // only the one that paints ever records anything.
+  // only the one that paints ever records anything
   const workerSessions = new Map(); // sessionId -> { url, hook }
   R.client.paint_hook = null;
   page.on((d) => {
@@ -893,7 +873,7 @@ async function main() {
   const gpu = await browser.send('SystemInfo.getInfo').catch(() => null);
   R.client.gpu = gpu && gpu.gpu ? { devices: (gpu.gpu.devices || []).map((d) => d.deviceString || `${d.vendorId}:${d.deviceId}`), video_decode: (gpu.gpu.featureStatus || {}).video_decode } : null;
 
-  // Direct first (unless --relay on); a Local Network refusal falls back to the loopback relay.
+  // direct first (unless --relay on); a Local Network refusal falls back to the loopback relay
   const navErrors = [];
   page.on((d) => { if (d.method === 'Network.loadingFailed' && d.params.type === 'Document') navErrors.push(d.params.errorText); });
   await page.send('Network.enable');
@@ -903,8 +883,8 @@ async function main() {
     for (let i = 0; i < tries; i++) { if (await ev('document.readyState === "complete" && !!document.getElementById("joinForm")').catch(() => false)) return true; if (navErrors.length) return false; await sleep(200); }
     return false;
   };
-  // One Fetch handler for both uses: client-file overrides (request stage) and the relay's WHEP
-  // answer rewrite (response stage). Fetch.enable replaces its pattern list, so it is rebuilt.
+  // one Fetch handler for both uses: client-file overrides (request stage) and the relay's WHEP
+  // answer rewrite (response stage). Fetch.enable replaces its pattern list, so it is rebuilt
   let relayFetch = false;
   const enableFetch = () => page.send('Fetch.enable', { patterns: [
     ...OVERRIDES.map((o) => ({ urlPattern: `*/${o.name}*`, requestStage: 'Request' })),
@@ -970,7 +950,6 @@ async function main() {
   for (let i = 0; i < 6; i++) { await sweep(); await sleep(150); }
   if (!(await ev('!document.getElementById("connect").disabled'))) throw new Error('Connect stayed disabled: ' + await ev('document.getElementById("errorMessage").textContent'));
 
-  // ---- join → first paint
   const tJoin = Date.now();
   await ev('document.getElementById("joinForm").requestSubmit()', true);
   let st0 = null;
@@ -994,16 +973,16 @@ async function main() {
     });
     return o; })()`).catch(() => null);
 
-  // ---- settle, then the measured window
+  // settle before the measured window
   await sleep(2000);
   const after = kv((await hostRun(['probe', mover])).out);
   const before = R.host.displays_before || [];
   const nowDisplays = displays(after.DISPLAYS) || [];
   const vd = nowDisplays.find((d) => !before.some((b) => b.id === d.id)) || null;
   R.host.virtual_display = vd;
-  // Geometry evidence ~1-2 s into the session: CGDisplayBounds of every active display and any
+  // geometry evidence ~1-2 s into the session: CGDisplayBounds of every active display and any
   // pair of rectangles that overlap (a display that kept an old origin after a resize sits on top
-  // of another one, and its content is then not where its bounds say).
+  // of another one, and its content is then not where its bounds say)
   const rectsOverlap = (a, b) => a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
   const actives = nowDisplays.filter((x) => x.active);
   R.host.displays_in_session = actives.map((x) => ({ id: x.id, x: x.x, y: x.y, w: x.w, h: x.h, main: x.main, builtin: x.builtin }));
@@ -1019,11 +998,9 @@ async function main() {
   R.quality = { requested: QUALITY == null && ADAPTIVE == null ? null : { quality: QUALITY == null ? null : +QUALITY, adaptive: ADAPTIVE }, join_id_before: join && join.joinId, rate_tier_before: tierOf(st1, join) };
   if (R.quality.requested) {
     if (!join || !join.token) throw new Error('host status has no join named ${DEVICE_NAME} with a device token; cannot pin quality');
-    // The join seeds the device's override with the defaults (quality 15, adaptive off), and
-    // `devices set` only renegotiates when the saved row actually changes, so pinning exactly the
-    // seeded values would change nothing while the live session still runs its join-time
-    // (adaptive) tier. Two steps therefore: a neighbouring quality first, which is a stream-class
-    // change (epoch bump, renegotiation in place), then the requested one.
+    // the join seeds the device's override with the defaults (quality 15, adaptive off), and
+    // `devices set` only renegotiates when the saved row changes: pin a neighbouring quality
+    // first (a stream-class change, so an epoch bump), then the requested one
     const q = QUALITY == null ? 15 : +QUALITY;
     const nudge = q < 51 ? q + 1 : q - 1;
     const tSet = Date.now();
@@ -1035,8 +1012,8 @@ async function main() {
       const reneg0 = count(log0, /is renegotiating in place/g), swap0 = count(log0, /closing the transport this renegotiation replaced/g);
       const ds = await hostRun(['devset', BIN, dataDir, join.token, ...opts], { timeoutMs: 30_000 });
       const rec = { args: opts, exit: Number(kv(ds.out).DEVSET_EXIT), renegotiated: false, output: ds.out.split('\n').filter((l) => l && !/^DEVSET_EXIT=/.test(l)).slice(0, 4) };
-      // Done when the host's log shows the join renegotiating in place AND the transport it
-      // replaced being closed (the new one is carrying the stream). 15 s for each step.
+      // done when the host's log shows the join renegotiating in place AND the transport it
+      // replaced being closed (the new one is carrying the stream). 15 s for each step
       for (let k = 0; k < 30 && !rec.renegotiated; k++) {
         await sleep(500);
         const l = await serveLog();
@@ -1114,8 +1091,8 @@ async function main() {
   for (let i = 0; i < DURATION; i++) {
     await sleep(Math.max(0, ta + (i + 1) * 1000 - Date.now()));
     const tS = (Date.now() - ta) / 1000;
-    // The worker's live counters, straight from the worker: the page's own stats are a once-a-second
-    // copy that silently goes stale when the worker hangs. `null` = no reply in 600 ms (wedged).
+    // the worker's live counters, straight from the worker: the page's own stats are a once-a-second
+    // copy that silently goes stale when the worker hangs. `null` = no reply in 600 ms (wedged)
     const wk = await Promise.race([inWorkers(`(function () { var o = {}; ['framesIn', 'framesDecoded', 'framesRendered', 'framesDroppedBacklog', 'decodeErrors', 'keyRequests', 'inFlight', 'waitingForKey', 'submitsSinceOutput', 'silentTrips', 'configured', 'decoderResets'].forEach(function (k) { try { o[k] = eval(k); } catch (_) {} }); try { o.queue = decoder ? decoder.decodeQueueSize : -1; o.state = decoder ? decoder.state : 'none'; o.sinceOutputMs = lastOutputAtMs ? Math.round(performance.now() - lastOutputAtMs) : null; } catch (_) {} return o; })()`).then((v) => (v.map((x) => x.value).filter((x) => x && typeof x.framesIn === 'number').sort((x, y) => y.framesIn - x.framesIn)[0] || 'no-video-worker')), sleep(600).then(() => null)]);
     const [s, pc, chunk, hs] = await Promise.all([ev('SEVideo.getStats()').catch(() => null), pcStats(), serveLog(logOff), HOST_SERIES ? statusAt() : null]);
     if (hs) {
@@ -1153,7 +1130,7 @@ async function main() {
   R.host.cpu = { start: cpu0, end: cpu1, seconds: cpuS(cpu1) != null && cpuS(cpu0) != null ? +(cpuS(cpu1) - cpuS(cpu0)).toFixed(2) : null };
   if (R.host.cpu.seconds != null) R.host.cpu.pct_of_one_core = +((100 * R.host.cpu.seconds) / ((Date.now() - ta) / 1000)).toFixed(1);
   if (CPU_THROTTLE) {
-    // Is the worker really throttled? Time the same busy loop throttled and unthrottled.
+    // check the worker is really throttled: time the same busy loop throttled and unthrottled
     const busy = '(() => { const t0 = performance.now(); let x = 0; for (let i = 0; i < 3e7; i++) x += i % 7; return performance.now() - t0 + (x < 0 ? 1 : 0); })()';
     const vw = [...workerSessions.entries()].find(([, w]) => w.hook === 'hooked' && /blob:|transform/.test(w.url));
     if (vw) {
@@ -1163,9 +1140,7 @@ async function main() {
       R.client.cpu_throttle.worker_busy_loop_ms = { throttled: t1 && +t1.toFixed(1), unthrottled: t2 && +t2.toFixed(1), ratio: t1 && t2 ? +(t1 / t2).toFixed(2) : null };
     }
   }
-  // The fixed worker's own counter (a top-level binding in the worker; absent in the old one).
-  // The fixed worker's own guard counters (top-level bindings in the worker; absent in the
-  // shipped one, so null there).
+  // guard counters are top-level bindings in the worker; a worker without them reports null
   const guards = (await inWorkers(`(function () { var o = {}; ['keyDecodeGraceHits', 'stallFloorSaves', 'stallFloorSavesKey', 'stallFloorSavesGap', 'stallFloorSavesIdle', 'framesDroppedBacklog', 'keyRequests', 'silentTrips', 'seDeadAt', 'seKeyReqAt', 'seRevivedAt', 'seSwallowed'].forEach(function (k) { try { o[k] = eval(k); } catch (_) { o[k] = null; } }); return o; })()`)).map((x) => x.value).filter((v) => v && typeof v.keyRequests === 'number');
   R.client.worker_guards = guards.sort((x, y) => (y.keyRequests || 0) - (x.keyRequests || 0))[0] || null;
   R.client.key_decode_grace_hits = R.client.worker_guards ? R.client.worker_guards.keyDecodeGraceHits : null;
@@ -1181,10 +1156,9 @@ async function main() {
     const r = await powerP;
     const rows = r.out.split('\n').filter((l) => l.startsWith('PS ')).map((l) => Object.fromEntries(l.slice(3).trim().split(/\s+/).map((x) => x.split('='))));
     const stat = (k) => { const a = rows.map((x) => Number(x[k])).filter((x) => isFinite(x)).sort((x, y) => x - y); if (!a.length) return null; const q = (p) => a[Math.min(a.length - 1, Math.floor(p * a.length))]; return { n: a.length, mean: Math.round(a.reduce((x, y) => x + y, 0) / a.length), p50: q(0.5), p90: q(0.9), min: a[0], max: a[a.length - 1] }; };
-    // PowerTelemetryData refreshes about once a minute (verified on the M1: the sample count
-    // moves by ~59 per refresh). Between two refreshes seen inside the window, delta Accumulated /
-    // delta Count is the exact mean over that span; that is the number to compare, and the
-    // window has to span two refreshes (>= ~120 s) to contain one whole interval.
+    // PowerTelemetryData refreshes about once a minute (~59 samples per refresh on the M1).
+    // Between two refreshes inside the window, delta Accumulated / delta Count is the exact mean
+    // power over that span, so the window must span two refreshes (>= ~120 s) to contain one
     const ups = [];
     for (const x of rows) { const c = Number(x.SystemLoadAccumulatorCount); if (isFinite(c) && (!ups.length || ups[ups.length - 1].count !== c)) ups.push({ t: Number(x.t), count: c, acc_load: Number(x.AccumulatedSystemLoad), acc_in: Number(x.AccumulatedSystemPowerIn), in_count: Number(x.SystemPowerInAccumulatorCount) }); }
     const inside = ups.slice(1); // the first row is whatever value was current when the window began
@@ -1195,7 +1169,6 @@ async function main() {
       system_power_in_mw: stat('SystemPowerIn'), system_load_mw: stat('SystemLoad'), samples: rows };
   }
 
-  // ---- client summary
   const VP = { 0: 'none', 1: 'webcodecs-canvas', 2: 'webcodecs-video(track generator)', 3: 'video-element' };
   const TT = { 0: 'none', 1: 'RTCRtpScriptTransform', 2: 'createEncodedStreams' };
   const RT = { 0: 'none', 1: 'canvas2d', 2: 'VideoTrackGenerator', 3: '<video>' };
@@ -1227,7 +1200,6 @@ async function main() {
   R.client.console = page.events.filter((e) => e.method === 'Log.entryAdded' || e.method === 'Runtime.exceptionThrown' || (e.method === 'Runtime.consoleAPICalled' && /error|warn/.test(e.params.type)))
     .map((e) => (e.method === 'Log.entryAdded' ? `${e.params.entry.level}: ${e.params.entry.text}` : e.method === 'Runtime.exceptionThrown' ? 'EXC ' + JSON.stringify(e.params.exceptionDetails).slice(0, 300) : `${e.params.type}: ${e.params.args.map((x) => x.value || x.description || '').join(' ')}`).slice(0, 300)).slice(0, 60);
 
-  // ---- host summary
   R.host.status_start = hostStart; R.host.status_end = hostEnd;
   const m = mainSession(hostEnd, joinId);
   const jEnd = ourJoin(hostEnd) || join;
@@ -1239,9 +1211,9 @@ async function main() {
     page_screen: await ev('screen.width + "x" + screen.height + "@" + devicePixelRatio').catch(() => null), decoded_frame: pb ? `${pb.width}x${pb.height}` : null };
   if (R.display.actual !== SIZE) R.failures.push(`display ${R.display.actual} != requested ${SIZE}`);
   {
-    // r6+: "[clock] host_now_ns=<n> unix_ns=<n>" pairs the host clock with wall time. Truth for the
-    // page's offset (hostMs - absMs) is host_now_ms - unix_ms; on the same machine the page's
-    // absolute clock is the same wall clock, so the difference is the estimator's error.
+    // "[clock] host_now_ns=<n> unix_ns=<n>" in the host log pairs the host clock with wall time.
+    // The true page offset (hostMs - absMs) is host_now_ms - unix_ms; on the same machine the
+    // page's absolute clock is that wall clock, so the difference is the estimator's error
     const full = await serveLog();
     const cl = [...full.matchAll(/\[clock\][^\n]*?host_now_ns=(\d+)[^\n]*?unix_ns=(\d+)/g)].map((m) => ({ host_now_ns: m[1], unix_ns: m[2], true_offset_ms: Number((BigInt(m[1]) - BigInt(m[2])) / 1000n) / 1000 }));
     const page = R.client.clock && R.client.clock.end;
@@ -1258,21 +1230,21 @@ async function main() {
       frames_encoded_window: (() => { const s0 = mainSession(hostStart, joinId); return s0 ? m.frames_encoded - s0.frames_encoded : null; })(),
       wire: (() => { const s0 = mainSession(hostStart, joinId); if (!s0) return null; const dt = R.client.video.window_s; return { mbps: +((((m.bytes_sent - s0.bytes_sent) * 8) / 1e6) / dt).toFixed(2), frames_per_s: +((m.frames_encoded - s0.frames_encoded) / dt).toFixed(2), submitted_per_s: m.frames_submitted != null && s0.frames_submitted != null ? +((m.frames_submitted - s0.frames_submitted) / dt).toFixed(2) : null }; })(),
       stages: m.stages, degradation: deg, client_reported: m.client,
-      // Whatever else the session object carries that bears on repeats, holds and tuning
+      // whatever else the session object carries that bears on repeats, holds and tuning
       // (encode_repeat lives in stages; rtp_ts_clamped, hold_push_bytes, perf-hold/tuning fields
-      // appear only when non-empty).
+      // appear only when non-empty)
       extras: Object.fromEntries(Object.entries(m).filter(([k]) => /repeat|clamp|hold|perf|tuning|power|synthetic|source|suspen|qp|ceiling|cap|reason|clock/i.test(k))),
-      // Everything the session object carries beyond the fields this harness was written against,
-      // so a new build's telemetry is recorded even before anyone names it here.
+      // every session field this harness does not know, so a new build's telemetry is recorded
+      // before anyone names it here
       new_fields: Object.fromEntries(Object.entries(m).filter(([k]) => !['key', 'capture_backend', 'capture_features', 'encoder', 'frames_encoded', 'bytes_sent', 'stages', 'degradation', 'client', 'frames_submitted', 'host_power', 'encoder_id', 'rate_tier', 'hold_push_bytes', 'hold_push_mode', 'rtp_ts_clamped'].includes(k))),
       new_degradation_fields: Object.keys(deg).filter((k) => !['audio_broadcast_lag_drops', 'bitrate_cuts', 'capture_fallback', 'capture_no_first_frame', 'client_jitter_overruns', 'client_jitter_underruns', 'client_keyframe_requests', 'cursor_composite_us', 'cursor_composites', 'cursor_frames', 'cursor_shape_errors', 'delay_overuse_events', 'encoder_output_drops', 'encoder_rate_drops', 'encoder_resets', 'encoder_tier_fallbacks', 'encoder_transient_errors', 'frames_dropped_broadcast', 'frames_dropped_capture', 'frames_dropped_ring', 'frames_dropped_stale', 'frames_hold_pushed', 'frames_repeated', 'frames_skipped_cadence', 'frames_skipped_unchanged', 'idrs_sent', 'input_parse_errors', 'input_queue_drops', 'input_reorder_drops', 'input_stale_drops', 'keyframe_requests', 'keyframe_requests_suppressed', 'nacks_received', 'pacer_deadline_misses'].includes(k)),
     };
     R.host.counters = Object.fromEntries(Object.entries(deg).filter(([k]) => /^frames_dropped|pacer_deadline_misses|keyframe_requests|client_keyframe_requests|nacks_received|encoder_rate_drops|frames_repeated|frames_hold_pushed|idrs_sent|encoder_output_drops|encoder_tier_fallbacks/.test(k)));
     if (SYNTHETIC && !String(m.capture_backend || '').startsWith('synthetic:')) R.failures.push(`--synthetic ${SYNTHETIC} requested but the host captured with ${m.capture_backend}`);
-    // Fresh captures in the window: capture->encode only counts frames a capture delivered
-    // (repeats and hold pushes do not pass through it).
+    // fresh captures in the window: capture->encode only counts frames a capture delivered
+    // (repeats and hold pushes do not pass through it)
     const s0 = mainSession(hostStart, joinId);
-    // A stage that has not fired yet is absent from the JSON: that is zero captures, not unknown.
+    // a stage that has not fired yet is absent from the JSON: that is zero captures, not unknown
     const cnt = (x, k) => (x && x.stages ? (x.stages[k] ? x.stages[k].count : 0) : null);
     const fresh = s0 && cnt(m, 'capture_to_encode') != null && cnt(s0, 'capture_to_encode') != null ? cnt(m, 'capture_to_encode') - cnt(s0, 'capture_to_encode') : null;
     R.host.session.fresh_captures_window = fresh;
@@ -1285,7 +1257,6 @@ async function main() {
     }
   } else R.failures.push('host status --json reported no session');
 
-  // ---- verdict
   if (RELAY_STALL && !(R.client.relay && R.client.relay.used)) R.failures.push('--relay-stall requested but the relay was not used: no stall was induced');
   if (!(b.framesPainted > 0)) R.failures.push('no frame painted');
   if (b.decodeErrors > 0) R.failures.push(`decode errors: ${b.decodeErrors}`);
@@ -1300,7 +1271,7 @@ async function main() {
     if (R.client.video.frames_dropped_window > 0) R.failures.push(`client dropped ${R.client.video.frames_dropped_window} frames`);
   }
 
-  // ---- leave cleanly, close the browser
+  // navigating away is the clean leave (pagehide)
   await page.send('Page.navigate', { url: 'about:blank' }).catch(() => {}); await sleep(1200);
   await browser.send('Browser.close').catch(() => {});
   if (CLIENT) { await sleep(1500); chromeExited = !sshC(`pgrep -f '${remoteChrome.profile}'`).out.trim(); }

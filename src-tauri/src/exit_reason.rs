@@ -1,17 +1,10 @@
 //! Why the host process ended, written down before it does.
 //!
-//! A host that is gone leaves almost nothing behind. The log bus is a 2000-line ring in memory,
-//! so it dies with the process; the lock file is `mem::forget`ed at startup and is byte-identical
-//! whether the process quit deliberately or was terminated; and a clean `exit(0)` produces no
-//! Application-log event and no crash dump. The observable evidence of a host that "vanished
-//! during a settings change" and of one the user quit from the menu is therefore *the same
-//! evidence*, which is why a report of the first could not be told from the second.
-//!
-//! So every deliberate exit route records itself here first. [`record`] stores the reason in the
-//! process and appends it to a one-line breadcrumb file beside the lock, and the next launch
-//! reads it back into the log ([`report_previous`]). A process that is gone with **no** breadcrumb
-//! did not leave through any route this crate owns — which is the distinction the silent-exit
-//! report needed and could not make.
+//! Nothing else tells a deliberate quit from a kill: the log ring dies with the process, the lock
+//! file is identical either way, and a clean `exit(0)` leaves no event and no crash dump. So
+//! every deliberate exit route calls [`record`], which writes a one-line breadcrumb beside the
+//! lock, and the next launch logs it ([`report_previous`]). A process gone with no breadcrumb
+//! left through no route this crate owns.
 //!
 //! The file is a diagnostic, never a decision: nothing reads it to choose behaviour, a missing or
 //! corrupt one is not an error, and it is rewritten (not appended to) so it cannot grow.
@@ -23,7 +16,7 @@ use std::sync::Mutex;
 pub const EXIT_FILE: &str = "screenextend.exit";
 
 /// Where to write the breadcrumb, remembered once so an exit route with no `AppHandle` in reach
-/// — the Ctrl+C handler, a `RunEvent` callback — can still record one.
+/// (the Ctrl+C handler, a `RunEvent` callback) can still record one.
 static DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 /// The reason this process recorded, if any. Read by the `RunEvent` handler to tell an exit
@@ -78,7 +71,6 @@ fn write_breadcrumb(path: &Path, reason: &str) {
     let _ = std::fs::write(path, breadcrumb_line(now, std::process::id(), reason));
 }
 
-/// What a breadcrumb says, once parsed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Breadcrumb {
     pub unix_secs: u64,
@@ -86,7 +78,7 @@ pub struct Breadcrumb {
     pub reason: String,
 }
 
-/// Parse one breadcrumb line. `None` for anything that is not one — an empty file, a truncated
+/// Parse one breadcrumb line. `None` for anything that is not one: an empty file, a truncated
 /// write, a file some other tool put there.
 pub fn parse(contents: &str) -> Option<Breadcrumb> {
     let line = contents.lines().next()?.trim();
@@ -112,9 +104,8 @@ pub fn previous(dir: &Path) -> Option<Breadcrumb> {
 
 /// Put the previous instance's exit reason into this instance's log, then clear it.
 ///
-/// Clearing is what makes the absence meaningful: after this, a breadcrumb on disk describes the
-/// currently running process, so a host that disappears without writing one can be said to have
-/// left through no route this crate owns.
+/// Clearing is what makes absence meaningful: after this, a breadcrumb on disk describes the
+/// running process.
 pub fn report_previous(dir: &Path) {
     if let Some(b) = previous(dir) {
         tprintln!(
@@ -176,7 +167,7 @@ mod test {
     /// loop was asked to exit", which is the one sentence that says nothing.
     #[test]
     fn the_first_reason_wins() {
-        // The statics are process-global, so this test owns them: it is the only one that writes.
+        // statics are process-global: this is the only test that writes them
         assert_eq!(recorded(), None, "another test recorded a reason first");
         record("exit_app: the desktop UI asked to quit");
         record("run loop: ExitRequested");

@@ -1,32 +1,24 @@
 //! Per-stage frame timing and degradation counters.
 //!
-//! Every timestamp here is nanoseconds off the one host clock the rest of the streamer already
-//! shares, [`crate::streamer::audio::host_now_ns`] — the same epoch the video RTP timestamps and
-//! the audio `capture_ns` ride, so a number from this module is directly comparable with one the
-//! client reports back over `OP::STATS`.
+//! Every timestamp is nanoseconds on the shared host clock,
+//! [`crate::streamer::audio::host_now_ns`]: the epoch the video RTP timestamps and the audio
+//! `capture_ns` ride, so a number from this module compares directly with one the client reports
+//! over `OP::STATS`.
 //!
-//! Two constraints shape the implementation:
-//!
-//! - **Nothing here allocates, locks, or logs.** `record` is three relaxed `fetch_add`s and a
-//!   `fetch_max` into a fixed array. The video capture callbacks and the audio capture thread are
-//!   real-time contexts; a mutex or a `tprintln!` on that path would cost more than the stage it
-//!   is measuring (every logbus line is a JSON IPC event to the UI).
-//! - **Distributions, not means.** An average hides exactly the tail that is felt. Histograms are
-//!   fixed log-scale buckets, so p50/p90/p99 come out of a bounded array with no sample storage.
+//! Nothing on the record path allocates, locks or logs: the capture callbacks and the audio
+//! capture thread are real-time contexts. Histograms are fixed log-scale buckets, so percentiles
+//! need no sample storage.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-/// Sub-buckets per power of two. 8 gives at most ~9% width at any magnitude, which is finer than
-/// the measurement noise on a millisecond-scale stage and still only 512 counters.
+/// Sub-buckets per power of two, as a shift: 8 gives at most ~9% bucket width for 512 counters.
 const SUB_BITS: u32 = 3;
 const SUBS: usize = 1 << SUB_BITS;
 const OCTAVES: usize = 64;
 const BUCKETS: usize = OCTAVES * SUBS;
 
-/// Lower bound of the bucket a value falls in, and back again.
-///
-/// Values below `SUBS` get their own bucket each, which keeps sub-microsecond stages honest.
+/// Bucket index for a value. Values below `SUBS` get a bucket each.
 #[inline]
 fn bucket_of(ns: u64) -> usize {
     if ns < SUBS as u64 {
@@ -47,9 +39,8 @@ fn bucket_lower_bound(bucket: usize) -> u64 {
         return u64::MAX;
     }
     let octave = bucket >> SUB_BITS;
-    // `bucket_of` gives every value below `SUBS` its own index and maps everything else to an
-    // octave of at least `SUB_BITS`, so indices in between are unreachable. Pin them to the
-    // first reachable value; a caller walking indices then still sees a monotonic sequence.
+    // indices between `SUBS` and the first real octave are unreachable from `bucket_of`: pin
+    // them to the first reachable value so a walk over indices stays monotonic
     if octave < SUB_BITS as usize {
         return SUBS as u64;
     }
@@ -73,7 +64,7 @@ impl HistSnapshot {
         self.count == 0
     }
 
-    /// `p50/p90/p99/max` in milliseconds — never a bare mean, which is what hides the tail.
+    /// `p50/p90/p99/max` in milliseconds.
     pub fn brief(&self) -> String {
         format!(
             "{:.2}/{:.2}/{:.2}/{:.2}",
@@ -92,7 +83,7 @@ pub struct Histogram {
     max_ns: AtomicU64,
 }
 
-/// The derived form would print 512 buckets. Print what a reader wants instead.
+/// The derived form would print 512 buckets.
 impl std::fmt::Debug for Histogram {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = self.snapshot();
@@ -134,7 +125,7 @@ impl Histogram {
     }
 
     /// Record `end - start`, skipping the sample when either stamp is missing (0) or the pair is
-    /// out of order. A stage that never fires reports `count == 0`, which is itself the finding.
+    /// out of order. A stage that never fires reports `count == 0`, which is itself the signal.
     #[inline]
     pub fn record_span(&self, start_ns: u64, end_ns: u64) {
         if start_ns == 0 || end_ns == 0 || end_ns < start_ns {
@@ -191,20 +182,16 @@ impl Histogram {
 
 /// The stamps one frame collects on its way from the compositor to the socket.
 ///
-/// `capture_available_ns` is the timestamp the OS attached to the frame itself — WGC's
-/// `SystemRelativeTime`, DXGI's `LastPresentTime`, CGDisplayStream's `displayTime`, ScreenCaptureKit's
-/// PTS. It is the only stamp that says when the pixels existed rather than when we noticed them,
-/// so `capture_available_ns -> capture_cb_entry_ns` is the delivery latency the host itself adds
-/// before doing any work. Zero means the backend did not supply one.
+/// `capture_available_ns` is the OS's own stamp on the frame (WGC `SystemRelativeTime`, DXGI
+/// `LastPresentTime`, CGDisplayStream `displayTime`, ScreenCaptureKit PTS): when the pixels
+/// existed, not when the callback ran, so `capture_available_ns -> capture_cb_entry_ns` is the
+/// host's own delivery latency. Zero means the backend did not supply one.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FrameTiming {
-    /// True for a frame the encoder re-emitted because the picture did not change — the idle
-    /// repeater and the ring keepalive. Such a frame was never captured, so its "capture"
-    /// stamps are the moment the repeater woke up and the end-to-end spans would read as
-    /// near-zero. On a static desktop repeats are the *majority* of frames (measured: 145 of
-    /// 235 over 30 s), so folding them into the end-to-end histograms would put the p50 on the
-    /// repeater and leave only the tail describing real capture. They are counted, and their
-    /// encode and transport stages are still real, but the capture-relative spans are not.
+    /// True for a frame the encoder re-emitted because the picture did not change (the idle
+    /// repeater and the ring keepalive). It was never captured, so its capture-relative spans
+    /// are not recorded: on a static desktop repeats are most frames (145 of 235 over 30 s) and
+    /// would put the p50 on the repeater. Its encode and transport stages are still real.
     pub repeated: bool,
     pub capture_available_ns: u64,
     pub capture_cb_entry_ns: u64,
@@ -261,7 +248,7 @@ impl FrameTiming {
     }
 
     /// The stamp to measure end-to-end host latency from: the OS frame time when the backend
-    /// gave us one, else our own callback entry.
+    /// supplied one, else callback entry.
     #[inline]
     pub fn origin_ns(&self) -> u64 {
         if self.capture_available_ns != 0 {
@@ -272,17 +259,16 @@ impl FrameTiming {
     }
 }
 
-/// `SE_FRAME_TRACE=1`: one log line per frame with every stamp, for slicing an exact time window
-/// out of a live session (the histograms are cumulative from join and have no reset). Off by
-/// default; it is read once. It runs from `record_frame`, which the RTP writer calls *after* the
-/// frame's last packet is written, so the formatting cannot delay the frame it describes.
+/// `SE_FRAME_TRACE=1`: one log line per frame with every stamp, for slicing a time window out of
+/// a live session (the histograms are cumulative from join). Read once. The line is written
+/// after the frame's last packet, so formatting cannot delay the frame it describes.
 pub fn frame_trace_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("SE_FRAME_TRACE").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| crate::envcfg::var("SE_FRAME_TRACE").is_ok_and(|v| v == "1"))
 }
 
 fn trace_frame(t: &FrameTiming) {
-    // Spans in microseconds, each relative to the previous stamp that was set; 0 = not stamped.
+    // spans in microseconds from the previous stamp that was set; 0 = not stamped
     let us = |a: u64, b: u64| {
         if a == 0 || b == 0 || b < a {
             0
@@ -338,15 +324,15 @@ stages! {
     encode => "encode",
     // A re-submitted picture's time inside the encoder (keepalive repeat, forced-keyframe repeat,
     // macOS hold push). Kept out of `encode`: on a one-frame-hold encoder it is waiting for the
-    // next submit, not work (measured `encode` p50 201 ms on a still screen before the split).
+    // next submit, not work (folded in, `encode` p50 read 201 ms on a still screen).
     encode_repeat => "encode_repeat",
     packetize => "packetize",
     socket_write => "socket_write",
     pace_wait => "pace_wait",
     capture_to_encode_done => "capture_to_encode",
     capture_to_socket => "capture_to_socket",
-    // Input. Recorded per event by `streamer::input`, not per frame, so these three are the
-    // only stages `record_frame` does not feed. See `docs/INPUT-PROTOCOL.md`.
+    // input: recorded per event by `streamer::input`, not per frame, so these three are the
+    // only stages `record_frame` does not feed
     input_recv => "input_recv",
     input_queue => "input_queue",
     input_inject => "input_inject",
@@ -373,9 +359,8 @@ counters! {
     capture_fallback => "capture_fallback",
     capture_no_first_frame => "capture_no_first_frame",
     frames_repeated => "frames_repeated",
-    // `frames_hold_pushed`: of `frames_repeated`, the repeats the macOS encode loop submitted to
-    // push a held frame out of a one-frame-hold encoder (`hold_push_mode`), not because the
-    // keepalive was due. Always 0 on an encoder that does not hold.
+    // `frames_hold_pushed`: of `frames_repeated`, those submitted to push a held frame out of a
+    // one-frame-hold encoder (macOS `hold_push_mode`), not for the keepalive; 0 on other encoders
     frames_hold_pushed => "frames_hold_pushed",
     // `hold_push_suspensions`: times the macOS hold push left immediate mode because pushing was
     // making real frames slower (the efficacy guard, or captured frames waiting for the cap).
@@ -385,27 +370,21 @@ counters! {
     frames_dropped_ring => "frames_dropped_ring",
     frames_dropped_broadcast => "frames_dropped_broadcast",
     frames_dropped_stale => "frames_dropped_stale",
-    // `frames_dropped_capture`: presents the OS coalesced away because we were still busy with
-    // the previous frame — DXGI's `AccumulatedFrames` past the first, which was read only as an
-    // early-out and never counted.
+    // `frames_dropped_capture`: presents the OS coalesced away while the previous frame was still
+    // in hand (DXGI's `AccumulatedFrames` past the first)
     frames_dropped_capture => "frames_dropped_capture",
     // `frames_skipped_unchanged`: frames the compositor reported no dirty region for and the
-    // capture path therefore did not encode. It went uncounted for the whole of its first life,
-    // which is why a scene it was silently eating — a pointer moving over a still desktop, where
-    // the dirty-region report is empty and the picture has still changed — looked identical in
-    // every host number to a scene where nothing had happened at all.
+    // capture path therefore did not encode. A pointer moving over a still desktop is one such
+    // scene: the dirty-region report is empty and the picture has still changed.
     frames_skipped_unchanged => "frames_skipped_unchanged",
     // `frames_skipped_cadence`: frames dropped because the display composes faster than the rate
-    // this device asked for. Not a degradation — it is the cap doing its job — but the two must
-    // be distinguishable from each other and from a frame nobody dropped on purpose.
+    // this device asked for. Not a degradation (it is the cap doing its job), but it must be
+    // distinguishable from `frames_skipped_unchanged` and from a frame nobody dropped on purpose.
     frames_skipped_cadence => "frames_skipped_cadence",
     // `cursor_frames`: frames emitted because the *pointer* moved and nothing else did. On an
-    // indirect display the compositor produces no frame for pointer-only motion, so before the
-    // host drew the cursor itself these were not slow frames — they did not exist, and the
-    // keepalive repeat carried the pointer wherever it had last been composited.
-    // `cursor_composites` / `cursor_composite_us`: how many sprite draws happened and the total
-    // CPU time spent submitting them, so the mean per composite is one division. GPU time is not
-    // in it; that shows up in `capture_to_socket`.
+    // indirect display the compositor produces no frame for pointer-only motion.
+    // `cursor_composites` / `cursor_composite_us`: sprite draws and the total CPU time spent
+    // submitting them. GPU time is not in it; that shows up in `capture_to_socket`.
     // `cursor_shape_errors`: cursors whose bitmap could not be converted. A host with a moving
     // count is drawing no pointer at all for that shape.
     cursor_frames => "cursor_frames",
@@ -432,15 +411,46 @@ counters! {
     input_queue_drops => "input_queue_drops",
     input_stale_drops => "input_stale_drops",
     // `input_reorder_drops`: fast-channel frames whose sequence number was behind one already
-    // injected — the channel is unordered and zero-retransmit, so this is reorder, not loss.
+    // injected (the channel is unordered and zero-retransmit, so this is reorder, not loss).
     // `input_parse_errors`: frames the input parser rejected; a drifted client page shows up
     // here and nowhere else.
     input_reorder_drops => "input_reorder_drops",
     input_parse_errors => "input_parse_errors",
+    // `capture_access_denied_waits`: times the capture found the desktop refused to it (the
+    // secure desktop, the lock screen, a session switch) and waited for it to come back.
+    // `capture_format_skips`: captured surfaces skipped because they could not be converted.
+    capture_access_denied_waits => "capture_access_denied_waits",
+    capture_format_skips => "capture_format_skips",
+    // `capture_lost`: the captured display went away under a running capture.
+    // `capture_stopped`: the capture ended for good while its session was still open.
+    capture_lost => "capture_lost",
+    // `ring_slot_quarantines`: ring slots taken out of service after their keyed mutex could not
+    // be acquired or handed on. Kept apart from `encoder_resets`, which counts a ring that gave
+    // up.
+    ring_slot_quarantines => "ring_slot_quarantines",
+    capture_stopped => "capture_stopped",
+    // `capture_first_frame_reopens`: captures that opened, delivered no frame within their bound
+    // and were opened again before the session was handed over.
+    capture_first_frame_reopens => "capture_first_frame_reopens",
+    // `input_contact_stale_drops`: pen and touch positions dropped because the stroke had moved
+    // on (older than a second when reached), or refused while a stalled injector's queue was
+    // full. Downs, ups and cancels are never dropped.
+    input_contact_stale_drops => "input_contact_stale_drops",
+    // `capture_dark_rebuilds`: renegotiations because a capture answered without a first frame
+    // stayed dark (Windows, `capture_late_first_frame`).
+    capture_dark_rebuilds => "capture_dark_rebuilds",
+    // `capture_never_ready`: sessions answered before their capture opened whose monitor never
+    // handed out a capture item within the wait's budget, and were ended (Windows).
+    capture_never_ready => "capture_never_ready",
+    // `keyframes_for_packet_distance`: IDRs a viewer was sent because a delta was about to get
+    // `PACKET_DISTANCE_LIMIT` sequence numbers from its keyframe (`keyframe::PacketDistance`).
+    keyframes_for_packet_distance => "keyframes_for_packet_distance",
+    // `packet_distance_asks_refused`: those asks the gate's window refused; each is retried.
+    packet_distance_asks_refused => "packet_distance_asks_refused",
 }
 
-/// What a client last told us about its own half of the path. Written by the `OP::STATS` parser,
-/// read by `status --json` and the log summary; see `docs/TELEMETRY.md` for the wire layout.
+/// What a client last reported about its own half of the path. Written by the `OP::STATS`
+/// parser, read by `status --json` and the log summary.
 #[derive(Clone, Debug, Default)]
 pub struct ClientStats {
     pub received_host_ns: u64,
@@ -465,9 +475,8 @@ pub struct ClientStats {
     pub audio_overruns: u32,
     pub clock_offset_valid: bool,
     pub rtt_us: u32,
-    // v2 tail. All zero when the client only sent the 72-byte v1 prefix, which is also the
-    // "not measured" value for every one of them, so a v1 client is indistinguishable from a
-    // v2 client that could not measure anything — as it should be.
+    // v2 tail: all zero when the client sent only the 72-byte v1 prefix, which is also the
+    // "not measured" value for every one of them
     pub transport_tier: u8,
     pub render_tier: u8,
     pub key_tier: u8,
@@ -478,10 +487,18 @@ pub struct ClientStats {
     pub audio_concealed: u32,
     pub audio_output_latency_us: u32,
     /// v3 tail. A redundant Opus copy that filled a real hole, and one that arrived for a
-    /// packet the client already had — the benefit and the cost of `FLAG_REDUNDANT`. A
+    /// packet the client already had: the benefit and the cost of `FLAG_REDUNDANT`. A
     /// client older than v3 leaves both at 0, which is also what "never sent one" means.
     pub audio_redundant_used: u32,
     pub audio_redundant_discarded: u32,
+    /// v4 tail. A client slower than its stream: decoder resets to a keyframe because it fell
+    /// behind, decoded frames left unpainted because a newer one was ready, the most time a
+    /// frame lost on the client over the last second, and the state (`video_late_state_name`).
+    /// Reported only; nothing on the host acts on them yet.
+    pub video_catch_ups: u32,
+    pub video_frames_stale: u32,
+    pub video_late_peak_us: u32,
+    pub video_late_state: u8,
 }
 
 pub mod client_flags {
@@ -536,8 +553,19 @@ pub fn sink_tier_name(code: u8) -> &'static str {
     }
 }
 
-/// Names for the v2 degradation bits, in bit order. Every one was a bare `catch (_) {}` or an
-/// untaken branch on the client before it became a bit here.
+/// The v4 `video_late_state` byte: where a client that may be slower than its stream stands.
+pub fn video_late_state_name(code: u8) -> &'static str {
+    match code {
+        0 => "in-step",
+        1 => "skipping-stale-paints",
+        2 => "behind",
+        3 => "catching-up",
+        _ => "unknown",
+    }
+}
+
+/// Names for the v2 degradation bits, in bit order. Each is a silent fallback on the client: a
+/// swallowed `catch` or an untaken branch.
 pub const CLIENT_DEGRADED_NAMES: [&str; 25] = [
     "fullscreen_refused",
     "pointer_lock_refused",
@@ -592,7 +620,7 @@ pub fn audio_path_name(code: u8) -> &'static str {
         1 => "worklet+sab",
         2 => "worklet+postmessage",
         3 => "opus-track",
-        // The private ring fed over a `MessagePort` (`AUDIO_PATH.workletPort` in index.html).
+        // the private ring fed over a `MessagePort` (`AUDIO_PATH.workletPort` in index.html)
         4 => "worklet+port",
         _ => "unknown",
     }
@@ -609,16 +637,15 @@ pub struct SessionTelemetry {
     /// macOS encode loop only (absent from the JSON while zero), so `frames_submitted -
     /// frames_encoded` is what the encoder took and never returned with a picture.
     pub frames_submitted: AtomicU64,
-    /// Host power state at session start (`low_power_mode=… thermal=…`), when the macOS
+    /// Host power state at session start (`low_power_mode=... thermal=...`), when the macOS
     /// `power_report` tuning candidate is on. Empty otherwise.
     pub host_power: Slot<String>,
     /// `(frames_encoded, host_ns)` at the last summary line, so the next one can report a
-    /// delivered *rate*. A running total cannot distinguish a path keeping up at 60 fps from
-    /// one silently delivering 45.
+    /// delivered rate.
     last_rate_sample: std::sync::Mutex<(u64, u64)>,
     pub bytes_sent: AtomicU64,
     pub encoder: Slot<String>,
-    /// The encoder implementation VideoToolbox picked (`h264.rtvc`, `ave.avc`, `h264.gva`…).
+    /// The encoder implementation VideoToolbox picked (`h264.rtvc`, `ave.avc`, `h264.gva`, ...).
     /// macOS only; absent from the JSON while empty.
     pub encoder_id: Slot<String>,
     /// The macOS rate-control tier (`BaseFrameQp`, `ClampCeiling`, `LowLatencyBitrate`,
@@ -649,18 +676,34 @@ pub struct SessionTelemetry {
     /// tick after it instead (the RTP writer keeps it strictly increasing). Absent while zero.
     pub rtp_ts_clamped: AtomicU64,
     pub capture_backend: Slot<String>,
-    /// Which optional knobs of the chosen capture backend this OS build actually exposed. Empty
-    /// where the backend has no such tiering. Reported so a latency number can be read against
-    /// the feature set that produced it rather than against the backend name alone.
+    /// Frames the capture API handed over, before any gate or encode: WGC callbacks, DXGI
+    /// acquires that returned a desktop surface. Moves on the first delivery, which is what tells
+    /// an open capture that delivers nothing from a slow one.
+    pub capture_frames_arrived: AtomicU64,
+    /// The peer connection reached `Connected`: a client is there, picture or not.
+    pub transport_connected: std::sync::atomic::AtomicBool,
+    /// The session was answered before its capture opened (Windows, `answer_before_capture`):
+    /// the client is told the picture is pending until the first frame leaves the host.
+    pub picture_pending: std::sync::atomic::AtomicBool,
+    /// That capture is still waiting for its monitor to hand out a capture item.
+    pub capture_waiting: std::sync::atomic::AtomicBool,
+    /// The capture backend that delivered the session's first frame. Empty until one has, and on
+    /// backends that do not report it.
+    pub first_frame_backend: Slot<String>,
+    /// Which optional knobs of the chosen capture backend this OS build exposed. Empty where the
+    /// backend has no such tiering.
     pub capture_features: Slot<String>,
     pub client: Slot<Option<ClientStats>>,
+    /// The Windows QP and frame-rate governor: feedback in from the transport, the frame-rate
+    /// divisor out to the capture gate, and its state for `status --json` (`link_governor`).
+    #[cfg(windows)]
+    pub link: crate::windows_utils::streamer::governor::LinkShared,
 }
 
 /// One value behind a lock.
 ///
-/// Only slow paths touch these — a backend naming itself once at startup, a client stats frame
-/// arriving once a second, a reader building a report — never the frame path, which is why a
-/// plain `Mutex` is the right thing here and an atomic would not be.
+/// Slow paths only (a backend naming itself at startup, a client stats frame once a second, a
+/// reader building a report), never the frame path, so a plain `Mutex` is enough.
 #[derive(Default)]
 pub struct Slot<T>(std::sync::Mutex<T>);
 
@@ -691,10 +734,14 @@ pub fn clock_pair() -> (u64, u64) {
 }
 
 impl SessionTelemetry {
-    /// Record a client stats frame, mirroring the two jitter counters into `degradation` so a
-    /// starving or spilling audio ring shows up beside the host-side degradations instead of
-    /// only inside the client blob. The client reports cumulative totals, so these are stored,
-    /// not added.
+    /// Answered before its capture opened, and no frame has left the host yet.
+    pub fn picture_pending_now(&self) -> bool {
+        self.picture_pending.load(Ordering::Relaxed) && self.bytes_sent.load(Ordering::Relaxed) == 0
+    }
+
+    /// Record a client stats frame, mirroring the two jitter counters into `degradation` so
+    /// they show beside the host-side ones. The client reports cumulative totals, so these are
+    /// stored, not added.
     pub fn set_client_stats(&self, stats: ClientStats) {
         self.degradation
             .client_jitter_underruns
@@ -728,9 +775,8 @@ impl SessionTelemetry {
             .scale
             .record_span(t.capture_cb_entry_ns, t.scale_done_ns);
         if t.repeated {
-            // Nothing queued it (its stamps are the repeater's own), and what follows the submit
-            // is not encode work on a holding encoder: a separate stage, out of `encode` and
-            // `encode_queue`.
+            // a repeat was never queued, and on a holding encoder what follows the submit is
+            // not encode work: its own stage, out of `encode` and `encode_queue`
             self.stages
                 .encode_repeat
                 .record_span(t.encode_submit_ns, t.encode_done_ns);
@@ -834,21 +880,30 @@ impl SessionTelemetry {
                     key_tier_name(c.key_tier),
                     sink_tier_name(c.sink_tier),
                 ));
-                // A non-zero degradation field is the most useful line a support conversation
-                // can start from, so it is named rather than printed as a hex mask.
+                // named, not a hex mask: this is where a support conversation starts
                 let degraded = client_degraded_list(c.degraded_flags);
                 if !degraded.is_empty() {
                     s.push_str(&format!(" degraded={}", degraded.join(",")));
                 }
             }
-            // Read as a pair: `used` climbing while `concealed` stays flat is redundancy
-            // working, and `discarded` climbing with `used` at zero is payload spent on a link
-            // that did not need it, which points at the send-side threshold rather than at the
-            // client. Printed only when the feature actually did something.
+            // read as a pair: `used` climbing while `concealed` stays flat is redundancy
+            // working; `discarded` climbing with `used` at zero is payload spent on a link
+            // that did not need it (the send-side threshold, not the client)
             if c.version >= 3 && (c.audio_redundant_used > 0 || c.audio_redundant_discarded > 0) {
                 s.push_str(&format!(
                     " redundant={}used/{}discarded",
                     c.audio_redundant_used, c.audio_redundant_discarded
+                ));
+            }
+            // a client that cannot keep up: printed only once it has had to act
+            if c.version >= 4
+                && (c.video_catch_ups > 0 || c.video_frames_stale > 0 || c.video_late_state != 0)
+            {
+                s.push_str(&format!(
+                    " late={}/{}catchups/{}stale",
+                    video_late_state_name(c.video_late_state),
+                    c.video_catch_ups,
+                    c.video_frames_stale
                 ));
             }
         }
@@ -933,6 +988,11 @@ impl SessionTelemetry {
                 "audio_output_latency_ms": c.audio_output_latency_us as f64 / 1000.0,
                 "audio_redundant_used": c.audio_redundant_used,
                 "audio_redundant_discarded": c.audio_redundant_discarded,
+                "video_catch_ups": c.video_catch_ups,
+                "video_frames_stale": c.video_frames_stale,
+                "video_late_peak_ms": c.video_late_peak_us as f64 / 1000.0,
+                "video_late_state": video_late_state_name(c.video_late_state),
+                "video_late_state_code": c.video_late_state,
             })
         });
         let mut out = serde_json::json!({
@@ -957,6 +1017,10 @@ impl SessionTelemetry {
         if !encoder_id.is_empty() {
             out["encoder_id"] = serde_json::json!(encoder_id);
         }
+        let first_frame = self.first_frame_backend.get();
+        if !first_frame.is_empty() {
+            out["first_frame_backend"] = serde_json::json!(first_frame);
+        }
         let rate_tier = self.rate_tier.get();
         if !rate_tier.is_empty() {
             out["rate_tier"] = serde_json::json!(rate_tier);
@@ -979,6 +1043,10 @@ impl SessionTelemetry {
                 "steps": self.qp_ceiling_steps.load(Ordering::Relaxed),
             });
         }
+        #[cfg(windows)]
+        if let Some(v) = self.link.to_json() {
+            out["link_governor"] = v;
+        }
         let (host_now_ns, unix_ns) = clock_pair();
         out["clock"] = serde_json::json!({ "host_now_ns": host_now_ns, "unix_ns": unix_ns });
         let hold_push_guard = self.hold_push_guard.get();
@@ -993,11 +1061,10 @@ impl SessionTelemetry {
     }
 }
 
-/// Process-wide registry, keyed the way sessions are: by client IP.
+/// Process-wide registry, keyed the way sessions are: by join id.
 ///
-/// It exists because the reader is usually not the writer's thread and sometimes not even the
-/// writer's process — `ScreenExtend status --json` asks the running host over the single-instance
-/// control socket, and this is what that request reads.
+/// The reader is usually another thread and sometimes another process: `ScreenExtend status
+/// --json` asks the running host over the single-instance control socket, which reads this.
 pub type Registry = std::sync::Mutex<std::collections::HashMap<String, SharedTelemetry>>;
 
 static REGISTRY: std::sync::OnceLock<Registry> = std::sync::OnceLock::new();
@@ -1012,8 +1079,8 @@ pub fn register(key: &str) -> SharedTelemetry {
     t
 }
 
-/// Put an existing handle in the registry. The pipeline makes its own at start, before the
-/// client IP is known to it, so the server publishes it once the session has a key.
+/// Put an existing handle in the registry. The pipeline makes its own at start, before it knows
+/// the session's key, so the server publishes it once the session has one.
 pub fn publish(key: &str, telemetry: SharedTelemetry) {
     if let Ok(mut g) = registry().lock() {
         g.insert(key.to_string(), telemetry);
@@ -1030,8 +1097,7 @@ pub fn unregister(key: &str) {
 ///
 /// A renegotiated join publishes a second session's handle under the same join id, and the
 /// superseded session's teardown runs after that (as soon as the new transport connects). A plain
-/// `unregister` there removed the live session's telemetry, so `status --json` lost the join from
-/// its first settings edit on.
+/// `unregister` there would remove the live session's telemetry.
 pub fn unregister_if(key: &str, mine: &SharedTelemetry) {
     if let Ok(mut g) = registry().lock() {
         if g.get(key).is_some_and(|t| Arc::ptr_eq(t, mine)) {
@@ -1056,9 +1122,8 @@ pub fn snapshot_json() -> serde_json::Value {
         all().into_iter().map(|(k, v)| (k, v.to_json())).collect();
     serde_json::json!({
         "sessions": sessions,
-        // Peer connections, ICE agents and injector threads that have not been given back.
-        // It should equal the number of live sessions; a number that only climbs across joins
-        // is the leak this counter exists to make falsifiable.
+        // peer connections, ICE agents and injector threads not yet given back: equals the
+        // number of live sessions unless something leaks
         "live_transport_sessions": crate::streamer::webrtc_session::live_sessions(),
     })
 }
@@ -1066,8 +1131,8 @@ pub fn snapshot_json() -> serde_json::Value {
 /// Interval for the verbose one-line summary. Chosen so a 30 s baseline run yields six lines.
 pub const SUMMARY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Start the summary printer. It is a plain OS thread on a 5 s timer, deliberately not a task on
-/// the streaming runtime and never anywhere near the frame path.
+/// Start the summary printer: a plain OS thread on a timer, deliberately not a task on the
+/// streaming runtime.
 pub fn spawn_summary_printer(stop: Arc<std::sync::atomic::AtomicBool>) {
     std::thread::Builder::new()
         .name("telemetry-summary".into())
@@ -1091,6 +1156,38 @@ pub fn spawn_summary_printer(stop: Arc<std::sync::atomic::AtomicBool>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_and_ring_counters_extend_the_list_without_moving_it() {
+        let t = SessionTelemetry::new_shared();
+        t.degradation
+            .ring_slot_quarantines
+            .fetch_add(2, Ordering::Relaxed);
+        let labels: Vec<&str> = t.degradation.each().iter().map(|(k, _)| *k).collect();
+        let tail = &labels[labels.len() - 12..];
+        assert_eq!(
+            tail,
+            [
+                "input_parse_errors",
+                "capture_access_denied_waits",
+                "capture_format_skips",
+                "capture_lost",
+                "ring_slot_quarantines",
+                "capture_stopped",
+                "capture_first_frame_reopens",
+                "input_contact_stale_drops",
+                "capture_dark_rebuilds",
+                "capture_never_ready",
+                "keyframes_for_packet_distance",
+                "packet_distance_asks_refused",
+            ]
+        );
+        assert!(t.to_json().get("first_frame_backend").is_none());
+        t.first_frame_backend.set("wgc".into());
+        assert_eq!(t.to_json()["first_frame_backend"], "wgc");
+        assert_eq!(t.to_json()["degradation"]["ring_slot_quarantines"], 2);
+        assert_eq!(t.to_json()["degradation"]["encoder_resets"], 0);
+    }
 
     #[test]
     fn buckets_are_monotonic_and_contain_their_values() {
@@ -1128,8 +1225,7 @@ mod tests {
     #[test]
     fn percentiles_track_a_known_distribution() {
         let h = Histogram::new();
-        // 99 samples at 1 ms, one at 100 ms: p50 and p90 must sit at 1 ms, p99 at 1 ms and the
-        // max at 100 ms. A mean would read 2 ms and describe neither.
+        // 99 samples at 1 ms, one at 100 ms: a mean would read 2 ms and describe neither
         for _ in 0..99 {
             h.record(1_000_000);
         }
@@ -1167,13 +1263,12 @@ mod tests {
         t.packetize_done_ns = t.encode_done_ns + 100_000;
         t.socket_write_done_ns = t.packetize_done_ns + 200_000;
         tel.record_frame(&t);
-        // Its time in the encoder is measured, but apart from real encodes; its transport is
-        // real and measured as usual.
+        // its encoder time is measured apart from real encodes; its transport as usual
         assert!(tel.stages.encode.snapshot().is_empty());
         assert!(tel.stages.encode_queue.snapshot().is_empty());
         assert_eq!(tel.stages.encode_repeat.snapshot().count, 1);
         assert_eq!(tel.stages.socket_write.snapshot().count, 1);
-        // Nothing was captured, so nothing capture-relative is claimed.
+        // nothing was captured, so nothing capture-relative is claimed
         assert!(tel.stages.capture_delivery.snapshot().is_empty());
         assert!(tel.stages.capture_to_encode_done.snapshot().is_empty());
         assert!(tel.stages.capture_to_socket.snapshot().is_empty());
@@ -1199,7 +1294,7 @@ mod tests {
         assert!(tel.stages.encode_repeat.snapshot().is_empty());
         let total = tel.stages.capture_to_socket.snapshot();
         assert_eq!(total.count, 1);
-        // 9 ms from the OS frame time to the socket, not 8 ms from our callback.
+        // 9 ms from the OS frame time to the socket, not 8 ms from the callback
         assert!((total.max_ns as f64 - 9.0e6).abs() < 1.0e6);
     }
 
@@ -1259,10 +1354,10 @@ mod tests {
         let old = register(key);
         let new = SessionTelemetry::new_shared();
         publish(key, Arc::clone(&new));
-        // The superseded session's teardown leaves the live one's handle alone ...
+        // the superseded session's teardown leaves the live one's handle alone ...
         unregister_if(key, &old);
         assert!(get(key).is_some_and(|t| Arc::ptr_eq(&t, &new)));
-        // ... and the live one's own teardown removes it.
+        // ... and the live one's own teardown removes it
         unregister_if(key, &new);
         assert!(get(key).is_none());
     }

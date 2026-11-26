@@ -1,0 +1,83 @@
+{
+ "version": 1,
+ "name": "win-pipe-gates",
+ "workloads": [
+  {
+   "id": "take-60",
+   "kind": "recording",
+   "fps": 60,
+   "transform": "fps:60",
+   "max_frames": 2900
+  }
+ ],
+ "recipes": [
+  {
+   "name": "nvenc-gates",
+   "vendor": "nvenc",
+   "production": {
+    "qp": 15
+   },
+   "gates": true
+  },
+  {
+   "name": "nvenc-gates-auto",
+   "vendor": "nvenc",
+   "production": {
+    "qp": 15
+   },
+   "gates": true,
+   "auto_frame_rate": true
+  },
+  {
+   "name": "nvenc-gates-no-trailing",
+   "vendor": "nvenc",
+   "production": {
+    "qp": 15
+   },
+   "gates": true,
+   "env": [
+    [
+     "SE_TUNE_OFF",
+     "wgc_trailing_frame,wgc_cadence_counts_staged_only"
+    ]
+   ]
+  },
+  {
+   "name": "qsv-gates",
+   "vendor": "qsv",
+   "production": {
+    "qp": 15
+   },
+   "gates": true
+  },
+  {
+   "name": "qsv-gates-auto",
+   "vendor": "qsv",
+   "production": {
+    "qp": 15
+   },
+   "gates": true,
+   "auto_frame_rate": true
+  }
+ ],
+ "groups": [
+  {
+   "name": "the capture handler's gates on the take's recorded flags, 1080p60",
+   "stage": "pipe",
+   "recipes": [
+    "nvenc-gates",
+    "nvenc-gates-auto",
+    "nvenc-gates-no-trailing",
+    "qsv-gates",
+    "qsv-gates-auto"
+   ],
+   "workloads": [
+    "take-60"
+   ],
+   "per_frame": true
+  }
+ ],
+ "order": {
+  "cooldown_ms": 1000
+ }
+}

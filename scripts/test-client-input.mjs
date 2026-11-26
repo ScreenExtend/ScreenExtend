@@ -1,20 +1,8 @@
 // Golden vectors for the input wire protocol, produced by the shipped `input.js` and parsed by
-// the shipped Rust parser.
-//
-// `streamer/input/protocol.rs` has tests for the format and `input.js` writes the same format
-// with no test — the sharpest version of the client/host coverage gap, because both sides can be
-// individually correct about different layouts and nothing notices. This closes it in the only
-// way that does not restate one side in the other's language:
-//
-//   1. This harness drives `input.js` under Node and asserts every field of every frame it
-//      emits, at the offsets `docs/INPUT-PROTOCOL.md` documents.
-//   2. It writes those exact bytes to `src-tauri/src/streamer/input/client-frames.json`
-//      (with `--write`), which is checked in.
-//   3. `streamer/input/protocol.rs`'s `client_golden_vectors_still_parse` feeds each one to the
-//      real `parse()` and asserts the decoded event.
-//
-// So a client-side change to the bytes fails here, and a host-side change to the parser fails
-// there, against the same fixture. Neither side can drift alone.
+// the shipped Rust parser. This harness asserts every field of every frame `input.js` emits and
+// (with `--write`) records the bytes in `src-tauri/src/streamer/input/client-frames.json`;
+// `client_golden_vectors_still_parse` in `streamer/input/protocol.rs` feeds each one to the
+// real `parse()`. A change on either side fails against the same fixture.
 //
 //   node scripts/test-client-input.mjs [path/to/static] [--write]
 import fs from 'node:fs';
@@ -24,8 +12,7 @@ import vm from 'node:vm';
 const args = process.argv.slice(2).filter((a) => a !== '--write');
 const WRITE = process.argv.includes('--write');
 const STATIC = args[0] || 'src-tauri/src/streamer/static';
-// Next to the parser that reads it: `streamer/input/client-frames.json`, `include_str!`'d by
-// `protocol.rs` the way `streamer/test/trickle-fragment.sdpfrag` is.
+// next to the parser that reads it: `protocol.rs` `include_str!`s `input/client-frames.json`
 const FIXTURE = path.join(path.dirname(STATIC), 'input', 'client-frames.json');
 
 let failures = 0;
@@ -34,7 +21,7 @@ const fail = (m) => { failures++; console.log('FAIL- ' + m); };
 const eq = (name, got, want) => (got === want ? ok(name + ' = ' + got) : fail(name + ' = ' + got + ', expected ' + want));
 const close = (name, got, want) => (Math.abs(got - want) < 1e-4 ? ok(name + ' ~= ' + got) : fail(name + ' = ' + got + ', expected ' + want));
 
-// ── input.js under the smallest browser it will run in ───────────────────────────────────
+// input.js under the smallest browser it will run in
 const src = fs.readFileSync(STATIC + '/input.js', 'utf8');
 const sent = [];
 const chan = (label) => ({
@@ -107,10 +94,10 @@ const OP = {
   POINTER_ENTER: 0x05, POINTER_LEAVE: 0x06, POINTER_OVER: 0x07, POINTER_OUT: 0x08,
   POINTER_MOVE_BATCH: 0x09, WHEEL: 0x10, ZOOM: 0x11, KEY: 0x20, TEXT_INPUT: 0x21,
   CLIPBOARD: 0x30, FOCUS_STATE: 0x50, VISIBILITY: 0x51, RESIZE: 0x52,
-  POINTERLOCK_STATE: 0x53, MOUSE_DELTA: 0x54, PING: 0x60,
+  POINTERLOCK_STATE: 0x53, MOUSE_DELTA: 0x54, PING: 0x60, STATS: 0x62,
 };
 
-// Everything the fixture will carry: a label the Rust side asserts on, and the bytes.
+// what the fixture carries: a label the Rust side asserts on, and the bytes
 const vectors = [];
 const capture = (name, frame) => {
   if (!frame) { fail('no frame captured for ' + name); return null; }
@@ -118,7 +105,7 @@ const capture = (name, frame) => {
   return frame;
 };
 
-// ── POINTER_DOWN: the 40-byte fixed layout ───────────────────────────────────────────────
+// POINTER_DOWN, the 40-byte fixed layout:
 // op u8 @0, source u8 @1, pointerId u32 @2, x f32 @6, y f32 @10, pressure f32 @14,
 // tiltX f32 @18, tiltY f32 @22, twist f32 @26, w f32 @30, h f32 @34, buttons u16 @38.
 sent.length = 0;
@@ -139,14 +126,14 @@ if (down) {
   close('POINTER_DOWN tiltY', d.getFloat32(22, true), 30);
   close('POINTER_DOWN twist', d.getFloat32(26, true), 90);
   eq('POINTER_DOWN buttons', d.getUint16(38, true), 1);
-  // x and y are normalised against the video rect, so they are in 0..1 rather than CSS pixels.
+  // x and y are normalised against the video rect: 0..1, not CSS pixels
   const x = d.getFloat32(6, true);
   const y = d.getFloat32(10, true);
   if (x >= 0 && x <= 1 && y >= 0 && y <= 1) ok('POINTER_DOWN x/y are normalised into 0..1');
   else fail('POINTER_DOWN x=' + x + ' y=' + y + ' is not normalised');
 }
 
-// ── POINTER_UP and POINTER_CANCEL share the layout, and the opcode is the phase ──────────
+// POINTER_UP and POINTER_CANCEL share the layout: the opcode is the phase
 sent.length = 0;
 fire('pointerup', {
   pointerId: 7, pointerType: 'pen', clientX: 640, clientY: 360, pressure: 0,
@@ -165,7 +152,7 @@ fire('pointercancel', {
 const cancel = capture('pointer_cancel_touch', lastOf(OP.POINTER_CANCEL));
 if (cancel) eq('POINTER_CANCEL length', cancel.bytes.length, 40);
 
-// ── WHEEL: 15 bytes — op, source, dx f32, dy f32, dz f32, mode u8 ────────────────────────
+// WHEEL, 15 bytes: op, source, dx f32, dy f32, dz f32, mode u8
 sent.length = 0;
 fire('wheel', { deltaX: -12.5, deltaY: 120, deltaZ: 0, deltaMode: 1, preventDefault() {} });
 const wheel = capture('wheel_lines', lastOf(OP.WHEEL));
@@ -178,7 +165,7 @@ if (wheel) {
   eq('WHEEL deltaMode', d.getUint8(14), 1);
 }
 
-// ── KEY: op, down u8, repeat u8, mods u16, then two length-prefixed strings ──────────────
+// KEY: a flags byte, a modifier bitfield, then two length-prefixed strings
 sent.length = 0;
 fire('keydown', {
   code: 'KeyA', key: 'a', repeat: false,
@@ -208,7 +195,7 @@ fire('keyup', {
 });
 capture('key_up_a', lastOf(OP.KEY));
 
-// ── PING: op + u64 of client monotonic nanoseconds ───────────────────────────────────────
+// PING: op + u64 of client monotonic nanoseconds
 sent.length = 0;
 now = 12_345;
 if (typeof ctx.__tick === 'function') ctx.__tick();
@@ -220,7 +207,7 @@ if (ping) {
   eq('PING stamp is performance.now() in ns', t, Math.round(12_345 * 1e6));
 }
 
-// ── The lifecycle frames: two bytes each ─────────────────────────────────────────────────
+// the lifecycle frames: two bytes each
 sent.length = 0;
 fire('blur', {});
 const focus = lastOf(OP.FOCUS_STATE);
@@ -230,7 +217,7 @@ if (focus) {
   eq('FOCUS_STATE payload', focus.bytes[1], 0);
 } else fail('blur produced no FOCUS_STATE');
 
-// ── MOUSE_DELTA under pointer lock: op, dx i16, dy i16, buttons u16, flags u8 ────────────
+// MOUSE_DELTA under pointer lock
 ctx.document.pointerLockElement = {};
 sent.length = 0;
 now = 20_000;
@@ -251,7 +238,26 @@ if (delta) {
 }
 ctx.document.pointerLockElement = null;
 
-// ── Fixture ──────────────────────────────────────────────────────────────────────────────
+// STATS: the v4 telemetry frame, video catch-up tail included
+ctx.SEVideo = { getStats: () => ({
+  videoPath: 1, audioPath: 1, framesPainted: 5000, framesDropped: 12, keyRequests: 1,
+  transportTier: 1, renderTier: 1, keyTier: 2, sinkTier: 1,
+  videoCatchUps: 3, videoFramesStale: 250, videoLateMs: 140.25, videoLateState: 2,
+}) };
+sent.length = 0;
+if (typeof ctx.__tick === 'function') ctx.__tick();
+const st = capture('client_stats_v4', lastOf(OP.STATS));
+if (st) {
+  const v = view(st);
+  eq('STATS length', st.bytes.length, 120);
+  eq('STATS version', v.getUint8(1), 4);
+  eq('STATS keyframe requests', v.getUint32(56, true), 1);
+  eq('STATS video catch-ups', v.getUint32(104, true), 3);
+  eq('STATS video frames not painted', v.getUint32(108, true), 250);
+  eq('STATS video peak local lateness us', v.getUint32(112, true), 140250);
+  eq('STATS video late state', v.getUint8(116), 2);
+}
+
 if (!vectors.length) fail('no vectors were captured');
 
 const payload = {
@@ -263,7 +269,6 @@ const payload = {
     "the bytes on either side fails against this file rather than silently diverging.",
     "",
     "`hex` is the whole DataChannel message. `channel` is which of the three it went out on.",
-    "docs/INPUT-PROTOCOL.md is the prose.",
   ],
   vectors,
 };

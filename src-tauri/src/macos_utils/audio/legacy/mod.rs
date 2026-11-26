@@ -75,8 +75,7 @@ impl AudioSource for LegacyVirtualDeviceSource {
                  ({:.2} ms @ 48 kHz), st={st}",
                 got as f64 / 48.0
             );
-            // Until now only the Windows path ever wrote this, so the 2 s summary reported the
-            // legacy tier's IO cycle as `period=0fr`.
+            // feeds the `period=` field of the 2 s diagnostics summary
             sink.diagnostics.period_frames.store(got, Ordering::Relaxed);
         }
 
@@ -117,7 +116,7 @@ impl AudioSource for LegacyVirtualDeviceSource {
         let playthrough = Playthrough::start(target, Arc::clone(&mon_cons), Arc::clone(&gain));
         if playthrough.is_none() {
             crate::teprintln!(
-                "audio(legacy): no usable output device for playthrough — capture continues, but \
+                "audio(legacy): no usable output device for playthrough. Capture continues, but \
                  local monitoring is silent until a device appears"
             );
         }
@@ -236,17 +235,14 @@ impl ControlRuntime {
             }
         }
         self.router.restore();
-        // A clean stop means there is nothing left for the post-crash agent to recover, so it goes
-        // with us rather than outliving the app as a permanent background job.
+        // a clean stop leaves nothing for the post-crash agent to recover, so it goes with us
         routing::uninstall_watchdog_agent();
         crate::tprintln!("audio(legacy): stopped; default output restored");
     }
 
-    /// Say when the monitor ring has run dry, and what the drift loop paid for it.
-    ///
-    /// The playthrough setpoint is the host's own monitoring latency, so it starts at three output
-    /// IO periods and is only raised by a measured underrun. A `bump` that keeps climbing is this
-    /// machine telling us the floor is too low for it.
+    /// Says when the monitor ring has run dry and what the drift loop paid for it. The setpoint
+    /// starts at three output IO periods and is raised only by a measured underrun, so a `bump`
+    /// that keeps climbing means the floor is too low for this machine.
     fn report_underruns(&self, reported: &mut u32) {
         let Some(p) = self.playthrough.as_ref() else {
             return;
@@ -301,7 +297,7 @@ impl ControlRuntime {
             routing::preferred_playthrough_device(branding::DEVICE_UID, self.router.saved_uid())
                 .unwrap_or(0);
         if preferred == self.playthrough_target && self.playthrough.is_some() {
-            return; // no change
+            return;
         }
         self.set_playthrough(preferred);
     }

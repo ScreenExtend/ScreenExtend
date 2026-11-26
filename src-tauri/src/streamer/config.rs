@@ -100,9 +100,8 @@ impl Default for ScalePercent {
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// What the axum servers bind. `IpAddr`, not `Ipv4Addr`: an IPv6-only network used to
-    /// produce no listener at all and no diagnostic, because every v6 address the enumeration
-    /// found failed a `parse::<Ipv4Addr>()` and was dropped with `.ok()`.
+    /// What the axum servers bind. `IpAddr`, not `Ipv4Addr`: an IPv6-only network must still
+    /// get a listener.
     pub bind_ip: IpAddr,
     pub lan_ip: Option<String>,
     pub local_ips: Option<SharedLocalIps>,
@@ -119,16 +118,14 @@ pub struct Config {
     /// Which scripted pattern `--synthetic-pattern` produces.
     pub workload: crate::streamer::synthetic::Workload,
     /// Paint a large frame number and elapsed-millisecond clock over it, for the
-    /// camera-based glass-to-glass method in `docs/BASELINE.md`.
+    /// camera-based glass-to-glass method.
     pub counter: bool,
-    /// How long a probe runs, in seconds. The self-test keeps streaming this long after it
-    /// has proved RTP flows; `--live` captures for this long instead of stopping at a fixed
-    /// frame count. 0 means "just prove it works", which is a liveness check and not a
-    /// measurement — a baseline run wants 30 or more.
+    /// How long a probe runs, in seconds: the self-test streams this long after RTP flows, and
+    /// `--live` captures this long. 0 is a liveness check, not a measurement (a baseline run
+    /// wants 30 or more).
     pub probe_secs: u64,
-    /// Force the DXGI Desktop Duplication capture path instead of letting WGC try first.
-    /// DXGI is otherwise only ever reached as a fallback, which means it can only be
-    /// measured by first breaking WGC.
+    /// Force DXGI Desktop Duplication instead of letting WGC try first: DXGI is otherwise only
+    /// a fallback, so it could be measured only by breaking WGC.
     pub force_dxgi: bool,
     pub scale: ScalePercent,
     pub stun_urls: Vec<String>,
@@ -154,24 +151,17 @@ pub struct Config {
     pub quality_qp: Option<u8>,
     pub intra_refresh: bool,
     /// Whether the pipeline may deliver fewer frames per second than `max_fps` asks for.
-    ///
-    /// `false`, the default, is the owner's ruling: the rate the user chose is the rate the
-    /// stream runs at, an unchanged frame is repeated at that cadence rather than skipped, and
-    /// no controller lowers it. Copied out of `DeviceOverride::auto_frame_rate` at join, so the
-    /// per-session pipeline can read one plain `bool` and never reaches for the override map.
-    /// The probe harness leaves it `false` for the same reason: a measurement wants a fixed
-    /// cadence.
+    /// `false` (the default): the stream runs at the rate the user chose, an unchanged frame is
+    /// repeated at that cadence (not skipped), and no controller lowers it. Copied from
+    /// `DeviceOverride::auto_frame_rate` at join, so the pipeline never touches the override map.
     pub auto_frame_rate: bool,
     pub encoder_vendor: EncoderVendor,
     /// The snapshot the standalone probe harness and `--software-encode` set. Prefer
     /// [`Config::software_encode_now`] everywhere that has a live host behind it.
     pub disable_gpu_encode: bool,
     /// The live "GPU video encoding" toggle, when there is an `AppState` behind this config.
-    ///
-    /// Every other shared field in this struct is a cloned `Arc` and this one was a `bool` read
-    /// once at streamer-construction time, so a Settings toggle could only take effect by draining
-    /// and rebuilding every streamer — which is a visible disconnection for every device on the
-    /// host. With a handle, the encoder selection can read it at the moment it picks a backend.
+    /// A shared handle so encoder selection reads it when it picks a backend: a Settings change
+    /// then needs no streamer rebuild, which would disconnect every device.
     pub gpu_encode_toggle: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub virtual_display: Option<SharedVirtualDisplay>,
     pub session_auth: Option<SessionAuth>,
@@ -523,7 +513,7 @@ CAPTURE / ENCODE\n\
   --max-fps <n>           cap auto-detected fps, 15..550 (default 550)\n\
   --max-bitrate-kbps <n>  override computed CBR target (default auto)\n\
   --h264-profile <p>      baseline | main | high (default baseline)\n\
-  --qp <1..51>            constant-QP rate control instead of CBR — kills flicker on\n\
+  --qp <1..51>            constant-QP rate control instead of CBR: kills flicker on\n\
                           static/dark content (lower = higher quality; try 18-23)\n\
   --intra-refresh <on|off>  rolling intra refresh for passive loss recovery (default off;\n\
                           on = periodic refresh waves can be visible as bands repainting\n\
@@ -541,14 +531,14 @@ CAPTURE / ENCODE\n\
   --workload <w>          scripted synthetic workload, implies --synthetic-pattern:\n\
                           mixed (default) | static | scroll | motion | drag\n\
   --counter               overlay a large frame number + elapsed ms clock, for the\n\
-                          camera glass-to-glass method (docs/BASELINE.md)\n\
+                          camera glass-to-glass method\n\
 \n\
 ICE / TLS\n\
   --stun <a,b,..>         comma-separated STUN urls (default Google STUN)\n\
   --turn-url <url>        static TURN relay url\n\
   --turn-username <u>     static TURN username\n\
   --turn-credential <c>   static TURN credential\n\
-  --turn-secret <s>       shared secret for our self-hosted TURN (TURN-SERVER/);\n\
+  --turn-secret <s>       shared secret of a self-hosted TURN server;\n\
                           enables per-session ephemeral creds (env: SCREENEXTEND_TURN_SECRET)\n\
   --turn-urls <a,b,..>    TURN urls for the self-hosted relay\n\
                           (env: SCREENEXTEND_TURN_URLS; default turn.screenextend.app)\n\

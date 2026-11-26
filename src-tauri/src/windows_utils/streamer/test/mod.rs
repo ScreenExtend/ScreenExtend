@@ -1,13 +1,13 @@
-// `skip` and `show_measurements` live in `crate::test_support` so the macOS and cross-platform
-// suites use the same convention; these two re-exports keep the `super::skip(...)` call sites
-// in this directory reading the way they always did.
+// re-exported for the `super::skip(...)` call sites in this directory
 pub(crate) use crate::test_support::{show_measurements, skip};
 
+mod amd_encoder;
+mod amd_fake;
 mod amd_layout;
 mod capture_latency;
-// Visible to the rest of `streamer`: `amd::sps`'s tests read their own output back with a
-// parser written separately from the writer, which is the only way that assertion means
-// anything.
+mod frame_gate;
+// pub(super): `amd::sps`'s tests read their output back with this parser, which is written
+// separately from the writer
 pub(super) mod h264;
 mod intel_encoder;
 mod intel_layout;

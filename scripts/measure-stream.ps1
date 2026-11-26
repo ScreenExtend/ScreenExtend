@@ -41,10 +41,8 @@ param(
     [int]$HttpPort = 8080,
     [int]$HttpsPort = 8443,
     [switch]$Http,
-    # 0 picks a fresh port per run. A browser from a previous run holds the debugging port for
-    # several seconds after its process is gone, and a second Chrome that cannot bind it exits
-    # without ever exposing a target - which is a failed run for a reason that has nothing to do
-    # with the build under test.
+    # 0 picks a fresh port per run: a previous run's browser holds the debugging port for several
+    # seconds after its process is gone, and a Chrome that cannot bind it exits without a target
     [int]$CdpPort = 0,
     [string]$OutDir = "$env:TEMP\se-measure",
     [switch]$NoRecord
@@ -62,10 +60,8 @@ $null = New-Item -ItemType Directory -Force -Path $runDir
 Start-Transcript -Path (Join-Path $runDir 'harness.log') -Force | Out-Null
 function Step($m) { Write-Host ("[{0:HH:mm:ss}] {1}" -f (Get-Date), $m) }
 
-# --------------------------------------------------------------------------------------------
 # SendInput. SetCursorPos would move the pointer too, but it is not what a mouse does: it does
 # not raise WM_INPUT and it is not what the injection path under test uses.
-# --------------------------------------------------------------------------------------------
 if (-not ('SEInput' -as [type])) {
     Add-Type @'
 using System;
@@ -142,11 +138,9 @@ public static class SEInput {
 '@
 }
 
-# --------------------------------------------------------------------------------------------
-# Chrome DevTools Protocol over a raw WebSocket. PowerShell 5.1 has ClientWebSocket; it has no
-# JSON-RPC client, so one request/response pair is written by hand. Events arriving on the same
-# socket are skipped by id, which is why the read loop is not a single ReceiveAsync.
-# --------------------------------------------------------------------------------------------
+# Chrome DevTools Protocol over a raw WebSocket: PowerShell 5.1 has ClientWebSocket but no
+# JSON-RPC client. Events arriving on the same socket are skipped by id, which is why the read
+# loop is not a single ReceiveAsync.
 $script:cdpSocket = $null
 $script:cdpId = 0
 
@@ -202,14 +196,10 @@ function Invoke-Js {
     return $r.result.value
 }
 
-# How smooth the *host's* desktop is while all this is going on.
-#
-# The owner's second report is not about the stream at all - "the system becomes laggy in general
-# and the cursor is weird". A window's requestAnimationFrame cadence is driven by the compositor,
-# and the compositor is what draws the pointer, so the interval between animation frames in an
-# ordinary window on the host's own screen is the closest thing to a number for "does the desktop
-# feel smooth". It is measured in a second, small, always-visible window so that the work of
-# decoding the stream is not what is being timed.
+# How smooth the host's own desktop is during the run. requestAnimationFrame cadence is driven
+# by the compositor, which also draws the pointer, so the frame interval in an ordinary window
+# on the host's screen is the closest number to "does the desktop feel smooth". Measured in a
+# second, small, always-visible window so the stream's decode work is not what is timed.
 $RAF_PROBE = @'
 <!doctype html><meta charset=utf-8><title>desktop smoothness</title>
 <style>body{margin:0;font:13px system-ui;background:#101014;color:#ddd;padding:12px}</style>
@@ -233,17 +223,12 @@ window.__reset=function(){d=[];p=0};
 </script>
 '@
 
-# --------------------------------------------------------------------------------------------
-# Host
-# --------------------------------------------------------------------------------------------
 Get-Process ScreenExtend -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 800
 
-# A device row saved from an earlier session pins the geometry and the refresh rate for every
-# later join from the same address - `refreshRate: 360` and `dpr: 2` were both found on this box,
-# written by a browser window that happened to be sitting on the *virtual* display, and they
-# survived every restart. Measuring against one is measuring that row, not the build. Removed for
-# the run and put back afterwards.
+# A saved device row pins the geometry and the refresh rate for every later join from the same
+# address, so a run against one measures the row, not the build. Removed for the run and put
+# back afterwards.
 $storeFile = Join-Path $env:APPDATA 'app.screenextend.desktop\config.json'
 $storeBackup = Join-Path $runDir 'config.json.before'
 if (Test-Path $storeFile) {
@@ -252,21 +237,17 @@ if (Test-Path $storeFile) {
         $store = Get-Content -Raw $storeFile | ConvertFrom-Json
         if ($null -ne $store.devices) {
             $store.devices = @()
-            # `Set-Content -Encoding UTF8` writes a **BOM** on PowerShell 5.1, and
-            # `tauri-plugin-store` cannot parse one: the host reads the file, fails, falls back to
-            # `defaultConfig` and rewrites it — so clearing one device row silently threw away the
-            # whole saved configuration (every device, every known device, the ports, TURN, STUN)
-            # on the next launch. Verified on this box: restoring the same JSON without the BOM
-            # survives a relaunch; with it, `devices` and `knownDevices` come back empty.
+            # `Set-Content -Encoding UTF8` writes a BOM on PowerShell 5.1 and `tauri-plugin-store`
+            # cannot parse one: the host falls back to `defaultConfig` and rewrites the file, losing
+            # the whole saved configuration. Hence WriteAllText without a BOM.
             [IO.File]::WriteAllText($storeFile, ($store | ConvertTo-Json -Depth 12),
                 (New-Object Text.UTF8Encoding $false))
         }
     } catch { Write-Warning "could not clear the saved device row: $_" }
 }
 
-# The join form validates the session id against /^[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{12}$/ and
-# leaves Connect disabled for anything else - so an id the *host* accepts on the command line is
-# not necessarily one the page will let you submit.
+# the join form validates the session id against /^[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{12}$/ and
+# leaves Connect disabled otherwise, so an id the host accepts is not always one the page takes
 $alphabet = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ'.ToCharArray()
 $sessionId = -join (1..12 | ForEach-Object { $alphabet[(Get-Random -Maximum $alphabet.Length)] })
 $otp = '{0:D6}' -f (Get-Random -Minimum 100000 -Maximum 999999)
@@ -277,10 +258,9 @@ $hostProc = Start-Process -FilePath $Binary -PassThru -WindowStyle Minimized `
     '--http-port', "$HttpPort", '--session-id', $sessionId, '--otp', $otp) `
     -RedirectStandardOutput $hostLog -RedirectStandardError (Join-Path $runDir 'host.err.log')
 
-# The server binds to the adapter address, not to loopback - `http://localhost:8080/health` is
-# refused even while the host is up - so the address is read out of the banner it printed rather
-# than assumed. curl.exe rather than Invoke-WebRequest: the latter goes through the system proxy
-# resolution and ignores -TimeoutSec while it does, which turns a 60 s wait into a 40 minute one.
+# The server binds to the adapter address, not loopback (`http://localhost:8080/health` is
+# refused), so the address is read from the banner. curl.exe, not Invoke-WebRequest: that goes
+# through system proxy resolution and ignores -TimeoutSec while it does.
 $serveHost = $null
 for ($i = 0; $i -lt 120; $i++) {
     Start-Sleep -Milliseconds 500
@@ -302,25 +282,18 @@ Step "host up: $base session=$sessionId otp=$otp"
 
 $displaysBefore = ([SEInput]::Monitors()).Count
 
-# --------------------------------------------------------------------------------------------
-# Client
-# --------------------------------------------------------------------------------------------
 $chrome = 'C:\Program Files\Google\Chrome\Application\chrome.exe'
 if (-not (Test-Path $chrome)) { $chrome = 'C:\Program Files (x86)\Google\Chrome\Application\chrome.exe' }
 $profileDir = Join-Path $runDir 'chrome-profile'
-# HTTPS, not HTTP. `VideoDecoder` needs a secure context, so a client joined over plain HTTP is
-# on the `<video>` element path with no WebCodecs at all - a different pipeline from the one under
-# measurement. The certificate is the host's own self-signed one, so Chrome is told to accept it.
+# HTTPS: `VideoDecoder` needs a secure context, so a client joined over plain HTTP is on the
+# `<video>` element path, a different pipeline. The certificate is the host's self-signed one,
+# so Chrome is told to accept it.
 $joinUrl = if ($Http) { "$base/?id=$sessionId&otp=$otp&name=measure&fs=0" }
            else { "https://${serveHost}:$HttpsPort/?id=$sessionId&otp=$otp&name=measure&fs=0" }
 
-# A measurement browser from an earlier run keeps the debugging port, and `curl /json` would then
-# hand back its stale join page - which this script would drive with the wrong OTP and then wait
-# on forever. Take the port back before asking for it.
-# Every process of a previous measurement browser, not just the one that was launched: Chrome's
-# renderers and GPU process outlive the browser process by enough to keep the debugging port, and
-# `curl /json` then answers with the *last* run's join page, which this script would drive with
-# the wrong OTP and then wait on forever.
+# Kill every process of a previous measurement browser, not just the one that was launched:
+# Chrome's renderers and GPU process outlive it long enough to keep the debugging port, and
+# `curl /json` would then return the last run's join page, driven with the wrong OTP forever.
 $killed = 0
 Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" -ErrorAction SilentlyContinue |
     Where-Object { $_.CommandLine -like '*se-measure*' -or $_.CommandLine -like "*--remote-debugging-port=$CdpPort*" } |
@@ -331,10 +304,8 @@ for ($i = 0; $i -lt 20; $i++) {
     Start-Sleep -Milliseconds 500
 }
 
-# Launched on about:blank and navigated over CDP, not straight at the join URL: it is the only
-# way to be sure the attached target is this run's, and it is where the dialog stubs go in. A
-# `window.alert` raised in a page blocks the renderer, and with it every `Runtime.evaluate` this
-# script depends on - a hang with no error anywhere.
+# launched on about:blank and navigated over CDP, not straight at the join URL: the only way
+# to be sure the attached target is this run's
 $chromeArgs = @(
     "--remote-debugging-port=$CdpPort",
     "--user-data-dir=$profileDir",
@@ -364,7 +335,7 @@ Step 'cdp connected'
 Invoke-Cdp 'Page.enable' @{} | Out-Null
 Step 'page domain enabled'
 
-# The desktop-smoothness probe, in its own small window beside the stream on the host's screen.
+# the desktop-smoothness probe, in its own small window beside the stream on the host's screen
 $rafSession = $null
 try {
     $probeUrl = 'data:text/html;charset=utf-8,' + [Uri]::EscapeDataString($RAF_PROBE)
@@ -386,10 +357,9 @@ try {
 
 
 
-# The page raises a microphone card during the join and genuinely waits for the answer:
-# `enumerateBeforeJoin` is the one thing on it that can prompt, and it is deliberately in front
-# of the first ICE candidate. Granting the permission up front is what a returning user has, and
-# it takes the card - and the race to dismiss it - out of the measurement.
+# The page raises a microphone card during the join and waits for the answer
+# (`enumerateBeforeJoin` runs before the first ICE candidate). Pre-granting the permission, as
+# a returning user has it, takes the card and the race to dismiss it out of the measurement.
 try {
     $origin = ([Uri]$joinUrl).GetLeftPart([UriPartial]::Authority)
     Invoke-Cdp 'Browser.grantPermissions' @{ origin = $origin; permissions = @('audioCapture') } | Out-Null
@@ -405,10 +375,9 @@ for ($i = 0; $i -lt 40; $i++) {
 }
 if (-not $loaded) { throw 'the join page never finished loading' }
 
-# Record the exact body of the join POST. The host sizes the virtual display from `width`,
-# `height` and `dpr` in it, and reading those back off the page afterwards is not the same thing:
-# they are computed at submit time. Installed here rather than through
-# `Page.addScriptToEvaluateOnNewDocument`, which did not run at all on this Chrome.
+# Record the exact body of the join POST: the host sizes the virtual display from its `width`,
+# `height` and `dpr`, which are computed at submit time. Installed here because
+# `Page.addScriptToEvaluateOnNewDocument` did not run on this Chrome.
 Invoke-Js @'
 (function () {
   window.__whep = null;
@@ -429,8 +398,8 @@ Invoke-Js @'
 })()
 '@ | Out-Null
 
-# The page raises a same-device warning when the request came from the host itself; it is modal
-# over the join form, so it is dismissed before anything else is touched.
+# the page raises a same-device warning when the request came from the host itself; it is modal
+# over the join form, so it is dismissed before anything else is touched
 Start-Sleep -Milliseconds 1500
 Invoke-Js @'
 (function () {
@@ -440,9 +409,8 @@ Invoke-Js @'
 })()
 '@ | ForEach-Object { Step "same-device modal: $_" }
 
-# The same-device warning is not the only modal in front of the form: the HTTPS upsell and the
-# limited-browser-support card both raise themselves on load, and a button under a modal cannot
-# be clicked. Dismissing whatever is up is retried, because they are raised in sequence.
+# the HTTPS upsell and the limited-browser-support card also raise themselves on load, in
+# sequence, and a button under a modal cannot be clicked: retry dismissing whatever is up
 for ($i = 0; $i -lt 6; $i++) {
     $state = Invoke-Js @'
 (function () {
@@ -460,32 +428,27 @@ for ($i = 0; $i -lt 6; $i++) {
     if (-not $state.disabled -and $state.clicked.Count -eq 0) { break }
     Start-Sleep -Milliseconds 700
 }
-# What the client is about to ask the host to build. The host sizes the virtual display at
-# `screen` x `devicePixelRatio` and drives it at the refresh rate the page measured, so a page
-# that measures either of those wrongly is a 4K 360 Hz display nobody asked for.
+# what the client is about to ask for: the host sizes the virtual display at `screen` x
+# `devicePixelRatio` and drives it at the refresh rate the page measured
 $pre = Invoke-Js "JSON.stringify({ disabled: document.getElementById('connect').disabled, webcodecs: 'VideoDecoder' in window, secure: window.isSecureContext, coi: !!self.crossOriginIsolated, dpr: window.devicePixelRatio, screen: screen.width + 'x' + screen.height })"
 Step "pre-click: $pre"
 Step 'clicking connect'
 Invoke-Js "document.getElementById('connect').click(), true" -UserGesture | Out-Null
 
-# The join is only real once the client has painted; framesPainted is the client's own count of
-# frames that reached a sink, not of frames it accepted.
+# the join is only real once the client has painted; framesPainted is the client's own count of
+# frames that reached a sink, not of frames it accepted
 $asked = $null
 $joined = $false
 for ($i = 0; $i -lt 160; $i++) {
     Start-Sleep -Milliseconds 500
     try {
-        # The microphone card is raised *after* Connect, and the join genuinely waits for the
-        # user's answer - `enumerateBeforeJoin` is the one thing on the page that can prompt, and
-        # it is deliberately in front of the first ICE candidate. Nobody is here to answer it.
+        # the microphone card is raised after Connect and the join waits for an answer: skip it
         Invoke-Js "(function(){var b=document.getElementById('permSkip');if(b&&b.offsetParent!==null){b.click();return 1}return 0})()" | Out-Null
         $s = Invoke-Js 'window.SEVideo ? JSON.stringify(SEVideo.getStats()) : ""'
         if ($s) {
             $st = $s | ConvertFrom-Json
-            # `framesPainted` comes from the worker's own counter, refreshed by a 1 Hz poll, and
-            # it resets to zero whenever the page rebuilds its session. `videoPath` is the tier
-            # that is live right now, so it is the readiness signal; the painted count is what the
-            # run measures afterwards.
+            # `framesPainted` is the worker's own counter, refreshed by a 1 Hz poll; it resets to
+            # zero whenever the page rebuilds its session
             if ($st.framesPainted -gt 0) {
                 try { $asked = Invoke-Js "(function(){var b={};try{b=JSON.parse(window.__whep||'{}')}catch(e){} return JSON.stringify({posted:{refreshRate:b.refreshRate,width:b.width,height:b.height,dpr:b.dpr},now:{dpr:window.devicePixelRatio,screen:screen.width+'x'+screen.height},hooked:typeof window.__whep});})()" } catch { }
                 $joined = $true
@@ -505,7 +468,7 @@ if (-not $joined) {
 }
 Step "client painted its first frame; asked for $asked"
 
-# The display the host created for this client is the one that was not there before the join.
+# the display the host created for this client is the one that was not there before the join
 Start-Sleep -Milliseconds 500
 $virtual = $null
 for ($i = 0; $i -lt 20; $i++) {
@@ -519,8 +482,8 @@ $vb = [pscustomobject]@{ X = [int]$p[0]; Y = [int]$p[1]; Width = [int]$p[2]; Hei
 Step "virtual display: $($vb.Width)x$($vb.Height) at $($vb.X),$($vb.Y)"
 
 if ($Scene -eq 'motion') {
-    # A second window on the virtual display painting a full-frame 60 fps animation, so every
-    # captured frame carries a real content change as well as the moving cursor.
+    # a second window on the virtual display painting a full-frame 60 fps animation, so every
+    # captured frame carries a real content change as well as the moving cursor
     $anim = Join-Path $runDir 'motion.html'
     @'
 <!doctype html><meta charset=utf-8><title>motion</title>
@@ -543,8 +506,8 @@ addEventListener('resize',r);r();
     Start-Sleep -Seconds 3
 }
 
-# The desktop as it is with the host process running but nothing streaming: the control for the
-# streaming number below, taken on the same machine seconds apart rather than on another day.
+# the desktop with the host running but nothing streaming: the control for the streaming
+# number below, taken seconds apart on the same machine
 $desktopIdle = $null
 if ($rafSession) {
     try {
@@ -553,14 +516,9 @@ if ($rafSession) {
     } catch { }
 }
 
-# --------------------------------------------------------------------------------------------
-# The sweep. A circle rather than a line so the pointer never rests and never leaves the display,
-# stepped at 8 ms so the motion is finer than any plausible compose cadence.
-#
-# Proved before it is trusted: a stationary pointer produces a plausible-looking run of an
-# entirely different scene, and every number in it would be wrong about the thing the scene
-# exists to measure.
-# --------------------------------------------------------------------------------------------
+# The sweep: a circle, so the pointer never rests and never leaves the display, stepped at 8 ms
+# so the motion is finer than any plausible compose cadence. Self-tested first: a stationary
+# pointer produces a plausible-looking run of a different scene.
 $sweepFault = [SEInput]::SelfTest($vb.X + [int]($vb.Width / 2), $vb.Y + [int]($vb.Height / 2))
 if ($sweepFault) { throw "the pointer cannot be moved, so the sweep would measure a still desktop: $sweepFault" }
 Step 'pointer sweep self-test passed'
@@ -611,11 +569,9 @@ if (-not $NoRecord) {
         # -draw_mouse 0 so the only pointer in the recording is the one the host composited into
         # the video. qp 0 because mpdecimate is about to be asked whether a 32x32 sprite moved.
         #
-        # The crop is an *input* option and has to precede `-i`. After it, ffmpeg parses it as an
-        # output option and silently ignores it, and gdigrab records the whole virtual desktop -
-        # so every "changed frame" counted below is a clock ticking somewhere else on screen and
-        # the freeze numbers describe the desktop rather than the stream. The coordinates are
-        # desktop coordinates, matching `--window-position=0,0 --window-size=1280,800` above.
+        # The crop is an input option and must precede `-i`: after it ffmpeg silently ignores it
+        # and gdigrab records the whole virtual desktop. Desktop coordinates, matching
+        # `--window-position=0,0 --window-size=1280,800` above.
         $ffmpeg = Start-Process -FilePath $ff.Source -PassThru -WindowStyle Hidden -ArgumentList @(
             '-y', '-f', 'gdigrab', '-framerate', '60', '-draw_mouse', '0',
             '-offset_x', '0', '-offset_y', '0', '-video_size', '1280x800',
@@ -627,9 +583,6 @@ if (-not $NoRecord) {
     }
 }
 
-# --------------------------------------------------------------------------------------------
-# Sample
-# --------------------------------------------------------------------------------------------
 $samples = @()
 $sw = [Diagnostics.Stopwatch]::StartNew()
 $prevPainted = $null
@@ -659,8 +612,8 @@ while ($sw.Elapsed.TotalSeconds -lt $Seconds) {
         $cpuNow = $proc.TotalProcessorTime.TotalMilliseconds
         $wallNow = $sw.Elapsed.TotalMilliseconds
         if ($null -ne $prevCpuMs -and $wallNow -gt $prevWallMs) {
-            # Against wall time actually elapsed, not against the nominal 1 s: the CDP round trips
-            # in this loop make the real interval longer, and dividing by 1 s reads low.
+            # against wall time actually elapsed, not the nominal 1 s: the CDP round trips in
+            # this loop make the real interval longer, and dividing by 1 s reads low
             $row.hostCpuPct = [Math]::Round(($cpuNow - $prevCpuMs) / ($wallNow - $prevWallMs) / $cores * 100.0, 1)
         }
         $prevCpuMs = $cpuNow
@@ -673,7 +626,7 @@ $sw.Stop()
 
 if ($ffmpeg) { $ffmpeg.WaitForExit(20000) | Out-Null }
 if ($ffmpeg -and -not (Test-Path $recording)) {
-    # Missing, not zero. A recording that never started reads downstream as "no freezes".
+    # missing, not zero: a recording that never started reads downstream as "no freezes"
     Write-Warning "no recording was produced; the freeze numbers are absent. $(Join-Path $runDir 'ffmpeg.log') says why"
 }
 Stop-Job $mover -ErrorAction SilentlyContinue
@@ -694,12 +647,9 @@ if ($rafSession) {
     try { $desktop = (Invoke-Js 'JSON.stringify(window.__stats())' -SessionId $rafSession) | ConvertFrom-Json } catch { }
 }
 
-# --------------------------------------------------------------------------------------------
 # Freeze analysis. mpdecimate with the thresholds at their floor: `hi`/`lo` are 8x8-block SAD
-# sums, so the defaults (64*12, 64*5) call a 32x32 cursor sprite moving across a still desktop a
-# duplicate - which is precisely the frame this is trying to count. frac 0 means one changed
-# block is enough.
-# --------------------------------------------------------------------------------------------
+# sums, and the defaults (64*12, 64*5) call a 32x32 cursor sprite moving across a still desktop
+# a duplicate. frac 0 means one changed block is enough.
 $freeze = $null
 if ($ffmpeg -and (Test-Path $recording)) {
     $info = Join-Path $runDir 'decimate.txt'

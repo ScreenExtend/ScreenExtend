@@ -1,19 +1,10 @@
-//! The audio DataChannel wire format.
+//! The audio DataChannel wire format: a 13-byte header (`seq` u32 LE, `capture_ns` u64 LE,
+//! `flags` u8), then the Opus payload.
 //!
-//! 13 bytes of header — `seq` u32 LE, `capture_ns` u64 LE, `flags` u8 — then the Opus payload.
-//!
-//! When [`FLAG_REDUNDANT`] is set the body carries **two** payloads instead of one: a u16 LE
-//! length, the current frame's Opus packet, then the previous frame's. That is RFC 2198-style
-//! redundancy without the RTP framing, and it is the only loss-robustness tool available here:
-//! libopus documents `OPUS_SET_INBAND_FEC` and `OPUS_SET_DTX` as "only applicable to the LPC
-//! layer", the LPC layer is SILK, and this encoder runs `OPUS_APPLICATION_RESTRICTED_LOWDELAY`
-//! at 5 ms frames — both CELT-only conditions — so in-band FEC is structurally inert no matter
-//! what it is set to. A duplicate payload is what is left, and it is cheap: the measured 5 ms
-//! stereo payload is 118 bytes of speech or 3 bytes of silence against ~50-70 bytes of
-//! SCTP/DTLS/UDP/IP overhead already being paid per packet.
-//!
-//! A client that does not understand the flag must not be sent it, so the host only sets it
-//! when the join request advertised support.
+//! With [`FLAG_REDUNDANT`] the body is a u16 LE length, the current frame's Opus packet, then
+//! the previous frame's (RFC 2198-style redundancy without the RTP framing). It is the only
+//! loss tool here: in-band FEC is SILK-only and this encoder is CELT-only. The host sets the
+//! flag only for a client whose join request advertised support.
 
 use bytes::{BufMut, Bytes, BytesMut};
 
@@ -42,12 +33,8 @@ pub fn build_message(seq: u32, capture_ns: u64, flags: u8, opus: &[u8]) -> Vec<u
     out
 }
 
-/// Build one DataChannel message, ready to send.
-///
-/// One allocation and one copy of each payload. The forwarder used to `resize` a scratch
-/// `Vec` (zero-filling the growth), memcpy the payload into it, and then memcpy the whole
-/// thing again into a fresh `Bytes` — two copies and an allocation per packet, 200 times a
-/// second per session, on a path whose entire purpose is stable latency.
+/// Build one DataChannel message, ready to send: one allocation and one copy of each
+/// payload, on a path that runs 200 times a second per session.
 ///
 /// `redundant` carries the previous frame's Opus payload and sets [`FLAG_REDUNDANT`]. Pass
 /// `None` unless the client advertised that it can parse it.
@@ -58,8 +45,7 @@ pub fn build_datachannel_message(
     opus: &[u8],
     redundant: Option<&[u8]>,
 ) -> Bytes {
-    // A payload that will not fit the u16 length prefix cannot be described, so it travels
-    // alone rather than corrupting the frame. At 128 kbps / 5 ms this is unreachable.
+    // a payload too long for the u16 prefix travels alone (unreachable at 128 kbps / 5 ms)
     let redundant = redundant.filter(|_| opus.len() <= u16::MAX as usize);
     let extra = redundant.map_or(0, |r| REDUNDANCY_PREFIX_LEN + r.len());
     let mut buf = BytesMut::with_capacity(HEADER_LEN + opus.len() + extra);
@@ -80,10 +66,8 @@ pub fn build_datachannel_message(
     buf.freeze()
 }
 
-/// Split a body into (current, previous) according to `flags`.
-///
-/// The host does not parse its own messages; this exists so the wire format has one
-/// definition and the tests can hold it to it.
+/// Split a body into (current, previous) according to `flags`. The host never parses its
+/// own messages; this keeps the wire format in one place for the tests.
 pub fn split_payloads<'a>(
     header: &AudioHeader,
     body: &'a [u8],

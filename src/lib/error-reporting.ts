@@ -1,14 +1,9 @@
 import { commands } from "@/lib/bindings";
 
-// Roughly seventy `console.error` calls across the desktop UI, and in a release build every
-// one of them goes nowhere: no devtools are attached to the webview and nothing captures
-// its console. Forwarding them to the Rust log bus puts them where every other diagnostic
-// already is -- the Settings log terminal, `get_log_backlog` and `ScreenExtend logs`.
-//
-// Done by wrapping `console.error` rather than by editing each call site, because the call
-// sites are not the only source: an uncaught exception or a rejected promise never reaches
-// `console.error` at all, and a dependency's error message is worth just as much as ours.
-// The original console call is always made first, so devtools behave exactly as before.
+// In a release build no devtools are attached to the webview, so `console.error` goes nowhere.
+// Forward it to the Rust log bus (the Settings log terminal, `get_log_backlog`,
+// `ScreenExtend logs`). Wrapped rather than edited per call site: uncaught exceptions,
+// rejected promises and dependencies' errors count too. The original call is made first.
 
 const MAX_CHARS = 2000;
 
@@ -25,8 +20,7 @@ function describe(value: unknown): string {
 }
 
 function forward(parts: unknown[]): void {
-  // The bridge itself failing is the one thing that must not recurse: reporting it would
-  // call console.error again, which would try to report that.
+  // must not recurse: reporting a failure of the bridge would call console.error again
   if (forwarding) return;
   forwarding = true;
   try {

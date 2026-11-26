@@ -1,10 +1,9 @@
 # A train of short tone bursts on the default output, each at a recorded host time.
 #
-# winmm waveOut, 48 kHz mono 16-bit, streamed in 10 ms blocks. The host time of a click is the
-# moment waveOutGetPosition says the device path consumed the click's first sample (interpolated
-# between position samples taken every block), in Unix milliseconds on the system clock. That is
-# the same reference for every build under test, so delays compare; it is not "the instant the
-# speaker moved". Prints one JSON document at the end: {"clicks":[ms,...], ...}.
+# A click's host time is when waveOutGetPosition says the device path consumed its first sample
+# (interpolated between per-block position samples), in Unix ms on the system clock. Same reference
+# for every build under test, so delays compare; it is not "the instant the speaker moved".
+# Prints one JSON document at the end: {"clicks":[ms,...], ...}.
 param([int]$Seconds = 12, [int]$IntervalMs = 700, [double]$Amplitude = 0.25, [int]$BurstMs = 4, [int]$FreqHz = 2000)
 $ErrorActionPreference = 'Stop'
 Add-Type -TypeDefinition @'

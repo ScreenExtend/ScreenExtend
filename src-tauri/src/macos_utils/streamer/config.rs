@@ -16,9 +16,7 @@ pub struct EncoderConfig {
     /// The GPU driving the captured display, from `display::metal_registry_id`. `None` means
     /// "let VideoToolbox choose", which is right on a single-GPU Mac and a coin toss on any other.
     pub gpu_registry_id: Option<u64>,
-    /// The user's "software encode" setting. Until this landed, macOS read the flag nowhere at
-    /// all - `streamer/platform.rs` consumes it under `cfg(windows)` only - so the Settings
-    /// toggle and `serve --software-encode` were both inert on this platform.
+    /// The user's "software encode" setting: the Settings toggle or `serve --software-encode`.
     pub software_encode: bool,
     /// Build the session from this recipe instead of the production ladder and properties
     /// (`vt_recipe.rs`). `None` is the shipped behaviour; `SE_VT_RECIPE` can still supply one.
@@ -43,10 +41,8 @@ pub fn live_encoder_config(
     let fps = if let Some(f) = cfg.fps {
         f.clamp(15, 550)
     } else {
-        // The display's own rate, not a floor of 60. A 30 Hz display or a client that asked for
-        // 30 was being captured and encoded at 60 anyway: twice the frames, none of them new,
-        // and twice the encoder work competing with the ones that were. The `refresh_hz == 0`
-        // line above is what covers a display that reports nothing sensible.
+        // the display's own rate, not a floor of 60: a 30 Hz display encoded at 60 is twice the
+        // encoder work for no new frames. 60 only when the display reports nothing sensible
         let refresh = if refresh_hz == 0 { 60 } else { refresh_hz };
         let max_fps = cfg.max_fps.clamp(15, 550);
         refresh.clamp(15, max_fps)
@@ -72,10 +68,9 @@ pub fn live_encoder_config(
         min_qp: cfg.quality_qp,
         intra_refresh: cfg.intra_refresh,
         gpu_registry_id: None,
-        // The live handle where a host exists, the snapshot where one does not — the probe
-        // harness has no `AppState`, and `--software-encode` is the source of truth there. Read
-        // here, at encoder-selection time, so the Settings toggle changes the *next* session's
-        // encoder without every streamer having to be drained and rebuilt.
+        // read at encoder selection, so the Settings toggle changes the next session's encoder
+        // without rebuilding every streamer. The live handle where a host exists, else the
+        // snapshot: the probe harness has no `AppState`, so `--software-encode` decides there
         software_encode: cfg.software_encode_now(),
         recipe: None,
     }
@@ -110,8 +105,7 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
 
-        // The defect this closes: the flag was copied by value when the streamer was built, so a
-        // user flipping the setting changed an atomic nothing downstream ever read again.
+        // a flag copied by value when the streamer is built would never see the user's toggle
         let flag = Arc::new(AtomicBool::new(false));
         let cfg = Config {
             disable_gpu_encode: true,

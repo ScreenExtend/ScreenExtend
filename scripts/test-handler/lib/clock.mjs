@@ -1,19 +1,14 @@
 // The one reference clock every stamp and every browser time is compared on: the system's
 // precise wall clock (GetSystemTimePreciseAsFileTime), in Unix milliseconds.
 //
-// Why not Date.now() or performance.timeOrigin: at Windows' default 15.6 ms timer resolution
-// (what a freshly booted machine runs at until some process asks for more) the coarse wall clock
-// moves in 15.6 ms steps, and every clock anchored on it is off by a different 0-16 ms per
-// process: node's Date.now(), node's and every Chrome context's `performance.timeOrigin`, and
-// .NET's DateTime.UtcNow, which stage.ps1 used to draw the stamp with. Measured on 2026-10-06
-// after a reboot: .NET UtcNow lagged the precise clock by a 0-15.9 ms sawtooth, node's
-// timeOrigin was off by -3 to -8 ms per process, and the page's offset from node read 0.95 to
-// 13.76 ms run to run — so the stamp metric carried a bias of up to about ±16 ms that changed
-// from run to run. Before the reboot something on the machine held the timer at 1 ms and hid it.
+// Not Date.now() or performance.timeOrigin: at Windows' default timer resolution (in effect
+// until some process asks for more) the coarse wall clock moves in 15.6 ms steps, so every clock
+// anchored on it (node's Date.now(), each context's `performance.timeOrigin`, .NET's
+// DateTime.UtcNow) is off by a different 0-16 ms per process: a run-to-run bias in the stamp.
 //
 // node's process.hrtime() is QueryPerformanceCounter on Windows, so one paired QPC / precise
-// wall-clock sample taken in a helper process anchors it exactly; after that preciseNow() is
-// hrtime plus a constant, immune to the coarse clock.
+// wall-clock sample taken in a helper process anchors it; after that preciseNow() is hrtime
+// plus a constant.
 import { execFileSync } from 'node:child_process';
 
 let K = null;

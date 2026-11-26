@@ -21,7 +21,7 @@ const MAX_DISPLAYS: usize = 16;
 ///
 /// It is what `kVTVideoEncoderSpecification_PreferredEncoderGPURegistryID` takes. Without it
 /// VideoToolbox picks an encoder by its own criteria, and on a Mac with more than one GPU that can
-/// be a different one from the GPU WindowServer composites this display on — in which case every
+/// be a different one from the GPU WindowServer composites this display on, in which case every
 /// frame's IOSurface migrates across the PCIe bridge before it can be encoded.
 ///
 /// `CGDirectDisplayCopyCurrentMetalDevice` is CoreGraphics 10.11, below the floor. The returned
@@ -114,12 +114,11 @@ pub fn dimensions_by_name(device_name: &str) -> Option<(u32, u32)> {
 
 /// Keep a display changing for the duration of a capture measurement.
 ///
-/// Every capture number in this territory is meaningless on a still screen: the delivery
-/// handlers drop frames whose dirty-rect list is empty, and WindowServer stops compositing a
-/// display that has gone to sleep (run `caffeinate -u -t 900 &` first, or these tests measure
-/// an asleep panel and report one frame). `CGDisplayMoveCursorToPoint` needs no Accessibility
-/// grant, unlike `CGEventPost`, and the cursor is composited into the frame because both
-/// backends ask for it — so moving it is the cheapest animation available over SSH.
+/// A still screen measures nothing: the delivery handlers drop frames with no dirty rects, and
+/// WindowServer stops compositing a sleeping display (run `caffeinate -u -t 900 &` first, or
+/// the tests report one frame). `CGDisplayMoveCursorToPoint` needs no Accessibility grant,
+/// unlike `CGEventPost`, and both backends composite the cursor into the frame, so moving it is
+/// the cheapest animation available over SSH.
 #[cfg(test)]
 pub struct CursorAnimation {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -132,10 +131,9 @@ impl CursorAnimation {
         use objc2_core_foundation::CGPoint;
         use objc2_core_graphics::CGDisplayMoveCursorToPoint;
 
-        // Moving the pointer alone is not enough: macOS hides the cursor when there has been no
-        // real HID input, and a hidden cursor composites nothing. The hide/show pair is
-        // reference-counted and forces WindowServer to recomposite the cursor rectangle whether
-        // or not the pointer was visible, which is what actually produces the dirty rects.
+        // moving the pointer alone is not enough: macOS hides the cursor without real HID input,
+        // and a hidden cursor composites nothing. The refcounted hide/show pair forces
+        // WindowServer to recomposite the cursor rectangle either way: that makes the dirty rects
         unsafe extern "C" {
             fn CGDisplayHideCursor(display: DisplayId) -> i32;
             fn CGDisplayShowCursor(display: DisplayId) -> i32;

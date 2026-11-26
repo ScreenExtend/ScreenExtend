@@ -43,12 +43,8 @@ struct OutputCtx {
 
 /// How long to wait on each of SCK's async-to-sync bridges.
 ///
-/// SCK offers no non-blocking variant, so the fix is bounding the waits rather than removing them.
-/// Both are taken under the `AudioHub` mutex, which holds every other session's audio subscribe
-/// and unsubscribe, and both are hit in the denied-Screen-Recording case a user is most likely to
-/// meet: at 5 s each, serially, plus the candidate loop trying the next backend after them, one
-/// device enabling audio could freeze the others for ten seconds. A display list or a stream start
-/// that has not arrived in 1.5 s is not going to succeed.
+/// SCK has no non-blocking variant, and each wait holds up every other session's audio subscribe
+/// and unsubscribe. A display list or stream start that has not arrived in 1.5 s will not succeed.
 const SCK_CALL_TIMEOUT: Duration = Duration::from_millis(1500);
 
 pub struct SckAudioCapture {
@@ -90,11 +86,9 @@ impl SckAudioCapture {
         let cls_config = runtime_class(c"SCStreamConfiguration")?;
         let cls_stream = runtime_class(c"SCStream")?;
 
-        // `getShareableContent` raises the Screen Recording alert on macOS 15+ while the app is
-        // unauthorized, and this runs automatically at system-audio start. It is refused only
-        // on a *definite* denial — the same rule the video pipeline applies before it starts
-        // its own SCStream at this same join. An unknown read (a host granted while running,
-        // with no other window on screen to confirm it) must not silence the session.
+        // `getShareableContent` raises the Screen Recording alert on macOS 15+ while unauthorized,
+        // and this runs unprompted at audio start. Refuse only on a definite denial: an unknown
+        // read (granted while running, no other window to confirm it) must not silence the session
         let Some(permit) = crate::macos_utils::permissions::capture_start_permit() else {
             return Err(AudioCaptureError::Setup(
                 "Screen Recording is definitely denied for this process (the live window list \
@@ -135,12 +129,9 @@ impl SckAudioCapture {
                 epoch: 0,
             };
             let _: () = msg_send![&*config, setMinimumFrameInterval: interval];
-            // SCK has no audio-only mode before the 14.2 Process Tap, so this backend has to run
-            // a real screen stream to get audio at all — which is why it needs Screen Recording
-            // and lights the menu-bar indicator for the whole session. That much is Apple's
-            // constraint. What is ours is how much that dummy stream costs: 2x2 at 1 fps with no
-            // cursor compositing and the shallowest queue SCK accepts, and no screen output is
-            // ever registered so every frame it does produce is dropped at the delegate.
+            // SCK has no audio-only mode, so audio rides a real screen stream (hence Screen
+            // Recording and the menu-bar indicator). Keep that stream cheap: 2x2 at 1 fps, no
+            // cursor, the shallowest queue SCK accepts, and no screen output registered
             let _: () = msg_send![&*config, setShowsCursor: false];
             let _: () = msg_send![&*config, setQueueDepth: 3isize];
         }
@@ -250,21 +241,19 @@ impl AudioSource for SckAudioCapture {
     }
 
     fn stop(&mut self) {
-        // The order here is the whole of this function's correctness. Releasing an `SCStream`, its
-        // delegate and a `DispatchQueue` handle does not drain or cancel blocks already enqueued
-        // on that queue, and Apple does not document `stopCaptureWithCompletionHandler:` as a
-        // barrier against an in-flight `stream:didOutputSampleBuffer:ofType:`. The Process Tap
-        // sibling gets that guarantee for free — `AudioDeviceDestroyIOProcID` is documented not to
-        // return while the IOProc runs — and SCK has no equivalent, so it is built by hand.
+        // order matters: releasing the stream, delegate and queue does not drain blocks already
+        // enqueued, and `stopCaptureWithCompletionHandler:` is not documented as a barrier against
+        // an in-flight `stream:didOutputSampleBuffer:ofType:` (unlike the Process Tap's
+        // `AudioDeviceDestroyIOProcID`, documented not to return while the IOProc runs), so the
+        // barrier is built by hand
 
-        // 1. Blank the ivar the handler reads its context out of. A callback that starts after
-        //    this sees null and returns; one already past that read is covered by step 3.
+        // blank the ctx ivar first: a callback that starts after this sees null and returns, and
+        // one already past that read is covered by the queue drain below
         if let Some(delegate) = &self.delegate {
             // SAFETY: `delegate` is an instance of `delegate_class`, which declares the ivar
             unsafe { set_ctx_ivar(delegate, ptr::null_mut()) };
         }
 
-        // 2. Stop the stream and wait for its completion block.
         if let Some(stream) = &self.stream {
             let (tx, rx) = mpsc::channel::<()>();
             let handler = RcBlock::new(move |_error: *mut AnyObject| {
@@ -284,9 +273,8 @@ impl AudioSource for SckAudioCapture {
             }
         }
 
-        // 3. Drain the delivery queue. It is serial, so a synchronous block posted to it cannot
-        //    run until every handler queued ahead of it has returned — which is exactly the
-        //    guarantee the context box needs before it is freed.
+        // the delivery queue is serial, so a sync block cannot run until every handler queued
+        // ahead of it has returned: the guarantee the ctx box needs before it is freed
         if let Some(queue) = &self._queue {
             queue.exec_sync(|| {});
         }
@@ -403,11 +391,9 @@ fn handle_audio_sample(sample: &CMSampleBuffer, ctx: &OutputCtx) {
         return;
     };
 
-    // `setSampleRate: 48000` is a request. SCK derives its audio from the system mix and nothing
-    // downstream resamples - `format.rs` converts sample kind and channel layout only, and the
-    // reported `AudioFormat` hardcodes 48 kHz - so a stream honoured only approximately would be
-    // encoded as if it were 48 kHz: roughly 9% fast and sharp, with A/V drift accumulating at
-    // about 80 ms per second. Drop the block rather than emit that, and say so once per rate.
+    // `setSampleRate: 48000` is only a request and nothing downstream resamples, so another rate
+    // would be encoded as 48 kHz (about 9% fast, ~80 ms of A/V drift per second): drop the block
+    // and log once per rate
     if desc.sample_rate != 48_000 {
         if ctx.seen_rate.swap(desc.sample_rate, Ordering::Relaxed) != desc.sample_rate {
             crate::teprintln!(
@@ -524,11 +510,10 @@ fn handle_audio_sample(sample: &CMSampleBuffer, ctx: &OutputCtx) {
 
 /// Host-clock time of an SCK audio chunk, from its presentation timestamp.
 ///
-/// SCK stamps sample buffers on the host time base, so the age of the stamp against
-/// `mach_absolute_time` is the chunk's delivery latency, and subtracting it from the shared clock
-/// gives the capture instant. A stamp that is in the future or more than a second old means a
-/// different epoch than assumed; delivery time is then used instead, which is still the callback
-/// rather than the encoder's later wakeup.
+/// SCK stamps sample buffers on the host time base, so the stamp's age against
+/// `mach_absolute_time` is the delivery latency, and subtracting it from the shared clock gives
+/// the capture instant. A stamp in the future or over a second old means another epoch: delivery
+/// time is used instead.
 fn sample_host_ns(sample: &CMSampleBuffer) -> u64 {
     let now = crate::streamer::audio::host_now_ns();
     // SAFETY: floor-present CoreMedia accessor on a sample buffer live for this call

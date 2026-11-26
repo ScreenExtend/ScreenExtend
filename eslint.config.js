@@ -15,9 +15,7 @@ export default [
       "*.config.ts",
     ],
   },
-  // The compatibility gate itself was outside every lint the repo has, which is a poor
-  // place for a script whose whole job is to fail the build correctly. Node globals only;
-  // no TypeScript rules, because these are plain ES modules.
+  // Node globals only, no TypeScript rules: these are plain ES modules
   {
     files: ["scripts/**/*.mjs"],
     languageOptions: {
@@ -32,9 +30,7 @@ export default [
       parser: tsParser,
       ecmaVersion: "latest",
       sourceType: "module",
-      // Type-aware linting. It roughly doubles `pnpm lint` (3.2 s -> 6.7 s here) and is
-      // what `no-floating-promises` needs -- in a codebase whose every backend call is an
-      // async Tauri command, that is the single most valuable rule available.
+      // type-aware linting doubles `pnpm lint` (3.2 s -> 6.7 s), but `no-floating-promises` needs it
       parserOptions: { ecmaFeatures: { jsx: true }, project: "./tsconfig.json" },
     },
     plugins: {
@@ -49,8 +45,7 @@ export default [
       "react-hooks/exhaustive-deps": "warn",
       "react-refresh/only-export-components": ["warn", { allowConstantExport: true }],
       "@typescript-eslint/no-explicit-any": "warn",
-      // A warning, not an error: the eighteen existing hits are mostly formik's
-      // `setFieldValue`, which cannot reject, and triaging them is its own change.
+      // warn, not error: most existing hits are formik's `setFieldValue`, which cannot reject
       "@typescript-eslint/no-floating-promises": "warn",
       "@typescript-eslint/no-unused-vars": [
         "warn",

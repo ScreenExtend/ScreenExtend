@@ -56,8 +56,7 @@ fn generation_change_means_resync_to_head() {
 }
 
 /// The header the driver is compiled against, read at build time so this test fails when
-/// `shm_ring.hpp` changes and the Rust reader does not. The two are built by different toolchains
-/// and neither runs in CI, so a comment saying "change both together" is not enough.
+/// `shm_ring.hpp` changes and the Rust reader does not.
 const CPP_HEADER: &str = include_str!("../../../../../macos/ScreenExtendAudio/src/shm_ring.hpp");
 
 /// Value of `inline constexpr <type> <name> = <literal>;` in the C++ header.

@@ -19,7 +19,7 @@ use crate::streamer::audio::AudioDiagnostics;
 
 use super::branding::SHM_NAME;
 
-// Hard ABI contract with `src-tauri/macos/ScreenExtendAudio/src/shm_ring.hpp` — change both
+// Hard ABI contract with `src-tauri/macos/ScreenExtendAudio/src/shm_ring.hpp`: change both
 // together. `legacy/test/ring.rs` scrapes that header and fails if the two drift.
 const SHM_MAGIC: u32 = 0x3141_4553; // 'SEA1' little-endian
 const LAYOUT_VERSION: u32 = 2;
@@ -41,7 +41,7 @@ const OFF_ANCHOR_POS: usize = 72;
 const OFF_ANCHOR_HOST_TIME: usize = 80;
 const SHM_TOTAL_BYTES: usize = HEADER_BYTES + RING_CAPACITY * 4;
 const DRAIN_CHUNK: usize = 4096;
-/// interleaved stereo samples per second — the ring's unit
+/// interleaved stereo samples per second (the ring's unit)
 const RING_SAMPLES_PER_SEC: i128 = 96_000;
 
 pub(crate) fn clamp_read(read_pos: u64, write_pos: u64, capacity: u64) -> (u64, u64, bool) {
@@ -77,7 +77,7 @@ pub struct CaptureTargets {
     pub nonsilent: Arc<AtomicU64>,
 }
 
-/// silence floor (~−90 dBFS), matching the Process Tap backend
+/// Silence floor (about -90 dBFS), matching the Process Tap backend.
 const SILENCE_THRESHOLD: f32 = 1.0 / 32768.0;
 
 impl CaptureTargets {
@@ -105,8 +105,8 @@ impl CaptureTargets {
 
 struct ShmMap {
     base: *mut c_void,
-    /// false when the segment could only be opened read-only, so `readPos` cannot be published and
-    /// the driver's overrun accounting stays off
+    /// False when the segment could only be opened read-only: `readPos` cannot be published and
+    /// the driver's overrun accounting stays off.
     writable: bool,
 }
 
@@ -252,7 +252,7 @@ impl ShmMap {
             if got != want {
                 crate::teprintln!(
                     "audio(legacy): shared segment header rejected: {name} is {got}, expected \
-                     {want} (driver and host layouts differ — reinstall the audio driver)"
+                     {want} (driver and host layouts differ: reinstall the audio driver)"
                 );
                 return false;
             }
@@ -311,8 +311,7 @@ pub fn start(device_id: AudioObjectID, mut targets: CaptureTargets) -> Reader {
                 };
             }
             Err(e) => {
-                // Discarding this used to leave `Transport::Shm` reported with no thread behind
-                // it: the success line already printed, and no audio produced, forever.
+                // fall back rather than report `Transport::Shm` with no thread behind it
                 crate::teprintln!(
                     "audio(legacy): shm reader thread spawn failed ({e}); falling back to HAL input"
                 );
@@ -335,18 +334,15 @@ pub fn start(device_id: AudioObjectID, mut targets: CaptureTargets) -> Reader {
 
 /// How long the reader sleeps when the shared ring is empty.
 ///
-/// A pure polling interval, not a wait: the producer is `coreaudiod` in another process writing to
-/// shared memory, so there is no cross-process wakeup to be had and nothing ever unparks this
-/// thread. It is a quarter of the driver's own 2.67 ms IO cycle (128 frames at 48 kHz), so a block
-/// waits at most a fraction of the period that produced it.
+/// A polling interval, not a wait: the producer is `coreaudiod` writing shared memory from
+/// another process, so nothing can unpark this thread. A quarter of the driver's 2.67 ms IO
+/// cycle (128 frames at 48 kHz).
 const POLL_INTERVAL: Duration = Duration::from_micros(250);
 
 fn shm_reader_loop(map: ShmMap, targets: CaptureTargets, stop: Arc<AtomicBool>) {
-    // Not a Mach time-constraint policy. That declares a periodic deadline the scheduler holds the
-    // thread to, and this thread then sleeps for an interval unrelated to it — a contract it
-    // cannot honour, whose usual reward is being demoted out of the real-time band anyway. The
-    // work here is a memcpy out of shared memory and a ring push; `user_interactive` is what it
-    // actually needs, and is what the SCK audio delivery queue asks for on the native tiers.
+    // Not a Mach time-constraint policy: that declares a periodic deadline, and a thread that
+    // sleeps on an unrelated interval cannot honour it and gets demoted anyway. A memcpy and a
+    // ring push need only `user_interactive`.
     crate::macos_utils::streamer::qos::pin_current_thread_user_interactive();
 
     let mask = RING_CAPACITY - 1;
@@ -442,10 +438,9 @@ extern "C-unwind" fn input_ioproc(
     };
     let scratch = unsafe { &mut *ctx.scratch.get() };
 
-    // Run the delivered layout through the same converter the native backends use, rather than
-    // reinterpreting whatever arrives as interleaved stereo f32. This is the path a host takes
-    // when the driver could not create its shared segment — the case where least is known about
-    // the running configuration, and the last place to be guessing at the format.
+    // Run the delivered layout through the converter the native backends use instead of
+    // assuming interleaved stereo f32: this path runs when the driver could not create its
+    // shared segment, where least is known about the running configuration.
     let written = if desc.non_interleaved {
         let ch = nbuf.min(8);
         let mut planes: [&[u8]; 8] = [&[][..]; 8];
@@ -516,8 +511,8 @@ impl HalInputProc {
             return None;
         }
         let desc = read_input_format(device)?;
-        // Nothing in the macOS audio path resamples, and the ring's whole contract is 48 kHz — a
-        // rate mismatch here would encode at the wrong speed rather than fail, so refuse instead.
+        // nothing in the macOS audio path resamples and the ring's contract is 48 kHz: a rate
+        // mismatch would encode at the wrong speed rather than fail
         if desc.sample_rate != 48_000 {
             crate::teprintln!(
                 "audio(legacy): HAL input on device {device} is {} Hz, not 48000; refusing the \

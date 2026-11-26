@@ -1,7 +1,7 @@
 #!/bin/bash
 # Fail the build if the macOS binary link-time-references anything newer than the
 # deployment floor (10.15). dyld binds every non-weak undefined symbol before main(),
-# so ONE such reference makes the whole app fail to launch on Catalina — a load bug,
+# so ONE such reference makes the whole app fail to launch on Catalina: a load bug,
 # not a missing feature.
 #
 #   ./scripts/check-macos-dyld.sh <binary> <sdk-path> [options]
@@ -22,7 +22,7 @@
 # either absent from the SDK's .tbd stubs or annotated in the SDK headers as
 # introduced after the floor. The .tbd stubs are the authoritative test: they are
 # generated from the dylibs that shipped with that SDK, so "in the stub" == "the
-# 10.15 dyld can bind it". The INTRO column is diagnostic only — it is scraped
+# 10.15 dyld can bind it". The INTRO column is diagnostic only: it is scraped
 # from the availability macro nearest the declaration, which can misattribute
 # when several declarations share a 3-line window. Never relax the stub verdict
 # because INTRO looks old.
@@ -75,7 +75,6 @@ FLOOR_MIN="${FLOOR#*.}"; FLOOR_MIN="${FLOOR_MIN%%.*}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/macos-dyld.XXXXXX")" || die "mktemp failed"
 trap 'rm -rf "$WORK"' EXIT
 
-# ---------------------------------------------------------------- binary facts
 say "== binary =="
 say "  $BIN"
 say "  $(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")"
@@ -88,15 +87,12 @@ if [ "$QUIET" -eq 0 ]; then
   echo
 fi
 
-# ------------------------------------------------- SDK export index (.tbd stubs)
 SDK_KEY="$(echo "$SDK" | tr -c 'A-Za-z0-9' '_')"
 INDEX_CACHE="${TMPDIR:-/tmp}/macos-dyld-sdkindex${SDK_KEY}.txt"
 if [ ! -s "$INDEX_CACHE" ]; then
   say "building SDK export index from .tbd stubs (first run only, ~30s)..."
-  # A .tbd lists plain C symbols under `symbols:`/`weak-symbols:` but Objective-C
-  # classes under a separate `objc-classes:` key, as BARE names — so the class-ref
-  # symbols the linker actually emits (_OBJC_CLASS_$_NSString) have to be
-  # reconstructed, or every ObjC class in the app looks absent from the SDK.
+  # a .tbd lists C symbols under `symbols:`/`weak-symbols:` but ObjC classes as bare names
+  # under `objc-classes:`, so rebuild the names the linker emits (_OBJC_CLASS_$_NSString)
   find "$SDK/System/Library" "$SDK/usr/lib" -name '*.tbd' -print0 2>/dev/null \
     | xargs -0 cat 2>/dev/null \
     | awk '
@@ -133,24 +129,23 @@ if [ ! -s "$INDEX_CACHE" ]; then
       ' \
     | sort -u > "$INDEX_CACHE.tmp" && mv "$INDEX_CACHE.tmp" "$INDEX_CACHE"
 fi
-[ -s "$INDEX_CACHE" ] || die "SDK export index is empty — is $SDK a real SDK?"
+[ -s "$INDEX_CACHE" ] || die "SDK export index is empty: is $SDK a real SDK?"
 say "SDK export index: $(wc -l < "$INDEX_CACHE" | tr -d ' ') symbols ($INDEX_CACHE)"
 say ""
 
-# --------------------------------------------------------- undefined symbols
 # `nm -m` marks weak imports; a weak undefined symbol binds to 0 instead of
-# aborting the load, so it is never a load bug.
+# aborting the load, so it is never a load bug
 nm -m -arch all "$BIN" 2>/dev/null > "$WORK/nm-m.txt" || nm -m "$BIN" > "$WORK/nm-m.txt"
 [ -s "$WORK/nm-m.txt" ] || die "nm produced no output for $BIN"
 
 awk '
   /\(undefined\)/ {
-    # "(undefined) weak external _foo" — must not be confused with a mangled Rust
+    # "(undefined) weak external _foo": must not be confused with a mangled Rust
     # name that merely contains "Weak" (alloc::sync::Weak<T> and friends).
     weak = ($0 ~ /\(undefined\)[ \t]+weak/) ? 1 : 0
     lib = "?"
     if (match($0, /\(from [^)]+\)/)) lib = substr($0, RSTART + 6, RLENGTH - 7)
-    # "(undefined) [weak] external <symbol> [(from <lib>)]" — take the field after
+    # "(undefined) [weak] external <symbol> [(from <lib>)]": take the field after
     # "external" rather than the first underscore-prefixed one, so a symbol without
     # the usual leading underscore (dyld_stub_binder) is not silently dropped.
     sym = ""
@@ -168,10 +163,9 @@ awk -F'\t' '
 
 TOTAL=$(wc -l < "$WORK/undef.txt" | tr -d ' ')
 
-# Names without the leading underscore, for the header grep. Restricted to symbols
-# that come from a framework (or look like a framework/os symbol) — feeding grep the
-# whole libSystem C runtime (memcpy, malloc, ...) matches millions of header lines for
-# no benefit: everything in libc has been there since long before the floor.
+# names without the leading underscore, for the header grep. Framework symbols only: the
+# libSystem C runtime (memcpy, malloc, ...) matches millions of header lines and all of
+# it predates the floor
 awk -F'\t' '
   {
     sym = $1; lib = $3
@@ -183,12 +177,9 @@ awk -F'\t' '
 ' "$WORK/undef.txt" | sed -e 's/^OBJC_CLASS_\$_//' -e 's/^OBJC_METACLASS_\$_//' \
   | sort -u > "$WORK/names.txt"
 
-# ------------------------------------------------------------ availability scan
-# Anchor on the availability MACRO, not on the symbol names: grepping the headers
-# for names like NSString or NSObject matches millions of lines, while the set of
-# lines that carry an availability annotation is small and cacheable per SDK. The
-# annotation usually trails the declaration or sits on the next line, so keep two
-# lines of leading context and stitch a 3-line window back together.
+# anchor on the availability macro, not the symbol names: names like NSString match
+# millions of header lines, while annotated lines are few and cacheable per SDK. The
+# annotation trails the declaration or sits on the next line, hence -B2
 ANNOT_RE='API_AVAILABLE|API_DEPRECATED|API_UNAVAILABLE|__OSX_AVAILABLE|CF_AVAILABLE|CF_DEPRECATED|NS_AVAILABLE|NS_DEPRECATED|AVAILABLE_MAC_OS_X_VERSION'
 ANNOT_CACHE="${TMPDIR:-/tmp}/macos-dyld-annot${SDK_KEY}.txt"
 if [ ! -s "$ANNOT_CACHE" ]; then
@@ -259,13 +250,11 @@ if [ -s "$WORK/names.txt" ]; then
   ' "$ANNOT_CACHE" | sort > "$WORK/avail.txt"
 fi
 
-# ---------------------------------------------------------------- allowlist
 : > "$WORK/allow.txt"
 if [ -f "$ALLOWLIST" ]; then
   sed -e 's/#.*//' -e 's/[[:space:]]//g' "$ALLOWLIST" | grep -v '^$' | sort -u > "$WORK/allow.txt"
 fi
 
-# ---------------------------------------------------------------- classify
 say "== undefined symbols ($TOTAL) =="
 say ""
 printf '%-8s %-52s %-9s %-26s %s\n' STATUS SYMBOL INTRO LIBRARY NOTE > "$WORK/table.txt"
@@ -325,7 +314,6 @@ else
   echo
 fi
 
-# ----------------------------------------------------- runtime-resolved names
 if [ "$SRC_SCAN" -eq 1 ] && [ -d "$SRC_DIR" ]; then
   say "== runtime-resolved (NOT link-time; these are the safe way to reach newer APIs) =="
   {
@@ -341,13 +329,12 @@ if [ "$SRC_SCAN" -eq 1 ] && [ -d "$SRC_DIR" ]; then
       | grep -oE '"[A-Za-z_][A-Za-z0-9_]*"' | tr -d '"' | sed 's/^/  sck runtime    /'
     grep -rhoE 'set_optional[a-z0-9_]*\([^,]*,[[:space:]]*"k[A-Za-z0-9_]*"' "$SRC_DIR" 2>/dev/null \
       | grep -oE '"k[A-Za-z0-9_]*"' | tr -d '"' | sed 's/^/  VT dlsym key   /'
-    # A dlsym target is often reached through a helper that takes &str and does the
-    # CString::new itself (permissions.rs cg_bool_fn, streamer/mod.rs), so the literal
-    # never sits next to the word "dlsym".
+    # a dlsym target often goes through a helper that does the CString::new itself
+    # (permissions.rs cg_bool_fn, streamer/mod.rs), so the literal is not next to "dlsym"
     grep -rhoE 'CString::new\("[A-Za-z_][A-Za-z0-9_]*"' "$SRC_DIR" 2>/dev/null \
       | grep -oE '"[A-Za-z_][A-Za-z0-9_]*"' | tr -d '"' | sed 's/^/  CString+dlsym  /'
-    # ...and the dlsym call is often split over several lines, putting the name out of
-    # reach of a line-based match. `c"Name".as_ptr()` is the giveaway.
+    # a dlsym call split over several lines hides the name from a line match;
+    # `c"Name".as_ptr()` is the giveaway
     grep -rhoE 'c"[A-Za-z_][A-Za-z0-9_]*"\.as_ptr\(\)' "$SRC_DIR" 2>/dev/null \
       | grep -oE '"[A-Za-z_][A-Za-z0-9_]*"' | tr -d '"' | sed 's/^/  cstr FFI name  /'
   } | sort -u -k2 | sed '/^[[:space:]]*$/d' > "$WORK/runtime.txt"
@@ -357,7 +344,6 @@ if [ "$SRC_SCAN" -eq 1 ] && [ -d "$SRC_DIR" ]; then
   say ""
 fi
 
-# ---------------------------------------------------------------- verdict
 echo "== verdict =="
 echo "  floor          $FLOOR"
 echo "  undefined      $TOTAL"

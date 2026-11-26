@@ -1,91 +1,18 @@
-//! macOS permission reads (Screen Recording, Accessibility).
+//! macOS permission reads (Screen Recording, Accessibility) and the prompt policy.
 //!
-//! The hard constraint here is that `CGPreflightScreenCaptureAccess` is *cached per
-//! process*: Apple DTS states it "will not reflect this change until the application is
-//! restarted", so it never reflects a grant made after the process started. Reading it
-//! as a negative is what made the first-run gate unclosable, because the answer is
-//! monotonically false for the life of a process that started denied.
+//! Every read is tri-state ([`Silent`]) and `Unknown` is never a denial: only
+//! `DefinitelyDenied` may refuse a join, kick a session or reset a TCC row.
 //!
-//! `AXIsProcessTrusted` is a different case, and this comment used to say otherwise. It is
-//! not documented as cached, and the common practice of polling it after the prompt (and
-//! carrying on without a restart once it turns true) depends on it being re-read. This
-//! project has not verified either behaviour on its own machines, so nothing here depends
-//! on it: an Accessibility negative is only treated as definite when the AX messaging
-//! probe independently fails with `kAXErrorAPIDisabled` in the same read (see
-//! [`silent_accessibility`]).
+//! Periodic and automatic paths use silent reads only; a prompting call needs a
+//! [`PromptPermit`]. Prompting: `CGRequestScreenCaptureAccess`, `AXIsProcessTrustedWithOptions`
+//! with the prompt option, `SCShareableContent` while unauthorized (macOS 15+ raises the alert
+//! on every call), and starting an `SCStream` or `CGDisplayStream` while unauthorized.
 //!
-//! So the Screen Recording ladder is ordered by *liveness*, not by convenience:
-//!
-//! 1. `CONFIRMED` — a positive this process has already proven once. One-way: once it is
-//!    latched, no negative is ever definite again for this process ([`classify_screen_recording`]).
-//! 2. `CGPreflightScreenCaptureAccess` — trusted as a **positive only**.
-//! 3. The window-list probe — `CGWindowListCopyWindowInfo` + `kCGWindowName`.
-//!    Without the grant macOS strips window names from other processes' entries.
-//!    10.15+, no prompt, no capture session, microseconds, and it flips the
-//!    instant the user ticks the toggle. On-screen windows are read first; off-screen
-//!    windows count as *positive evidence only*, because plenty of them are untitled
-//!    even with the grant (measured: 25 foreign layer-0 windows, 3 titled, on an
-//!    authorized macOS 26 session).
-//! 4. `SCShareableContent` (12.3+) — only as a confirmation of a silent grant (doctor).
-//!
-//! The cached preflight negative is never a definite denial on its own. It is what the
-//! *startup gate* shows as "not granted yet" (with the restart hint), and nothing else.
-//!
-//! ## The three silent answers
-//!
-//! [`Silent`] is `Granted`, `DefinitelyDenied` or `Unknown`, each with the source that
-//! produced it ([`SilentRead`]). `DefinitelyDenied` for Screen Recording needs positive
-//! evidence: at least [`DENY_MIN_WINDOWS`] normal windows owned by at least
-//! [`DENY_MIN_OWNERS`] other processes on screen, none of them titled, in a process that
-//! has never latched `CONFIRMED`. Everything else is `Unknown` — including "preflight
-//! false and nothing on screen to read", which is exactly the state of a process that
-//! started unauthorized and was granted while running.
-//!
-//! What each answer may do:
-//!
-//! | | refuse a join / capture start | kick live sessions | `tccutil reset` on Retry |
-//! |---|---|---|---|
-//! | `Granted` | no | no | no |
-//! | `Unknown` | **no** | **no** | **no** |
-//! | `DefinitelyDenied` | yes | yes | yes (`.app` that owns its TCC identity only) |
-//!
-//! `CGDisplayStream` is deliberately absent: an *unauthorized* process still gets
-//! a stream and still gets `FrameComplete` frames — they just contain wallpaper —
-//! so frame delivery is a liveness signal and never an authorization one.
-//!
-//! Every read is tri-state. "We could not learn the answer" is `unknown`, and
-//! `unknown` must never be treated as a denial by anything that refuses, kicks or resets.
-//!
-//! ## Silent reads and prompting calls
-//!
-//! The APIs split into two kinds, and the split is the whole of the prompt policy:
-//!
-//! - **Silent**: `CGPreflightScreenCaptureAccess`, the window-name probe
-//!   (`CGWindowListCopyWindowInfo`), `AXIsProcessTrusted`, and the AX messaging probe.
-//! - **Prompting**: `CGRequestScreenCaptureAccess`, `AXIsProcessTrustedWithOptions`
-//!   with `AXTrustedCheckOptionPrompt`, `+[SCShareableContent getShareableContent…]`
-//!   while not authorized (macOS 15+ raises the system alert on every call), and
-//!   starting an `SCStream` / `CGDisplayStream` while not authorized.
-//!
-//! Every periodic or automatic path — `check_permissions` (polled by the bootstrap
-//! gate and the lapse dialog), `screen_recording_live` (the session watchdog and
-//! `ensure_screen_recording_access` at pipeline start), `prime` — uses silent reads
-//! only. A prompting call needs a [`PromptPermit`], and exactly three functions mint
-//! one: [`prompt_gate`], which hands it out for the *first* request for a permission
-//! and for an explicit user Retry; [`silently_granted_permit`], which hands it out only
-//! once a silent read has already said granted, when nothing can prompt; and
-//! [`capture_start_permit`], for starting capture, which is refused only on a definite
-//! denial (the video pipeline already starts an `SCStream` on the same answer). The
-//! decision itself is the pure [`prompt_policy`], and source-level tests pin the mint
-//! sites, the call sites, and the only caller of [`prompt_gate`] outside this file
-//! (`serve`, which makes the one first request a headless host would otherwise never make).
-//!
-//! The first request is remembered per *TCC identity*: in `permission-requests.json`
-//! only when this process is an `.app` with a bundle id that LaunchServices started
-//! (see [`owns_tcc_identity`]). A bare binary (`pnpm tauri dev`, `cargo run`) or an
-//! `.app` executable started from a shell is attributed by TCC to its parent (the
-//! terminal), so its request says nothing about the app's row: it may prompt once per
-//! process and persists nothing.
+//! `CGPreflightScreenCaptureAccess` is cached per process, so it counts as a positive only.
+//! Whether `AXIsProcessTrusted` sees a grant made while running is unverified, so its negative
+//! is definite only when the AX messaging probe agrees ([`silent_accessibility`]).
+//! `CGDisplayStream` frame delivery is no authorization signal: an unauthorized process still
+//! gets `FrameComplete` frames, they just contain wallpaper.
 
 use std::collections::BTreeMap;
 use std::ffi::{c_void, CString};
@@ -125,15 +52,14 @@ unsafe extern "C" {
     fn CFStringGetLength(s: *const c_void) -> isize;
 }
 
-// `CGWindowListCopyWindowInfo` is 10.5+, so the link-time reference is safe on the
-// 10.15 floor.
+// `CGWindowListCopyWindowInfo` is 10.5+, so linking it is safe on the 10.15 floor
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
     fn CGWindowListCopyWindowInfo(option: u32, relative_to_window: u32) -> *const CFArray;
 }
 
-// Signatures must match the other declarations in this crate
-// (`macos_utils/streamer/sck.rs`) or the linker sees a clash.
+// signatures must match the other declarations in this crate (`macos_utils/streamer/sck.rs`)
+// or the linker sees a clash
 unsafe extern "C-unwind" {
     fn CFDictionaryGetValue(the_dict: *const CFDictionary, key: *const c_void) -> *const c_void;
     fn CFNumberGetValue(number: *const CFNumber, the_type: isize, value_ptr: *mut c_void) -> u8;
@@ -148,8 +74,8 @@ const CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY: u32 = 1 << 0;
 const CG_WINDOW_LIST_EXCLUDE_DESKTOP_ELEMENTS: u32 = 1 << 4;
 const CG_NULL_WINDOW_ID: u32 = 0;
 
-/// How long after a permission prompt we keep waiting before concluding that this
-/// grant is one of the ones macOS will only hand to a fresh process.
+/// How long after a prompt before concluding the grant is one macOS only hands to a fresh
+/// process.
 const RELAUNCH_GRACE: Duration = Duration::from_secs(3);
 /// Background refresh interval for the probes too slow to run inline.
 const PROBE_REFRESH: Duration = Duration::from_secs(2);
@@ -161,13 +87,8 @@ pub const STATE_UNKNOWN: &str = "unknown";
 pub const KEY_ACCESSIBILITY: &str = "accessibility";
 pub const KEY_SCREEN_RECORDING: &str = "screen_recording";
 
-// ---------------------------------------------------------------------------
-// A background-refreshed probe slot.
-//
-// The contract that matters: `get` never blocks and never invents an answer. It
-// returns the last value the probe produced, kicks a refresh when one is due, and
-// a probe that panics loses its own result instead of wedging the slot.
-// ---------------------------------------------------------------------------
+// background-refreshed probe slot: `get` never blocks and never invents an answer, and a probe
+// that panics loses its own result instead of wedging the slot
 
 struct BgState<T> {
     running: bool,
@@ -219,14 +140,9 @@ impl<T: Copy + Send + 'static> BgProbe<T> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Accessibility
-// ---------------------------------------------------------------------------
-
-/// What the system-wide accessibility element had to say. This is a *secondary*
-/// signal: Apple DTS is explicit that a failed AX call is not evidence of a
-/// missing grant, so a messaging failure downgrades the answer to unknown rather
-/// than asserting a denial.
+/// What the system-wide accessibility element had to say. A secondary signal: per Apple DTS a
+/// failed AX call is not evidence of a missing grant, so a messaging failure downgrades the
+/// answer to unknown rather than asserting a denial.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AxSecondary {
     Enabled,
@@ -248,15 +164,10 @@ static AX_SECONDARY: BgProbe<AxSecondary> = BgProbe::new();
 static AX_REQUESTED_AT: Mutex<Option<Instant>> = Mutex::new(None);
 static SCREEN_REQUESTED_AT: Mutex<Option<Instant>> = Mutex::new(None);
 
-/// `AXUIElementSetMessagingTimeout` on the system-wide element sets the default for
-/// *every* accessibility message this process sends, not just this one — a second
-/// reason to keep this call off the hot path and out of the primary read.
-///
-/// The timeout is therefore restored before returning. There is no getter, but Apple
-/// documents 0 as "use the system default", so setting it back to 0 is the restore.
-/// Without it a single permission read left remote input (`streamer/input/macos.rs`) and
-/// the AirPlay menu-extra walk (`airplay/ax.rs`) on a 0.5 s ceiling for the rest of the
-/// process's life, having never asked for one.
+/// `AXUIElementSetMessagingTimeout` on the system-wide element sets the default for every
+/// accessibility message this process sends, so keep this off the hot path. It is put back
+/// to 0 (documented as "use the system default"; there is no getter) before returning, or
+/// remote input and the AirPlay menu-extra walk would inherit the 0.5 s ceiling.
 fn accessibility_api_probe() -> Option<AxSecondary> {
     unsafe {
         let el = AXUIElementCreateSystemWide();
@@ -323,9 +234,8 @@ fn accessibility_status() -> (&'static str, bool, String) {
             "Granted to this running copy of ScreenExtend.".to_string(),
         );
     }
-    // Whether `AXIsProcessTrusted` picks up a grant made while we run is not verified on
-    // this project's machines (see the module comment), so after a prompt has had time to be
-    // answered the restart hint is offered as the fallback.
+    // unverified whether `AXIsProcessTrusted` sees a grant made while running, so once a
+    // prompt has had time to be answered the restart hint is the fallback
     let relaunch = requested_long_enough(&AX_REQUESTED_AT);
     match AX_SECONDARY.get("accessibility", accessibility_api_probe) {
         Some(AxSecondary::Unreadable) => (
@@ -338,7 +248,7 @@ fn accessibility_status() -> (&'static str, bool, String) {
         _ if RESET_ACCESSIBILITY.load(Ordering::Relaxed) => (
             STATE_DENIED,
             relaunch,
-            "ScreenExtend cleared its Accessibility entry and asked macOS again — the entry was \
+            "ScreenExtend cleared its Accessibility entry and asked macOS again: the entry was \
              either switched off or no longer matched this copy of ScreenExtend. Turn \
              ScreenExtend on under System Settings → Privacy & Security → Accessibility; restart \
              ScreenExtend if it still says not granted."
@@ -369,10 +279,6 @@ fn accessibility_status() -> (&'static str, bool, String) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Screen Recording
-// ---------------------------------------------------------------------------
-
 fn cg_bool_fn(name: &str) -> Option<unsafe extern "C" fn() -> bool> {
     let cname = CString::new(name).ok()?;
     unsafe {
@@ -388,8 +294,9 @@ fn cg_bool_fn(name: &str) -> Option<unsafe extern "C" fn() -> bool> {
     }
 }
 
-/// Trustworthy as a positive; provably stale as a negative — Apple DTS states it
-/// "will not reflect this change until the application is restarted".
+/// `CGPreflightScreenCaptureAccess`, which is cached per process. Trustworthy as a positive,
+/// stale as a negative: Apple DTS states it "will not reflect this change until the
+/// application is restarted", so it never shows a grant made after the process started.
 pub fn preflight_screen_capture() -> Option<bool> {
     cg_bool_fn("CGPreflightScreenCaptureAccess").map(|f| unsafe { f() })
 }
@@ -433,7 +340,8 @@ pub const DENY_MIN_OWNERS: usize = 2;
 /// Walk the window list. Without the Screen Recording grant macOS strips `kCGWindowName`
 /// from every window belonging to another process, so this skips our own windows and
 /// everything that is not a normal layer-0 window (the Dock, the menu bar, the wallpaper)
-/// and counts what is left and how much of it is titled.
+/// and counts what is left and how much of it is titled. The read needs no prompt and no
+/// capture session, and it flips the instant the user ticks the toggle.
 fn window_scan(on_screen_only: bool) -> Option<WindowScan> {
     let mut option = CG_WINDOW_LIST_EXCLUDE_DESKTOP_ELEMENTS;
     if on_screen_only {
@@ -478,10 +386,10 @@ fn window_scan(on_screen_only: bool) -> Option<WindowScan> {
 /// The raw on-screen read, for diagnostics (`doctor`, the bench). Not a decision: use
 /// [`screen_recording_silent`] for that.
 ///
-/// - `Some(true)`  — a foreign window's title is visible: authorized, right now.
-/// - `Some(false)` — foreign windows exist and none is named. Only a *definite* denial
-///   when [`classify_screen_recording`] says so.
-/// - `None`        — nothing to look at. Unknown; conclude nothing.
+/// - `Some(true)`: a foreign window's title is visible, so authorized right now.
+/// - `Some(false)`: foreign windows exist and none is named. A definite denial only when
+///   [`classify_screen_recording`] says so.
+/// - `None`: nothing to look at. Unknown; conclude nothing.
 pub fn window_name_probe() -> Option<bool> {
     let scan = window_scan(true)?;
     if scan.candidates == 0 {
@@ -491,17 +399,18 @@ pub fn window_name_probe() -> Option<bool> {
     }
 }
 
-/// Positive evidence only: is any foreign window anywhere — minimised, hidden, on another
-/// Space — titled? Used when nothing on screen can be read (Show Desktop, an empty Space).
+/// Is any foreign window anywhere (minimised, hidden, on another Space) titled? Used when
+/// nothing on screen can be read (Show Desktop, an empty Space). Positive evidence only:
+/// off-screen windows are often untitled even with the grant (3 of 25 foreign layer-0 windows
+/// were titled on an authorized macOS 26 session).
 fn titled_window_anywhere() -> bool {
     window_scan(false).is_some_and(|s| s.named > 0)
 }
 
 /// `SCShareableContent`, 12.3+. PROMPTING while unauthorized on macOS 15+, so it takes
 /// a [`PromptPermit`]: in practice the one from [`silently_granted_permit`], where it is
-/// a confirmation that cannot raise anything. It used to run on a 2 s background slot
-/// kicked by every `check_permissions`, which is what re-raised the system alert over
-/// System Settings every two seconds while the bootstrap gate polled.
+/// a confirmation that cannot raise anything. Never call it from a polled path: the system
+/// alert comes up again on every call.
 fn sck_probe(permit: PromptPermit) -> Option<bool> {
     if !crate::macos_utils::streamer::screencapturekit_available() {
         return None;
@@ -571,7 +480,7 @@ pub fn classify_screen_recording(
 /// `CONFIRMED` for the rest of the process.
 pub fn screen_recording_silent() -> SilentRead {
     let preflight = preflight_screen_capture();
-    // Short-circuit the window walks when the cheap answer is already yes.
+    // skip the window walks when the cheap answer is already yes
     let (on_screen, anywhere) = if preflight == Some(true) {
         (None, false)
     } else {
@@ -597,11 +506,10 @@ fn silent_screen_recording() -> Silent {
 
 /// The silent Accessibility read.
 ///
-/// `AXIsProcessTrusted` true is a grant. False is only definite when the AX messaging
-/// probe, run right now (not the cached background slot), also fails with
-/// `kAXErrorAPIDisabled`, which is what an untrusted process gets for every message.
-/// Both are read in the same moment, so a grant made "a moment ago" shows up in at least
-/// one of them; a probe that timed out, or that worked while `AXIsProcessTrusted` said no,
+/// `AXIsProcessTrusted` true is a grant. False is definite only when the AX messaging probe,
+/// run now (not the cached background slot), also fails with `kAXErrorAPIDisabled`, which is
+/// what an untrusted process gets for every message. Both are read in the same moment, so a
+/// fresh grant shows in at least one. A probe that timed out, or that worked while untrusted,
 /// is `Unknown`, and `Unknown` never resets the TCC row.
 fn silent_accessibility() -> SilentRead {
     if accessibility_trusted() {
@@ -611,7 +519,7 @@ fn silent_accessibility() -> SilentRead {
         };
     }
     let secondary = accessibility_api_probe();
-    // Re-read after the probe: a toggle flipped while the probe ran must not be reset.
+    // re-read: a toggle flipped while the probe ran must not be reset
     if accessibility_trusted() {
         return SilentRead {
             state: Silent::Granted,
@@ -652,10 +560,10 @@ fn silent_state(key: &str) -> SilentRead {
     }
 }
 
-/// The silent answer as the old tri-state, for the callers that act on it: the session
+/// The silent answer as an `Option<bool>`, for the callers that act on it: the session
 /// watchdog and `ensure_screen_recording_access` at every pipeline start.
 ///
-/// `Some(false)` means **`DefinitelyDenied`** and nothing weaker — never the cached
+/// `Some(false)` means **`DefinitelyDenied`** and nothing weaker: never the cached
 /// preflight negative, never a read with too few windows to judge, and never anything
 /// once this process has confirmed a grant. `None` is `Unknown`: callers must not refuse,
 /// kick or reset on it.
@@ -667,14 +575,13 @@ pub fn screen_recording_live() -> Option<bool> {
     }
 }
 
-/// `(state, relaunch_required, detail)` — what the startup gate and the lapse dialog show.
+/// `(state, relaunch_required, detail)`: what the startup gate and the lapse dialog show.
 ///
-/// This is the one place the cached preflight negative still counts, and only for display:
-/// when the window list has nothing to read, `preflight == false` is reported as "not
-/// granted yet", so the gate stays up (and the first request gets made) on a first run with
-/// an empty screen. The detail says the answer is unconfirmed, and the restart hint appears
-/// once a request has had time to be answered. Nothing that refuses a join, kicks a session
-/// or resets a TCC row reads this: they read [`screen_recording_silent`].
+/// The one place the cached preflight negative counts, and only for display: with nothing in
+/// the window list to read, `preflight == false` is shown as "not granted yet", so the gate
+/// stays up (and the first request gets made) on a first run with an empty screen. Nothing
+/// that refuses a join, kicks a session or resets a TCC row reads this: they read
+/// [`screen_recording_silent`].
 fn screen_recording_status() -> (&'static str, bool, String) {
     if CONFIRMED.load(Ordering::Relaxed) {
         return (
@@ -684,8 +591,8 @@ fn screen_recording_status() -> (&'static str, bool, String) {
         );
     }
 
-    // No ScreenCaptureKit here. `check_permissions` is polled, and on macOS 15+
-    // `SCShareableContent` raises the system alert on every call while unauthorized.
+    // no ScreenCaptureKit here: `check_permissions` is polled, and on macOS 15+
+    // `SCShareableContent` raises the system alert on every call while unauthorized
     let preflight = preflight_screen_capture();
     let read = screen_recording_silent();
     match read.state {
@@ -695,16 +602,16 @@ fn screen_recording_status() -> (&'static str, bool, String) {
             "Granted to this running copy of ScreenExtend.".to_string(),
         ),
         Silent::Granted => {
-            // The toggle is on and capture works now, but anything in this process that
-            // consults the cached preflight — including ScreenCaptureKit on macOS 15 — may
-            // still be looking at the old answer.
+            // the toggle is on and capture works now, but anything in this process that
+            // consults the cached preflight (ScreenCaptureKit on macOS 15 included) may still
+            // be looking at the old answer
             let stale_cache = preflight == Some(false);
             let detail = if stale_cache {
                 "Granted. macOS still has the old answer cached for this process, so restart \
                  ScreenExtend if capture misbehaves."
                     .to_string()
             } else {
-                "Granted — confirmed by reading the live window list.".to_string()
+                "Granted, confirmed by reading the live window list.".to_string()
             };
             (STATE_GRANTED, stale_cache, detail)
         }
@@ -738,13 +645,13 @@ fn screen_recording_status() -> (&'static str, bool, String) {
 
 fn denied_detail() -> String {
     if RESET_SCREEN_RECORDING.load(Ordering::Relaxed) {
-        "ScreenExtend cleared its Screen Recording entry and asked macOS again — the entry was \
+        "ScreenExtend cleared its Screen Recording entry and asked macOS again: the entry was \
          either switched off or no longer matched this copy of ScreenExtend. Turn ScreenExtend \
          on under System Settings → Privacy & Security → Screen Recording, then restart \
          ScreenExtend."
             .to_string()
     } else if requested_long_enough(&SCREEN_REQUESTED_AT) {
-        "Grant Screen Recording in System Settings, then restart ScreenExtend — macOS will not \
+        "Grant Screen Recording in System Settings, then restart ScreenExtend: macOS will not \
          hand a new grant to an app that is already running."
             .to_string()
     } else if first_requested_ms(KEY_SCREEN_RECORDING).is_some() {
@@ -768,16 +675,12 @@ fn request_screen_capture_access(_permit: PromptPermit) -> bool {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The prompt policy
-//
-// The rule, in the user's words: "always poll with silent check only after the first
-// time it requests. the user shouldn't get more than one prompt unless they explicitly
-// hit retry."
-// ---------------------------------------------------------------------------
+// prompt policy: after the first request, poll with silent reads only. The user gets no second
+// prompt unless they explicitly hit Retry
 
-/// What the silent reads say. Never produced by a prompting call. See the module
-/// comment for what each answer is allowed to cause.
+/// What the silent reads say. Never produced by a prompting call. Only `DefinitelyDenied` may
+/// refuse a join or a capture start, kick a live session, or reset a TCC row on Retry;
+/// `Granted` and `Unknown` do none of those.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Silent {
     Granted,
@@ -797,23 +700,20 @@ pub struct PromptDecision {
 
 /// The whole policy, as a pure function.
 ///
-/// - `first_requested_ms`: when this permission was first requested under this TCC
-///   identity — from the persisted marker for an `.app` that owns its identity, from this
-///   process's memory otherwise. `None` if it never was.
+/// - `first_requested_ms`: when this permission was first requested under this TCC identity
+///   (the persisted marker for an `.app` that owns its identity, this process's memory
+///   otherwise). `None` if it never was.
 /// - `explicit_retry`: the user pressed a visible Retry button.
-/// - `silent`: what the silent reads say right now.
-/// - `owns_identity`: [`owns_tcc_identity`] — an `.app` with a bundle id, started by
-///   LaunchServices. Anything else is attributed by TCC to its parent (the terminal), so
-///   resetting "its" row would reset nothing useful, or the wrong thing.
+/// - `owns_identity`: [`owns_tcc_identity`]. A process that does not is attributed by TCC to
+///   its parent (the terminal), so resetting "its" row would reset nothing useful, or the
+///   wrong thing.
 ///
-/// Granted never prompts. The first request prompts. Any later automatic request does
-/// not, whether in this process or after a relaunch. An explicit Retry prompts, and
-/// additionally resets the row when — and only when — the silent read is
-/// `DefinitelyDenied`: macOS will not prompt again over an existing row, whether the user
-/// switched it off or it is a stale row pinned to an earlier build's cdhash. That holds
-/// whenever the first request happened, including earlier in this same process; the old
-/// "the request predates this process" trigger is the special case of it. `Unknown` never
-/// resets, because it is exactly what a grant made a moment ago looks like.
+/// Granted never prompts. The first request prompts; a later automatic one does not, in this
+/// process or after a relaunch. An explicit Retry prompts, and first resets the row only when
+/// the silent read is `DefinitelyDenied`, whenever the first request happened: macOS will not
+/// prompt again over an existing row, whether the user switched it off or it is stale and
+/// pinned to an earlier build's cdhash. `Unknown` never resets, because it is exactly what a
+/// grant made a moment ago looks like.
 pub fn prompt_policy(
     first_requested_ms: Option<u64>,
     explicit_retry: bool,
@@ -900,14 +800,14 @@ pub fn prompt_gate(key: &str, explicit_retry: bool) -> bool {
         }
     } else if explicit_retry && silent.state != Silent::DefinitelyDenied {
         tprintln!(
-            "[permissions] {key}: Retry without a TCC reset — the silent read is {:?} ({}), \
+            "[permissions] {key}: Retry without a TCC reset. The silent read is {:?} ({}), \
              which could be a grant made a moment ago",
             silent.state,
             silent.source
         );
     }
-    // Recorded before the prompt, which blocks: a process that dies with the dialog up
-    // has still asked once.
+    // recorded before the prompt, which blocks: a process that dies with the dialog up has
+    // still asked once
     record_request(key);
     let permit = PromptPermit(());
     match key {
@@ -970,7 +870,7 @@ fn running_bundle_id() -> Option<&'static str> {
 
 /// Whether TCC attributes this process's requests to *this app*: an `.app` with a bundle id
 /// that LaunchServices started (parent is launchd). A bare binary, or an `.app`'s executable
-/// started from a shell (`…/Contents/MacOS/ScreenExtend serve` in Terminal), is attributed to
+/// started from a shell (`.../Contents/MacOS/ScreenExtend serve` in Terminal), is attributed to
 /// the responsible ancestor instead, so its request neither creates nor answers the app's
 /// row. Only an identity-owning process persists the request marker or resets a row.
 fn owns_tcc_identity() -> bool {
@@ -982,10 +882,6 @@ fn owns_tcc_identity() -> bool {
 fn identity_owned(has_bundle_id: bool, parent_pid: i32) -> bool {
     has_bundle_id && parent_pid == 1
 }
-
-// ---------------------------------------------------------------------------
-// The persisted request marker
-// ---------------------------------------------------------------------------
 
 const REQUEST_MARKER_FILE: &str = "permission-requests.json";
 /// Tauri's app-local-data directory on macOS is `~/Library/Application Support/<id>`;
@@ -1029,7 +925,7 @@ fn marker_path() -> Option<PathBuf> {
 
 /// The request record. For a process that owns its TCC identity it is loaded from (and
 /// written back to) `permission-requests.json`; for anything else it lives in memory only,
-/// so a dev binary's request — attributed by TCC to the terminal — can never suppress the
+/// so a dev binary's request (attributed by TCC to the terminal) can never suppress the
 /// `.app`'s one automatic prompt, and the dev binary may itself prompt once per process.
 fn with_marker<R>(f: impl FnOnce(&mut BTreeMap<String, RequestRecord>) -> R) -> R {
     with_marker_for(owns_tcc_identity(), f)
@@ -1104,10 +1000,6 @@ fn unix_ms_now() -> u64 {
         .unwrap_or(0)
 }
 
-// ---------------------------------------------------------------------------
-// Diagnostics for `ScreenExtend doctor`
-// ---------------------------------------------------------------------------
-
 /// Every probe, separately and uncollapsed. A disagreement between these *is* the
 /// diagnosis, which is why `doctor` prints them individually rather than the one
 /// boolean the UI sees.
@@ -1141,8 +1033,8 @@ pub fn raw_probes() -> ProbeReport {
 
     let sck_available = crate::macos_utils::streamer::screencapturekit_available();
     let t = Instant::now();
-    // Only as a confirmation of a silent grant: unauthorized, it would raise the
-    // system alert from a diagnostic command.
+    // only after a silent grant: unauthorized, it would raise the system alert from a
+    // diagnostic command
     let sck = if sck_available {
         silently_granted_permit().and_then(sck_probe)
     } else {
@@ -1179,7 +1071,7 @@ pub struct IdentityReport {
     pub os_version: String,
 }
 
-/// The `.app` containing `exe`, if the executable sits in `…/Contents/MacOS/`.
+/// The `.app` containing `exe`, if the executable sits in `.../Contents/MacOS/`.
 pub fn bundle_path_of(exe: &std::path::Path) -> Option<std::path::PathBuf> {
     let macos_dir = exe.parent()?;
     if macos_dir.file_name()? != "MacOS" {
@@ -1216,8 +1108,8 @@ fn shell_out(cmd: &str, args: &[&str]) -> String {
 }
 
 pub fn identity_report() -> IdentityReport {
-    // `current_exe` can hand back the path as invoked, `./` and all. Resolving it
-    // is what makes the `/AppTranslocation/` test and the codesign read meaningful.
+    // `current_exe` can return the path as invoked (`./` and all); the `/AppTranslocation/`
+    // test and the codesign read need it resolved
     let exe = std::env::current_exe().unwrap_or_default();
     let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
     let bundle = bundle_path_of(&exe);
@@ -1242,11 +1134,7 @@ pub fn identity_report() -> IdentityReport {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Commands
-// ---------------------------------------------------------------------------
-
-/// The probe itself, for callers that are already off the main thread — `ScreenExtend
+/// The probe itself, for callers that are already off the main thread: `ScreenExtend
 /// doctor`, and the async command below.
 pub fn probe_permissions() -> Vec<PermissionStatus> {
     let (ax_state, ax_relaunch, ax_detail) = accessibility_status();
@@ -1259,8 +1147,8 @@ pub fn probe_permissions() -> Vec<PermissionStatus> {
                 .to_string(),
             state: ax_state.to_string(),
             detail: ax_detail,
-            // Only per-device remote input needs this, and that is opt-in. A user
-            // who wants a second monitor and nothing else must not be stopped here.
+            // only opt-in remote input needs this: a user who just wants a second monitor
+            // must not be stopped here
             required: false,
             relaunch_required: ax_relaunch,
         },
@@ -1276,11 +1164,9 @@ pub fn probe_permissions() -> Vec<PermissionStatus> {
     ]
 }
 
-/// Warm the window-list probe so its cold cost — 37 ms on 10.15.8, CoreGraphics
-/// establishing its WindowServer connection — is paid on a background thread at startup
-/// rather than inside the first `check_permissions`, which lands mid-launch.
-///
-/// Silent only. It also loads the request marker.
+/// Warms the window-list probe on a background thread, so its cold cost (37 ms on 10.15.8,
+/// CoreGraphics connecting to WindowServer) is not paid inside the first `check_permissions`,
+/// mid-launch. Silent only. It also loads the request marker.
 pub fn prime() {
     std::thread::Builder::new()
         .name("se-perm-warm".into())
@@ -1339,8 +1225,8 @@ pub fn open_permission_settings(key: String) {
         KEY_SCREEN_RECORDING => "Privacy_ScreenCapture",
         _ => "Privacy",
     };
-    // Ventura renamed the pane. Try the modern identifier first and fall back, so
-    // the choice is made by what the OS honours rather than by a version number.
+    // Ventura renamed the pane: try the modern identifier first and fall back, so the OS
+    // decides rather than a version number
     for base in [SETTINGS_PANE_MODERN, SETTINGS_PANE_LEGACY] {
         let url = format!("{base}?{anchor}");
         match Command::new("open").arg(&url).status() {
@@ -1355,7 +1241,7 @@ pub fn open_permission_settings(key: String) {
 ///
 /// TCC attributes a request to the *responsible* process, and a binary started by
 /// another process inherits that process's attribution instead of establishing its
-/// own — the documented reason an app launched from a terminal never appears in the
+/// own: the documented reason an app launched from a terminal never appears in the
 /// Screen Recording list. `open -n -a` hands the launch to LaunchServices, so the
 /// new instance is its own responsible process and the grant the user just made
 /// applies to it.
@@ -1436,8 +1322,8 @@ mod tests {
         warm.sort_unstable();
         let median = warm[warm.len() / 2];
         eprintln!("window_name_probe warm median: {median} us");
-        // The gate polls this at 5 Hz on the main thread, so the warm cost is the
-        // one that matters; the first call also pays CoreGraphics' one-off setup.
+        // the gate polls this at 5 Hz, so the warm cost is the one that matters; the first
+        // call also pays CoreGraphics' one-off setup
         assert!(median < 100_000, "warm window-list probe took {median} us");
     }
 
@@ -1488,8 +1374,6 @@ mod tests {
         );
     }
 
-    // ---- the three-way silent read -------------------------------------------
-
     fn scan(candidates: usize, owners: usize, named: usize) -> Option<WindowScan> {
         Some(WindowScan {
             candidates,
@@ -1514,10 +1398,10 @@ mod tests {
         (refuses_join, kicks, resets)
     }
 
-    /// The reviewer's case: a process that started unauthorized (preflight cached false),
-    /// was granted while running, and then the user pressed Show Desktop, so there is no
-    /// foreign window on screen or off it to read. That is `Unknown`, and `Unknown` refuses
-    /// nothing, kicks nothing and resets nothing.
+    /// A process that started unauthorized (preflight cached false), was granted while
+    /// running, and then the user pressed Show Desktop, so there is no foreign window on
+    /// screen or off it to read. That is `Unknown`, and `Unknown` refuses nothing, kicks
+    /// nothing and resets nothing.
     #[test]
     fn granted_while_running_then_nothing_on_screen_is_unknown_and_harmless() {
         for confirmed in [false, true] {
@@ -1527,7 +1411,7 @@ mod tests {
             assert_eq!(r.state, Silent::Unknown, "confirmed={confirmed}: {r:?}");
             assert_eq!(consequences(r.state), (false, false, false));
         }
-        // And the moment any titled window exists, anywhere, it is a grant.
+        // and the moment any titled window exists, anywhere, it is a grant
         let r = classify_screen_recording(false, Some(false), scan(0, 0, 0), true);
         assert_eq!((r.state, r.source), (Silent::Granted, SRC_OFFSCREEN_TITLE));
         let r = classify_screen_recording(false, Some(false), scan(3, 2, 1), false);
@@ -1542,11 +1426,11 @@ mod tests {
             (Silent::DefinitelyDenied, SRC_UNTITLED_WINDOWS)
         );
         assert_eq!(consequences(r.state), (true, true, true));
-        // preflight unavailable does not matter: the evidence is the window list.
+        // preflight unavailable does not matter: the evidence is the window list
         let r = classify_screen_recording(false, None, scan(5, 3, 0), false);
         assert_eq!(r.state, Silent::DefinitelyDenied);
 
-        // One untitled window, or several from one app: not enough.
+        // one untitled window, or several from one app: not enough
         for s in [scan(1, 1, 0), scan(4, 1, 0)] {
             let r = classify_screen_recording(false, Some(false), s, false);
             assert_eq!(
@@ -1556,7 +1440,7 @@ mod tests {
             );
             assert_eq!(consequences(r.state), (false, false, false));
         }
-        // A titled window off screen outweighs untitled ones on screen.
+        // a titled window off screen outweighs untitled ones on screen
         let r = classify_screen_recording(false, Some(false), scan(4, 3, 0), true);
         assert_eq!(r.state, Silent::Granted);
     }
@@ -1614,8 +1498,6 @@ mod tests {
         }
     }
 
-    // ---- the prompt policy ----------------------------------------------------
-
     const EARLIER: u64 = 1_700_000_000_000;
 
     fn decide(first: Option<u64>, retry: bool, silent: Silent) -> PromptDecision {
@@ -1640,8 +1522,8 @@ mod tests {
         }
     }
 
-    /// A Retry on a definite denial resets — whenever the first request happened, including
-    /// earlier in this same process (the reviewer's finding 3).
+    /// A Retry on a definite denial resets, whenever the first request happened, including
+    /// earlier in this same process.
     #[test]
     fn retry_on_a_definite_denial_resets_then_prompts() {
         for first in [None, Some(EARLIER)] {
@@ -1652,10 +1534,10 @@ mod tests {
 
     #[test]
     fn retry_never_resets_on_unknown_or_without_the_identity() {
-        // Unknown is what a grant made a moment ago looks like.
+        // `Unknown` is what a grant made a moment ago looks like
         let d = decide(Some(EARLIER), true, Silent::Unknown);
         assert!(d.may_prompt && !d.may_reset, "{d:?}");
-        // A bare binary, or an .app started from a shell: TCC attributes it elsewhere.
+        // a bare binary, or an .app started from a shell: TCC attributes it elsewhere
         let d = prompt_policy(Some(EARLIER), true, Silent::DefinitelyDenied, false);
         assert!(d.may_prompt && !d.may_reset, "{d:?}");
     }
@@ -1679,7 +1561,7 @@ mod tests {
             "an .app executable started from a shell"
         );
         assert!(!identity_owned(false, 4242));
-        // `cargo test` is a bare binary started by cargo.
+        // `cargo test` is a bare binary started by cargo
         assert!(!owns_tcc_identity());
     }
 
@@ -1687,8 +1569,6 @@ mod tests {
     /// so a dev session cannot suppress the `.app`'s one automatic prompt.
     #[test]
     fn a_bare_binary_never_persists_the_marker() {
-        // This (bare) test binary records in memory only: the file under `marker_path()` is
-        // never created or touched by `record_request`.
         assert!(!owns_tcc_identity());
         let before =
             marker_path().and_then(|p| std::fs::metadata(p).ok().map(|m| m.modified().ok()));
@@ -1721,8 +1601,6 @@ mod tests {
         let back: BTreeMap<String, RequestRecord> = serde_json::from_str(&json).unwrap();
         assert_eq!(back, m);
     }
-
-    // ---- source-level: no periodic path can reach a prompting call -------------
 
     /// The production half of this file, comment lines removed.
     fn code_lines(src: &str) -> Vec<&str> {
@@ -1771,7 +1649,7 @@ mod tests {
         let src = include_str!("permissions.rs");
         let lines = code_lines(src);
 
-        // Exactly three places mint a permit.
+        // exactly three places mint a permit
         let no_decl: Vec<&str> = lines
             .iter()
             .map(|l| {
@@ -1796,7 +1674,7 @@ mod tests {
             ]
         );
 
-        // Every prompting call site is inside a fn that demands a permit.
+        // every prompting call site is inside a fn that demands a permit
         for needle in [
             "\"CGRequestScreenCaptureAccess\"",
             "AXTrustedCheckOptionPrompt",
@@ -1813,7 +1691,7 @@ mod tests {
             }
         }
 
-        // The periodic entry points never mint one.
+        // the periodic entry points never mint one
         for (name, body_must_not) in [
             ("check_permissions", "prompt_gate"),
             ("probe_permissions", "prompt_gate"),
@@ -1907,10 +1785,10 @@ mod tests {
             "prompting calls outside the gate:\n{}",
             offenders.join("\n")
         );
-        // The deliberate allow-list of `prompt_gate` callers outside this file: `serve`
-        // makes the one first Screen Recording request a headless host would otherwise
-        // never make (without it the app never appears in the Screen Recording list).
-        // Anything else calling it from outside is a new prompting path and needs review.
+        // the deliberate allow-list of `prompt_gate` callers outside this file: `serve` makes
+        // the one first Screen Recording request a headless host would otherwise never make
+        // (without it the app never appears in the Screen Recording list). Any other outside
+        // caller is a new prompting path
         gate_callers.sort();
         assert_eq!(
             gate_callers,

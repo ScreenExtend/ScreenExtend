@@ -26,10 +26,9 @@ ShmRing::~ShmRing()
 bool ShmRing::Open()
 {
     // A POSIX shared-memory object on macOS can only be sized once: ftruncate on an already-sized
-    // segment fails with EINVAL. A segment left over from an older driver is therefore not merely
-    // stale, it is unusable — the layout-1 one is 64 bytes short. Unlinking first only removes the
-    // name; a reader that still has it mapped keeps reading until it re-opens, and the generation
-    // bump below is what tells it to.
+    // segment fails with EINVAL, so a segment left by an older driver is unusable (the layout-1
+    // one is 64 bytes short). Unlinking only removes the name; a reader that still has it mapped
+    // keeps reading until it re-opens, and the generation bump below is what tells it to.
     if (::shm_unlink(branding::kShmName) == 0) {
         SE_LOG("unlinked a pre-existing %{public}s segment", branding::kShmName);
     }
@@ -48,15 +47,15 @@ bool ShmRing::Open()
     const int openErrno = errno;
     ::umask(prevMask);
     if (fd < 0) {
-        SE_LOG_ERROR("shm_open(%{public}s) failed: %{public}s — the host will fall back to the "
+        SE_LOG_ERROR("shm_open(%{public}s) failed: %{public}s. The host will fall back to the "
                      "slower HAL-input transport",
             branding::kShmName,
             ::strerror(openErrno));
         return false;
     }
 
-    // A POSIX shared-memory object can only be sized once on macOS, so EINVAL here means the
-    // segment already had a size — fine if it is the size we want, fatal otherwise.
+    // EINVAL here means the segment already had a size (it can only be sized once): fine if it
+    // is the size we want, fatal otherwise
     struct stat st = {};
     if (::ftruncate(fd, static_cast<off_t>(kShmTotalBytes)) != 0
         && (::fstat(fd, &st) != 0 || size_t(st.st_size) != kShmTotalBytes)) {
@@ -68,7 +67,7 @@ bool ShmRing::Open()
         return false;
     }
     if (::fstat(fd, &st) == 0 && (st.st_mode & 0666) != 0666) {
-        SE_LOG_ERROR("%{public}s is mode 0%{public}o, not 0666 — the host may not be able to map "
+        SE_LOG_ERROR("%{public}s is mode 0%{public}o, not 0666: the host may not be able to map "
                      "it and will fall back to the HAL-input transport",
             branding::kShmName,
             unsigned(st.st_mode & 0777));
@@ -145,7 +144,7 @@ void ShmRing::Write(const float* frames, uint32_t sampleCount, uint64_t hostTime
     const uint64_t w = header_->writePos.load(std::memory_order_relaxed);
 
     // Account for what this write overwrites unread. readPos == 0 means no reader has attached
-    // yet — the ring is simply free-running and nothing is being lost.
+    // yet: the ring is free-running and nothing is being lost.
     const uint64_t r = header_->readPos.load(std::memory_order_acquire);
     if (r != 0) {
         const uint64_t backlog = w - r;

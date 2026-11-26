@@ -1,19 +1,8 @@
-//! libopus ABI, measured against the library that is actually loaded.
-//!
-//! `windows_utils/audio/test/opus_layout.rs` asserts the constants in `opus_sys.rs` against
-//! literals. That is a change-detector for our own file: it passes whatever libopus thinks, and
-//! nothing in it links or loads the library. The numbers it guards are exactly the kind that
-//! fail silently — a wrong CTL request reads or writes a *different* property and still returns
-//! `OPUS_OK`, so a mis-numbered `OPUS_SET_BITRATE_REQUEST` would leave the encoder at its
-//! default bitrate with the bitrate controller believing it had been obeyed.
-//!
-//! These tests ask the library instead. A CTL number is proved by setting a distinctive value
-//! and reading it back through its paired getter; an error constant is proved by the string
-//! `opus_strerror` returns for it; and the encoder configuration is proved by the TOC byte of a
-//! real packet, which carries the mode and the channel count the encoder actually used.
-//!
-//! Cross-platform on purpose: `libopus.dll` and `libopus.dylib` are separate artifacts built
-//! from the same commit, and this is the only test that would notice them diverging.
+//! libopus ABI, checked against the library that is actually loaded. A wrong CTL request
+//! number reads or writes a different property and still returns `OPUS_OK`, so each one is
+//! proved by a set and read-back, each error constant by its `opus_strerror` text, and the
+//! encoder mode by the TOC byte of a real packet. `libopus.dll` and `libopus.dylib` are
+//! separate artifacts, and this is the only test that would notice them diverging.
 
 use std::ffi::c_int;
 
@@ -93,9 +82,7 @@ fn the_library_identifies_itself() {
 
 #[test]
 fn every_error_constant_is_the_number_libopus_names() {
-    // `opus_strerror` is a switch over the real error values, so a constant we got wrong falls
-    // through to its "unknown error" arm. This is the cheapest possible check that our error
-    // table is the library's, and it needs no encoder.
+    // a wrong constant falls through to opus_strerror's "unknown error" arm
     let Ok(api) = OpusApi::load() else {
         skip("libopus ABI", "library unavailable");
         return;
@@ -120,8 +107,7 @@ fn every_error_constant_is_the_number_libopus_names() {
             "error {code} reads as {text:?}, which does not mention {name:?}"
         );
     }
-    // And a value that really is not an error code must come back as unknown, or the assertion
-    // above proves nothing.
+    // a non-error value must read as unknown, or the loop above proves nothing
     assert!(api.strerror(-9999).to_lowercase().contains("unknown"));
 }
 
@@ -138,7 +124,7 @@ fn an_encoder_state_has_a_real_size() {
         stereo > mono,
         "stereo state should be larger: {stereo} vs {mono}"
     );
-    // A negative return is an error code, which would mean the signature is wrong.
+    // a negative return is an error code, which would mean the signature is wrong
     assert!(
         unsafe { (api.encoder_get_size)(0) } <= 0,
         "0 channels is not valid"
@@ -147,8 +133,7 @@ fn an_encoder_state_has_a_real_size() {
 
 #[test]
 fn each_ctl_request_number_reaches_the_property_it_names() {
-    // The whole point: a wrong request number is not an error, it is a different property.
-    // Every pair below writes a value nothing else would produce and reads it back.
+    // each pair writes a value nothing else would produce and reads it back
     let Some(enc) = Encoder::new() else { return };
 
     assert_eq!(enc.set(o::OPUS_SET_BITRATE_REQUEST, 96_000), o::OPUS_OK);
@@ -199,7 +184,7 @@ fn each_ctl_request_number_reaches_the_property_it_names() {
         o::OPUS_OK
     );
 
-    // Read-only requests, which prove their own numbers by answering something specific.
+    // read-only requests prove their numbers by answering something specific
     assert_eq!(
         enc.get(o::OPUS_GET_SAMPLE_RATE_REQUEST),
         Ok(SR),
@@ -211,22 +196,18 @@ fn each_ctl_request_number_reaches_the_property_it_names() {
         "lookahead of {lookahead} samples is not a codec delay"
     );
 
-    // A request number that is not a request must be refused, or the reads above could be
-    // hitting a permissive default path.
+    // a bogus request must be refused, or the reads above could be hitting a permissive default
     assert_eq!(enc.get(9999), Err(o::OPUS_UNIMPLEMENTED));
 }
 
 #[test]
 fn a_restricted_lowdelay_packet_is_celt_only_and_stereo() {
-    // The TOC byte is the codec's own statement of what it produced: bits 7..3 are the config
-    // (16..31 are the CELT-only modes), bit 2 is the stereo flag. `RESTRICTED_LOWDELAY` is
-    // documented to force CELT, and this is the assertion behind that claim — and behind the
-    // decision not to advertise in-band FEC, which is SILK-only and therefore inert here.
+    // TOC byte: bits 7..3 are the config (16..31 are the CELT-only modes), bit 2 is stereo.
+    // CELT-only is also why in-band FEC (SILK-only) is not advertised.
     let Some(enc) = Encoder::new() else { return };
     assert_eq!(enc.set(o::OPUS_SET_BITRATE_REQUEST, 128_000), o::OPUS_OK);
 
-    // A tone rather than silence: DTX is off, but an all-zero frame still encodes to almost
-    // nothing and says less about the mode.
+    // a tone, not silence: an all-zero frame encodes to almost nothing and says less about the mode
     let mut pcm = vec![0f32; FRAME_SAMPLES * CHANNELS as usize];
     for (i, frame) in pcm.chunks_mut(CHANNELS as usize).enumerate() {
         let s = (i as f32 * 0.13).sin() * 0.5;
@@ -259,9 +240,7 @@ fn a_restricted_lowdelay_packet_is_celt_only_and_stereo() {
     );
     assert_eq!(stereo, 1, "a stereo encoder produced a mono packet");
 
-    // The same call through the int16 entry point, which the capture path uses when the engine
-    // hands it PCM. Two different symbols, one signature each; a mismatch in either is a crash
-    // or a garbage packet.
+    // same call through the int16 entry point, which the capture path uses for integer PCM
     let pcm16: Vec<i16> = pcm.iter().map(|s| (s * 32767.0) as i16).collect();
     let len16 = unsafe {
         (enc.api.encode)(
@@ -281,8 +260,7 @@ fn a_restricted_lowdelay_packet_is_celt_only_and_stereo() {
 
 #[test]
 fn a_frame_size_the_codec_does_not_support_is_refused() {
-    // 241 samples is not one of Opus's frame sizes. It must come back as an error rather than
-    // as a short packet, because the capture path checks the return value and nothing else.
+    // 241 samples is not an Opus frame size; the capture path checks only the return value
     let Some(enc) = Encoder::new() else { return };
     let pcm = vec![0f32; 241 * CHANNELS as usize];
     let mut out = vec![0u8; 4000];

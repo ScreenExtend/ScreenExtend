@@ -57,7 +57,7 @@ function seGlDraw(frame) {
 
 function build(v) {
   let s = at(src, "'use strict';", `\nconst SE_VARIANT = '${v}';\n`);
-  // a: read only.
+  // a: read only
   s = at(s, "if (type === 'key') keyframesIn++;", `
       if (SE_VARIANT === 'a') {
         framesRendered++;
@@ -65,12 +65,12 @@ function build(v) {
         if (type === 'key') forwardKeyframe(encodedFrame);
         continue;
       }`);
-  // b: decode, no paint.
+  // b: decode, no paint
   s = at(s, 'function presentFrame(frame) {', "\n  if (SE_VARIANT === 'b') return PRESENT.painted;");
-  // track: mark the hand-off to the generator (the frame is detached after write()).
+  // track: mark the hand-off to the generator (the frame is detached after write())
   s = at(s, 'genWriter.write(frame).then(null, note);', "const seTs = frame.timestamp; ", 'before');
   s = at(s, 'genWriter.write(frame).then(null, note);', ' if (self.__seMark) self.__seMark(seTs);');
-  // ibr / gl contexts.
+  // ibr / gl contexts
   s = at(s, "ctx = canvas.getContext('2d', { alpha: false });", "ctx = SE_VARIANT === 'ibr' ? canvas.getContext('bitmaprenderer') : SE_VARIANT === 'gl' ? seGlInit(canvas) : ", 'before');
   s = s.replace("ctx = SE_VARIANT === 'ibr' ? canvas.getContext('bitmaprenderer') : SE_VARIANT === 'gl' ? seGlInit(canvas) : ctx = canvas.getContext('2d', { alpha: false });",
     "ctx = SE_VARIANT === 'ibr' ? canvas.getContext('bitmaprenderer') : SE_VARIANT === 'gl' ? seGlInit(canvas) : canvas.getContext('2d', { alpha: false });");

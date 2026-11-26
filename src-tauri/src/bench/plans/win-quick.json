@@ -1,0 +1,67 @@
+{
+ "version": 1,
+ "name": "win-quick",
+ "workloads": [
+  {
+   "id": "mixed-1080p60",
+   "kind": "synthetic",
+   "pattern": "mixed",
+   "width": 1920,
+   "height": 1080,
+   "fps": 60,
+   "seconds": 8
+  },
+  {
+   "id": "rec-1080p60",
+   "kind": "recording",
+   "fps": 60,
+   "transform": "fps:60",
+   "max_frames": 600
+  }
+ ],
+ "recipes": [
+  {
+   "name": "nvenc-prod",
+   "vendor": "nvenc",
+   "production": {
+    "qp": 15
+   }
+  },
+  {
+   "name": "qsv-prod",
+   "vendor": "qsv",
+   "production": {
+    "qp": 15
+   }
+  },
+  {
+   "name": "x264-prod",
+   "vendor": "x264",
+   "production": {
+    "qp": 15
+   }
+  },
+  {
+   "name": "amf-prod",
+   "vendor": "amf",
+   "production": {
+    "qp": 15
+   }
+  }
+ ],
+ "groups": [
+  {
+   "name": "every vendor, production recipe, 1080p60",
+   "recipes": [
+    "*-prod"
+   ],
+   "workloads": [
+    "mixed-1080p60",
+    "rec-1080p60"
+   ]
+  }
+ ],
+ "order": {
+  "cooldown_ms": 1000
+ }
+}

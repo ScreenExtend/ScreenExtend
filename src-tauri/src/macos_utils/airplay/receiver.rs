@@ -1,23 +1,8 @@
-//! The fake AirPlay receiver: one control socket, one mirroring socket, and
-//! just enough protocol to make macOS decide we are a display.
+//! The fake AirPlay receiver: one control socket, one mirroring socket, and just enough protocol
+//! to make macOS decide we are a display.
 //!
-//! What it answers, and nothing more:
-//!
-//! | request | answer |
-//! |---|---|
-//! | `GET /info` (qualifier) | our Bonjour TXT blob |
-//! | `GET /info` (bare) | the device description, carrying the geometry we want |
-//! | `POST /fp-setup` | the static FairPlay table (see [`super::fairplay`]) |
-//! | `POST /pair-setup` | 32 bytes of stable public key |
-//! | `SETUP` (keys/timing) | our timing port, event port 0 |
-//! | `SETUP` (streams) | a real data port per requested stream |
-//! | `RECORD` / `FLUSH` / `SET_PARAMETER` / `POST /feedback` | bare 200 |
-//! | `GET_PARAMETER` | `volume: 0.0` |
-//! | `TEARDOWN` | 200, then the session ends |
-//!
-//! There is no decryption anywhere in this file. `ekey`/`eiv` from the first
-//! SETUP and `streamConnectionID` from the second are the inputs to AES-CTR
-//! video decryption, and we parse neither.
+//! No decryption anywhere: `ekey`/`eiv` from the first SETUP and `streamConnectionID` from the
+//! second are the inputs to AES-CTR video decryption, and we parse neither.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -30,18 +15,12 @@ use super::mirror::{MirrorSink, MirrorStats, TimingSocket};
 use super::rtsp::{self, Proto, ReadOutcome, Request, Response};
 use super::{fairplay, Cancel};
 
-/// Legacy pairing (features bit 27). Off matches the reference receiver's
-/// shipped default: with the bit clear a sender skips `/pair-setup` and
-/// `/pair-verify` entirely, which saves both a round trip and the ed25519 /
-/// x25519 / AES-CTR implementation we would otherwise need.
-///
-/// If a sender turns out to insist on pairing, advertising the bit is the first
-/// thing to try — and then `/pair-verify` has to be implemented for real. That
-/// experiment used to need a rebuild, which is why nobody had run it; the whole
-/// plumbing below already takes the value as a parameter, only its source was
-/// frozen. `SE_AIRPLAY_LEGACY_PAIRING=1` unfreezes it.
+/// Legacy pairing (features bit 27). Off matches the reference receiver's default: with the bit
+/// clear a sender skips `/pair-setup` and `/pair-verify`, so no ed25519 / x25519 / AES-CTR is
+/// needed. `SE_AIRPLAY_LEGACY_PAIRING=1` advertises the bit for a sender that insists on
+/// pairing; `/pair-verify` would then have to be implemented for real.
 fn legacy_pairing() -> bool {
-    std::env::var("SE_AIRPLAY_LEGACY_PAIRING")
+    crate::envcfg::var("SE_AIRPLAY_LEGACY_PAIRING")
         .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
@@ -61,11 +40,7 @@ struct State {
     phase: Phase,
     /// Set the first time a sender touches us, for diagnostics.
     peer: Option<String>,
-    /// Control connections currently open.
-    ///
-    /// The phase used to drop to `Ended` whenever *any* connection finished,
-    /// including one of several, and never came back — so from the second
-    /// session onwards [`super::diagnose`] reported the first session's answer.
+    /// Control connections currently open. The session is over only when the last one closes.
     live_connections: usize,
     /// `requests` at the start of the current session, so the diagnosis can
     /// report this session's traffic rather than a lifetime total.
@@ -114,7 +89,6 @@ impl Receiver {
         let mirror_port = mirror.port();
         let timing = TimingSocket::bind()?;
 
-        // Bound so the ports we name in a type-96 SETUP reply are real; never read.
         let audio_data = TimingSocket::bind()?;
         let audio_control = TimingSocket::bind()?;
 
@@ -193,12 +167,8 @@ impl Receiver {
             .saturating_sub(base)
     }
 
-    /// Clears everything that describes the previous session.
-    ///
-    /// The receiver deliberately outlives a session, so without this the phase,
-    /// the request count and the mirror latches all still describe the first
-    /// join for the rest of the process's life — and `diagnose` is the only
-    /// explanation this backend has for its hardest failure.
+    /// Clears everything that describes the previous session. The receiver outlives a session,
+    /// and `diagnose` has to describe the current attempt.
     pub fn begin_session(&self) {
         let mut st = self.inner.state.lock().unwrap();
         st.phase = Phase::Advertised;
@@ -210,10 +180,8 @@ impl Receiver {
         self.inner.stats.connected.load(Ordering::Relaxed)
     }
 
-    /// Read and clear the "macOS moved the display under us" latch.
-    ///
-    /// Clearing on read is what makes it usable as an edge: the sender sets it every time it
-    /// re-sends codec data, and the caller wants each of those once.
+    /// Read and clear the "macOS moved the display under us" latch. The sender sets it each
+    /// time it re-sends codec data, and clearing on read hands the caller each of those once.
     pub fn take_geometry_changed(&self) -> bool {
         self.inner
             .stats
@@ -221,9 +189,8 @@ impl Receiver {
             .swap(false, Ordering::Relaxed)
     }
 
-    /// Ends the session. Closing the control socket is the only receiver-side
-    /// termination the protocol has — `TEARDOWN` is a sender-to-receiver
-    /// request, not something we may originate.
+    /// Ends the session. Closing the control socket is the only receiver-side termination the
+    /// protocol has: `TEARDOWN` is a sender-to-receiver request, not something we may originate.
     pub fn stop(&self) {
         self.cancel.cancel();
         self.inner.state.lock().unwrap().phase = Phase::Ended;
@@ -272,9 +239,8 @@ async fn serve_control(listener: TcpListener, inner: Arc<Inner>, cancel: Cancel)
                     }
                     let mut st = inner.state.lock().unwrap();
                     st.live_connections = st.live_connections.saturating_sub(1);
-                    // Only the *last* connection ending means the session is
-                    // over. A sender that closes one and opens another is a
-                    // normal thing to do, and used to look like a goodbye.
+                    // only the last connection ending is the end of the session: a sender
+                    // may close one and open another
                     if st.live_connections == 0 && st.phase != Phase::Ended {
                         st.phase = Phase::Ended;
                     }
@@ -329,8 +295,7 @@ fn handle(req: &Request, inner: &Inner) -> Response {
         ("POST", "/fp-setup") => handle_fp_setup(req),
 
         ("POST", "/pair-setup") => {
-            // The reference receivers return their public key with no
-            // validation of the request whatsoever.
+            // the reference receivers return their public key without validating the request
             let pk = hex_bytes(&inner.identity.public_key);
             Response::ok().body("application/octet-stream", pk)
         }
@@ -393,7 +358,7 @@ fn handle(req: &Request, inner: &Inner) -> Response {
         ("POST", "/audioMode") | ("FLUSH", _) | ("POST", "/reverse") => Response::ok(),
 
         (method, url) => {
-            tprintln!("[airplay] unhandled {method} {url} — answering 200");
+            tprintln!("[airplay] unhandled {method} {url}, answering 200");
             Response::ok()
         }
     }
@@ -407,7 +372,7 @@ fn handle_info(req: &Request, inner: &Inner) -> Response {
         }
     }
 
-    // The qualifier form asks only for the Bonjour TXT blob back.
+    // the qualifier form asks only for the Bonjour TXT blob back
     if req.is_binary_plist() && wants_txt_airplay(&req.body) {
         return Response::ok().body(
             "application/x-apple-binary-plist",
@@ -450,9 +415,8 @@ fn handle_fp_setup(req: &Request) -> Response {
 
 fn handle_setup(req: &Request, inner: &Inner) -> Response {
     if info::is_timing_setup(&req.body) {
-        // Phase one: the sender hands us the encrypted AES key and its own
-        // timing port. We parse neither — the key is only ever used to decrypt
-        // video, and nothing polls our timing port.
+        // phase one carries the encrypted AES key and the sender's timing port; we parse
+        // neither (the key only decrypts video, and nothing polls our timing port)
         return Response::ok().body(
             "application/x-apple-binary-plist",
             info::setup_timing(inner.timing.port),
@@ -461,8 +425,7 @@ fn handle_setup(req: &Request, inner: &Inner) -> Response {
 
     let types = info::requested_stream_types(&req.body);
     if types.is_empty() {
-        // Some senders split the phases differently; answering with the timing
-        // ports is the tolerant thing to do.
+        // some senders split the phases differently, so answer with the timing ports
         return Response::ok().body(
             "application/x-apple-binary-plist",
             info::setup_timing(inner.timing.port),

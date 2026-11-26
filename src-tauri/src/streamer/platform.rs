@@ -175,24 +175,28 @@ pub fn start_audio_capture(
     }
 }
 
-/// What an encoder did with a runtime bitrate request. A silent `Ok(())` for a request the
-/// encoder ignored made the pipeline log "adapting bitrate" for a change that never happened.
+/// What an encoder did with a runtime bitrate request, so an ignored request is never logged
+/// as a bitrate change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BitrateApplied {
     Applied,
     /// The encoder is in explicit constant-QP mode, so bitrate is not a control input.
     IgnoredConstantQp,
+    /// The engine cannot change its bitrate in a running session (NVENC without the
+    /// dynamic-bitrate capability); the session keeps the rate it was opened with.
+    #[cfg(windows)]
+    Unsupported,
+    /// Applied, but held to the encoder's own limit (Quick Sync's rate fields at the multiplier
+    /// fixed at `Init`).
+    #[cfg(windows)]
+    Clamped {
+        applied_bps: u32,
+    },
 }
 
-/// What the local end of the nominated ICE pair is physically riding.
-///
-/// Every competitor in this category treats the wired path as its low-latency tier and two of them
-/// publish the gap: Luna Display's own 50-sample bench reports **11.3 ms mean over USB against
-/// 22.4 ms over Wi-Fi**, and Apple's wireless Sidecar path rides AWDL, which periodically pulls the
-/// radio onto a social channel and produces 50-200 ms spikes. ScreenExtend supports the wired path
-/// incidentally — a USB-tethered Android phone presents an ordinary IP interface and joins with no
-/// code change — and until now nothing on the host could tell it apart from Wi-Fi, so it could
-/// neither be reported nor used as a policy input.
+/// What the local end of the nominated ICE pair is physically riding. The medium matters (Luna
+/// Display publishes 11.3 ms mean over USB against 22.4 ms over Wi-Fi), and a USB-tethered phone
+/// joins as an ordinary IP interface, so the address alone does not say which a session is on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkMedium {
     Wired,
@@ -210,10 +214,8 @@ impl LinkMedium {
     }
 }
 
-/// The medium behind a local IP address, or `None` when the platform cannot say.
-///
-/// Called once per session, half a second after the connection comes up, from the same place the
-/// nominated candidate pair is read — never on a hot path.
+/// The medium behind a local IP address, or `None` when the platform cannot say. Called once per
+/// session, where the nominated candidate pair is read, never on a hot path.
 pub fn link_medium_for_local_ip(ip: &str) -> Option<LinkMedium> {
     #[cfg(windows)]
     {

@@ -1,24 +1,9 @@
-// One place where a malformed `config.json` becomes the shape the rest of the app declares.
-//
-// The defect this exists for: `config.json` held `"devices": {"0": {"refreshRate": 30}}` — an
-// object where the type says array — and the bootstrap's saved-settings replay did
-// `for (const d of config.devices ?? [])`, which throws `object is not iterable`. The throw was
-// caught as a setup failure and the user was shown "Setup Error … this often occurs due to core
-// drivers or libraries not being installed", about a machine whose drivers were fine.
-//
-// The rule that follows from it, and the reason this is a module and not three `Array.isArray`
-// guards at the call sites: **a reader treats a value of the wrong container type as absent.**
-// It logs one line, carries on with the default, and never throws. Coercing once, here, is what
-// lets `bootstrap.tsx`, `settings.tsx` and `apply-config.ts` go on reading `config.serverPorts.http`
-// and `config.devices.map(…)` without each of them having to distrust the store.
-//
-// The declared shape comes from `configJsonSchema` rather than a second table, because a second
-// table is a second thing to drift — which is the exact failure `scripts/test-config-editor.mjs`
-// was written after. The types-only half of the same shape is mirrored in Rust in `cli.rs`, where
-// it is the *writer's* rule; that copy is cross-checked against this schema by the same script.
-//
-// Deliberately imports only the two plain-data modules, with explicit `.ts` extensions, so bare
-// `node` can load it for the test harness: no React, no Tauri IPC, no bundler.
+// Turns a malformed `config.json` into the shape the app declares, once, for every consumer.
+// A reader treats a value of the wrong container type as absent: it logs one line, uses the
+// default and never throws (`devices` stored as an object would otherwise throw at startup).
+// The shape comes from `configJsonSchema`, not a second table that could drift. `cli.rs`
+// mirrors its container types for the writer; `scripts/test-config-editor.mjs` checks the two.
+// Imports only the two plain-data modules, with `.ts` extensions, so bare `node` can load it.
 import { defaultConfig, type Config } from "./config-defaults.ts";
 import { configJsonSchema } from "./config-schema.ts";
 
@@ -31,9 +16,8 @@ export interface NormalizedConfig {
   notes: string[];
   /**
    * Top-level keys whose stored value was present and malformed, so the caller can write the
-   * corrected value back. A key that was merely *absent* is not in here: filling a gap in memory
-   * is not a repair, and rewriting the file for it would churn every config ever written by an
-   * older version.
+   * corrected value back. An absent key is not listed: rewriting the file for it would churn
+   * every config written by an older version.
    */
   repaired: string[];
 }
@@ -109,11 +93,8 @@ function clone<T>(value: T): T {
 
 /**
  * A value of the declared shape to stand in for one that is missing or unusable.
- *
- * `fallback` is the runtime default where there is one — `defaultConfig`, for the top-level keys
- * and everything under them. Rows of `devices[]`/`knownDevices[]` have no runtime default (the
- * list starts empty), so those fall back to the schema's own `default`, which is the value the
- * editor shows and `apply-config.ts` resolves to.
+ * `fallback` is the runtime default (`defaultConfig`); rows of `devices[]`/`knownDevices[]`
+ * have none, so they fall back to the schema's own `default`.
  */
 function defaultFor(schema: JsonSchema, fallback: unknown): unknown {
   if (fallback !== undefined) return clone(fallback);
@@ -171,9 +152,7 @@ function coerce(
     const rows: unknown[] = [];
     let changed = false;
     value.forEach((row, i) => {
-      // A row that is not the shape the list is made of cannot be repaired into one — there is
-      // nothing in it to keep — so it goes, loudly. Every other row survives: one malformed
-      // device must not cost the user the settings of all the others.
+      // drop only the malformed row, loudly: one bad device must not cost the others their settings
       if (!matchesType(row, items.type as string | undefined)) {
         notes.push(
           `[migrate] ${path}[${i}] is not ${article(items)} (${describe(row)}); dropping it`
@@ -192,18 +171,15 @@ function coerce(
     const props = schema.properties as Record<string, JsonSchema>;
     const record = value as Record<string, unknown>;
     const fallbackRecord = (fallback ?? {}) as Record<string, unknown>;
-    // Keys the schema does not name are carried through untouched. `readStore` drops the
-    // unrecognised ones on the way into `Config` anyway, and the editor calls them a warning —
-    // deleting somebody's hand-written key here would be a worse answer than ignoring it.
+    // keys the schema does not name pass through: never delete somebody's hand-written key here
     const out: Record<string, unknown> = { ...record };
     let changed = false;
     for (const [key, child] of Object.entries(props)) {
       const childPath = `${path}.${key}`;
       const childFallback = fallbackRecord[key];
       if (!(key in record) || record[key] === undefined) {
-        // Absent is not malformed. Fill it so every consumer sees the declared shape — the
-        // replay hands these straight to Tauri commands, and `undefined` where a number belongs
-        // is rejected at the IPC boundary — but do not call the file wrong for it.
+        // absent is not malformed: fill it (`undefined` where a number belongs is rejected at
+        // the IPC boundary) but do not mark the file as changed
         const filled = defaultFor(child, childFallback);
         if (filled !== undefined) out[key] = filled;
         continue;
@@ -221,9 +197,8 @@ function coerce(
 /**
  * Read a raw store snapshot as a `Config`.
  *
- * Never throws, whatever is in it — including every top-level key being the wrong type at once.
- * That is the property the bootstrap depends on: a malformed setting is not one of the three
- * things allowed to stop the app (`src/lib/startup-gate.ts`).
+ * Never throws, whatever is in it, including every top-level key being the wrong type at once:
+ * a malformed setting is not one of the things allowed to stop the app (`startup-gate.ts`).
  */
 export function normalizeConfig(raw: Record<string, unknown>): NormalizedConfig {
   const notes: string[] = [];
@@ -239,8 +214,7 @@ export function normalizeConfig(raw: Record<string, unknown>): NormalizedConfig 
       continue;
     }
     if (!schema) {
-      // A key in the type with no schema entry. `test-config-editor.mjs` fails on that, so it
-      // cannot ship — but if it ever does, the stored value is kept rather than discarded.
+      // no schema entry (`test-config-editor.mjs` fails on that): keep the stored value anyway
       config[key] = stored;
       continue;
     }

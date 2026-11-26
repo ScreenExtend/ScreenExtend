@@ -1,17 +1,18 @@
 mod client;
 mod core;
 mod driver_client;
+pub mod host;
 pub mod sync;
+pub mod v2;
 
-pub use client::Client;
+pub use client::{Client, ClosedWatch, Handshake};
 pub use core::*;
-/// The connect/handshake errors, re-exported so a caller outside this module can tell *why* a
-/// connection failed rather than only that it did. `virtual_display` needs the distinction: a
-/// pipe whose single instance is already taken is a driver that is busy, not one that is dead.
+/// Connect and handshake errors, so a caller can tell why a connection failed: a pipe whose
+/// single instance is taken is a busy driver, not a dead one.
 pub use driver_client::error;
 pub use driver_client::DriverClient;
 
 #[cfg(test)]
-mod mock;
+pub(crate) mod mock;
 
 pub static DEFAULT_PIPE_NAME: &str = "virtualdisplaydriver";

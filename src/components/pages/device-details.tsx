@@ -85,24 +85,18 @@ function TipLabel({
   );
 }
 
-// Radix unmounts `SheetContent` while the sheet is closed, but everything around it -- a
-// full formik instance, a config-store subscription, two effects and a 500-line render
-// function -- ran once per row of the devices table on every parent render, open or not.
-// The trigger stays light; the body mounts with the sheet. `SHEET_EXIT_MS` keeps it alive
-// across Radix's close animation so the slide-out is unchanged: the number to match is
-// `data-[state=closed]:duration-300` in ui/sheet.tsx.
+// the body (formik, a config subscription) mounts with the sheet instead of once per table row.
+// It outlives the close by this long so the slide-out plays: keep above
+// `data-[state=closed]:duration-300` in ui/sheet.tsx
 const SHEET_EXIT_MS = 500;
 
 export function DeviceDetails({ device }: { device: ConnectedDevice }) {
   const [open, setOpen] = useState(false);
   const [mounted, setMounted] = useState(false);
-  // The Sheet root owns `onOpenChange`, but the unsaved-changes prompt needs the formik
-  // state that only exists inside the body.
+  // the root owns onOpenChange, but the unsaved-changes prompt needs formik state from the body
   const closeRequest = React.useRef<() => void>(() => setOpen(false));
 
-  // Mounting on open is done during render, not in an effect: an effect would put the
-  // body one commit behind the sheet and delay the slide-in by a frame. Unmounting is the
-  // part that waits.
+  // set during render: an effect would put the body one commit behind and delay the slide-in a frame
   if (open && !mounted) setMounted(true);
   useEffect(() => {
     if (open || !mounted) return;
@@ -170,36 +164,26 @@ function DeviceDetailsBody({
   const audioNeedsInstall = audioBackend === "needs_driver_install";
   const audioUnsupported = audioBackend === "unsupported";
   const audioActiveLegacy = audioBackend === "virtual_device";
-  // macOS 13.0-14.1. The Process Tap arrives in 14.2 and the driver tier covers everything
-  // below 13.0, so in that band ScreenCaptureKit is the only native backend -- and SCK has
-  // no audio-only mode, so ScreenExtend runs a 2x2 1 fps screen stream purely to receive
-  // sound. macOS lights the menu-bar recording indicator for the whole session, including
-  // when this device has audio on and video off, where it appears for no reason the user
-  // can see. Saying so where the toggle is is the whole fix.
+  // macOS 13.0-14.1: SCK is the only native audio backend and has no audio-only mode, so the
+  // menu-bar recording indicator stays lit all session, even with video off. The toggle says so.
   const audioLightsIndicator = audioBackend === "screencapturekit";
 
   const volumeKeyProxy = useConfig()?.legacyVolumeKeyProxy ?? false;
   const [proxyBusy, setProxyBusy] = useState(false);
 
-  // Keyed by device token, because two tabs of one browser share one set of speakers and the
-  // sink the host picks applies to both.
+  // keyed by device token: two tabs of one browser share speakers, so the sink applies to both
   const audioOutputsByToken = useAudioOutputs();
   const { setAudioOutputsByToken } = useGlobalSetters();
   const audioOutputs = audioOutputsByToken[device.token];
-  // An output with no id (a browser that has not granted the microphone yet) cannot be an
-  // item: Radix refuses an empty value, and it is the default output anyway. Chromium also
-  // lists a pseudo-device whose id is literally "default"; that is the "System default" row.
+  // Radix refuses an empty value, and an empty id (microphone not granted yet) is the default
+  // output anyway. Chromium's pseudo-device with id "default" is the "System default" row.
   const selectableOutputs = (audioOutputs?.outputs ?? []).filter(
     (o, i, all) => o.id !== "" && o.id !== "default" && all.findIndex((p) => p.id === o.id) === i,
   );
-  // The client says whether the ids arrived carrying the operating system's own names.
-  // `false` means they did not -- the page then names them by position ("Output 1"), which
-  // is honest and routable but is not what the hardware is called, so the panel says so
-  // instead of presenting them as device names. A client too old to send the field says
-  // `null`/`undefined`, which is "did not say", not "no".
+  // `false`: the client named the outputs by position ("Output 1"), not by their OS names.
+  // An old client sends null/undefined, which is "did not say", not "no".
   const namesUnavailable = audioOutputs?.labelled === false;
-  // Falls back to `(names unavailable)` rather than a truncated id when the client has told
-  // us the names are missing: an eight-character hash is not a thing a person can choose from.
+  // a truncated id is nothing a person can choose from once the client says names are missing
   const unnamed = (id: string): string =>
     namesUnavailable ? t("device.audioOutput.unnamed") : id.slice(0, 8);
   const outputLabel = (o: { id: string; label: string }): string =>
@@ -267,9 +251,8 @@ function DeviceDetailsBody({
     }
   };
 
-  // One shape for `initialValues`, for every `resetForm` and for the dirty check, so a
-  // device saved to config.json before a field existed still yields a fully-typed form and
-  // does not read as modified the moment the sheet opens.
+  // one shape for initialValues, resetForm and the dirty check, so a device saved before a
+  // field existed does not read as modified when the sheet opens
   const formValues = React.useMemo(
     () => ({
       ...device,
@@ -300,11 +283,7 @@ function DeviceDetailsBody({
         videoQuality: Number(values.videoQuality),
         dpr: Number(values.dpr),
       };
-      // What the sheet was showing when it opened. A save pushes only the commands whose
-      // values actually moved: the host classifies every edit anyway, but a command nobody
-      // needed is still a lock taken, a log line written and — for a device the host holds no
-      // settings for yet — a comparison it cannot make. Renaming a device should reach the
-      // Rust side as nothing at all.
+      // values at open: a save sends only the commands whose values moved, so a rename sends none
       const was = formValues;
       const pointerScope = normalized.pointerScope ?? DEFAULT_POINTER_SCOPE;
       const autoFrameRate = normalized.autoFrameRate ?? DEFAULT_AUTO_FRAME_RATE;
@@ -318,9 +297,7 @@ function DeviceDetailsBody({
         was.dpr !== normalized.dpr ||
         was.systemAudio !== normalized.systemAudio;
       try {
-        // Every command below takes the *device*, which is its token. The address was the key
-        // until it turned out to be recycled between machines and to move under a live
-        // session; it is a label on this sheet now and nothing more.
+        // keyed by token, never the address: that is recycled between machines and moves mid-session
         if (overrideMoved) {
           await commands.setDeviceOverride(
             normalized.token,
@@ -334,8 +311,7 @@ function DeviceDetailsBody({
             normalized.systemAudio
           );
         }
-        // Their own commands, not an eleventh and twelfth argument to `setDeviceOverride`:
-        // that one is already at specta's ten-parameter ceiling.
+        // separate commands: setDeviceOverride is already at specta's ten-parameter ceiling
         if ((was.pointerScope ?? DEFAULT_POINTER_SCOPE) !== pointerScope) {
           await commands.setDevicePointerScope(normalized.token, pointerScope);
         }
@@ -361,13 +337,11 @@ function DeviceDetailsBody({
           await commands.setDeviceAudioOutput(normalized.token, normalized.audioOutputDeviceId);
         }
         await saveDeviceSettings(normalized);
-        // The event's `Device` comes from Rust, where neither field is optional; the
-        // config-file `Device` makes them optional because devices saved before they existed
-        // exist. Resolve the defaults on the way out rather than lying in either type.
+        // the Rust event type requires these fields, the config type leaves them optional:
+        // resolve the defaults here
         await events.deviceModify.emit({
           ...normalized,
-          // The row this sheet was opened from. The settings are the device's and reach every
-          // tab it has open; the row the dashboard replaces is this one.
+          // settings reach every tab of the device, but the dashboard replaces only this row
           joinId: device.joinId,
           pointerScope: normalized.pointerScope ?? DEFAULT_POINTER_SCOPE,
           autoFrameRate: normalized.autoFrameRate ?? DEFAULT_AUTO_FRAME_RATE,
@@ -654,9 +628,7 @@ function DeviceDetailsBody({
                 <TipLabel text={t("device.audioOutput.tip")}>
                   <Label>{t("device.audioOutput.label")}</Label>
                 </TipLabel>
-                {/* The outputs a person can actually pick: no empty id, no Chromium "default"
-                    pseudo-device (the row above is that), no duplicates. A report with none of
-                    these is a device whose browser offered only its default output. */}
+                {/* a report with no selectable outputs: the browser offered only its default */}
                 {audioOutputs?.supported === false ? (
                   <span className="text-sm text-muted-foreground text-right">
                     {t("device.audioOutput.unsupported")}
@@ -686,16 +658,13 @@ function DeviceDetailsBody({
                   </Select>
                 )}
               </div>
-              {/* "Waiting" only while the device has said nothing at all. A report that offers
-                  only the default output gets the select restricted to "System default" and no
-                  text under it (the owner's instruction). */}
+              {/* "waiting" only before the first report; a default-only report shows no text here */}
               {audioOutputs?.supported !== false && !audioOutputs && (
                 <p className="mt-2 text-sm text-muted-foreground">
                   {t("device.audioOutput.waiting")}
                 </p>
               )}
-              {/* Names, not routing: the ids work either way. This says so, because a list
-                  reading "Output 1, Output 2" with no explanation looks like a fault. */}
+              {/* ids route either way; unexplained "Output 1, Output 2" names look like a fault */}
               {audioOutputs?.supported !== false &&
                 namesUnavailable &&
                 selectableOutputs.length > 0 && (

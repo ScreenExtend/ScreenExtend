@@ -1,16 +1,15 @@
-/* amf_layout_gen.c — emits the Rust body of
- * src/windows_utils/streamer/test/amd_layout.rs from the real AMD AMF headers.
+/* Emits the Rust body of src/windows_utils/streamer/test/amd_layout.rs from the real AMD
+ * AMF headers.
  *
  * Compiled in C mode (`cl /TC`) on purpose: the AMF headers carry two APIs behind
- * `#ifdef __cplusplus`, and the `#else` C branch — plain vtable structs — is the one
- * `amd_sys` binds. `offsetof(SomeVtbl, member) / sizeof(void *)` IS the vtable slot
- * index, because a C-API vtable struct is exactly an array of function pointers.
+ * `#ifdef __cplusplus`, and the C branch (plain vtable structs) is the one `amd_sys`
+ * binds. `offsetof(SomeVtbl, member) / sizeof(void *)` is the vtable slot index, because
+ * a C-API vtable struct is exactly an array of function pointers.
  *
- * The Rust field names in `amd_sys::vtbl` are the C member names verbatim (the module
- * carries `#![allow(non_snake_case)]`), so the output below is a literal paste, not a
- * translation.
+ * The Rust field names in `amd_sys::vtbl` are the C member names verbatim, so the output
+ * is a literal paste.
  *
- * Build and run — see tools/README.md:
+ * Build and run (see tools/README.md):
  *   call "C:\...\VC\Auxiliary\Build\vcvars64.bat"
  *   cl /nologo /TC /W3 /I ..\resources\amf-headers amf_layout_gen.c /Fe:amf_layout_gen.exe
  *   amf_layout_gen.exe > generated.txt
@@ -64,11 +63,11 @@ int main(void)
     OFF(AMFRate, num);   OFF(AMFRate, den);
 
     /* AMFPropertyInfo is deliberately NOT modelled in Rust: its C layout (112 bytes,
-     * name @0) differs from its C++ layout (120 bytes, name @8 — it has a virtual
+     * name @0) differs from its C++ layout (120 bytes, name @8: it has a virtual
      * destructor), and amfrt64.dll is built from the C++ headers. amd_sys probes
      * optional properties with HasProperty instead of GetPropertyInfo, so the trap
      * cannot be hit. tools/amf_layout_cpp_check.cpp re-measures the divergence. */
-    printf("    // AMFPropertyInfo: C sizeof=%zu name@%zu — not modelled in Rust, see amf_layout_cpp_check.cpp\n",
+    printf("    // AMFPropertyInfo: C sizeof=%zu name@%zu, not modelled in Rust, see amf_layout_cpp_check.cpp\n",
            sizeof(AMFPropertyInfo), offsetof(AMFPropertyInfo, name));
 
     puts("");
@@ -255,8 +254,8 @@ int main(void)
 
     /* Colour signalling. `amd/encoder.rs` transcribes these as plain `i64` constants rather
      * than binding the enums, so this pins the transcription against the header. The enum is
-     * not densely packed — FULL_709 is 7, not 4, because ColorSpace.h leaves the G10/G2084
-     * values commented out in between — so counting instead of reading is how it goes wrong. */
+     * not densely packed: FULL_709 is 7, not 4, because ColorSpace.h leaves the G10/G2084
+     * values commented out in between. */
     COLORV(COLOR_PRIMARIES_BT709, AMF_COLOR_PRIMARIES_BT709);
     COLORV(TRANSFER_CHARACTERISTIC_BT709, AMF_COLOR_TRANSFER_CHARACTERISTIC_BT709);
     COLORV(MATRIX_COEFF_BT709, AMF_COLOR_MATRIX_COEFF_BT_709);

@@ -36,10 +36,8 @@ impl ProcessTuning {
             | NSActivityOptions::SuddenTerminationDisabled;
         let _activity = unsafe { pi.beginActivityWithOptions_reason(opts, &reason) };
         tprintln!("[tuning] process-wide App-Nap + termination hardening applied");
-        // No `setpriority(PRIO_PROCESS, -10)`: a negative nice value needs root, so for every
-        // real user it printed an EACCES line and changed nothing. Darwin expresses process
-        // priority through QoS classes and NSProcessInfo activities, both of which are in use
-        // here and on the encode threads.
+        // no setpriority(PRIO_PROCESS, -10): a negative nice needs root, and Darwin takes
+        // process priority from QoS classes and NSProcessInfo activities anyway
         ProcessTuning { _activity }
     }
 }

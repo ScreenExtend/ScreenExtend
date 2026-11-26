@@ -33,11 +33,9 @@ pub struct RoutingState {
 }
 
 impl RoutingState {
-    /// Is the process that made this change still alive?
-    ///
-    /// `kill(pid, 0)` is a signal-existence check, not a fork — the whole point of not asking
-    /// `pgrep`. A file from an older build carries `owner_pid` 0, which reads as "no owner", and
-    /// recovery then falls back to the lock check alone exactly as before.
+    /// Is the process that made this change still alive? `kill(pid, 0)` is an existence check,
+    /// not a fork. `owner_pid` 0 (a file from an older build) reads as "no owner", and recovery
+    /// then relies on the lock check alone.
     fn owner_alive(&self) -> bool {
         if self.owner_pid == 0 || self.owner_pid == std::process::id() {
             return false;
@@ -68,8 +66,6 @@ impl RoutingState {
                 return;
             }
         };
-        // A state file that cannot be written means crash recovery cannot run, and the user's
-        // default output device stays on the virtual device after a crash with nothing to say why.
         if let Err(e) = std::fs::write(path, bytes) {
             crate::teprintln!(
                 "audio(legacy): cannot write {} ({e}); crash recovery will not be able to restore \
@@ -181,11 +177,9 @@ pub fn recover<P: DefaultDevicePort>(port: &P, our_uid: &str, state_path: &Path)
     if !state.changed {
         return false;
     }
-    // Recovery is for a host that *died* holding the default output. A host that is still running
-    // owns it, and pulling the device out from under it mid-stream would look exactly like the
-    // user switching away — which is how `probe --audio` caught this: the agent is bootstrapped
-    // with `RunAtLoad`, so it runs the instant the tier starts, and the probe takes no
-    // single-instance lock for `another_instance_running` to find.
+    // Recovery is for a host that died holding the default output. One still running owns it,
+    // and the agent runs at load (`RunAtLoad`), so without this it would pull the device from
+    // under a live `probe --audio`, which takes no single-instance lock.
     if state.owner_alive() {
         return false;
     }
@@ -250,11 +244,9 @@ pub fn recover_on_launch() {
 
 /// Is a ScreenExtend host holding the single-instance lock?
 ///
-/// The lock, not a `pgrep` fork: `single_instance` already keeps an exclusive `fs4` lock on
-/// `screenextend.lock` in the app's local data directory for exactly this question, and acquiring
-/// it is one `open` plus one `flock` against a process spawn plus a PID-list parse. The directory
-/// is the one Tauri's `app_local_data_dir` resolves to on macOS, which is the parent of the
-/// routing state file — the watchdog runs before any Tauri app exists, so it cannot ask Tauri.
+/// The lock, not a `pgrep` fork: one `open` plus one `flock`. The directory is what Tauri's
+/// `app_local_data_dir` resolves to on macOS (the parent of the routing state file); the
+/// watchdog runs before any Tauri app exists, so it cannot ask Tauri.
 fn another_instance_running() -> bool {
     let Some(dir) = default_state_path().parent().map(PathBuf::from) else {
         return false;
@@ -274,9 +266,8 @@ fn another_instance_running() -> bool {
 
 /// The `audio-recover` subcommand: restore the default output device a crashed host left hijacked.
 ///
-/// Also the agent's own exit condition. Once the host is gone and the device has been put back
-/// there is nothing left for a periodic job to do, so it removes itself rather than polling on
-/// forever against a path that may not even exist any more.
+/// Also the agent's own exit condition: once the host is gone and the device is back, it
+/// removes itself rather than polling forever.
 pub fn watchdog_recover() {
     if another_instance_running() {
         return; // the host is alive and owns the routing; nothing to recover
@@ -318,11 +309,9 @@ fn watchdog_plist(exe: &Path) -> String {
 
 /// Install the post-crash recovery agent, if it is not already installed with these contents.
 ///
-/// The agent exists only for the window in which the virtual device is the system default output.
-/// It is removed again by [`uninstall_watchdog_agent`] on a clean stop and on driver uninstall, and
-/// by [`watchdog_recover`] itself the first time it finds no host running — so it is a job with a
-/// bounded life rather than a permanent background poll against a path the app may have moved away
-/// from.
+/// The agent lives only while the virtual device is the system default output:
+/// [`uninstall_watchdog_agent`] removes it on a clean stop and on driver uninstall, and
+/// [`watchdog_recover`] removes it the first time it finds no host running.
 pub fn install_watchdog_agent() {
     let exe = match std::env::current_exe() {
         Ok(p) => p,
@@ -334,8 +323,7 @@ pub fn install_watchdog_agent() {
     let plist = watchdog_plist(&exe);
     let path = watchdog_plist_path();
 
-    // Re-bootstrapping an already-loaded job is an error every start would log; only touch launchd
-    // when the plist is actually new or its embedded path changed.
+    // re-bootstrapping an already-loaded job is an error: skip launchd when nothing changed
     let unchanged = std::fs::read_to_string(&path).is_ok_and(|on_disk| on_disk == plist);
     if unchanged && watchdog_agent_loaded() {
         return;

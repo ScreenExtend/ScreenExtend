@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// TEST-WORKFLOW.md §5.7 acceptance for the handler itself.
+// Acceptance runs for the test handler itself: N at once (measurement windows must not overlap),
+// N in a row (the run-to-run spread), and one on a build without the isolation switch.
 //
 //   node scripts/test-handler/acceptance.mjs concurrent --exe <isolated build> [--n 5] [--request <json>]
 //   node scripts/test-handler/acceptance.mjs noise      --exe <build> [--runs 5] [--request <json>]
@@ -38,7 +39,6 @@ function summarize(x) {
   return { label: x.label, exit: x.code, wallMs: x.ms, ok: r.ok, mode: r.mode, slot: r.slot, queueWaitMs: r.queueWaitMs, errors: r.errors, joins: (r.joins || []).map((j) => ({ answerMs: j.answerMs, firstPictureMs: j.firstPictureMs, offers: j.offers })), latency: lat, static: sc.static ? { framesWithChange: sc.static.framesWithChange, paintedFps: sc.static.paintedFps, greenFrames: sc.static.greenFrames } : undefined, cleanup: r.cleanup ? { displaysLeft: r.cleanup.displaysLeftByUs, hostsLeft: r.cleanup.hostProcessesLeft, chromeLeft: r.cleanup.chromeLeft, driverRemoved: r.cleanup.driverRemoved, hostStop: (r.cleanup.hosts || []).map((h) => h.method) } : null, ownerConfigIdentical: r.ownerConfig ? r.ownerConfig.identical : null, host: r.host ? { credentialsVia: r.host.credentialsVia, statusJson: r.host.statusJson, controlVerbs: r.host.controlVerbs, isolationVerified: r.host.isolationVerified } : null, warnings: r.warnings, runDir: r.runDir, windows: r.measurementWindows };
 }
 
-/** Every timed window from every run, checked for overlap. */
 function overlapCheck(runs) {
   const w = runs.flatMap((x) => ((x.result && x.result.measurementWindows) || []).map((m) => ({ ...m, run: x.label })));
   w.sort((a, b) => a.start - b.start);

@@ -1,38 +1,25 @@
-//! Rewriting the SPS VUI on the way out of the AMF encoder.
+//! Rewrites the SPS VUI on the way out of the AMF encoder.
 //!
-//! **Why this exists.** AMF is reported never to write `OutColorProfile`, `OutColorPrimaries`,
-//! `OutColorTransferChar` or `OutMatrixCoeff` into an AVC bitstream (GPUOpen AMF issues #398,
-//! #277 and #540, still open on driver 24.8.1). Only `FullRangeColor` reaches the stream. The
-//! NVENC path meanwhile writes a full VUI, including **`bitstream_restriction_flag = 1`**, which
-//! is what tells a decoder `max_num_reorder_frames = 0`. Without it a decoder infers the reorder
+//! AMF is reported to write none of its `OutColor*` properties into an AVC SPS (only
+//! `FullRangeColor`) and no `bitstream_restriction_flag`; unverified, the `AMF SPS/PPS ready` log
+//! line on a Radeon settles it. Without `max_num_reorder_frames = 0` a decoder infers the reorder
 //! depth from the level and holds `min(16, MaxDpbMbs / PicSizeInMbs)` frames before showing the
-//! first — 33–267 ms at 60 fps. So an AMD host and an NVIDIA host produce differently signalled
-//! streams from identical input, and the AMD one may be asking browsers to buffer frames we
-//! never reorder.
+//! first: 33-267 ms at 60 fps.
 //!
-//! We packetize H.264 by hand (`webrtc_session.rs` uses a raw `TrackLocalStaticRTP`), so the SPS
-//! is ours to rewrite, and doing it here keeps the change inside the AMD backend.
+//! The rewrite is gated on a read-back (`needs_patch`), so an SPS that is already correct is left
+//! alone. The VUI written is canonical, not merged: no HRD and no timing info (RTP carries the
+//! clock), so an HRD block from `EnforceHRD = true` is dropped. Browsers skip the buffering-period
+//! and picture-timing SEI that then refer to it by size.
 //!
-//! **The VUI written is canonical, not merged.** Every field the encoder could have put there is
-//! one this configuration deliberately turns off — `EnforceHRD = false`, no filler, no AUD, no
-//! SEI, one slice, no B-frames — so the honest thing is to emit exactly the VUI this stream
-//! means rather than to parse and preserve an HRD block that cannot be present. Timing info goes
-//! with it: the transport is RTP, whose timestamps are the clock.
-//!
-//! **It is gated on a read-back.** `needs_patch` parses what AMF actually produced; if a future
-//! driver fixes #398 and already writes the colour description and the bitstream restriction we
-//! want, the SPS is left alone. That is the same "probe the capability, never the version" rule
-//! the rest of the project follows.
-//!
-//! The independent check is `windows_utils/streamer/test/h264.rs::parse_sps`, which was written
-//! separately and reads the result back — a rewriter verified by its own parser proves nothing.
+//! The independent check is `windows_utils/streamer/test/h264.rs::parse_sps`: a rewriter verified
+//! by its own parser proves nothing.
 
 /// H.264 profiles whose SPS carries `chroma_format_idc` (7.3.2.1.1).
 const HIGH_PROFILES: &[u8] = &[100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135];
 
 /// `video_format` = 5, "Unspecified video format" (Table E-2). What NVENC writes.
 const VIDEO_FORMAT_UNSPECIFIED: u32 = 5;
-/// BT.709 in Tables E-3, E-4 and E-5 — `colour_primaries`, `transfer_characteristics` and
+/// BT.709 in Tables E-3, E-4 and E-5, `colour_primaries`, `transfer_characteristics` and
 /// `matrix_coefficients` all take the value 1.
 const BT709: u32 = 1;
 /// `log2_max_mv_length_*`: 15 is the value H.264 defines as the default when
@@ -51,6 +38,8 @@ struct VuiObserved {
 /// The parts of an SPS this module needs: where the VUI flag sits, and the DPB size.
 #[derive(Debug, Clone, Copy)]
 struct SpsPrefix {
+    profile_idc: u8,
+    level_idc: u8,
     /// Bit index of `vui_parameters_present_flag` in the unescaped RBSP.
     vui_flag_bit: usize,
     max_num_ref_frames: u32,
@@ -58,47 +47,121 @@ struct SpsPrefix {
     vui: Option<VuiObserved>,
 }
 
+/// What the encoder's own parameter sets say, for the one-off decision in `read_extradata`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpsInspection {
+    /// No SPS NAL in the buffer at all (an empty or SPS-less `ExtraData`).
+    NoSps,
+    /// An SPS was there but could not be walked to its VUI.
+    Unparseable,
+    /// Every SPS already carries the canonical colour description and bitstream restriction.
+    AlreadyCorrect,
+    /// At least one SPS needed the canonical VUI; this is the rewritten buffer.
+    Patched(Vec<u8>),
+}
+
+/// The fields of the first SPS that the encoder logs: what AMF really chose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpsSummary {
+    pub profile_idc: u8,
+    pub level_idc: u8,
+    pub max_num_ref_frames: u32,
+}
+
+/// One SPS NAL, judged.
+enum SpsVerdict {
+    Unparseable,
+    AlreadyCorrect,
+    Patched(Vec<u8>),
+}
+
+/// What one pass over the parameter-set prefix of an access unit found.
+struct Scan {
+    out: Option<Vec<u8>>,
+    sps_seen: u32,
+    sps_unparseable: u32,
+}
+
 /// Rewrite every SPS in an Annex-B buffer. `None` means nothing needed changing, so the caller
 /// keeps the bytes it already has.
 ///
 /// Scanning stops at the first slice NAL (types 1 and 5): parameter sets always precede the
-/// slices of their access unit, so on a P frame this reads one NAL header and returns.
+/// slices of their access unit, so a P frame costs one NAL header read and no allocation.
 pub fn patch_annexb(au: &[u8], full_range: bool) -> Option<Vec<u8>> {
-    let nals = split_annexb(au);
-    let mut out: Option<Vec<u8>> = None;
+    scan(au, full_range).out
+}
+
+/// [`patch_annexb`], plus the reason when nothing was rewritten.
+pub fn inspect_annexb(au: &[u8], full_range: bool) -> SpsInspection {
+    let s = scan(au, full_range);
+    match s.out {
+        Some(patched) => SpsInspection::Patched(patched),
+        None if s.sps_seen == 0 => SpsInspection::NoSps,
+        None if s.sps_unparseable > 0 => SpsInspection::Unparseable,
+        None => SpsInspection::AlreadyCorrect,
+    }
+}
+
+/// Profile, level and reference count of the first SPS in an Annex-B buffer.
+pub fn summarize_annexb(au: &[u8]) -> Option<SpsSummary> {
+    for (start, end) in parameter_set_nals(au) {
+        if au[start] & 0x1f != 7 {
+            continue;
+        }
+        let prefix = parse_prefix(&unescape(&au[start + 1..end]))?;
+        return Some(SpsSummary {
+            profile_idc: prefix.profile_idc,
+            level_idc: prefix.level_idc,
+            max_num_ref_frames: prefix.max_num_ref_frames,
+        });
+    }
+    None
+}
+
+fn scan(au: &[u8], full_range: bool) -> Scan {
+    let mut s = Scan {
+        out: None,
+        sps_seen: 0,
+        sps_unparseable: 0,
+    };
     let mut copied_to = 0usize;
 
-    for nal in &nals {
-        let nal_type = au[nal.payload_start] & 0x1f;
-        if nal_type == 1 || nal_type == 5 {
-            break;
-        }
-        if nal_type != 7 {
+    for (start, end) in parameter_set_nals(au) {
+        if au[start] & 0x1f != 7 {
             continue;
         }
-        let body = &au[nal.payload_start + 1..nal.end];
-        let Some(patched) = patch_sps_nal_body(body, full_range) else {
-            continue;
+        s.sps_seen += 1;
+        let patched = match judge_sps_nal_body(&au[start + 1..end], full_range) {
+            SpsVerdict::Patched(p) => p,
+            SpsVerdict::Unparseable => {
+                s.sps_unparseable += 1;
+                continue;
+            }
+            SpsVerdict::AlreadyCorrect => continue,
         };
-        let buf = out.get_or_insert_with(|| Vec::with_capacity(au.len() + 32));
-        buf.extend_from_slice(&au[copied_to..nal.payload_start + 1]);
+        let buf = s
+            .out
+            .get_or_insert_with(|| Vec::with_capacity(au.len() + 32));
+        buf.extend_from_slice(&au[copied_to..start + 1]);
         buf.extend_from_slice(&patched);
-        copied_to = nal.end;
+        copied_to = end;
     }
 
-    if let Some(buf) = out.as_mut() {
+    if let Some(buf) = s.out.as_mut() {
         buf.extend_from_slice(&au[copied_to..]);
     }
-    out
+    s
 }
 
 /// One SPS NAL body (everything after the one-byte NAL header), escaped as it appears on the
-/// wire. `None` when the SPS already says what we want, or cannot be parsed.
-fn patch_sps_nal_body(escaped_body: &[u8], full_range: bool) -> Option<Vec<u8>> {
+/// wire.
+fn judge_sps_nal_body(escaped_body: &[u8], full_range: bool) -> SpsVerdict {
     let rbsp = unescape(escaped_body);
-    let prefix = parse_prefix(&rbsp)?;
+    let Some(prefix) = parse_prefix(&rbsp) else {
+        return SpsVerdict::Unparseable;
+    };
     if !needs_patch(&prefix, full_range) {
-        return None;
+        return SpsVerdict::AlreadyCorrect;
     }
 
     let mut w = BitWriter::new();
@@ -106,10 +169,10 @@ fn patch_sps_nal_body(escaped_body: &[u8], full_range: bool) -> Option<Vec<u8>> 
     w.bit(1); // vui_parameters_present_flag
     write_vui(&mut w, full_range, prefix.max_num_ref_frames);
     w.rbsp_trailing_bits();
-    Some(escape(&w.finish()))
+    SpsVerdict::Patched(escape(&w.finish()))
 }
 
-/// Whether the SPS AMF produced already carries what we would write.
+/// False when AMF's SPS already carries the VUI this module would write.
 fn needs_patch(prefix: &SpsPrefix, full_range: bool) -> bool {
     match prefix.vui {
         None => true,
@@ -122,7 +185,8 @@ fn needs_patch(prefix: &SpsPrefix, full_range: bool) -> bool {
     }
 }
 
-/// The canonical VUI: colour signalling, and a bitstream restriction that says we never reorder.
+/// The canonical VUI: colour signalling, and a bitstream restriction that says nothing is
+/// reordered.
 fn write_vui(w: &mut BitWriter, full_range: bool, max_num_ref_frames: u32) {
     w.bit(0); // aspect_ratio_info_present_flag
     w.bit(0); // overscan_info_present_flag
@@ -136,20 +200,19 @@ fn write_vui(w: &mut BitWriter, full_range: bool, max_num_ref_frames: u32) {
     w.bits(BT709, 8); // matrix_coefficients
 
     w.bit(0); // chroma_loc_info_present_flag
-    w.bit(0); // timing_info_present_flag — RTP carries the clock
-    w.bit(0); // nal_hrd_parameters_present_flag — EnforceHRD is deliberately false
+    w.bit(0); // timing_info_present_flag, RTP carries the clock
+    w.bit(0); // nal_hrd_parameters_present_flag: see the module comment on HRD
     w.bit(0); // vcl_hrd_parameters_present_flag
     w.bit(0); // pic_struct_present_flag
 
-    w.bit(1); // bitstream_restriction_flag — the whole reason this exists
+    w.bit(1); // bitstream_restriction_flag, the whole reason this exists
     w.bit(1); // motion_vectors_over_pic_boundaries_flag
     w.ue(0); // max_bytes_per_pic_denom: 0 = no limit
     w.ue(0); // max_bits_per_mb_denom: 0 = no limit
     w.ue(LOG2_MAX_MV_LENGTH);
     w.ue(LOG2_MAX_MV_LENGTH);
     w.ue(0); // max_num_reorder_frames
-             // max_dec_frame_buffering must be at least max_num_ref_frames, and at least
-             // max_num_reorder_frames. The DPB we actually use is the reference count.
+             // max_dec_frame_buffering: at least max_num_ref_frames, which is the DPB in use
     w.ue(max_num_ref_frames.max(1));
 }
 
@@ -160,7 +223,7 @@ fn parse_prefix(rbsp: &[u8]) -> Option<SpsPrefix> {
 
     let profile_idc = r.bits(8)? as u8;
     r.bits(8)?; // constraint flags + reserved
-    r.bits(8)?; // level_idc
+    let level_idc = r.bits(8)? as u8;
     r.ue()?; // seq_parameter_set_id
 
     if HIGH_PROFILES.contains(&profile_idc) {
@@ -219,14 +282,16 @@ fn parse_prefix(rbsp: &[u8]) -> Option<SpsPrefix> {
     };
 
     Some(SpsPrefix {
+        profile_idc,
+        level_idc,
         vui_flag_bit,
         max_num_ref_frames,
         vui,
     })
 }
 
-/// Read an existing VUI far enough to know whether it already says what we want. A VUI we cannot
-/// walk is treated as absent, which means it gets replaced.
+/// Read an existing VUI far enough to know whether it is already the canonical one. A VUI that
+/// cannot be walked is treated as absent, which means it gets replaced.
 fn parse_vui(r: &mut BitReader) -> Option<VuiObserved> {
     if r.bits(1)? == 1 {
         // aspect_ratio_info_present_flag
@@ -322,16 +387,64 @@ fn skip_scaling_list(r: &mut BitReader, size: usize) -> Option<()> {
     Some(())
 }
 
-// -------------------------------------------------------------------------------------------
-// Annex-B framing
-// -------------------------------------------------------------------------------------------
+/// The index just past the next `00 00 01` at or after `from`, or `None` when there is none. A
+/// start code that ends the buffer opens no NAL and also ends the walk.
+fn next_payload(au: &[u8], from: usize) -> Option<usize> {
+    let mut i = from;
+    while i + 3 <= au.len() {
+        if au[i] == 0 && au[i + 1] == 0 && au[i + 2] == 1 {
+            return (i + 3 < au.len()).then_some(i + 3);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The NALs in front of an access unit's first slice, as `(header index, end)` spans, found
+/// lazily: the walk stops at the first VCL NAL (types 1 and 5) without looking for its end, so
+/// the slice data, nearly every byte of a frame, is never scanned.
+fn parameter_set_nals(au: &[u8]) -> ParameterSetNals<'_> {
+    ParameterSetNals {
+        au,
+        next: next_payload(au, 0),
+    }
+}
+
+struct ParameterSetNals<'a> {
+    au: &'a [u8],
+    next: Option<usize>,
+}
+
+impl Iterator for ParameterSetNals<'_> {
+    type Item = (usize, usize);
+
+    fn next(&mut self) -> Option<(usize, usize)> {
+        let start = self.next?;
+        let nal_type = self.au[start] & 0x1f;
+        if nal_type == 1 || nal_type == 5 {
+            self.next = None;
+            return None;
+        }
+        let following = next_payload(self.au, start);
+        // the next start code may be three or four bytes: trailing zeros belong to it
+        let mut end = following.map(|s| s - 3).unwrap_or(self.au.len());
+        while end > start && self.au[end - 1] == 0 {
+            end -= 1;
+        }
+        self.next = following;
+        Some((start, end.max(start + 1)))
+    }
+}
 
 /// One NAL in an Annex-B buffer: where its header byte is, and where the next start code begins.
+#[cfg(test)]
 struct NalSpan {
     payload_start: usize,
     end: usize,
 }
 
+/// Whole-buffer splitter: the reference the lazy `parameter_set_nals` walk is tested against.
+#[cfg(test)]
 fn split_annexb(au: &[u8]) -> Vec<NalSpan> {
     let mut starts = Vec::new();
     let mut i = 0usize;
@@ -347,7 +460,7 @@ fn split_annexb(au: &[u8]) -> Vec<NalSpan> {
     }
     let mut out = Vec::with_capacity(starts.len());
     for (idx, &start) in starts.iter().enumerate() {
-        // The next start code may be three or four bytes; trailing zeros belong to it, not to us.
+        // the next start code may be three or four bytes: trailing zeros belong to it
         let mut end = starts.get(idx + 1).map(|&s| s - 3).unwrap_or(au.len());
         while end > start && au[end - 1] == 0 {
             end -= 1;
@@ -398,10 +511,6 @@ fn escape(rbsp: &[u8]) -> Vec<u8> {
     }
     out
 }
-
-// -------------------------------------------------------------------------------------------
-// Bit IO
-// -------------------------------------------------------------------------------------------
 
 struct BitReader<'a> {
     data: &'a [u8],
@@ -519,8 +628,8 @@ mod tests {
     use crate::windows_utils::streamer::test::h264;
 
     /// 1280x720 constrained-baseline SPS+PPS from libx264, captured verbatim. Its VUI claims
-    /// `max_num_reorder_frames = 2` and limited range — both wrong for this pipeline, and the
-    /// second of which is the washed-out picture.
+    /// `max_num_reorder_frames = 2` and limited range, both wrong for this pipeline (limited
+    /// range is the washed-out picture).
     const BASELINE_AU: &[u8] = &[
         0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0xc0, 0x1f, 0xd9, 0x00, 0x50, 0x05, 0xbb, 0x01, 0x6a,
         0x02, 0x02, 0x02, 0x80, 0x00, 0x00, 0x03, 0x00, 0x80, 0x00, 0x00, 0x1e, 0x07, 0x8c, 0x18,
@@ -574,7 +683,7 @@ mod tests {
             after.max_num_reorder_frames, 0,
             "a decoder told 2 holds two frames before it shows the first"
         );
-        // The prefix is copied bit for bit, so everything the encoder decided is unchanged.
+        // the prefix is copied bit for bit, so everything the encoder decided is unchanged
         assert_eq!(after.profile_idc, before.profile_idc);
         assert_eq!(after.level_idc, before.level_idc);
         assert_eq!(after.chroma_format_idc, before.chroma_format_idc);
@@ -621,9 +730,8 @@ mod tests {
 
     #[test]
     fn an_sps_that_already_says_what_we_want_is_left_alone() {
-        // Patch once, then ask again: the second call must be a no-op, which is what makes the
-        // steady-state cost a comparison rather than a rewrite — and what will make this code
-        // stand down the day AMD fix issue #398.
+        // the second call must be a no-op: that keeps the steady-state cost a comparison, and
+        // makes this code stand down once a driver writes the VUI itself
         let patched = patch_annexb(BASELINE_AU, true).expect("a patch was needed");
         let parsed = h264::parse_sps(&patched).expect("patched SPS parses");
         assert!(
@@ -634,7 +742,7 @@ mod tests {
             patch_annexb(&patched, true).is_none(),
             "re-patching an already-correct SPS must not rewrite it"
         );
-        // ...but a different colour range is a different answer.
+        // but a different colour range is a different answer
         assert!(
             patch_annexb(&patched, false).is_some(),
             "a limited-range stream needs video_full_range_flag = 0"
@@ -657,7 +765,7 @@ mod tests {
                 "an unescaped start-code-alike survived into the SPS: {sps:02x?}"
             );
         }
-        // And the escaping is reversible: our own reader must see what the writer meant.
+        // the escaping is reversible: the reader must see what the writer meant
         let prefix = parse_prefix(&unescape(&sps)).expect("the patched SPS parses");
         let vui = prefix.vui.expect("it has a VUI");
         assert!(vui.colour_description && vui.full_range && vui.bitstream_restriction);
@@ -683,9 +791,89 @@ mod tests {
 
     #[test]
     fn a_frame_with_no_parameter_sets_is_not_scanned_past_its_first_slice() {
-        // A bare P slice: no SPS, so no patch and no allocation.
+        // a bare P slice: no SPS, so no patch and no allocation
         let p_frame: &[u8] = &[0x00, 0x00, 0x00, 0x01, 0x41, 0x9a, 0x24, 0x6c];
         assert!(patch_annexb(p_frame, true).is_none());
+    }
+
+    /// The lazy walk must find exactly the NALs the whole-buffer splitter finds, up to the
+    /// first slice, on every shape of buffer: three- and four-byte start codes, trailing zeros,
+    /// a start code that ends the buffer, empty NALs and no start code at all.
+    #[test]
+    fn the_lazy_walk_finds_the_same_parameter_sets_as_the_full_split() {
+        let alphabet = [
+            0x00u8, 0x00, 0x00, 0x01, 0x03, 0x67, 0x68, 0x06, 0x09, 0x41, 0x65,
+        ];
+        let mut seed = 0x2545_f491_u32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for _ in 0..4000 {
+            let len = (next() % 48) as usize;
+            let au: Vec<u8> = (0..len)
+                .map(|_| alphabet[(next() as usize) % alphabet.len()])
+                .collect();
+            let mut expected = Vec::new();
+            for nal in split_annexb(&au) {
+                let t = au[nal.payload_start] & 0x1f;
+                if t == 1 || t == 5 {
+                    break;
+                }
+                expected.push((nal.payload_start, nal.end));
+            }
+            let lazy: Vec<(usize, usize)> = parameter_set_nals(&au).collect();
+            assert_eq!(lazy, expected, "buffer {au:02x?}");
+        }
+    }
+
+    /// The per-frame cost: a P frame's slice data is never walked. A 40 KB slice full of byte
+    /// patterns that look like start codes followed by SPS headers would be visited by a
+    /// whole-buffer split; the lazy walk returns at the first NAL header.
+    #[test]
+    fn a_p_frame_is_rejected_at_its_first_nal_header() {
+        let mut au = vec![0x00, 0x00, 0x00, 0x01, 0x41];
+        for _ in 0..10_000 {
+            au.extend_from_slice(&[0x00, 0x00, 0x01, 0x67]);
+        }
+        assert_eq!(parameter_set_nals(&au).count(), 0);
+        assert!(patch_annexb(&au, true).is_none());
+        assert_eq!(inspect_annexb(&au, true), SpsInspection::NoSps);
+    }
+
+    #[test]
+    fn inspection_tells_missing_unparseable_and_correct_apart() {
+        assert_eq!(inspect_annexb(&[], true), SpsInspection::NoSps);
+        // a PPS alone: parameter sets, but no SPS to judge
+        assert_eq!(
+            inspect_annexb(&[0, 0, 0, 1, 0x68, 0xcb, 0x83, 0xcb, 0x20], true),
+            SpsInspection::NoSps
+        );
+        // an SPS truncated after two bytes cannot be walked to the VUI
+        assert_eq!(
+            inspect_annexb(&[0, 0, 0, 1, 0x67, 0x42, 0xc0], true),
+            SpsInspection::Unparseable
+        );
+        let patched = match inspect_annexb(BASELINE_AU, true) {
+            SpsInspection::Patched(p) => p,
+            other => panic!("the fixture needs a patch, got {other:?}"),
+        };
+        assert_eq!(
+            inspect_annexb(&patched, true),
+            SpsInspection::AlreadyCorrect
+        );
+    }
+
+    #[test]
+    fn the_summary_reads_the_level_the_encoder_chose() {
+        let parsed = h264::parse_sps(BASELINE_AU).expect("fixture SPS parses");
+        let summary = summarize_annexb(BASELINE_AU).expect("the fixture has an SPS");
+        assert_eq!(summary.profile_idc, parsed.profile_idc);
+        assert_eq!(summary.level_idc, parsed.level_idc);
+        assert_eq!(summary.max_num_ref_frames, parsed.max_num_ref_frames);
+        assert_eq!(summary.level_idc, 0x1f, "the fixture is level 3.1");
     }
 
     #[test]

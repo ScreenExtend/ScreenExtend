@@ -5310,9 +5310,6 @@ pub use self::{
     _NV_ENC_VUI_VIDEO_FORMAT as NV_ENC_VUI_VIDEO_FORMAT,
 };
 
-// ---------------------------------------------------------------------------
-// NOTE: the trailing `extern "C" { pub fn NvEnc* }` block of static-link function
-// declarations was removed. This crate loads `nvEncodeAPI64.dll` at runtime via
-// `libloading` (see ../encoder.rs) and dispatches through NV_ENCODE_API_FUNCTION_LIST,
-// so no import library (`nvencodeapi.lib`) is needed at build time.
-// ---------------------------------------------------------------------------
+// bindgen's trailing `extern "C" { pub fn NvEnc* }` block is left out on purpose:
+// `nvEncodeAPI64.dll` is loaded at runtime with `libloading` (../encoder.rs) and called through
+// NV_ENCODE_API_FUNCTION_LIST, so the build needs no `nvencodeapi.lib`

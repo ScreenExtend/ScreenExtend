@@ -1,20 +1,14 @@
-/* nvenc_layout_gen.c — emits the Rust body of
- * src/windows_utils/streamer/test/nvenc_layout.rs from the real NVENC header.
+/* Emits the Rust body of src/windows_utils/streamer/test/nvenc_layout.rs from the real
+ * NVENC header.
  *
- * The problem this exists to solve: the layout test used to assert the Rust structs'
- * `size_of`/`offset_of` against constants emitted by the same bindgen run that produced
- * the structs. That is self-referential — it detects a hand edit to the Rust and nothing
- * else, and in particular it cannot detect bindings generated against one SDK while
- * `version.rs`, which is hand-written, encodes the struct revisions of another. A wrong
- * revision word is not a compile error and not a crash: `nvEncInitializeEncoder` returns
- * NV_ENC_ERR_INVALID_VERSION, `build_backend` catches it, and the whole NVIDIA path
- * silently degrades to Quick Sync or x264.
+ * Every number comes from a C compiler reading ../resources/nvenc-headers/nvEncodeAPI.h.
+ * Constants from the bindgen run that produced the Rust structs would only catch a hand
+ * edit, not bindings from one SDK beside a hand-written `version.rs` that encodes the
+ * struct revisions of another. A wrong revision word is not a compile error and not a
+ * crash: `nvEncInitializeEncoder` returns NV_ENC_ERR_INVALID_VERSION, `build_backend`
+ * catches it, and the whole NVIDIA path silently degrades to Quick Sync or x264.
  *
- * Every number below comes from a C compiler reading
- * ../resources/nvenc-headers/nvEncodeAPI.h, so a header bump moves the numbers and the
- * diff is the review item.
- *
- * Build and run — see tools/README.md:
+ * Build and run (see tools/README.md):
  *   call "C:\...\VC\Auxiliary\Build\vcvars64.bat"
  *   cl /nologo /TC /W3 /I ..\resources\nvenc-headers nvenc_layout_gen.c /Fe:nvenc_layout_gen.exe
  *   nvenc_layout_gen.exe > nvenc_layout_generated.txt

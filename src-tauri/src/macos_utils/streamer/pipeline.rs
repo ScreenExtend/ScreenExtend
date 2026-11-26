@@ -31,13 +31,9 @@ pub struct EncodedFrame {
 
 const BROADCAST_CAPACITY: usize = 4;
 
-/// How long a session may run without a single captured frame before the client is handed a
-/// picture anyway.
-///
-/// A capture backend that starts and never delivers produces a session that negotiates, connects,
-/// reports healthy and then shows nothing forever: the keepalive can only repeat a frame, and
-/// there is no frame to repeat. A freshly created virtual display with nothing on it is exactly
-/// that case — no window has moved on it yet, so nothing is dirty and nothing is delivered.
+/// How long a session may run with no captured frame before the client is handed a placeholder:
+/// a fresh virtual display has no dirty region, so nothing is delivered and the keepalive has
+/// nothing to repeat.
 const FIRST_FRAME_DEADLINE: Duration = Duration::from_millis(750);
 
 /// How long the encode loop waits for a frame before looking at its other work.
@@ -52,14 +48,9 @@ const SUBMIT_ERRORS_BEFORE_RESET: u32 = 3;
 /// How many times a session may rebuild its encoder before it ends instead.
 const MAX_ENCODER_RESETS: u32 = 3;
 
-/// How long the in-flight cap waits for the encoder to emit anything before it stands aside.
-///
-/// The cap assumes an encoder that returns roughly one frame for each one it is given. Not every
-/// VideoToolbox implementation does: without low-latency rate control some hold several frames
-/// before emitting the first, and against such an encoder a hard cap of two is a deadlock, not
-/// back-pressure — which is what the old code's blocking `CompleteFrames` on the keepalive path
-/// was really working around. So the cap yields to evidence: if nothing has come out for this
-/// long, keep feeding (up to a much larger bound) and say so once.
+/// How long the in-flight cap waits for any output before it stands aside. Without low-latency
+/// rate control some VideoToolbox encoders hold several frames before emitting the first, and
+/// against those a hard cap of two is a deadlock, not back-pressure.
 const STALL_BYPASS: Duration = Duration::from_millis(100);
 
 /// The bound that still applies while the cap is stood aside.
@@ -75,15 +66,11 @@ const DROP_GUARD_MIN_SUBMITS: u64 = 30;
 /// Trip when rate drops exceed this percentage of submits in a window.
 const DROP_GUARD_PERCENT: u64 = 5;
 
-/// Watches a low-latency constant-quality session for its rate controller dropping frames.
-///
-/// The low-latency encoder's rate controller keeps running under a QP clamp, and when its budget
-/// runs out it drops the frame (status 0, `kVTEncodeInfo_FrameDropped`, no sample) — 86 % of a
-/// recorded window drag with no `AverageBitRate`. The tier selection avoids that on every Mac we
-/// measured, but not on every Mac there is, so the encode loop checks: more than
-/// `DROP_GUARD_PERCENT` of the submits in any `DROP_GUARD_WINDOW_MS` window (sliding in
-/// `DROP_GUARD_STEP_MS` steps) dropped means the session is rebuilt, once, on the standard
-/// encoder. Pure: fed totals and a millisecond clock, so it is unit-tested without an encoder.
+/// Watches a low-latency constant-quality session for rate-control drops. Under a QP clamp the
+/// rate controller still drops a frame when its budget runs out (status 0,
+/// `kVTEncodeInfo_FrameDropped`, no sample): 86 % of a recorded window drag with no
+/// `AverageBitRate`. A backstop to tier selection: tripping rebuilds the session, once, on the
+/// standard encoder. Pure: fed totals and a millisecond clock.
 struct DropGuard {
     /// `(t_ms, submitted, rate_drops)`, a ring.
     snaps: [(u64, u64, u64); DROP_GUARD_SNAPSHOTS],
@@ -115,7 +102,7 @@ impl DropGuard {
             self.next = (self.next + 1) % DROP_GUARD_SNAPSHOTS;
             self.len = (self.len + 1).min(DROP_GUARD_SNAPSHOTS);
         }
-        // The newest snapshot at least a window old is the window's start.
+        // the newest snapshot at least a window old is the window's start
         let base = (1..=self.len)
             .map(|k| self.snaps[(self.next + DROP_GUARD_SNAPSHOTS - k) % DROP_GUARD_SNAPSHOTS])
             .find(|(t, _, _)| now_ms.saturating_sub(*t) >= DROP_GUARD_WINDOW_MS)?;
@@ -126,9 +113,7 @@ impl DropGuard {
     }
 }
 
-// ---------------------------------------------------------------------------------------------
-// Hold push: get the newest frame out of an encoder that keeps it until the next submit.
-// ---------------------------------------------------------------------------------------------
+// hold push: get the newest frame out of an encoder that keeps it until the next submit
 
 /// The floor of the probing wait: a real frame alone in the encoder this long is pushed.
 const PUSH_AFTER_FLOOR_NS: u64 = 50_000_000;
@@ -137,10 +122,9 @@ const PUSH_AFTER_FLOOR_NS: u64 = 50_000_000;
 const PUSH_AFTER_EWMA_MULT: f64 = 3.0;
 /// Weight of each new sample in the latency averages.
 const PUSH_EWMA_ALPHA: f64 = 0.125;
-/// The floor of the release window: a pushed frame that comes out within
-/// `max(this, 2.5 × the push→emit average)` of its push was released by the push. A fixed 20 ms
-/// was wrong for a slow encoder: `h264.gva` takes ~11 ms at 60 fps, ~16 ms at 30 fps and ~22 ms at
-/// 10 fps (bigger deltas), so at 10 fps 44 % of frames got a wasted second push.
+/// The floor of the release window: a pushed frame out within `max(this, 2.5 x the push-to-emit
+/// average)` of its push was released by the push. Scaled because `h264.gva` takes ~22 ms at
+/// 10 fps, where a fixed 20 ms gives 44 % of frames a wasted second push.
 const PUSH_RELEASE_WINDOW_NS: u64 = 20_000_000;
 const PUSH_RELEASE_EWMA_MULT: f64 = 2.5;
 /// Released-by-a-push frames before every real frame is pushed at once (1 on an encoder already
@@ -160,24 +144,21 @@ const STEADY_PROBE_SPACING_NS: u64 = 1_000_000_000;
 const STEADY_BACKOFF_START_NS: u64 = 2_000_000_000;
 const STEADY_BACKOFF_MAX_NS: u64 = 60_000_000_000;
 /// A probe passes when the pushed frame came out at least this much sooner than its suspicious
-/// predecessors: `max(5 ms, 30 % of their median submit→emit)`.
+/// predecessors: `max(5 ms, 30 % of their median submit-to-emit)`.
 const STEADY_MARGIN_FLOOR_NS: u64 = 5_000_000;
 
-/// The efficacy guard (r7). Pushing is judged against the measured alternative, `L0`: the median
-/// real submit→emit of this encoder WITHOUT pushes in this session (probing or suspended frames
-/// released by the next real one), not against one frame interval. The r6 criterion ("median ≥
-/// 0.9 × interval") suspended pushes that were helping: Intel host, noise 1080p60, 19.3 ms with pushes
-/// against 21–23 ms without, browser capture→paint 34.6 → 46.8 ms p50 once suspended.
-///
-/// The window: real, non-keyframe frames emitted in the last `GUARD_SPAN_NS`, at least
-/// `GUARD_MIN_SAMPLES` of them; fewer keeps the current mode (an idle desktop at 3.5 fresh
-/// frames/s is never judged on a window reaching back to the session's start).
+/// The efficacy guard judges pushing against `L0`, this encoder's median real submit-to-emit
+/// WITHOUT pushes in this session, not against the frame interval: on Intel (noise, 1080p60)
+/// pushes at 19.3 ms beat 21 to 23 ms without (capture-to-paint p50 34.6 vs 46.8 ms), and an
+/// interval test suspends them. The window is real non-keyframe frames emitted in the last
+/// `GUARD_SPAN_NS`; with fewer than `GUARD_MIN_SAMPLES` the mode is kept (an idle desktop at
+/// 3.5 fresh frames/s is never judged).
 const GUARD_SPAN_NS: u64 = 2_000_000_000;
 const GUARD_MIN_SAMPLES: usize = 30;
-/// `L0 = current median interval + median(work)`. On a holding encoder the no-push submit→emit
-/// follows the frame interval, so what is kept is the part that does not: `work`, from the moment a
-/// frame's releasing submit was in (and the frame before it out) to its own emission. Kept per
-/// encoder id and size for the process, so a session that starts in a learned mode has it.
+/// `L0 = current median interval + median(work)`. On a holding encoder the no-push
+/// submit-to-emit follows the frame interval, so only the part that does not is kept: `work`,
+/// from a frame's releasing submit going in (and the frame before it coming out) to its own
+/// emission. Kept per encoder id and size for the process, so a learned-mode start has it.
 const GUARD_WORK_SAMPLES: usize = 15;
 /// While pushing, one real frame this often is left unpushed under steady motion, so `work`
 /// follows the load.
@@ -203,11 +184,9 @@ const SUSPEND_HEALTHY_RESET_NS: u64 = 300_000_000_000;
 /// end-of-burst push (what removes the 200 ms keepalive wait for the last frame of a burst).
 const END_OF_BURST_INTERVALS: f64 = 1.25;
 
-/// The client guard. The page's STATS frame (about once a second) carries arrival→paint p50 over
-/// a sliding window of its last 512 painted frames — a count, not a time: ~8.5 s at 60 fps, ~4.3 s
-/// at 120 fps with pushes. So a baseline (not pushing) is taken only once the window holds frames
-/// painted entirely since pushing stopped, and a judgement (pushing) only once at least half of it
-/// was painted while pushing.
+/// The client guard. The page's STATS frame (about once a second) carries arrival-to-paint p50
+/// over its last 512 painted frames (a count, not a time: ~8.5 s at 60 fps, ~4.3 s at 120 fps
+/// with pushes), so a baseline is taken only once that whole window was painted without pushes.
 const CLIENT_WINDOW_FRAMES: u64 = 512;
 /// Fresh STATS in a row over the threshold before pushing is suspended for the client's sake.
 const CLIENT_OVER_TO_SUSPEND: u32 = 3;
@@ -219,8 +198,8 @@ const CLIENT_STALE_NS: u64 = 3_000_000_000;
 const PUSH_CAP_WAITS_TO_LEAVE: u32 = 3;
 /// ...and the waits must span at least this long: one slow frame is not overload.
 const PUSH_CAP_WAIT_SPAN_NS: u64 = 150_000_000;
-/// Cap waits do not count this long after the encoder's first submit (the session-start IDR:
-/// ~580 KB and ~50 ms on `gva`, which made every immediate start fall out and spend ~2.2 s
+/// Cap waits do not count this long after the encoder's first submit (the session-start IDR,
+/// ~580 KB and ~50 ms on `gva`, otherwise ends every immediate start and costs ~2.2 s of
 /// re-learning), nor while a forced keyframe is in flight.
 const PUSH_CAP_WAIT_GRACE_NS: u64 = 1_000_000_000;
 
@@ -309,7 +288,7 @@ struct HeldReal {
     pushes: u8,
     first_push_ns: u64,
     last_push_ns: u64,
-    /// The first push came after the full probing wait (condition (a) of the evidence).
+    /// The first push came after the full probing wait: only then is it a pause probe.
     waited_full: bool,
     emitted: bool,
     exhausted: bool,
@@ -322,28 +301,25 @@ struct HeldReal {
 /// Emission `n` is submit `n`: VideoToolbox makes one output callback per accepted frame, in
 /// decode order, which with frame reordering off is submit order (`Encoder::emit_time_ns`).
 ///
-/// Evidence, all of it behavioural, every bound scaled by what this encoder has shown:
-/// * A **free emission** — any frame that comes out with nothing submitted after it — is proof
-///   the encoder does not hold. It voids all gathered evidence and leaves immediate mode; on a
-///   real frame its latency feeds the average that sets the probing wait, so an encoder that is
-///   slow (4K on an M1) pushes later and later and never doubles its own load.
+/// Evidence is behavioural, every bound scaled by what this encoder has shown:
+/// * A **free emission** (a frame that comes out with nothing submitted after it) proves the
+///   encoder does not hold: it voids all gathered evidence and leaves immediate mode. On a real
+///   frame its latency feeds the average that sets the probing wait, so a slow encoder (4K on an
+///   M1) pushes later and never doubles its own load.
 /// * **Pause probe:** a real frame that sat unemitted for the whole probing wait with nothing
 ///   newer submitted, was pushed, and came out within [`HoldPush::pause_window_ns`] of the push.
-///   One that did not come out that promptly resets the streak. A frame simply released by a
-///   later frame proves nothing either way and leaves the streak alone.
+///   A slower release resets the streak; release by a later frame leaves the streak alone.
 /// * **Steady-cadence probe** ([`Steady`]), for continuous motion where no frame is ever alone.
-/// * The **push→emit average** (every pushed real frame that came out after its push) sets the
-///   release window and the second-push delay, so a slow holding encoder is neither missed nor
-///   pushed twice.
-/// * In immediate mode, [`PUSH_CAP_WAITS_TO_LEAVE`] captured frames in a row spanning at least
-///   [`PUSH_CAP_WAIT_SPAN_NS`] that had to wait for the in-flight cap — outside the first second
-///   and while no forced keyframe is in flight — mean the encoder is not keeping up.
+/// * The **push-to-emit average** sets the release window and the second-push delay, so a slow
+///   holding encoder is neither missed nor pushed twice.
+/// * In immediate mode, [`PUSH_CAP_WAITS_TO_LEAVE`] captured frames in a row waiting for the
+///   in-flight cap mean the encoder is not keeping up.
 /// * An encoder **confirmed holding** earlier in the process re-enters immediate mode on a
 ///   single passing probe of either kind.
 pub(crate) struct HoldPush {
     mode: HoldMode,
     ewma_ns: Option<f64>,
-    /// Average push→emit of pushed real frames.
+    /// Average push-to-emit latency of pushed real frames.
     push_emit_ewma_ns: Option<f64>,
     real: Option<HeldReal>,
     last_seq: u64,
@@ -351,7 +327,7 @@ pub(crate) struct HoldPush {
     /// newest emitted frame (to answer "was anything submitted after it, and when").
     recent: std::collections::VecDeque<(u64, u64, SubmitKind)>,
     streak: u32,
-    /// Push→emit latencies of the current streak, for the transition's log line.
+    /// Push-to-emit latencies of the current streak, for the transition's log line.
     streak_ms: Vec<f64>,
     /// Consecutive captured frames that waited for the in-flight cap (immediate mode only), and
     /// when the first of them did.
@@ -368,8 +344,8 @@ pub(crate) struct HoldPush {
     keyframe_seq: u64,
     /// Confirmed holding earlier in this process: one passing probe is enough.
     confirmed: bool,
-    /// The efficacy guard (immediate mode): recent real submit→emit and real submit gaps.
-    /// `(emit ns, submit→emit ns)` of real non-keyframe frames emitted in immediate mode.
+    /// Efficacy guard: `(emit ns, submit-to-emit ns)` of real non-keyframe frames emitted in
+    /// immediate mode, then the recent real submit gaps.
     guard_lat: std::collections::VecDeque<(u64, u64)>,
     guard_gap: std::collections::VecDeque<u64>,
     /// `work` samples of unpushed real frames (see [`GUARD_WORK_SAMPLES`]).
@@ -397,31 +373,27 @@ pub(crate) struct HoldPush {
     /// `(mode, frames painted)` when the current mode's first fresh STATS arrived.
     client_marker: Option<(HoldMode, u64)>,
     client_over: u32,
-    /// Steady-cadence learning (see [`Steady`]).
     steady: Steady,
 }
 
-/// The steady-cadence probe's state. Under continuous motion a one-frame-hold encoder never
-/// leaves a frame alone long enough for the pause probe, so suspicion is built from what *can* be
-/// seen — every frame came out only after the next one went in — and then tested causally: one
-/// frame gets a push straight away, and the probe passes only if that frame's submit→emit was
-/// clearly below its predecessors' **and** below the frame interval. An encoder that is merely
-/// slow emits each frame at its own pace whatever is submitted after it, so the push changes
-/// nothing and the probe fails; one that holds emits the pushed frame an encode time after the
-/// push, a whole frame interval early. No absolute bound: `gva` at 30 fps takes ~16 ms.
+/// The steady-cadence probe's state. Under continuous motion no frame is alone long enough for
+/// the pause probe, so suspicion builds from every frame coming out only after the next went in,
+/// then one frame is pushed at once: the probe passes only if its submit-to-emit is clearly below
+/// its predecessors' **and** below the frame interval (a merely slow encoder is unmoved by the
+/// push). No absolute bound: `gva` at 30 fps takes ~16 ms.
 #[derive(Default)]
 struct Steady {
     suspect: u32,
-    /// submit→emit of the current run of suspicious frames, newest last (at most 8).
+    /// Submit-to-emit of the current run of suspicious frames, newest last (at most 8).
     lat_ns: std::collections::VecDeque<u64>,
     /// Submit-to-next-submit gaps of the same frames (the frame interval).
     gap_ns: std::collections::VecDeque<u64>,
     /// The next real frame becomes a probe.
     armed: bool,
-    /// `(seq, baseline submit→emit ns, interval ns, pushed)` of the frame being probed.
+    /// `(seq, baseline submit-to-emit ns, interval ns, pushed)` of the frame being probed.
     probe: Option<(u64, u64, u64, bool)>,
     passed: u32,
-    /// `(probe submit→emit ms, baseline ms)` of the passes, for the log line.
+    /// `(probe submit-to-emit ms, baseline ms)` of the passes, for the log line.
     passes_ms: Vec<(f64, f64)>,
     next_ns: u64,
     backoff_ns: u64,
@@ -453,7 +425,7 @@ impl Steady {
     }
 }
 
-/// The steady probe's causal test: the pushed frame's submit→emit `lat` is at least
+/// The steady probe's causal test: the pushed frame's submit-to-emit `lat` is at least
 /// `max(5 ms, 30 %)` below its predecessors' median `baseline`, and below the frame `interval`.
 fn steady_probe_passes(lat: u64, baseline: u64, interval: u64) -> bool {
     let margin = STEADY_MARGIN_FLOOR_NS.max(baseline * 3 / 10);
@@ -461,7 +433,7 @@ fn steady_probe_passes(lat: u64, baseline: u64, interval: u64) -> bool {
 }
 
 /// The window within which a push counts as having released its frame:
-/// `max(20 ms, 2.5 × the push→emit average)`.
+/// `max(20 ms, 2.5 x the push-to-emit average)`.
 fn release_window_ns(push_emit_ewma_ns: Option<f64>) -> u64 {
     let scaled = push_emit_ewma_ns.map_or(0.0, |e| e * PUSH_RELEASE_EWMA_MULT) as u64;
     scaled.max(PUSH_RELEASE_WINDOW_NS)
@@ -515,7 +487,7 @@ impl HoldPush {
     /// The encoder was replaced: its sequence numbers restart, and what it was is unknown again
     /// (the process-wide confirmation is re-applied by the caller).
     pub(crate) fn reset(&mut self) {
-        // The back-off belongs to the session, not to one encoder instance.
+        // the back-off belongs to the session, not to one encoder instance
         let (backoff, suspensions, samples) =
             (self.suspend_backoff_ns, self.suspensions, self.samples);
         *self = HoldPush::new(HoldMode::Probing);
@@ -558,7 +530,7 @@ impl HoldPush {
         }
     }
 
-    /// `max(50 ms, 3 × the free-emission latency average)`.
+    /// `max(50 ms, 3 x the free-emission latency average)`.
     pub(crate) fn push_after_ns(&self) -> u64 {
         let ewma = self.ewma_ns.map_or(0.0, |e| e * PUSH_AFTER_EWMA_MULT) as u64;
         ewma.max(PUSH_AFTER_FLOOR_NS)
@@ -570,7 +542,7 @@ impl HoldPush {
     }
 
     /// The delay before a second push in immediate mode: the scaled window (which is at least one
-    /// full push→emit average).
+    /// full push-to-emit average).
     pub(crate) fn second_push_after_ns(&self) -> u64 {
         release_window_ns(self.push_emit_ewma_ns)
     }
@@ -625,7 +597,7 @@ impl HoldPush {
         ))
     }
 
-    /// Immediate → suspended for the current back-off (then doubled, to its cap).
+    /// Immediate to suspended for the current back-off (then doubled, to its cap).
     fn suspend(&mut self, now_ns: u64, why: String) -> HoldTransition {
         let backoff = self.suspend_backoff_ns;
         self.suspended_until_ns = now_ns.saturating_add(backoff);
@@ -687,23 +659,19 @@ impl HoldPush {
         }
         match self.last_client_ns {
             Some(t) => now_ns.saturating_sub(t) < CLIENT_STALE_NS,
-            // The page's first STATS lands about a second after the stream starts: until then the
-            // wait counts from this encoder's first submit (and before any submit, nothing has
-            // started yet).
+            // the page's first STATS lands about a second after the stream starts
             None => self
                 .born_ns
                 .is_none_or(|b| now_ns.saturating_sub(b) < CLIENT_STALE_NS),
         }
     }
 
-    /// A fresh client STATS frame: arrival→paint p50 (µs) over the page's last 512 painted
-    /// frames, and its cumulative painted-frame count. Not pushing (probing / suspended), a
-    /// window painted entirely since pushing stopped becomes the baseline. Pushing, once at
-    /// least half the window was painted while pushing, a p50 above
-    /// `max(2 × baseline, baseline + half an interval)` in [`CLIENT_OVER_TO_SUSPEND`] frames in
-    /// a row suspends pushing with the same back-off: a client that cannot process twice the
-    /// frame rate builds a standing queue (measured: arrival→paint 11.7 -> 32.7 ms with pushes on
-    /// a client 8 ms slower per frame), and the end-of-burst push remains.
+    /// A fresh client STATS frame: arrival-to-paint p50 (us) over the page's last 512 painted
+    /// frames, and its cumulative painted-frame count. Not pushing, a window painted entirely
+    /// since pushing stopped becomes the baseline. Pushing, a p50 above
+    /// `max(2 x baseline, baseline + half an interval)` in [`CLIENT_OVER_TO_SUSPEND`] frames in a
+    /// row suspends with the same back-off: a client that cannot take twice the frame rate builds
+    /// a standing queue (11.7 -> 32.7 ms measured on a client 8 ms slower per frame).
     pub(crate) fn client_stats(
         &mut self,
         now_ns: u64,
@@ -711,9 +679,8 @@ impl HoldPush {
         frames_painted: u64,
         transport_tier: u8,
     ) -> Option<HoldTransition> {
-        // The page's `<video>` path cannot measure arrival→paint and sends 0: such a STATS frame is
-        // no evidence that the client can take twice the frame rate, so it neither keeps
-        // immediate mode eligible nor makes a baseline.
+        // the `<video>` path cannot measure arrival-to-paint and sends 0: no evidence the client
+        // can take twice the frame rate, so no baseline and no immediate-mode eligibility
         if transport_tier == 0 || p50_us == 0 {
             self.client_marker = None;
             self.client_over = 0;
@@ -735,17 +702,15 @@ impl HoldPush {
             }
             return None;
         }
-        // A quarter of what the page's p50 covers (its newest 512 frames, or all there are) was
-        // painted while pushing. The older frames are the faster ones, so a median over the line
-        // despite them is stronger evidence, not weaker; three STATS in a row are still needed.
+        // judge once a quarter of the p50's window was painted while pushing: the older frames
+        // are the faster ones, so a median over the line despite them is stronger evidence
         if since * 4 < frames_painted.min(CLIENT_WINDOW_FRAMES) {
             return None;
         }
         let iv_us = self.interval_ns().map(|iv| iv / 1_000);
-        // With no pushes-off window seen, judge against the frame interval: a client keeping up
-        // paints within ~4 ms of arrival, a software decoder ~11 ms and still gains; one that
-        // cannot take twice the frame rate queues (24.8 ms at 60 fps measured, 11.7 without
-        // pushes — 1.5 intervals, the former bound, was 25 and let it pass).
+        // no pushes-off window seen: judge against 1.2 frame intervals. A client keeping up paints
+        // within ~4 ms of arrival, a software decoder ~11 ms and still gains; one that cannot take
+        // twice the frame rate queues (24.8 ms at 60 fps), which 1.5 intervals (25 ms) lets pass
         let (base, threshold) = match (self.client_baseline_us, iv_us) {
             (Some(b), iv) => (b, (2 * b).max(b + iv.unwrap_or(0) / 2)),
             (None, Some(iv)) => (0, iv * 6 / 5),
@@ -778,7 +743,7 @@ impl HoldPush {
         (!self.guard_gap.is_empty()).then(|| median(&self.guard_gap))
     }
 
-    /// `L0`, what a real frame's submit→emit would be without pushes at the current cadence.
+    /// `L0`, what a real frame's submit-to-emit would be without pushes at the current cadence.
     /// `None` until a `work` sample exists: there is nothing to judge pushes against.
     fn l0_ns(&self) -> Option<u64> {
         (!self.work.is_empty()).then_some(())?;
@@ -792,7 +757,7 @@ impl HoldPush {
         self.work.push_back(work_ns);
     }
 
-    /// `(median real submit→emit ms with pushes over the recent window, L0 ms)` — what the guard
+    /// `(median real submit-to-emit ms with pushes over the recent window, L0 ms)`: what the guard
     /// judges. `None` while the window is too sparse, or there is no `L0`.
     pub(crate) fn guard_stat(&self) -> Option<(f64, f64)> {
         if self.guard_lat.len() < GUARD_MIN_SAMPLES {
@@ -890,7 +855,7 @@ impl HoldPush {
 
     fn enter_immediate(&mut self, now_ns: u64, why: String) -> Option<HoldTransition> {
         if !self.client_ok(now_ns) {
-            // No client reporting: no evidence it can take twice the frame rate.
+            // no client reporting: no evidence it can take twice the frame rate
             self.streak = 0;
             self.streak_ms.clear();
             self.steady.cancel();
@@ -930,7 +895,6 @@ impl HoldPush {
                 r.emitted = true;
             }
         }
-        // Every pushed real frame that came out after its push teaches the push→emit average.
         if let Some(r) = newest.filter(|r| r.pushes > 0 && at_ns >= r.first_push_ns) {
             let d = (at_ns - r.first_push_ns) as f64;
             self.push_emit_ewma_ns = Some(match self.push_emit_ewma_ns {
@@ -980,7 +944,7 @@ impl HoldPush {
         if let (SubmitKind::Real, false, Some((_, released_ns, SubmitKind::Real))) =
             (kind, is_key, next)
         {
-            // Released by the next real frame with nothing pushed behind it.
+            // released by the next real frame with nothing pushed behind it
             if sampled || self.mode != HoldMode::Immediate {
                 self.note_work(at_ns.saturating_sub(released_ns.max(prev_emit_ns)));
             }
@@ -1025,7 +989,7 @@ impl HoldPush {
                     return self.enter_immediate(at_ns, why);
                 }
             }
-            // Released by something other than the push, or not promptly: not this mechanism.
+            // released by something other than the push, or not promptly: not this mechanism
             _ => {
                 self.streak = 0;
                 self.streak_ms.clear();
@@ -1034,10 +998,8 @@ impl HoldPush {
         None
     }
 
-    /// The efficacy guard, for a real non-keyframe frame emitted in immediate mode: pushing is
-    /// worth its cost while real frames come out clearly sooner than they would without it
-    /// (`L0`). See [`GUARD_SPAN_NS`] and [`GUARD_SUSPEND_RATIO`]. A long healthy stretch resets
-    /// the back-off.
+    /// The efficacy guard, fed each real non-keyframe frame emitted in immediate mode (see
+    /// [`GUARD_SPAN_NS`] and [`GUARD_SUSPEND_RATIO`]). A long healthy stretch resets the back-off.
     fn guard_emitted(&mut self, at_ns: u64, latency_ns: u64) -> Option<HoldTransition> {
         let since = *self.immediate_since_ns.get_or_insert(at_ns);
         if at_ns.saturating_sub(since) >= SUSPEND_HEALTHY_RESET_NS {
@@ -1146,7 +1108,7 @@ impl HoldPush {
             );
             return self.enter_immediate(at_ns, why);
         }
-        // Released by the next captured frame (no push, no repeat in between).
+        // released by the next captured frame (no push, no repeat in between)
         let (by_next_real, gap) = match next {
             Some((_, ns, SubmitKind::Real)) if ns <= at_ns => (true, ns.saturating_sub(submit_ns)),
             _ => (false, 0),
@@ -1186,7 +1148,7 @@ impl HoldPush {
             return Due::Nothing;
         }
         if mode == HoldMode::Suspended {
-            // Only the end-of-burst push: one, for a real frame nothing followed.
+            // only the end-of-burst push: one, for a real frame nothing followed
             return if r.pushes == 0 && warm && now_ns.saturating_sub(r.submit_ns) >= end_of_burst {
                 Due::Push
             } else {
@@ -1205,7 +1167,7 @@ impl HoldPush {
             return Due::Nothing;
         }
         let ready = match (mode, r.pushes) {
-            // The sample frame is only pushed if the motion stopped right after it.
+            // the sample frame is only pushed if the motion stopped right after it
             (HoldMode::Immediate, 0) if sample_seq == Some(r.seq) => {
                 now_ns.saturating_sub(r.submit_ns) >= end_of_burst
             }
@@ -1222,10 +1184,9 @@ impl HoldPush {
     }
 }
 
-/// Test hook: start every session's hold push in immediate mode, so a steady-cadence clip can be
-/// measured in immediate mode in a fresh process. `SE_HOLD_PUSH_START=immediate` or the tuning
-/// candidate `hold_push_start_immediate` (a bench plan's `"tune_on"`), honoured only with
-/// `SE_TEST_HOOKS=1`. Recorded in the tuning report either way.
+/// Test hook: start every session's hold push in immediate mode (`SE_HOLD_PUSH_START=immediate`
+/// or the tuning candidate `hold_push_start_immediate`), honoured only with `SE_TEST_HOOKS=1`.
+/// Recorded in the tuning report either way.
 fn hold_push_start_immediate() -> bool {
     use super::vt_recipe;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1367,18 +1328,14 @@ impl RateLimitedLog {
 /// request is let go: the client's own PLI will ask again.
 const MAX_IDR_REARMS: u32 = 3;
 
-// ---------------------------------------------------------------------------------------------
-// QP governor: a bitrate ceiling for the per-frame-QP tier, for pathological content only.
-// ---------------------------------------------------------------------------------------------
+// QP governor: a bitrate ceiling for the per-frame-QP tier, for pathological content only
 
 /// The window the encoded rate is measured over.
 const QP_GOV_WINDOW_NS: u64 = 500_000_000;
 const QP_GOV_SNAP_NS: u64 = 25_000_000;
 /// The per-frame fast path: this many consecutive frames each over `QP_GOV_FAST_K` times the
-/// per-frame budget (`C / fps`) step at once from those frames' rate, instead of waiting for the
-/// first full window (~31 MB went out at 365–507 Mbps before the first step on noise). One large
-/// frame — a keyframe: 441 KB in the recording, 1.58 MB in the stress clip at 1080p60, against a
-/// 4 × 104 KB threshold there — followed by ordinary frames never meets it.
+/// per-frame budget (`C / fps`) step at once, not after the first full window (~31 MB of noise
+/// goes out by then). A lone keyframe never meets it (1.58 MB against 4 x 104 KB at 1080p60).
 const QP_GOV_FAST_FRAMES: u32 = 3;
 const QP_GOV_FAST_K: u64 = 4;
 /// After a fast step, long enough for the few frames already in flight at the old QP to come out
@@ -1389,12 +1346,10 @@ const QP_GOV_FAST_COOLDOWN_NS: u64 = 100_000_000;
 const QP_GOV_DOWN_RATIO: f64 = 0.6;
 const QP_GOV_DOWN_HOLD_NS: u64 = 1_000_000_000;
 
-/// The ceiling for a session: `clamp(4 × clamp(w·h·fps/10, 6, 40 Mbps), 24, 160 Mbps)` — 1080p60
-/// 49.8 Mbps, 1440p60 88 Mbps, 4K60 160 Mbps. At 1080p60 and QP 15 ordinary content is ~9–11 Mbps
-/// on average and ~27 Mbps in its worst second; four times the pixels is ~108 Mbps in that second,
-/// which the former 80 Mbps cap would have caught at 4K60 — so the cap scales with the pixel rate
-/// and the ceiling keeps a margin over heavy ordinary content there too. Incompressible content
-/// (371 Mbps measured at 800x600) is above it at every size.
+/// The ceiling for a session: `clamp(4 * clamp(w*h*fps/10, 6, 40 Mbps), 24, 160 Mbps)`
+/// (1080p60 49.8, 1440p60 88, 4K60 160 Mbps). It scales with the pixel rate to stay above heavy
+/// ordinary content (~27 Mbps in its worst second at 1080p60, QP 15) at every size;
+/// incompressible content (371 Mbps measured at 800x600) is always above it.
 pub(crate) fn qp_ceiling_bps(width: u32, height: u32, fps: u32) -> u64 {
     let base = (width as u64 * height as u64 * fps as u64 / 10).clamp(6_000_000, 40_000_000);
     (4 * base).clamp(24_000_000, 160_000_000)
@@ -1404,7 +1359,7 @@ pub(crate) fn qp_ceiling_bps(width: u32, height: u32, fps: u32) -> u64 {
 /// off. Read once (plain env, like `SE_PERF_HOLD`).
 fn qp_ceiling_override() -> Option<Option<u64>> {
     static V: std::sync::OnceLock<Option<Option<u64>>> = std::sync::OnceLock::new();
-    *V.get_or_init(|| qp_ceiling_from(std::env::var("SE_QP_CEILING_MBPS").ok().as_deref()))
+    *V.get_or_init(|| qp_ceiling_from(crate::envcfg::var("SE_QP_CEILING_MBPS").ok().as_deref()))
 }
 
 /// `None`: no override. `Some(None)`: off. `Some(Some(bps))`: that ceiling.
@@ -1413,12 +1368,11 @@ fn qp_ceiling_from(v: Option<&str>) -> Option<Option<u64>> {
     Some((mbps > 0.0).then_some((mbps * 1e6) as u64))
 }
 
-/// Raises the per-frame QP while the encoded rate over [`QP_GOV_WINDOW_NS`] is above the ceiling
-/// — in one move sized to the overshoot (`ceil(6·log2(rate/C))`: six QP steps halve the bits) —
-/// and steps back down by one per full second under `0.6 × C`, never below the user's `q` and
-/// never above 51. After a raise it waits one window before judging again, so it acts on the new
-/// rate rather than the one that triggered it; the band between 0.6·C and C is the hysteresis.
-/// A keyframe counts like any frame, but through the windowed rate, not its own size. Pure.
+/// Raises the per-frame QP while the encoded rate over [`QP_GOV_WINDOW_NS`] is above the ceiling,
+/// in one move sized to the overshoot (`ceil(6*log2(rate/C))`: six QP steps halve the bits), and
+/// steps back down by one per full second under `0.6 * C`, never below the user's `q` or above
+/// 51. After a raise it waits one window, so it judges the new rate. A keyframe counts through
+/// the windowed rate, not its own size. Pure.
 pub(crate) struct QpGovernor {
     q_user: u8,
     q: u8,
@@ -1482,7 +1436,7 @@ impl QpGovernor {
 
     /// One encoded real frame of `bytes` seen at `now_ns` (repeats and hold pushes are not fed: a
     /// near-empty repeat between two big frames would break the run): the fast path. Its
-    /// cooldown is its own — the windowed path's +1 must not delay the step that matters.
+    /// cooldown is its own: the windowed path's +1 must not delay the step that matters.
     /// `Some((new q, why))` on a step.
     pub(crate) fn frame(&mut self, now_ns: u64, bytes: u64) -> Option<(u8, String)> {
         self.newest[self.newest_n % 5] = bytes;
@@ -1502,8 +1456,7 @@ impl QpGovernor {
         if self.big_run < QP_GOV_FAST_FRAMES || now_ns < self.fast_until_ns || self.q >= 51 {
             return None;
         }
-        // The rate these frames really came at: big frames at 10 fps are not the rate of big
-        // frames at 60.
+        // the rate these frames really came at: big frames at 10 fps are not big frames at 60
         let span = now_ns
             .saturating_sub(self.big_start_ns)
             .max((self.big_run as u64 - 1) * 1_000_000_000 / self.fps as u64);
@@ -1518,7 +1471,7 @@ impl QpGovernor {
         self.q = self.q.saturating_add(delta).min(51);
         self.cooldown_until_ns = now_ns + QP_GOV_WINDOW_NS;
         self.fast_until_ns = now_ns + QP_GOV_FAST_COOLDOWN_NS;
-        // The window restarts: it must not judge the new QP by bytes of the old one.
+        // the window restarts: it must not judge the new QP by bytes of the old one
         self.snaps.clear();
         self.below_since_ns = None;
         self.steps += 1;
@@ -1553,7 +1506,7 @@ impl QpGovernor {
         {
             self.snaps.push_back((now_ns, total_bytes));
         }
-        // Keep exactly one snapshot at or before the window's start.
+        // keep exactly one snapshot at or before the window's start
         while self.snaps.len() > 2 && now_ns.saturating_sub(self.snaps[1].0) >= QP_GOV_WINDOW_NS {
             self.snaps.pop_front();
         }
@@ -1569,9 +1522,9 @@ impl QpGovernor {
             if now_ns < self.cooldown_until_ns || self.q >= 51 {
                 return None;
             }
-            // Sized from the newest frames when they are bigger than the window's average: the
-            // window is still mostly the content before the change. A median, so one keyframe
-            // does not size it.
+            // sized from the newest frames when they are bigger than the window's average (the
+            // window is still mostly the content before the change); a median, so one keyframe
+            // does not size it
             let mut newest = self.newest;
             newest.sort_unstable();
             let now_rate = if self.newest_n >= 5 {
@@ -1631,9 +1584,9 @@ pub struct Pipeline {
     pub max_bitrate_bps: u32,
     pub h264_profile: H264Profile,
     /// Loss recovery that is not a keyframe. The transport writes receipts into it from
-    /// transport-wide feedback; the encode thread reads them at its next submit. Inert — and the
-    /// transport falls back to its keyframe request — on any encoder with no long-term reference
-    /// slots, which `RepairState::set_ltr_slots(0)` is how a backend says.
+    /// transport-wide feedback; the encode thread reads them at its next submit. Inert (the
+    /// transport falls back to its keyframe request) on any encoder with no long-term reference
+    /// slots, which a backend declares with `RepairState::set_ltr_slots(0)`.
     pub repair: Arc<crate::streamer::repair::RepairState>,
 }
 
@@ -1649,9 +1602,7 @@ impl Pipeline {
     }
 
     /// Ask for a repair frame instead of a keyframe, if the client is known to hold a reference.
-    ///
-    /// Returns whether the request was taken; `false` means the caller must fall back to
-    /// `request_idr`, which is what every session did before this existed.
+    /// On `false` the request was not taken and the caller must fall back to `request_idr`.
     pub fn request_repair(&self) -> bool {
         if !self.repair.request_repair() {
             return false;
@@ -1715,20 +1666,10 @@ pub(crate) fn spawn_pipeline(
         wake,
         max_bitrate_bps: enc.max_bitrate_bps,
         h264_profile: enc.profile,
-        // Zero slots, so `request_repair` falls through to a keyframe — but not because
-        // VideoToolbox cannot do this. It can, from macOS 12.0, in a shape that does not fit a
-        // slot bitmap: `EnableLTR` makes the encoder mark and manage its own long-term
-        // references and hand back an opaque token per picture
-        // (`kVTSampleAttachmentKey_RequireLTRAcknowledgementToken`); the host acknowledges tokens
-        // on a later submit and the encoder simply never predicts from an unacknowledged one.
-        // There is no "mark this picture", no slot number and no explicit invalidation, so
-        // `RepairAction`'s `mark_ltr` / `use_ltr_bitmap` have nothing to map onto — the adapter is
-        // the acknowledgement direction plus `ForceLTRRefresh` for `request_repair`, specified in
-        // `docs/OPTIMIZATIONS.md` and deferred for want of a Mac that reports `EnableLTR`.
-        //
-        // The state still has to exist regardless: the transport writes feedback receipts into it
-        // unconditionally, and `Encoder::supports_ltr()` already reports per session whether this
-        // Mac's encoder advertises the property at all.
+        // zero LTR slots, so `request_repair` falls through to a keyframe. VideoToolbox LTR (macOS
+        // 12.0+) is token-based (`kVTSampleAttachmentKey_RequireLTRAcknowledgementToken`), with no
+        // slot to name, so `mark_ltr` / `use_ltr_bitmap` have nothing to map onto. The state must
+        // exist anyway: the transport writes receipts into it unconditionally.
         repair: Arc::clone(&repair),
     };
 
@@ -1741,13 +1682,13 @@ pub(crate) fn spawn_pipeline(
         super::tune::record_skipped("power_report");
     }
 
-    // The host clock against wall time, for a harness checking the client's clock offset.
+    // host clock against wall time, for a harness checking the client's clock offset
     let (host_now_ns, unix_ns) = crate::streamer::telemetry::clock_pair();
     tprintln!("[clock] host_now_ns={host_now_ns} unix_ns={unix_ns}");
     let mut encoder = Encoder::new(enc.clone()).context("creating VideoToolbox encoder")?;
-    // A session on an encoder, tier and size the drop guard already moved off in this process
-    // starts on the fallback. The low-latency session is released before the standard one is
-    // asked for, for the same reason `reset_encoder` does it in that order.
+    // an encoder, tier and size the drop guard already moved off in this process starts on the
+    // fallback. Release the low-latency session before asking for the standard one: the hardware
+    // encoder is instance-limited (see `reset_encoder`).
     let mut standard_only = false;
     let key = fallback_key(&encoder, &enc);
     if drop_guard_fallbacks().lock_recover().contains(&key) {
@@ -1764,8 +1705,8 @@ pub(crate) fn spawn_pipeline(
             .context("creating the remembered standard-encoder fallback")?;
         standard_only = true;
     }
-    // The tier that actually started, not the one that was asked for: a session that fell back to
-    // the software encoder reports "videotoolbox-software" here and in the compatibility report.
+    // the tier that actually started, not the one asked for: a software fallback reports
+    // "videotoolbox-software" here and in the compatibility report
     note_encoder(&telemetry, &encoder);
 
     let stop_thread = Arc::clone(&stop);
@@ -1804,12 +1745,9 @@ struct EncodeLoop {
     standard_only: bool,
 }
 
-/// Turn compressed samples into broadcast frames.
-///
-/// Its own thread because `to_annexb` walks the whole access unit and the encode loop is on the
-/// deadline scheduler; the two share nothing but the encoder's output channel, which is the point
-/// — the shared `Mutex<VecDeque>` that used to carry per-frame timestamps between them is gone,
-/// the stamps now ride with their own frame through VideoToolbox.
+/// Turn compressed samples into broadcast frames. Its own thread because `to_annexb` walks the
+/// whole access unit and the encode loop is on the deadline scheduler; the two share only the
+/// encoder's output channel (per-frame stamps ride with their frame through VideoToolbox).
 fn spawn_drain(
     output: crossbeam_channel::Receiver<super::encoder::CompressedSample>,
     tx: broadcast::Sender<EncodedFrame>,
@@ -1821,8 +1759,8 @@ fn spawn_drain(
         .name("videotoolbox-drain".to_string())
         .spawn(move || {
             tune_drain_thread(frame_duration);
-            // One buffer for the life of the thread. `to_annexb` clears it first, so the only
-            // per-frame allocation left is the `Bytes` the transport takes ownership of.
+            // one buffer for the life of the thread (`to_annexb` clears it first): the only
+            // per-frame allocation is the `Bytes` the transport takes ownership of
             let mut au: Vec<u8> = Vec::with_capacity(256 * 1024);
             let mut real_encode = RealEncodeTime::default();
             while let Ok(mut sample) = output.recv() {
@@ -1833,9 +1771,8 @@ fn spawn_drain(
                 let emit = sample.callback_at;
                 let emit_ns = crate::streamer::audio::host_instant_to_ns(emit);
                 if timing.repeated {
-                    // A re-submitted picture: stamped as if it had been captured one real
-                    // encode time before it came out, but never at or after a real frame
-                    // submitted after it (see `repeat_capture_ns`).
+                    // a re-submitted picture is stamped one real encode time before it came out,
+                    // never at or after a real frame submitted after it (`repeat_capture_ns`)
                     let submit_ns = crate::streamer::audio::host_instant_to_ns(capture);
                     let stamp_ns = repeat_capture_ns(
                         submit_ns,
@@ -1869,8 +1806,8 @@ fn spawn_drain(
                 );
                 telemetry.frame_size_seq.store(n, Ordering::Release);
                 if hold_push {
-                    // What pushes cost: on `gva` ~21 KB each (it refines the repeated picture and
-                    // has no QP control), on the M1 a near-empty P frame.
+                    // what pushes cost: ~21 KB each on `gva` (it refines the repeated picture and
+                    // has no QP control), a near-empty P frame on the M1
                     telemetry
                         .hold_push_bytes
                         .fetch_add(au.len() as u64, Ordering::Relaxed);
@@ -1887,20 +1824,14 @@ fn spawn_drain(
 }
 
 /// The capture instant (host ns) a re-submitted picture (keepalive repeat, forced-keyframe
-/// repeat, hold push) carries, which the transport turns into its RTP timestamp and the client
-/// into "host capture → paint": `max(own submit, emit − E)`, `E` this session's recent real
-/// encode time. Not the original frame's capture: a still screen's repeats then read seconds old
-/// on the client, whose A/V sync followed them to its 400 ms audio-target cap. Not the submit
-/// alone either: on a one-frame-hold encoder a keepalive comes out ~200 ms after its submit (when
-/// the next one goes in), and would read 200 ms late. With no real frame timed yet, `E` is this
-/// picture's own submit→emit, i.e. the submit instant.
+/// repeat, hold push) carries: `max(own submit, emit - E)`, `E` this session's recent real
+/// encode time (the submit instant until a real frame is timed). It becomes the RTP timestamp
+/// and the client's video-delay estimate, so not the original capture (a still screen's repeats
+/// read seconds old and walk the audio target to its 400 ms cap) and not the submit alone (a
+/// held keepalive comes out ~200 ms after its submit).
 ///
-/// And it yields to real frames: when a captured frame was submitted after this picture
-/// (`newest_real_ns` later than its own submit — on a holding encoder in immediate mode that frame
-/// is what released this push), the stamp is capped [`REPEAT_STAMP_MARGIN_NS`] before that frame's
-/// capture. Otherwise `emit − E` lands a few µs after it and the RTP writer's strictly-increasing
-/// clamp had to nudge the *real* frame forward (171 of ~1200 outputs in a simulated-holder run).
-/// Pure.
+/// Capped [`REPEAT_STAMP_MARGIN_NS`] before the capture of a real frame submitted after it, or
+/// the RTP writer's strictly-increasing clamp nudges the *real* frame forward. Pure.
 fn repeat_capture_ns(
     submit_ns: u64,
     emit_ns: u64,
@@ -1908,9 +1839,9 @@ fn repeat_capture_ns(
     frame_interval_ns: u64,
     newest_real_ns: u64,
 ) -> u64 {
-    // An encoder that sustains the frame rate cannot take longer than one frame interval per
-    // frame. In a session that starts on a still screen the only real frames are the slow first
-    // ones (E ~54 ms on a holding encoder), which made its keepalives read 71 ms instead of ~25.
+    // cap E at one frame interval: in a session that starts on a still screen the only real
+    // frames are the slow first ones (E ~54 ms on a holding encoder), and its keepalives read
+    // 71 ms instead of ~25
     let stamp = match real_encode_ns.map(|e| e.min(frame_interval_ns.max(1))) {
         Some(e) => emit_ns.saturating_sub(e).max(submit_ns),
         None => submit_ns,
@@ -1922,11 +1853,11 @@ fn repeat_capture_ns(
     }
 }
 
-/// More than one 90 kHz RTP tick (11.1 µs), so a capped repeat's timestamp stays strictly below
+/// More than one 90 kHz RTP tick (11.1 us), so a capped repeat's timestamp stays strictly below
 /// the real frame's.
 const REPEAT_STAMP_MARGIN_NS: u64 = 12_000;
 
-/// This session's real-frame encode time (submit → emit of captured frames only): the minimum of
+/// This session's real-frame encode time (submit to emit of captured frames only): the minimum of
 /// the last [`RealEncodeTime::WINDOW`], so a ~2 MB first keyframe does not sit in it and the
 /// estimate follows a faster encoder at once.
 #[derive(Default)]
@@ -1959,8 +1890,7 @@ fn tune_drain_thread(frame_duration: Duration) {
     use super::tune;
     if tune::enabled("drain_time_constraint") {
         let period = frame_duration.as_nanos() as u64;
-        // The drain's work is a memcpy and a channel send: a quarter of the period is a generous
-        // reservation, and the constraint is the period itself.
+        // the drain's work is a memcpy and a channel send: a quarter of the period is generous
         let rc = super::qos::pin_current_thread_time_constraint_with(period, period / 4, period);
         tune::record(
             "drain_time_constraint",
@@ -2058,12 +1988,10 @@ struct DrainSetup {
     newest_real_capture: Arc<AtomicU64>,
 }
 
-/// Tear the encoder down and stand a new one up.
-///
-/// The old session is released *before* the replacement is asked for. The hardware encoder is a
-/// machine-wide, instance-limited resource, so creating the new one first is exactly how a
-/// recoverable error turns into a permanent software fallback. `standard_only` builds it without
-/// the low-latency rung (the drop guard's fallback, kept for every later reset of the session).
+/// Tear the encoder down and stand a new one up. The old session is released *before* the
+/// replacement is asked for: the hardware encoder is a machine-wide, instance-limited resource,
+/// and creating the new one first turns a recoverable error into a permanent software fallback.
+/// `standard_only` builds it without the low-latency rung (the drop guard's fallback).
 fn reset_encoder(
     encoder: &mut Option<Encoder>,
     drain: &mut Option<std::thread::JoinHandle<()>>,
@@ -2118,12 +2046,9 @@ fn run_encode_loop(l: EncodeLoop) {
         standard_only,
     } = l;
 
-    // One scheduling scheme per thread. This one is a deadline thread and deliberately takes no
-    // QoS class: a QoS class is how the kernel *manages* a thread's priority and a time-constraint
-    // reservation is how that management is taken away, so setting both only means the last
-    // writer wins and nothing in the log says which.
+    // a deadline thread, deliberately with no QoS class: with both set the last writer wins
     tune_encode_thread(frame_duration);
-    // The foreground task role while streaming, re-asserted about once a second below.
+    // foreground task role while streaming, re-asserted about once a second below
     super::tune::assert_task_role();
     let mut role_asserted_at = Instant::now();
     let mut last_client_rx_ns = 0u64;
@@ -2135,8 +2060,8 @@ fn run_encode_loop(l: EncodeLoop) {
         None
     };
 
-    // The capture instant (host ns) of the newest captured frame submitted, for the drain's
-    // stamping of re-submitted pictures (`repeat_capture_ns`).
+    // capture instant (host ns) of the newest captured frame submitted, for the drain's stamping
+    // of re-submitted pictures (`repeat_capture_ns`)
     let newest_real_capture = Arc::new(AtomicU64::new(0));
     let mut drain = spawn_drain(
         encoder.output(),
@@ -2162,8 +2087,7 @@ fn run_encode_loop(l: EncodeLoop) {
     let mut idr_rearms = 0u32;
     let mut rearm_log = RateLimitedLog::new();
 
-    // Hold push (see `HoldPush`). Starts in the mode this encoder settled on earlier in the
-    // process, if any.
+    // hold push starts in the mode this encoder settled on earlier in the process, if any
     let hold_enabled = super::tune::enabled("hold_push");
     let mut hold_key = (
         encoder.encoder_id_short().to_string(),
@@ -2243,10 +2167,10 @@ fn run_encode_loop(l: EncodeLoop) {
 
         source.wait(IDLE_POLL);
         if role_asserted_at.elapsed() >= Duration::from_secs(1) {
-            // macOS resets an app's task role on activation changes; one mach call a second.
+            // macOS resets an app's task role on activation changes; one mach call a second
             role_asserted_at = Instant::now();
             super::tune::assert_task_role();
-            // The client guard reads the newest STATS frame on the same slow path.
+            // the client guard reads the newest STATS frame on the same slow path
             if hold_enabled {
                 if let Some(c) = telemetry.client.get() {
                     if c.received_host_ns != last_client_rx_ns {
@@ -2266,15 +2190,13 @@ fn run_encode_loop(l: EncodeLoop) {
         }
         let mut force_idr = idr_request.swap(false, Ordering::Relaxed);
         if force_idr {
-            // A new request: it gets its own re-arms.
+            // a new request gets its own re-arms
             idr_rearms = 0;
         }
 
-        // A keyframe somebody asked for was dropped by rate control, so it never happened: ask
-        // again on this frame — at most `MAX_IDR_REARMS` times per request, because an encoder
-        // that drops every forced keyframe would otherwise make every frame an IDR attempt; the
-        // client's own PLI asks again later. (An ordinary dropped frame needs nothing; it never
-        // became a reference.)
+        // a forced keyframe dropped by rate control never happened: ask again on this frame, at
+        // most `MAX_IDR_REARMS` times per request, or an encoder that drops every forced keyframe
+        // makes every frame an IDR attempt. An ordinary dropped frame never became a reference.
         let forced_drops = enc.forced_keyframe_drops();
         if forced_drops != last_forced_drops {
             last_forced_drops = forced_drops;
@@ -2303,8 +2225,6 @@ fn run_encode_loop(l: EncodeLoop) {
             }
         }
 
-        // A discarded access unit breaks the reference chain for everything after it. The only
-        // repair is a fresh IDR, and the drop count is the only place the condition is visible.
         let rate_drops = enc.rate_drops();
         if rate_drops != last_rate_drops {
             telemetry
@@ -2313,8 +2233,7 @@ fn run_encode_loop(l: EncodeLoop) {
                 .fetch_add(rate_drops - last_rate_drops, Ordering::Relaxed);
             last_rate_drops = rate_drops;
         }
-        // The drop guard: a low-latency constant-quality session whose rate controller drops
-        // frames is rebuilt, once, on the standard encoder, and never goes back.
+        // drop guard: the session is rebuilt once on the standard encoder and never goes back
         if guard_active {
             let now_ms = started.elapsed().as_millis() as u64;
             if let Some((sub, dropped)) =
@@ -2348,7 +2267,7 @@ fn run_encode_loop(l: EncodeLoop) {
                     teprintln!("[vt] the standard-encoder fallback could not be created; ending");
                     break;
                 }
-                // The new encoder's counters start at zero.
+                // the new encoder's counters start at zero
                 last_rate_drops = 0;
                 last_output_drops = 0;
                 last_forced_drops = 0;
@@ -2372,6 +2291,7 @@ fn run_encode_loop(l: EncodeLoop) {
             }
         }
 
+        // a discarded access unit breaks the reference chain: only a fresh IDR repairs it
         let drops = enc.output_drops();
         if drops != last_output_drops {
             teprintln!(
@@ -2388,7 +2308,7 @@ fn run_encode_loop(l: EncodeLoop) {
 
         if let Some(g) = qp_gov.as_mut() {
             let now = crate::streamer::audio::host_now_ns();
-            // The per-frame fast path first, over every frame emitted since the last look.
+            // the per-frame fast path first, over every frame emitted since the last look
             let seq = telemetry.frame_size_seq.load(Ordering::Acquire);
             let mut fast = None;
             for k in (seq.saturating_sub(15).max(qp_seen_seq + 1))..=seq {
@@ -2411,8 +2331,8 @@ fn run_encode_loop(l: EncodeLoop) {
                     teprintln!("[vt] QP governor: BaseFrameQP {q} not applied: {r:?}");
                 }
                 let was = telemetry.qp_effective.swap(q as u64, Ordering::Relaxed);
-                // Every change is logged: they are rare by construction (a raise waits a window,
-                // a step down a full second).
+                // every change is logged: they are rare by construction (a raise waits a window,
+                // a step down a full second)
                 let what = if was == g.q_user as u64 {
                     "engaged"
                 } else if q == g.q_user {
@@ -2453,9 +2373,9 @@ fn run_encode_loop(l: EncodeLoop) {
             }
         }
 
-        // Back-pressure the capture side rather than the encoder's own queue. VideoToolbox will
-        // accept frames until memory runs out, and the only Apple-provided limit,
-        // MaxFrameDelayCount, is documented as blocking the *calling* thread — which is this one.
+        // back-pressure the capture side, not the encoder's queue: VideoToolbox accepts frames
+        // until memory runs out, and MaxFrameDelayCount (its only limit) is documented as blocking
+        // the calling thread, which is this one
         let emitted = enc.frames_emitted();
         if emitted != last_emitted {
             last_emitted = emitted;
@@ -2476,9 +2396,8 @@ fn run_encode_loop(l: EncodeLoop) {
         let in_flight = enc.frames_in_flight();
         if in_flight > max_in_flight_seen {
             max_in_flight_seen = in_flight;
-            // The single most informative number on this path, and it used to be invisible: how
-            // deep the encoder's own hidden queue gets. Cross-check it against VideoToolbox's own
-            // count — a disagreement means the encoder is holding frames for a reason of its own.
+            // how deep the encoder's hidden queue gets; a disagreement with VideoToolbox's own
+            // count means the encoder is holding frames for a reason of its own
             tprintln!(
                 "[vt] frames in flight reached {in_flight} (VideoToolbox reports {:?} pending)",
                 enc.pending_frames()
@@ -2493,16 +2412,11 @@ fn run_encode_loop(l: EncodeLoop) {
                 STALL_BYPASS.as_millis()
             );
         }
-        // In immediate hold-push mode the encoder keeps the latest push indefinitely, so that
-        // push gets a slot of its own on top of the cap. Steady state at any frame rate on a
-        // one-frame-hold encoder: the previous push (released by this frame's submit, encoding),
-        // this real frame (released by its push, encoding) and its push (held) — three, of which
-        // only two are work. With the plain cap of two the push for a new frame would wait for
-        // the previous push to come out, a whole encode time added to every frame; with the
-        // extra slot neither a real frame nor its push ever waits on a held one. Probing mode
-        // keeps the plain cap: a probing push is at most one per pause, and holds a slot only
-        // until the next frame arrives and releases it. The stall bypass is unchanged and still
-        // the backstop for an encoder that holds more than one frame.
+        // in immediate mode the encoder keeps the latest push indefinitely, so that push gets a
+        // slot on top of the cap. Steady state is three in flight, two of them work (the previous
+        // push and this frame encoding, this frame's push held); under the plain cap each push
+        // would wait a whole encode time for the previous one. Probing keeps the plain cap; the
+        // stall bypass is still the backstop for a multi-frame hold.
         let cap = if stalled {
             HARD_MAX_FRAMES_IN_FLIGHT
         } else {
@@ -2530,8 +2444,8 @@ fn run_encode_loop(l: EncodeLoop) {
         let mut submitted_kind = SubmitKind::Other;
         let submit_ns = crate::streamer::audio::host_now_ns();
         if let Some(frame) = fresh {
-            // The wake channel counts tokens; a token left behind by a frame that has already
-            // been taken makes the next wait return instantly and the loop spin.
+            // the wake channel counts tokens: one left behind by a frame already taken makes the
+            // next wait return instantly and the loop spin
             source.drain_wake();
             if let Some(pixbuf) = frame.pixel_buffer() {
                 let mut timing = FrameTiming::entering_capture();
@@ -2556,7 +2470,7 @@ fn run_encode_loop(l: EncodeLoop) {
                     false,
                 ));
                 submitted_kind = SubmitKind::Real;
-                // Only a captured frame starts or extends the performance hold's linger.
+                // only a captured frame starts or extends the performance hold's linger
                 super::perf_hold::real_frame_submitted();
             }
             seen_capture = true;
@@ -2564,15 +2478,14 @@ fn run_encode_loop(l: EncodeLoop) {
         } else if force_idr || last_emit.elapsed() >= KEEPALIVE {
             if let Some(frame) = last_frame.as_ref() {
                 if let Some(pixbuf) = frame.pixel_buffer() {
-                    // Re-encoding the frame we already have: the picture did not change, so it
-                    // is counted and kept out of the capture-relative histograms.
+                    // the picture did not change: counted as a repeat and kept out of the
+                    // capture-relative histograms
                     telemetry
                         .degradation
                         .frames_repeated
                         .fetch_add(1, Ordering::Relaxed);
-                    // Its own submit instant, not the repeated frame's capture: the transport derives
-                    // the RTP timestamp from it, and a still screen's repeat stamped with the
-                    // original capture read as a frame captured seconds ago on the client.
+                    // its own submit instant, not the repeated frame's capture: the RTP timestamp
+                    // comes from it, and the original capture reads seconds old on the client
                     submitted = Some(submit_one(
                         enc,
                         Instant::now(),
@@ -2583,8 +2496,8 @@ fn run_encode_loop(l: EncodeLoop) {
                     ));
                 }
             } else if !seen_capture && started.elapsed() >= FIRST_FRAME_DEADLINE {
-                // Nothing has ever been captured. Give the client a decodable picture so its
-                // video element starts and the session's silence is visible rather than mute.
+                // nothing has ever been captured: give the client a decodable picture so its
+                // video element starts
                 if let Some(pb) = placeholder_frame(cfg.width as usize, cfg.height as usize) {
                     telemetry
                         .degradation
@@ -2626,16 +2539,14 @@ fn run_encode_loop(l: EncodeLoop) {
                     .degradation
                     .encoder_transient_errors
                     .fetch_add(1, Ordering::Relaxed);
-                // The keyframe request was taken off the flag at the top of this iteration and
-                // the frame carrying it was refused, so put it back: a client waiting on a PLI
-                // would otherwise stay broken until it thought to ask again.
+                // the frame carrying the keyframe request was refused, so put the request back:
+                // a client waiting on a PLI would otherwise stay broken until it asked again
                 if force_idr {
                     idr_request.store(true, Ordering::Relaxed);
                 }
                 submit_errors += 1;
-                // One rejected frame is not a reason to stop streaming forever, which is what
-                // breaking out of this loop used to mean: the session stayed up, the transport
-                // stayed connected, and the picture simply stopped.
+                // one rejected frame is not a reason to stop streaming: rebuild the encoder after
+                // `SUBMIT_ERRORS_BEFORE_RESET` in a row
                 if submit_errors >= SUBMIT_ERRORS_BEFORE_RESET {
                     resets += 1;
                     telemetry
@@ -2659,8 +2570,7 @@ fn run_encode_loop(l: EncodeLoop) {
                     }
                     submit_errors = 0;
                     idr_request.store(true, Ordering::Relaxed);
-                    // The replacement's counters start at zero; without this the next delta
-                    // underflowed.
+                    // the replacement's counters start at zero: stale ones underflow the next delta
                     last_rate_drops = 0;
                     last_output_drops = 0;
                     last_forced_drops = 0;
@@ -2688,9 +2598,8 @@ fn run_encode_loop(l: EncodeLoop) {
             None => {}
         }
 
-        // Hold push: in immediate mode right after the real frame went in (this iteration), in
-        // probing mode once it has sat alone for the probing wait. Same pixels, repeat stamps,
-        // so it is counted and kept out of the capture-relative histograms like a keepalive.
+        // hold push: same pixels and repeat stamps as a keepalive, so it is kept out of the
+        // capture-relative histograms
         if hold_enabled {
             if let Some(t) = hold.poll(crate::streamer::audio::host_now_ns()) {
                 hold_transitions += 1;
@@ -2725,8 +2634,8 @@ fn run_encode_loop(l: EncodeLoop) {
                             }
                         }
                         if let Some(pixbuf) = frame.pixel_buffer() {
-                            // Its own instant (RTP timestamp), never the real frame's: a frame
-                            // and its push must not share one, and the push is not late.
+                            // its own instant (RTP timestamp), never the real frame's: a frame
+                            // and its push must not share one, and the push is not late
                             if submit_one(
                                 enc,
                                 Instant::now(),
@@ -2777,7 +2686,7 @@ fn run_encode_loop(l: EncodeLoop) {
     if let Some(mut enc) = encoder.take() {
         let _ = enc.flush();
     }
-    // Dropping the encoder closes its output channel, which is what lets the drain thread finish.
+    // dropping the encoder closes its output channel, which lets the drain thread finish
     if let Some(handle) = drain.take() {
         let _ = handle.join();
     }
@@ -2882,8 +2791,8 @@ fn note_hold_transition(
     telemetry.hold_push_mode.set(t.to.as_str().into());
     learn_from(t, key);
     if t.to == HoldMode::Suspended {
-        // Session-local: the next session on this encoder still starts where it learned, and the
-        // guard decides again from its own frames.
+        // session-local: the next session on this encoder still starts where it learned, and the
+        // guard decides again from its own frames
         telemetry
             .degradation
             .hold_push_suspensions
@@ -2909,11 +2818,10 @@ fn learn_from(t: &HoldTransition, key: &HoldKey) {
     }
 }
 
-/// Refuse to start capture on a definite Screen Recording denial.
-///
-/// Starting a stream anyway gives the client wallpaper at best, and on macOS 15+ starting capture
-/// while unauthorized raises the system's own prompt from an automatic path. Silent: this only
-/// reads (`ensure_screen_recording_access` never requests), and an unknown state does not block.
+/// Refuse to start capture on a definite Screen Recording denial: a stream started anyway shows
+/// the client wallpaper at best, and on macOS 15+ starting capture while unauthorized raises the
+/// system's own prompt from an automatic path. Read-only (`ensure_screen_recording_access`
+/// never requests), and an unknown state does not block.
 fn require_screen_recording() -> Result<()> {
     if super::ensure_screen_recording_access() {
         return Ok(());
@@ -2991,7 +2899,7 @@ fn submit_one(
     hold_push: bool,
 ) -> bool {
     timing.mark_encode_submit();
-    // The raw frame recorder is a bench-only diagnostic and does not exist in a shipped build.
+    // bench-only diagnostic: a shipped build has no raw frame recorder
     #[cfg(feature = "bench")]
     super::raw_capture::record(pixbuf, force_idr, &timing);
     match encoder.submit(
@@ -3012,17 +2920,14 @@ fn submit_one(
 }
 
 /// Start a pipeline on the primary display. Only the probe harness uses it; the session path
-/// is `start_on_monitor`. It returns the same `SessionCapture` its sibling does, because the
-/// version that returned a bare `Pipeline` had to `mem::forget` the capture backend and the
-/// latency activity to keep them alive — leaking a capture stream, a VideoToolbox session, a
-/// real-time thread, a process-wide App Nap suppression and two power assertions per call.
+/// is `start_on_monitor`. It returns a `SessionCapture` so the capture backend and the latency
+/// activity are owned and torn down, not leaked.
 pub fn start(cfg: &Config) -> Result<SessionCapture> {
     require_screen_recording()?;
     let display = select_display(cfg.monitor)?;
     let (native_w, native_h, refresh) = display_geometry(display);
     let mut enc = live_encoder_config(native_w, native_h, refresh, cfg);
-    // Ask VideoToolbox for an encoder on the GPU that drives this display, so the captured
-    // IOSurface does not have to migrate to another one before it can be read.
+    // encode on the GPU that drives this display, so the captured IOSurface need not migrate first
     enc.gpu_registry_id = display::metal_registry_id(display);
 
     let gpu = Gpu::new().context("initializing Metal GPU core")?;
@@ -3057,8 +2962,7 @@ pub fn start_on_monitor(cfg: &Config, device_name: &str) -> Result<SessionCaptur
         display_by_name(device_name).with_context(|| format!("resolving display {device_name}"))?;
     let (native_w, native_h, refresh) = display_geometry(display);
     let mut enc = live_encoder_config(native_w, native_h, refresh, cfg);
-    // Ask VideoToolbox for an encoder on the GPU that drives this display, so the captured
-    // IOSurface does not have to migrate to another one before it can be read.
+    // encode on the GPU that drives this display, so the captured IOSurface need not migrate first
     enc.gpu_registry_id = display::metal_registry_id(display);
 
     let gpu = Gpu::new().context("initializing Metal GPU core")?;
@@ -3156,8 +3060,7 @@ pub fn probe_live(cfg: &Config, path: &str) -> Result<()> {
     let display = select_display(cfg.monitor)?;
     let (native_w, native_h, refresh) = display_geometry(display);
     let mut enc = live_encoder_config(native_w, native_h, refresh, cfg);
-    // Ask VideoToolbox for an encoder on the GPU that drives this display, so the captured
-    // IOSurface does not have to migrate to another one before it can be read.
+    // encode on the GPU that drives this display, so the captured IOSurface need not migrate first
     enc.gpu_registry_id = display::metal_registry_id(display);
 
     let gpu = Gpu::new().context("initializing Metal GPU core")?;
@@ -3311,8 +3214,8 @@ fn pixel_dims(device_name: &str) -> Result<(u32, u32, u32)> {
 
 /// Geometry in **backing pixels**, plus refresh and the HiDPI flag. `pixel_dims` reads
 /// `CGDisplayPixelsWide`, which reports points, so on a HiDPI display it is half the size that was
-/// applied — feeding it back into `reconfigure_display` halves the display again. Displays we
-/// created remember what was applied to them; anything else falls back to the point size at 1x.
+/// applied, and feeding it back into `reconfigure_display` halves the display again. Displays
+/// this host created remember what was applied; anything else falls back to the point size at 1x.
 fn backing_dims(device_name: &str) -> Result<(u32, u32, u32, u32)> {
     if let Some(dims) = crate::macos_utils::virtual_display::applied_backing(device_name) {
         return Ok(dims);
@@ -3322,7 +3225,7 @@ fn backing_dims(device_name: &str) -> Result<(u32, u32, u32, u32)> {
 }
 
 /// Geometry changes must not silently reset the display's HiDPI flag: the join path sets it from
-/// the client's DPR, and dropping it here forced a second full reconfiguration to put it back.
+/// the client's DPR, and dropping it here forces a second full reconfiguration to put it back.
 fn current_hidpi(device_name: &str) -> u32 {
     crate::macos_utils::virtual_display::applied_backing(device_name)
         .map(|(_, _, _, hidpi)| hidpi)
@@ -3369,8 +3272,8 @@ pub fn set_display_orientation(device_name: &str, portrait: bool) -> Result<()> 
 }
 
 /// Returns the scale actually in effect. macOS HiDPI is a binary flag rather than a ladder, so
-/// the answer is only ever 100 or 200 — which is what `platform::snap_display_dpr` already
-/// clamps a requested ratio to there.
+/// the answer is only ever 100 or 200, which is what `platform::snap_display_dpr` already clamps
+/// a requested ratio to there.
 pub fn set_display_scale(device_name: &str, percent: u32) -> Result<u32> {
     let hidpi = if percent >= HIDPI_THRESHOLD_PERCENT {
         1
@@ -3386,17 +3289,10 @@ pub fn set_display_topology_extend() -> bool {
     false
 }
 
-// --- the identity-checked display writes -----------------------------------------------------
-//
-// On Windows a display's `\\.\DISPLAYn` is a slot the OS reuses, so a name cached when a display
-// was created can name a different monitor — a physical one included — by the time a reconfigure
-// writes to it, and every write there re-derives its target from the monitor's stable device
-// path. A `device_name` here is the `CGDirectDisplayID` of the display itself, so it *is* the
-// stable identity and the forwarding below is the whole of it: a display that has gone away is
-// not found by `display_by_name`, which is already how these fail.
-//
-// UNVERIFIED (not compiled) — written on Windows, mirroring the Windows surface so
-// `streamer/pipeline.rs` re-exports one set of names.
+// identity-checked display writes, mirroring the Windows surface so `streamer/pipeline.rs`
+// re-exports one set of names. A `device_name` here is the display's `CGDirectDisplayID`, the
+// stable identity (unlike a reused `\\.\DISPLAYn` slot), so forwarding is all it takes: a
+// display that has gone away is not found by `display_by_name`
 
 pub fn attached_display_paths() -> Vec<String> {
     display::device_names()
@@ -3406,7 +3302,7 @@ pub fn claim_display_identity(device_name: &str, _before: &[String]) -> Option<S
     display::display_by_name(device_name).map(|_| device_name.to_string())
 }
 
-pub fn forget_display_identity(_device_path: &str) {}
+pub fn forget_display_identity(_display_id: u32, _device_path: &str) {}
 
 pub fn set_display_mode_owned(
     target: &crate::streamer::session::DisplayTarget,
@@ -3484,8 +3380,8 @@ mod tests {
         let mut encoder = Encoder::new(enc_cfg(w, h, fps, display)).expect("encoder");
         let out = encoder.output();
 
-        // No side queue of timestamps: each frame's stamps ride with it through VideoToolbox as
-        // its `sourceFrameRefCon`, which is also what the production drain thread reads.
+        // each frame's stamps ride with it through VideoToolbox as its `sourceFrameRefCon`,
+        // which is also what the production drain thread reads
         let drain = std::thread::spawn(move || {
             let mut lat: Vec<f64> = Vec::new();
             let mut bytes = 0usize;
@@ -3695,9 +3591,9 @@ mod tests {
         let mut g = DropGuard::new();
         let mut totals = (0, 0);
         assert_eq!(run_guard(&mut g, 0, 10, 60, 0, &mut totals), None);
-        // 1 in 25 (4 %) is under the 5 % line.
+        // 1 in 25 (4 %) is under the 5 % line
         assert_eq!(run_guard(&mut g, 10_000, 10, 60, 25, &mut totals), None);
-        // The stress clip's one drop in 600 under the 300 Mbps ceiling.
+        // the stress clip's one drop in 600 under the 300 Mbps ceiling
         let mut g = DropGuard::new();
         let mut totals = (0, 0);
         assert_eq!(run_guard(&mut g, 0, 5, 60, 0, &mut totals), None);
@@ -3709,14 +3605,14 @@ mod tests {
     fn the_drop_guard_trips_on_heavy_drops_after_one_window() {
         let mut g = DropGuard::new();
         let mut totals = (0, 0);
-        // Every frame dropped (150 Mbps measured that): trips once a full window exists.
+        // every frame dropped (measured at 150 Mbps): trips once a full window exists
         let (t, (sub, dropped)) = run_guard(&mut g, 0, 10, 60, 1, &mut totals).expect("trips");
         assert!(
             (DROP_GUARD_WINDOW_MS..DROP_GUARD_WINDOW_MS + 300).contains(&t),
             "t={t}"
         );
         assert!(sub >= DROP_GUARD_MIN_SUBMITS && dropped * 100 > sub * DROP_GUARD_PERCENT);
-        // 1 in 10 (10 %) trips too.
+        // 1 in 10 (10 %) trips too
         let mut g = DropGuard::new();
         let mut totals = (0, 0);
         assert!(run_guard(&mut g, 0, 10, 60, 10, &mut totals).is_some());
@@ -3725,16 +3621,16 @@ mod tests {
     #[test]
     fn the_drop_guard_sees_a_burst_inside_any_window_and_needs_enough_frames() {
         // 8 s clean, then a 1.5 s burst of every frame dropped: caught although it starts mid
-        // window, because the window slides.
+        // window, because the window slides
         let mut g = DropGuard::new();
         let mut totals = (0, 0);
         assert_eq!(run_guard(&mut g, 0, 8, 60, 0, &mut totals), None);
         assert!(run_guard(&mut g, 8_000, 2, 60, 1, &mut totals).is_some());
-        // An idle keepalive (5 fps) dropping everything is too few frames to judge.
+        // an idle keepalive (5 fps) dropping everything is too few frames to judge
         let mut g = DropGuard::new();
         let mut totals = (0, 0);
         assert_eq!(run_guard(&mut g, 0, 10, 5, 1, &mut totals), None);
-        // After a reset (new encoder, counters from zero) the history is gone.
+        // after a reset (new encoder, counters from zero) the history is gone
         let mut g = DropGuard::new();
         let mut totals = (0, 0);
         assert_eq!(run_guard(&mut g, 0, 1, 60, 1, &mut totals), None);
@@ -3742,9 +3638,7 @@ mod tests {
         assert_eq!(g.observe(1_000, 0, 0), None);
     }
 
-    // -----------------------------------------------------------------------------------------
-    // Hold push (pure; simulated encoders).
-    // -----------------------------------------------------------------------------------------
+    // hold push (pure; simulated encoders)
 
     const MS: u64 = 1_000_000;
 
@@ -3774,14 +3668,14 @@ mod tests {
         ever_immediate: bool,
         /// SerialHold: when each frame's encode finished.
         done: Vec<u64>,
-        /// One STATS frame a second, `(p50 µs, tier)`, from second 1 on.
+        /// One STATS frame a second, `(p50 us, tier)`, from second 1 on.
         stats: Vec<Option<(u64, u8)>>,
     }
 
     impl Sim {
         fn new(mode: HoldMode, model: Model) -> Self {
             let mut hp = HoldPush::new(mode);
-            // These model the encoder only; the client guard has its own tests.
+            // these model the encoder only; the client guard has its own tests
             hp.client_gate = false;
             Sim {
                 hp,
@@ -3832,8 +3726,8 @@ mod tests {
 
         fn submit(&mut self, kind: SubmitKind, t: u64) {
             if kind == SubmitKind::Push {
-                // Never a push of a push, and never a push after another kind of repeat: since
-                // the newest real frame only that frame's own pushes were submitted.
+                // never a push of a push, and never a push after another kind of repeat: since
+                // the newest real frame only that frame's own pushes were submitted
                 let last_real = self
                     .submits
                     .iter()
@@ -3981,16 +3875,16 @@ mod tests {
         assert_eq!(sim.transitions.len(), 1, "{:?}", sim.transitions);
         let (_, reals, to) = sim.transitions[0];
         assert_eq!(to, HoldMode::Immediate);
-        // Frame 1 is the warm-up and never pushed (it comes out when frame 2 goes in); frames
-        // 2, 3 and 4 are the three qualifying frames.
+        // frame 1 is the warm-up and never pushed (it comes out when frame 2 goes in); frames
+        // 2, 3 and 4 are the three qualifying frames
         assert_eq!(reals, 4, "entered on the third qualifying frame");
         assert_eq!(sim.hp.mode(), HoldMode::Immediate);
-        // Before: every frame waits the 50 ms probing wait plus the encode; after: the encode.
+        // before: every frame waits the 50 ms probing wait plus the encode; after: the encode
         let before = sim.p50_ms(100, 400);
         let after = sim.p50_ms(500, 2_000);
         assert!((55.0..60.0).contains(&before), "before {before}");
         assert!(after <= 8.0, "after {after}");
-        // One push per real frame after the warm-up frame, which gets none.
+        // one push per real frame after the warm-up frame, which gets none
         assert_eq!(sim.pushes_for_real[0], 0);
         assert!(
             sim.pushes_for_real[1..].iter().all(|&p| p == 1),
@@ -4010,7 +3904,7 @@ mod tests {
             entered < 3 * 800,
             "entered at {entered} ms, after three pauses"
         );
-        // During motion before: one frame interval + encode (16 + 7); after: the encode.
+        // during motion before: one frame interval + encode (16 + 7); after: the encode
         let before = sim.p50_ms(0, 400);
         let after = sim.p50_ms(entered + 100, 6_000);
         assert!((21.0..25.0).contains(&before), "before {before}");
@@ -4028,7 +3922,7 @@ mod tests {
             bursts(16, 20, 400, 5_000),
             every(100, 3_000),
         ] {
-            // 7 ms a frame, after an 80 ms warm-up frame (the M1 measured 50.9 ms).
+            // 7 ms a frame, after an 80 ms warm-up frame (the M1 measured 50.9 ms)
             let mut sim = Sim::new(
                 HoldMode::Probing,
                 Model::Free(|k| if k == 0 { 80 } else { 7 }),
@@ -4041,9 +3935,9 @@ mod tests {
 
     #[test]
     fn a_slow_encoder_that_does_not_hold_never_enters_immediate() {
-        // 25–60 ms per frame (a deterministic scramble), frames every 16 ms in bursts with
+        // 25 to 60 ms per frame (a deterministic scramble), frames every 16 ms in bursts with
         // pauses: the encoder never keeps up during a burst and is often still busy after the
-        // probing wait, yet what it emits on its own is what keeps it out of immediate mode.
+        // probing wait, yet what it emits on its own is what keeps it out of immediate mode
         fn lat(k: u64) -> u64 {
             25 + (k.wrapping_mul(2_654_435_761) >> 7) % 36
         }
@@ -4055,7 +3949,7 @@ mod tests {
             let mut sim = Sim::new(HoldMode::Probing, Model::Free(lat));
             sim.run(&frames, 8_500);
             assert!(!sim.ever_immediate, "transitions {:?}", sim.transitions);
-            // And its load is never doubled: far fewer pushes than real frames.
+            // its load is never doubled: far fewer pushes than real frames
             assert!(
                 sim.pushes() * 4 <= sim.pushes_for_real.len(),
                 "{} pushes for {} frames",
@@ -4063,12 +3957,12 @@ mod tests {
                 sim.pushes_for_real.len()
             );
         }
-        // Even a session that starts in (wrongly learned) immediate mode leaves it — into the
+        // even a session that starts in (wrongly learned) immediate mode leaves it for the
         // suspension, by the efficacy guard (real frames far slower than the interval) or by
-        // three cap waits after the first-second grace, whichever comes first.
+        // three cap waits after the first-second grace, whichever comes first
         let mut sim = Sim::new(HoldMode::Immediate, Model::Free(lat));
         sim.run(&every(16, 3_000), 3_100);
-        // (A free emission later proves it does not hold at all, which ends in probing.)
+        // a free emission later proves it does not hold at all, which ends in probing
         assert_ne!(sim.hp.mode(), HoldMode::Immediate);
         assert_eq!(sim.transitions[0].2, HoldMode::Suspended);
         let left = sim.transitions[0].0 / MS;
@@ -4086,7 +3980,7 @@ mod tests {
         let left = sim.transitions[1].0 / MS;
         assert!((1_000..1_100).contains(&left), "left at {left} ms");
         assert_eq!(sim.hp.mode(), HoldMode::Probing);
-        // An encoder reset forgets the mode.
+        // an encoder reset forgets the mode
         let mut hp = HoldPush::new(HoldMode::Immediate);
         hp.submitted(SubmitKind::Real, 1, 0);
         hp.reset();
@@ -4096,7 +3990,7 @@ mod tests {
 
     #[test]
     fn a_frame_gets_at_most_two_pushes_and_never_a_push_of_a_push() {
-        // Holds three frames: two pushes cannot release it.
+        // holds three frames: two pushes cannot release it
         for mode in [HoldMode::Probing, HoldMode::Immediate] {
             let mut sim = Sim::new(mode, Model::Hold { n: 3, enc_ms: 7 });
             sim.run(&every(300, 3_000), 3_100);
@@ -4106,22 +4000,22 @@ mod tests {
                 sim.pushes_for_real
             );
             if mode == HoldMode::Immediate {
-                // The reserved slot lets the second push in, and then it stops.
+                // the reserved slot lets the second push in, and then it stops
                 assert!(sim.pushes_for_real.contains(&2));
                 assert!(sim.exhausted >= 1);
             } else {
-                // Probing keeps the plain cap of two: the real frame and one push (none for the
-                // warm-up frame).
+                // probing keeps the plain cap of two: the real frame and one push (none for the
+                // warm-up frame)
                 assert!(
                     sim.pushes_for_real[1..].iter().all(|&p| p == 1),
                     "{:?}",
                     sim.pushes_for_real
                 );
             }
-            // Pushes that do not release the frame are no evidence of a one-frame hold.
+            // pushes that do not release the frame are no evidence of a one-frame hold
             assert!(!sim.transitions.iter().any(|t| t.2 == HoldMode::Immediate));
         }
-        // Directly: after a push, `due` keeps naming the real frame, never the push.
+        // directly: after a push, `due` keeps naming the real frame, never the push
         let mut hp = HoldPush::new(HoldMode::Immediate);
         hp.submitted(SubmitKind::Real, 1, 0);
         assert_eq!(hp.due(0), Due::Push);
@@ -4131,7 +4025,7 @@ mod tests {
         hp.submitted(SubmitKind::Push, 3, PUSH_RELEASE_WINDOW_NS);
         assert_eq!(hp.due(PUSH_RELEASE_WINDOW_NS * 2), Due::Exhausted);
         assert_eq!(hp.due(PUSH_RELEASE_WINDOW_NS * 3), Due::Nothing);
-        // A keepalive repeat after the real frame supersedes it: nothing to push.
+        // a keepalive repeat after the real frame supersedes it: nothing to push
         let mut hp = HoldPush::new(HoldMode::Immediate);
         hp.submitted(SubmitKind::Real, 1, 0);
         hp.submitted(SubmitKind::Other, 2, 0);
@@ -4174,7 +4068,7 @@ mod tests {
     }
     #[test]
     fn a_non_holding_encoder_started_in_immediate_leaves_on_the_first_free_emission() {
-        // The `SE_HOLD_PUSH_START=immediate` test hook on an M1-like encoder.
+        // the `SE_HOLD_PUSH_START=immediate` test hook on an M1-like encoder
         let mut sim = Sim::new(HoldMode::Immediate, Model::Free(|_| 7));
         sim.run(&every(16, 2_000), 2_100);
         assert_eq!(sim.transitions.len(), 1, "{:?}", sim.transitions);
@@ -4195,12 +4089,12 @@ mod tests {
             sim.run(&every(interval, 6_000), 6_100);
             assert_eq!(sim.hp.mode(), HoldMode::Immediate, "interval {interval}");
             let entered = sim.transitions[0].0 / MS;
-            // 8 suspicious frames, then probes >= 1 s apart: the third lands after ~2 s.
+            // 8 suspicious frames, then probes >= 1 s apart: the third lands after ~2 s
             assert!(
                 (2_000..3_000).contains(&entered),
                 "interval {interval}: {entered} ms"
             );
-            // Exactly the three probe pushes before it.
+            // exactly the three probe pushes before it
             let before: usize = sim
                 .submits
                 .iter()
@@ -4219,8 +4113,8 @@ mod tests {
 
     #[test]
     fn a_slow_encoder_at_a_steady_cadence_fails_the_probe_and_backs_off() {
-        // Just slower than the frame interval (18 ms at 16 ms), and a bimodal one: each frame
-        // comes out at its own time whatever is submitted after it.
+        // just slower than the frame interval (18 ms at 16 ms), and a bimodal one: each frame
+        // comes out at its own time whatever is submitted after it
         fn bimodal(k: u64) -> u64 {
             if k.is_multiple_of(3) {
                 12
@@ -4236,10 +4130,10 @@ mod tests {
             let mut sim = Sim::new(HoldMode::Probing, model);
             sim.run(&every(16, 60_000), 60_100);
             assert!(!sim.ever_immediate, "{:?}", sim.transitions);
-            // Backoff 2, 4, 8, 16, 32 s: a handful of pushes in a minute.
+            // backoff 2, 4, 8, 16, 32 s: a handful of pushes in a minute
             assert!(sim.pushes() <= 6, "{} pushes", sim.pushes());
         }
-        // A multi-frame holder: the push does not release the frame.
+        // a multi-frame holder: the push does not release the frame
         let mut sim = Sim::new(HoldMode::Probing, Model::Hold { n: 3, enc_ms: 7 });
         sim.run(&every(16, 20_000), 20_100);
         assert!(!sim.ever_immediate, "{:?}", sim.transitions);
@@ -4248,18 +4142,18 @@ mod tests {
 
     #[test]
     fn the_steady_probe_is_a_causal_test_with_no_absolute_bound() {
-        // Holding encoder at 60 fps (M1-like): 23 ms before, 7 ms with the push.
+        // holding encoder at 60 fps (M1-like): 23 ms before, 7 ms with the push
         assert!(steady_probe_passes(7 * MS, 23 * MS, 16 * MS));
-        // `gva` at 30 fps: ~16 ms encode against 33 + 16 before.
+        // `gva` at 30 fps: ~16 ms encode against 33 + 16 before
         assert!(steady_probe_passes(16 * MS, 49 * MS, 33 * MS));
-        // `gva` at 10 fps: 22 ms encode is fine too.
+        // `gva` at 10 fps: 22 ms encode is fine too
         assert!(steady_probe_passes(22 * MS, 122 * MS, 100 * MS));
-        // Slow encoder: the push changes nothing.
+        // slow encoder: the push changes nothing
         assert!(!steady_probe_passes(18 * MS, 18 * MS, 16 * MS));
-        // Faster, but not by the margin (5 ms floor, then 30 %).
+        // faster, but not by the margin (5 ms floor, then 30 %)
         assert!(!steady_probe_passes(10 * MS, 14 * MS, 16 * MS));
         assert!(!steady_probe_passes(30 * MS, 40 * MS, 50 * MS));
-        // A clear speed-up that is still not inside one frame interval.
+        // a clear speed-up that is still not inside one frame interval
         assert!(!steady_probe_passes(20 * MS, 100 * MS, 16 * MS));
     }
 
@@ -4271,7 +4165,7 @@ mod tests {
         let mut hp = HoldPush::new(HoldMode::Immediate);
         hp.push_emit_ewma_ns = Some(22.0 * MS as f64);
         assert_eq!(hp.second_push_after_ns(), 55 * MS);
-        // The pause window never runs past the probing wait.
+        // the pause window never runs past the probing wait
         assert_eq!(hp.pause_window_ns(), hp.push_after_ns());
         hp.push_emit_ewma_ns = Some(8.0 * MS as f64);
         assert_eq!(hp.pause_window_ns(), 20 * MS);
@@ -4279,8 +4173,8 @@ mod tests {
 
     #[test]
     fn a_slow_holding_encoder_is_learned_and_never_pushed_twice() {
-        // `gva` at 10 fps: ~22 ms encode after the release. The fixed 20 ms window missed every
-        // release and the 20 ms second-push delay pushed 44 % of frames twice.
+        // `gva` at 10 fps: ~22 ms encode after the release. A fixed 20 ms window misses every
+        // release, and a 20 ms second-push delay pushes 44 % of frames twice
         let mut sim = Sim::new(HoldMode::Probing, Model::Hold { n: 1, enc_ms: 22 });
         sim.run(&every(100, 4_000), 4_100);
         assert_eq!(sim.hp.mode(), HoldMode::Immediate, "{:?}", sim.transitions);
@@ -4289,14 +4183,14 @@ mod tests {
         assert!(entered < 800, "entered at {entered} ms");
         assert!(
             sim.pushes_for_real[reals..].iter().all(|p| *p <= 1)
-                // Every frame pushed once, but for the one no-push sample.
+                // every frame pushed once, but for the one no-push sample
                 && sim.pushes_for_real[reals..].iter().filter(|p| **p == 0).count() <= 1,
             "second pushes: {:?}",
             sim.pushes_for_real
         );
         assert!(sim.p50_ms(entered + 200, 4_000) <= 23.0);
-        // Started immediate at 10 fps: no second pushes once the first frame has shown the
-        // encoder's push->emit time (that first frame, with nothing learned, may get two).
+        // started immediate at 10 fps: no second pushes once the first frame has shown the
+        // encoder's push->emit time (that first frame, with nothing learned, may get two)
         let mut sim = Sim::new(HoldMode::Immediate, Model::Hold { n: 1, enc_ms: 22 });
         sim.run(&every(100, 3_000), 3_100);
         assert!(
@@ -4305,7 +4199,7 @@ mod tests {
             sim.pushes_for_real
         );
         assert!(!sim.transitions.iter().any(|t| t.2 == HoldMode::Probing));
-        // `gva` at 30 fps (~16 ms): the steady-cadence learner engages.
+        // `gva` at 30 fps (~16 ms): the steady-cadence learner engages
         let mut sim = Sim::new(HoldMode::Probing, Model::Hold { n: 1, enc_ms: 16 });
         sim.run(&every(33, 6_000), 6_100);
         assert_eq!(sim.hp.mode(), HoldMode::Immediate, "{:?}", sim.transitions);
@@ -4316,13 +4210,13 @@ mod tests {
     #[test]
     fn cap_waits_do_not_count_in_the_first_second_or_under_a_keyframe_and_must_span_150_ms() {
         let wait = |hp: &mut HoldPush, t_ms: u64| hp.real_cap_wait(true, t_ms * MS);
-        // First second: never.
+        // first second: never
         let mut hp = HoldPush::new(HoldMode::Immediate);
         hp.submitted(SubmitKind::Real, 1, 0);
         for t in [100, 200, 300, 400, 900] {
             assert_eq!(wait(&mut hp, t), None);
         }
-        // Past it, three waits within 150 ms are not enough; spanning 150 ms they are.
+        // past it, three waits within 150 ms are not enough; spanning 150 ms they are
         assert_eq!(wait(&mut hp, 1_100), None);
         assert_eq!(wait(&mut hp, 1_120), None);
         assert_eq!(wait(&mut hp, 1_140), None);
@@ -4331,7 +4225,7 @@ mod tests {
             (t.from, t.to, t.evidence),
             (HoldMode::Immediate, HoldMode::Suspended, Evidence::Overload)
         );
-        // A forced keyframe in flight: no count until it is out.
+        // a forced keyframe in flight: no count until it is out
         let mut hp = HoldPush::new(HoldMode::Immediate);
         hp.submitted(SubmitKind::Real, 1, 0);
         hp.submitted(SubmitKind::Real, 2, 1_500 * MS);
@@ -4346,7 +4240,7 @@ mod tests {
             assert_eq!(wait(&mut hp, t), None);
         }
         assert!(wait(&mut hp, 2_000).is_some());
-        // A frame that did not wait breaks the streak.
+        // a frame that did not wait breaks the streak
         let mut hp = HoldPush::new(HoldMode::Immediate);
         hp.submitted(SubmitKind::Real, 1, 0);
         assert_eq!(wait(&mut hp, 1_100), None);
@@ -4357,8 +4251,8 @@ mod tests {
 
     #[test]
     fn a_big_first_keyframe_does_not_end_an_immediate_start() {
-        // The session-start IDR takes ~50 ms on `gva` (here 60 ms), so the frames behind it
-        // wait for the cap; then 11 ms per frame, held until the next submit.
+        // the session-start IDR takes ~50 ms on `gva` (here 60 ms), so the frames behind it
+        // wait for the cap; then 11 ms per frame, held until the next submit
         let mut sim = Sim::new(HoldMode::Immediate, Model::Hold { n: 1, enc_ms: 11 });
         sim.models = vec![
             (0, Model::Hold { n: 1, enc_ms: 60 }),
@@ -4375,7 +4269,7 @@ mod tests {
 
     #[test]
     fn a_confirmed_encoder_re_enters_immediate_on_one_probe() {
-        // Steady cadence: 8 suspicious frames, then a single probe.
+        // steady cadence: 8 suspicious frames, then a single probe
         let mut sim = Sim::new(HoldMode::Probing, Model::Hold { n: 1, enc_ms: 7 });
         sim.hp.set_confirmed(true);
         sim.run(&every(16, 2_000), 2_100);
@@ -4388,12 +4282,12 @@ mod tests {
             .filter(|s| s.1 == SubmitKind::Push && s.0 < entered * MS)
             .count();
         assert_eq!(probes, 1);
-        // Pause probe: one qualifying frame (frame 2; frame 1 is the warm-up).
+        // pause probe: one qualifying frame (frame 2; frame 1 is the warm-up)
         let mut sim = Sim::new(HoldMode::Probing, Model::Hold { n: 1, enc_ms: 7 });
         sim.hp.set_confirmed(true);
         sim.run(&every(100, 1_000), 1_100);
         assert_eq!(sim.transitions[0].1, 2, "{:?}", sim.transitions);
-        // A free emission withdraws the confirmation (and says so).
+        // a free emission withdraws the confirmation (and says so)
         let mut sim = Sim::new(HoldMode::Probing, Model::Free(|_| 7));
         sim.hp.set_confirmed(true);
         sim.run(&every(16, 500), 600);
@@ -4405,35 +4299,35 @@ mod tests {
     #[test]
     fn a_repeat_is_stamped_one_real_encode_time_before_it_came_out() {
         const MS: u64 = 1_000_000;
-        // 60 fps.
+        // 60 fps
         const IV: u64 = 16_666_667;
         let t0 = 1_000 * MS;
-        // A session that started on a still screen: the only real frames were the slow first
-        // ones (E 54 ms), but an encoder that keeps up takes at most one interval: emit - 16.7.
+        // a session that started on a still screen: the only real frames were the slow first
+        // ones (E 54 ms), but an encoder that keeps up takes at most one interval: emit - 16.7
         assert_eq!(
             repeat_capture_ns(t0, t0 + 200 * MS, Some(54 * MS), IV, t0 - 50 * MS),
             t0 + 200 * MS - IV
         );
-        // No real frame submitted after the repeat in these four (newest real capture older).
+        // no real frame submitted after the repeat in these four (newest real capture older)
         let old_real = t0 - 50 * MS;
-        // Free-emitting encoder (M1): emitted 6 ms after its submit, real encodes ~7 ms: its own
-        // submit.
+        // free-emitting encoder (M1): emitted 6 ms after its submit, real encodes ~7 ms: its own
+        // submit
         assert_eq!(
             repeat_capture_ns(t0, t0 + 6 * MS, Some(7 * MS), IV, old_real),
             t0
         );
-        // Holding encoder, keepalive released by the next keepalive 200 ms later, real encode
-        // ~11 ms: emit - 11 (unchanged by the cap: no real frame came after it).
+        // holding encoder, keepalive released by the next keepalive 200 ms later, real encode
+        // ~11 ms: emit - 11 (unchanged by the cap: no real frame came after it)
         assert_eq!(
             repeat_capture_ns(t0, t0 + 200 * MS, Some(11 * MS), IV, old_real),
             t0 + 189 * MS
         );
-        // No real frame timed yet: its own submit.
+        // no real frame timed yet: its own submit
         assert_eq!(repeat_capture_ns(t0, t0 + 200 * MS, None, IV, old_real), t0);
-        // A push released by the next real frame: that frame captured at t0 + 16.7 ms and
-        // submitted a few µs later released the push, which came out 11 ms after that. `emit - E`
-        // alone lands after the real frame's capture; capped, it is strictly before it (by more
-        // than one RTP tick) and still after the frame the push follows (captured before t0).
+        // a push released by the next real frame: that frame, captured at t0 + 16.7 ms and
+        // submitted a few microseconds later, released the push, which came out 11 ms after that.
+        // `emit - E` alone lands after the real frame's capture; capped, it is strictly before it
+        // (by more than one RTP tick) and still after the frame the push follows
         let next_real_capture = t0 + 16_700_000;
         let emit = next_real_capture + 20_000 + 11 * MS;
         let uncapped = emit - 11 * MS;
@@ -4442,7 +4336,7 @@ mod tests {
         assert!(push < next_real_capture, "{}", next_real_capture - push);
         assert!(next_real_capture - push >= 1_000_000_000 / 90_000);
         assert!(push >= t0);
-        // The RTP timestamps then increase without the writer's clamp.
+        // the RTP timestamps then increase without the writer's clamp
         use crate::streamer::audio::host_ns_to_rtp90k as rtp;
         assert!((rtp(next_real_capture).wrapping_sub(rtp(push)) as i32) > 0);
     }
@@ -4451,12 +4345,12 @@ mod tests {
     fn the_real_encode_time_is_a_short_window_minimum() {
         let mut e = RealEncodeTime::default();
         assert_eq!(e.get(), None);
-        // A 50 ms first keyframe, then 11 ms frames: the estimate is 11 ms at once.
+        // a 50 ms first keyframe, then 11 ms frames: the estimate is 11 ms at once
         e.note(50_000_000);
         assert_eq!(e.get(), Some(Duration::from_millis(50)));
         e.note(11_000_000);
         assert_eq!(e.get(), Some(Duration::from_millis(11)));
-        // A slower spell takes over once the window has turned.
+        // a slower spell takes over once the window has turned
         for _ in 0..RealEncodeTime::WINDOW {
             e.note(16_000_000);
         }
@@ -4465,7 +4359,7 @@ mod tests {
 
     #[test]
     fn a_fast_holding_encoder_stays_immediate_under_the_efficacy_guard() {
-        // 5 ms a frame serially: a real frame and its push take 10 ms of a 16 ms interval.
+        // 5 ms a frame serially: a real frame and its push take 10 ms of a 16 ms interval
         let mut sim = Sim::new(HoldMode::Immediate, Model::SerialHold { cost_ms: 5 });
         sim.run(&every(16, 30_000), 30_100);
         assert!(sim.transitions.is_empty(), "{:?}", sim.transitions);
@@ -4483,7 +4377,7 @@ mod tests {
         hp
     }
 
-    /// Feed real frames at 60 fps from `t0` for `secs` with submit→emit `lat(k)` ms. Returns the
+    /// Feed real frames at 60 fps from `t0` for `secs` with submit-to-emit `lat(k)` ms. Returns the
     /// transitions' times.
     fn guard_feed(hp: &mut HoldPush, t0: u64, secs: f64, lat: &dyn Fn(u64) -> f64) -> Vec<u64> {
         let mut out = Vec::new();
@@ -4503,7 +4397,7 @@ mod tests {
 
     #[test]
     fn the_guard_keeps_pushes_that_beat_the_no_push_latency() {
-        // M1 noise 1080p60: 15 and 19 ms with pushes against 23 ms without — both stay.
+        // M1 noise 1080p60: 15 and 19 ms with pushes against 23 ms without, both stay
         for with in [15.0, 19.0] {
             let mut hp = guard_rig(23.0);
             assert!(
@@ -4513,7 +4407,7 @@ mod tests {
             assert_eq!(hp.mode, HoldMode::Immediate);
         }
         // 25 ms with pushes (the in-process decoder at 1080p60) is a loss: suspended, once the
-        // line has held for a second.
+        // line has held for a second
         let mut hp = guard_rig(23.0);
         let t = guard_feed(&mut hp, 0, 30.0, &|_| 25.0);
         assert_eq!(t.len(), 1);
@@ -4523,7 +4417,7 @@ mod tests {
 
     #[test]
     fn a_guard_value_near_the_line_does_not_flap() {
-        // Oscillating around 0.9 × L0 (20.7 ms): 19.5 / 21.9 alternating, then blocks of each.
+        // oscillating around 0.9 x L0 (20.7 ms): 19.5 / 21.9 alternating, then blocks of each
         let mut hp = guard_rig(23.0);
         let t = guard_feed(&mut hp, 0, 30.0, &|k| {
             if (k / 7) % 2 == 0 {
@@ -4533,15 +4427,15 @@ mod tests {
             }
         });
         assert!(t.len() <= 1, "{t:?}");
-        // Within the dead band (between 0.8 and 0.9 × L0) nothing happens at all.
+        // within the dead band (between 0.8 and 0.9 x L0) nothing happens at all
         let mut hp = guard_rig(23.0);
         assert!(guard_feed(&mut hp, 0, 30.0, &|_| 19.5).is_empty());
     }
 
     #[test]
     fn a_sparse_window_is_never_judged() {
-        // An idle desktop: 3.5 fresh frames a second, every one slow. Never 30 in 2 s: no
-        // judgement, mode kept.
+        // an idle desktop: 3.5 fresh frames a second, every one slow. Never 30 in 2 s: no
+        // judgement, mode kept
         let mut hp = guard_rig(23.0);
         for k in 0..200u64 {
             let at = k * 285_714_286;
@@ -4561,8 +4455,8 @@ mod tests {
 
     #[test]
     fn a_cadence_change_does_not_misjudge_pushes() {
-        // `work` 6 ms whatever the cadence. 120 -> 30 fps with pushes at 16.3 ms: no-push there is
-        // 39 ms, so it stays (an L0 of 13.2 ms remembered from 120 fps suspended it)...
+        // `work` is 6 ms whatever the cadence. 120 -> 30 fps with pushes at 16.3 ms: no-push there
+        // is 39 ms, so it stays (an L0 of 13.2 ms remembered from 120 fps would suspend it)
         let rig = |iv_ms: f64| {
             let mut hp = guard_rig(16.666667 + 6.0);
             hp.guard_gap.clear();
@@ -4572,14 +4466,14 @@ mod tests {
             hp
         };
         assert!(guard_feed(&mut rig(33.3), 0, 20.0, &|_| 16.3).is_empty());
-        // ...and 30 -> 60 fps with pushes at 25 ms against 22.7: suspended (an L0 of 42.6 ms
-        // remembered from 30 fps never would have).
+        // 30 -> 60 fps with pushes at 25 ms against 22.7: suspended (an L0 of 42.6 ms remembered
+        // from 30 fps never would)
         assert_eq!(guard_feed(&mut rig(16.7), 0, 20.0, &|_| 25.0).len(), 1);
     }
 
     #[test]
     fn the_sustain_needs_one_unbroken_second() {
-        // 0.5 s over, then in the 0.8-0.9 band, then 0.6 s over: never a full second.
+        // 0.5 s over, then in the 0.8-0.9 band, then 0.6 s over: never a full second
         let mut hp = guard_rig(23.0);
         let t = guard_feed(&mut hp, 0, 1.2, &|_| 22.0); // window fills at 0.5 s, 0.7 s over
         assert!(t.is_empty());
@@ -4589,7 +4483,7 @@ mod tests {
         hp.guard_lat.clear();
         assert!(guard_feed(&mut hp, 2_600_000_000, 1.2, &|_| 22.0).is_empty());
         assert!(hp.guard_over_since_ns.is_some());
-        // A pause: no judgement for longer than the gap starts over too.
+        // a pause: no judgement for longer than the gap starts over too
         assert!(guard_feed(&mut hp, 6_000_000_000, 1.2, &|_| 22.0).is_empty());
     }
 
@@ -4600,19 +4494,19 @@ mod tests {
         assert!(one.hp.suspensions >= 1);
         let m = one.hp.memory(8_000 * MS);
         assert!(!m.work.is_empty());
-        // Seeded (a renegotiation): as fast as the window and the sustain allow.
+        // seeded (a renegotiation): as fast as the window and the sustain allow
         let mut two = Sim::new(HoldMode::Immediate, Model::SerialHold { cost_ms: 12 });
         two.hp.seed(&m, 9_000 * MS);
         two.run(&every(16, 8_000), 8_100);
         let t = two.transitions.first().expect("suspended").0;
         assert!(t < 2_500 * MS, "{} ms", t / MS);
-        // The back-off went on from where session one left it.
+        // the back-off went on from where session one left it
         assert!(
             two.hp.suspend_backoff_ns >= 4 * SUSPEND_START_NS,
             "{}",
             two.hp.suspend_backoff_ns
         );
-        // Unseeded: it samples its own.
+        // unseeded: it samples its own
         let mut three = Sim::new(HoldMode::Immediate, Model::SerialHold { cost_ms: 12 });
         three.run(&every(16, 8_000), 8_100);
         assert!(three.hp.suspensions >= 1);
@@ -4658,7 +4552,7 @@ mod tests {
         assert!(!is_confirmed_holding(&k));
     }
 
-    /// A session that went immediate at 2 s with no baseline (W20). `(suspensions, first, why)`.
+    /// A session that went immediate at 2 s with no baseline. `(suspensions, first, why)`.
     fn no_baseline_run(p50_us: u64, share: f64, secs: u64) -> (u64, Option<u64>, String) {
         let mut hp = immediate_with_interval(0);
         let mut painted = 120.0f64;
@@ -4687,26 +4581,26 @@ mod tests {
 
     #[test]
     fn an_overloaded_client_without_a_baseline_is_suspended_in_seconds() {
-        // W20: arrival->paint 24.8 ms, 0.944 of the frames painted — it queues, it does not drop.
+        // arrival->paint 24.8 ms, 0.944 of the frames painted: it queues, it does not drop
         let (n, first, why) = no_baseline_run(24_800, 0.944, 300);
         assert!((3..=5).contains(&first.expect("suspended")), "{first:?} s");
         assert!(why.starts_with("client:"), "{why}");
         assert!(n <= 6, "flapped: {n} suspensions in five minutes");
-        // A software decoder that keeps up: never.
+        // a software decoder that keeps up: never
         assert_eq!(no_baseline_run(11_400, 1.0, 300).0, 0);
-        // Painting fewer frames than were sent, at a healthy p50, is not a reason: the two counters
+        // painting fewer frames than were sent, at a healthy p50, is not a reason: the two counters
         // are read up to a second apart, and bursty content made a client that painted every
-        // frame read as 129 of 166.
+        // frame read as 129 of 166
         assert_eq!(no_baseline_run(9_000, 0.78, 300).0, 0);
     }
 
     #[test]
     fn which_stats_frames_count_as_evidence() {
-        // (version, video path, tier byte): script transform, encodedStreams, `<video>`.
+        // (version, video path, tier byte): script transform, encodedStreams, `<video>`
         assert_eq!(effective_transport_tier(3, 1, 1), 1);
         assert_eq!(effective_transport_tier(3, 1, 2), 2);
         assert_eq!(effective_transport_tier(3, 3, 0), 0);
-        // A v1 page has no tier byte: WebCodecs counts, `<video>` does not.
+        // a v1 page has no tier byte: WebCodecs counts, `<video>` does not
         assert_eq!(effective_transport_tier(1, 1, 0), 1);
         assert_eq!(effective_transport_tier(1, 2, 0), 1);
         assert_eq!(effective_transport_tier(1, 3, 0), 0);
@@ -4740,9 +4634,9 @@ mod tests {
             entered && mode == HoldMode::Immediate && left == 0,
             "{mode:?} {left}"
         );
-        // The legacy createEncodedStreams transport is tier 2.
+        // the legacy createEncodedStreams transport is tier 2
         assert!(gated_sim(HoldMode::Probing, 30, &|_| Some((4_000, 2))).1);
-        // No STATS at all: entered only inside the 3 s grace, and not kept.
+        // no STATS at all: entered only inside the 3 s grace, and not kept
         assert_ne!(
             gated_sim(HoldMode::Probing, 30, &|_| None).0,
             HoldMode::Immediate
@@ -4752,10 +4646,10 @@ mod tests {
     #[test]
     fn a_zero_p50_in_the_first_second_costs_nothing() {
         let late = |s: u64| Some(if s < 2 { (0, 1) } else { (4_000, 1) });
-        // Learned immediate: neither suspended nor left because of it.
+        // learned immediate: neither suspended nor left because of it
         let (mode, _, left) = gated_sim(HoldMode::Immediate, 30, &late);
         assert!(mode == HoldMode::Immediate && left == 0, "{mode:?} {left}");
-        // Learning: still gets there.
+        // learning: still gets there
         let (mode, _, left) = gated_sim(HoldMode::Probing, 30, &late);
         assert!(mode == HoldMode::Immediate && left == 0, "{mode:?} {left}");
     }
@@ -4773,7 +4667,7 @@ mod tests {
             }
             assert_eq!(hp.client_baseline_us, None);
             assert!(hp.enter_immediate(40_000 * MS, "t".into()).is_none());
-            // Started there (learned): out after the grace.
+            // started there (learned): out after the grace
             let mut hp = HoldPush::new(HoldMode::Immediate);
             hp.submitted(SubmitKind::Real, 1, 0);
             hp.client_stats(1_000 * MS, p50, 60, tier);
@@ -4784,8 +4678,8 @@ mod tests {
 
     #[test]
     fn noise_starting_mid_session_steps_at_once_not_after_a_plus_one() {
-        // Busy ordinary content near the ceiling, then noise: the windowed path may trip first
-        // with +1/+2, and its cooldown must not hold the fast path back.
+        // busy ordinary content near the ceiling, then noise: the windowed path may trip first
+        // with +1/+2, and its cooldown must not hold the fast path back
         for (w, h, base_mbps, noise_mbps) in [
             (800u32, 600u32, 3.0, 371.0),
             (800, 600, 20.0, 371.0),
@@ -4822,7 +4716,7 @@ mod tests {
 
     #[test]
     fn big_frames_at_a_low_rate_do_not_step() {
-        // 400 KB frames at 10 fps are 32 Mbps, under the 1080p60 ceiling.
+        // 400 KB frames at 10 fps are 32 Mbps, under the 1080p60 ceiling
         let mut g = QpGovernor::new(15, qp_ceiling_bps(1920, 1080, 60), 60);
         for k in 0..100u64 {
             assert!(g.frame(k * 100_000_000, 400_000).is_none(), "frame {k}");
@@ -4840,7 +4734,7 @@ mod tests {
     #[test]
     fn a_busy_holding_encoder_that_still_helps_stays_immediate() {
         // 8 ms a frame serially at 60 fps: each push costs the encoder 8 ms of a 16.7 ms
-        // interval, but a real frame still comes out well before the next one would release it.
+        // interval, but a real frame still comes out well before the next one would release it
         let mut sim = Sim::new(HoldMode::Immediate, Model::SerialHold { cost_ms: 8 });
         sim.run(&every(16, 60_000), 60_100);
         assert!(sim.transitions.is_empty(), "{:?}", sim.transitions);
@@ -4852,21 +4746,21 @@ mod tests {
     #[test]
     fn a_saturated_holding_encoder_is_suspended_and_real_frames_recover() {
         // 12 ms a frame serially: a real frame and its push need 24 ms of every 16 ms interval,
-        // so each push delays the next real frame (the Intel Mac's 1080p60 under real load).
+        // so each push delays the next real frame (the Intel Mac's 1080p60 under real load)
         let mut sim = Sim::new(HoldMode::Immediate, Model::SerialHold { cost_ms: 12 });
         sim.run(&every(16, 300_000), 300_100);
         let first = sim.transitions.first().expect("suspended");
         assert_eq!(first.2, HoldMode::Suspended);
         assert!(first.0 < 3_000 * MS, "suspended after {} ms", first.0 / MS);
         assert!(sim.hp.guard_stat().is_none() || sim.hp.mode() != HoldMode::Immediate);
-        // Real frames go back to the no-push value: released by the next real frame, one
-        // interval after their submit.
+        // real frames go back to the no-push value: released by the next real frame, one
+        // interval after their submit
         let after = sim.p50_ms(3_000, 300_000);
         assert!(after <= 17.0, "after suspension p50 {after}");
-        // No flapping over five minutes.
+        // no flapping over five minutes
         assert!(sim.transitions.len() <= 6, "{:?}", sim.transitions);
         assert!(sim.hp.suspensions <= 3, "{}", sim.hp.suspensions);
-        // And it no longer pushes every frame.
+        // it no longer pushes every frame
         let late_pushes: usize = sim
             .submits
             .iter()
@@ -4877,9 +4771,9 @@ mod tests {
 
     #[test]
     fn a_suspended_hold_push_still_pushes_the_end_of_a_burst() {
-        // Saturated, bursts of motion with pauses: after the suspension the last frame of each
+        // saturated, bursts of motion with pauses: after the suspension the last frame of each
         // burst is still pushed about an interval after it went in, instead of waiting ~200 ms
-        // for the keepalive.
+        // for the keepalive
         let mut sim = Sim::new(HoldMode::Immediate, Model::SerialHold { cost_ms: 12 });
         let frames = bursts(16, 120, 600, 60_000);
         sim.run(&frames, 60_100);
@@ -4889,7 +4783,7 @@ mod tests {
             .find(|t| t.2 == HoldMode::Suspended)
             .expect("suspended")
             .0;
-        // The last frame of every burst that started while suspended came out within ~30 ms.
+        // the last frame of every burst that started while suspended came out within ~30 ms
         let burst_ends: Vec<u64> = frames
             .windows(2)
             .filter(|w| w[1] - w[0] > 100)
@@ -4898,8 +4792,8 @@ mod tests {
             .collect();
         assert!(!burst_ends.is_empty());
         for end in burst_ends {
-            // The newest real frame submitted at or just after the burst's last offer (it may
-            // have waited for the cap).
+            // the newest real frame submitted at or just after the burst's last offer (it may
+            // have waited for the cap)
             let lat = sim
                 .real_lat_ms
                 .iter()
@@ -4919,7 +4813,7 @@ mod tests {
         assert_eq!(hp.poll(9_999 * MS), None);
         let back = hp.poll(10_000 * MS).expect("back to probing");
         assert_eq!(back.to, HoldMode::Probing);
-        // Next one is 20 s, then 40, ... to the 120 s cap.
+        // next one is 20 s, then 40, ... to the 120 s cap
         hp.mode = HoldMode::Immediate;
         assert!(hp.suspend(20_000 * MS, "t".into()).why.contains("20 s"));
         for _ in 0..5 {
@@ -4927,7 +4821,7 @@ mod tests {
             hp.suspend(0, "t".into());
         }
         assert_eq!(hp.suspend_backoff_ns, SUSPEND_MAX_NS);
-        // Five healthy minutes in immediate mode reset it.
+        // five healthy minutes in immediate mode reset it
         hp.mode = HoldMode::Immediate;
         hp.immediate_since_ns = None;
         hp.guard_emitted(1_000 * MS, MS);
@@ -4970,7 +4864,7 @@ mod tests {
 
     #[test]
     fn the_qp_governor_never_touches_ordinary_content() {
-        // 1080p60 at QP 15: ~10 Mbps average with a 27 Mbps worst second and a 2 MB keyframe.
+        // 1080p60 at QP 15: ~10 Mbps average with a 27 Mbps worst second and a 2 MB keyframe
         let c = qp_ceiling_bps(1920, 1080, 60);
         let mut g = QpGovernor::new(15, c, 60);
         let mut total = 0;
@@ -4990,7 +4884,7 @@ mod tests {
 
     #[test]
     fn noise_settles_under_the_ceiling_quickly_and_stays_then_returns_to_q() {
-        // Incompressible content: 371 Mbps at QP 15 (800x600 measured), halving every 6 QP.
+        // incompressible content: 371 Mbps at QP 15 (800x600 measured), halving every 6 QP
         let c = qp_ceiling_bps(800, 600, 60);
         let noise = |q: u8, _k: u64| -> u64 {
             (371e6 * 2f64.powf(-(q as f64 - 15.0) / 6.0) / 8.0 / 60.0) as u64
@@ -5000,7 +4894,7 @@ mod tests {
         let trace = drive_governor(&mut g, &mut total, 0, 30, 60, &noise);
         let settled = trace.first().expect("engaged").0;
         assert!(settled <= 1_000, "first move at {settled} ms");
-        // Settled under the ceiling within a second, with no oscillation afterwards.
+        // settled under the ceiling within a second, with no oscillation afterwards
         let final_q = g.q();
         let rate_at = |q: u8| 371e6 * 2f64.powf(-(q as f64 - 15.0) / 6.0);
         assert!(rate_at(final_q) <= c as f64, "q {final_q}");
@@ -5010,7 +4904,7 @@ mod tests {
         );
         assert!(trace.len() <= 2, "{trace:?}");
         assert!(final_q <= 51);
-        // The content calms down (ordinary 10 Mbps at q 15): back to q, one step a second.
+        // the content calms down (ordinary 10 Mbps at q 15): back to q, one step a second
         let calm = |q: u8, _k: u64| -> u64 {
             (10e6 * 2f64.powf(-(q as f64 - 15.0) / 6.0) / 8.0 / 60.0) as u64
         };
@@ -5055,7 +4949,7 @@ mod tests {
 
     fn immediate_with_interval(t0_ns: u64) -> HoldPush {
         let mut hp = HoldPush::new(HoldMode::Probing);
-        // A 60 fps cadence for the interval estimate.
+        // a 60 fps cadence for the interval estimate
         for k in 0..30u64 {
             hp.submitted(SubmitKind::Real, k + 1, t0_ns + k * 16_666_667);
         }
@@ -5066,12 +4960,12 @@ mod tests {
     fn a_healthy_client_keeps_immediate_mode() {
         let mut hp = immediate_with_interval(0);
         let mut painted = 0;
-        // Probing for 15 s at 60 fps: baseline 4 ms (window fully non-push after ~8.5 s).
+        // probing for 15 s at 60 fps: baseline 4 ms (window fully non-push after ~8.5 s)
         let none = feed_client(&mut hp, 1, 15, 60, &mut painted, &|_, _| 4.0);
         assert!(none.is_empty(), "{none:?}");
         assert_eq!(hp.client_baseline_us, Some(4_000));
         hp.mode = HoldMode::Immediate;
-        // Pushing, the client keeps up: 4.5 ms.
+        // pushing, the client keeps up: 4.5 ms
         let tr = feed_client(&mut hp, 16, 120, 60, &mut painted, &|_, _| 4.5);
         assert!(tr.is_empty(), "{tr:?}");
         assert_eq!(hp.mode(), HoldMode::Immediate);
@@ -5081,25 +4975,25 @@ mod tests {
     fn a_slow_client_suspends_pushing_within_seconds_and_does_not_flap() {
         let mut hp = immediate_with_interval(0);
         let mut painted = 0;
-        // Baseline 11.7 ms without pushes; 32.7 ms with (measured, client 8 ms slower a frame).
+        // baseline 11.7 ms without pushes; 32.7 ms with (measured, client 8 ms slower a frame)
         let model = |_t: u64, m: HoldMode| if m == HoldMode::Immediate { 32.7 } else { 11.7 };
         feed_client(&mut hp, 1, 15, 60, &mut painted, &model);
         hp.mode = HoldMode::Immediate;
         let tr = feed_client(&mut hp, 16, 300, 60, &mut painted, &model);
         let (t, to) = tr.first().copied().expect("suspended");
         assert_eq!(to, HoldMode::Suspended);
-        // Half a 512-frame window at 120 fps is ~2 s, then three STATS: about 5 s.
+        // half a 512-frame window at 120 fps is ~2 s, then three STATS: about 5 s
         assert!(t - 16 <= 6, "suspended after {} s", t - 16);
-        // After the back-off it only probes (immediate needs a probe this test never passes), so
-        // nothing flaps.
+        // after the back-off it only probes (immediate needs a probe this test never passes), so
+        // nothing flaps
         assert!(tr.len() <= 2, "{tr:?}");
         assert!(hp.mode() != HoldMode::Immediate);
     }
 
     #[test]
     fn immediate_mode_needs_a_reporting_client() {
-        // Before the page's first STATS: a 3 s grace from the encoder's first submit (a session
-        // started in immediate mode must not drop out at its first loop iteration).
+        // before the page's first STATS: a 3 s grace from the encoder's first submit (a session
+        // started in immediate mode must not drop out at its first loop iteration)
         let mut hp = HoldPush::new(HoldMode::Immediate);
         hp.submitted(SubmitKind::Real, 1, 0);
         assert_eq!(hp.poll(2_900 * MS), None);
@@ -5108,7 +5002,7 @@ mod tests {
             hp.poll(3_000 * MS).is_some(),
             "no STATS at all: leaves after the grace"
         );
-        // No STATS at all: never entered, and left 3 s after the last one.
+        // no STATS at all: never entered, and left 3 s after the last one
         let mut hp = immediate_with_interval(0);
         assert!(!hp.client_ok(4_000 * MS));
         assert_eq!(hp.enter_immediate(4_000 * MS, "t".into()), None);
@@ -5116,7 +5010,7 @@ mod tests {
         let mut painted = 0;
         feed_client(&mut hp, 1, 3, 60, &mut painted, &|_, _| 4.0);
         assert!(hp.enter_immediate(4_000 * MS, "t".into()).is_some());
-        // The STATS stop.
+        // the STATS stop
         assert_eq!(hp.poll(5_000 * MS), None);
         let left = hp.poll(7_000 * MS).expect("left");
         assert_eq!(
@@ -5128,8 +5022,8 @@ mod tests {
 
     #[test]
     fn a_slow_client_is_caught_even_with_no_pushes_off_baseline() {
-        // Started in immediate mode (learned, or the start hook): no baseline ever. A client
-        // whose queue grows reads far beyond 1.5 intervals and is suspended; a fast one is not.
+        // started in immediate mode (learned, or the start hook): no baseline ever. A client
+        // whose queue grows reads far beyond 1.5 intervals and is suspended; a fast one is not
         for (p50_ms, expect_suspend) in [(32.7, true), (6.0, false)] {
             let mut hp = immediate_with_interval(0);
             hp.mode = HoldMode::Immediate;
@@ -5151,25 +5045,25 @@ mod tests {
         let c = qp_ceiling_bps(1920, 1080, 60);
         let mut g = QpGovernor::new(15, c, 60);
         let t = |k: u64| k * 16_666_667;
-        // The stress clip's 1.58 MB keyframe, then ordinary 20 KB frames: nothing.
+        // the stress clip's 1.58 MB keyframe, then ordinary 20 KB frames: nothing
         assert!(g.frame(t(0), 1_580_000).is_none());
         for k in 1..60 {
             assert!(g.frame(t(k), 20_000).is_none());
         }
-        // The recording's 441 KB keyframe, same.
+        // the recording's 441 KB keyframe, same
         assert!(g.frame(t(60), 441_000).is_none());
         assert!(g.frame(t(61), 20_000).is_none());
-        // Two big frames then an ordinary one: still nothing.
+        // two big frames then an ordinary one: still nothing
         assert!(g.frame(t(62), 800_000).is_none());
         assert!(g.frame(t(63), 800_000).is_none());
         assert!(g.frame(t(64), 20_000).is_none());
         assert_eq!(g.q(), 15);
-        // Noise at 1080p60: ~850 KB a frame. The third in a row steps at once.
+        // noise at 1080p60: ~850 KB a frame. The third in a row steps at once
         assert!(g.frame(t(65), 850_000).is_none());
         assert!(g.frame(t(66), 850_000).is_none());
         let (q, why) = g.frame(t(67), 850_000).expect("steps at the third frame");
         assert!(q > 15 && why.contains("at once"), "{q} {why}");
-        // And then waits a window before stepping again.
+        // then waits a window before stepping again
         assert!(g.frame(t(68), 850_000).is_none());
         assert!(g.frame(t(69), 850_000).is_none());
         assert!(g.frame(t(70), 850_000).is_none());

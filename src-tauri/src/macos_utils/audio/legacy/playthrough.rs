@@ -43,27 +43,20 @@ pub fn ramp(current: f32, target: f32) -> f32 {
 
 /// Output IO periods of monitor backlog the drift loop steers toward.
 ///
-/// The setpoint *is* the steady-state monitoring latency: the loop's fixed point is that many
-/// frames sitting in the monitor ring, on top of the output device's own IOProc latency. On this
-/// tier the virtual device is the system default output, so every sound the Mac makes goes through
-/// here before reaching the speakers — the fixed 4096 frames this replaces was 85.3 ms at 48 kHz,
-/// well past where video on the host screen visibly leads its own audio and where UI click
-/// feedback feels broken. Three periods is enough to ride out a late callback.
+/// The setpoint is the steady-state monitoring latency, on top of the output device's own IOProc
+/// latency, and on this tier every sound the Mac makes goes through here. A fixed 4096 frames
+/// (85.3 ms at 48 kHz) visibly lagged the host's own video; three periods ride out a late
+/// callback.
 const SETPOINT_PERIODS: usize = 3;
-/// Floor and ceiling on that, in frames. 128 frames is 2.7 ms; the ceiling is the old fixed value,
-/// now only the point past which raising it further is not buying anything.
+/// Floor and ceiling on that, in frames (128 frames is 2.7 ms, 4096 is 85.3 ms).
 const MIN_SETPOINT_FRAMES: usize = 128;
 const MAX_SETPOINT_FRAMES: usize = 4096;
-/// How much headroom one measured underrun buys. Adaptive rather than pessimistic: start low and
-/// only pay for what this machine turns out to need.
+/// Headroom one measured underrun buys: start low and pay only for what this machine needs.
 const UNDERRUN_BUMP_FRAMES: usize = 64;
 
-/// Integrator gain on the resampler ratio, per frame of error per callback.
-///
-/// 25x the value that went with the 4096-frame setpoint, against errors that are now roughly an
-/// order of magnitude smaller: a typical error reaches [`DRIFT_TRIM_LIMIT`] in about two seconds
-/// instead of half a minute, which is what makes a low setpoint reachable rather than merely
-/// declared. The limit itself is unchanged — 0.3% is about five cents of pitch, inaudible.
+/// Integrator gain on the resampler ratio, per frame of error per callback. A typical error
+/// reaches [`DRIFT_TRIM_LIMIT`] in about two seconds, which is what makes a low setpoint
+/// reachable. The limit, 0.3%, is about five cents of pitch: inaudible.
 const DRIFT_GAIN: f64 = 5.0e-8;
 const DRIFT_TRIM_LIMIT: f64 = 0.003;
 
@@ -151,7 +144,7 @@ extern "C-unwind" fn playthrough_ioproc(
             *s = 0.0;
         }
         ctx.underruns.fetch_add(1, Ordering::Relaxed);
-        // Buy a little more headroom, up to the ceiling. Two atomic ops, no allocation, no lock.
+        // buy a little more headroom, up to the ceiling (two atomic ops, no allocation, no lock)
         if bump < MAX_SETPOINT_FRAMES {
             ctx.setpoint_bump
                 .store(bump + UNDERRUN_BUMP_FRAMES, Ordering::Relaxed);
@@ -176,7 +169,7 @@ extern "C-unwind" fn playthrough_ioproc(
         }
     };
 
-    // Reconstruct the destination slices once, not per frame.
+    // build the destination slices once, not per frame
     let mut out_il: &mut [f32] = &mut [];
     let mut out_l: &mut [f32] = &mut [];
     let mut out_r: &mut [f32] = &mut [];
@@ -228,11 +221,9 @@ extern "C-unwind" fn playthrough_ioproc(
         }
     }
 
-    // The interleaved branch zeroes channels 3+ per frame; the non-interleaved one writes only
-    // buffers 0 and 1, and CoreAudio does not promise the buffers handed to an IOProc are zeroed —
-    // many drivers recycle them. On a multichannel non-interleaved output (a USB or Thunderbolt
-    // interface) that would emit stale garbage on channels 3-8 while ScreenExtend is the default
-    // output. One memset per buffer per callback, not per frame.
+    // The non-interleaved branch writes only buffers 0 and 1, and CoreAudio does not promise
+    // zeroed IOProc buffers (many drivers recycle them): a multichannel output would emit stale
+    // garbage on channels 3+. One memset per buffer per callback.
     if !interleaved {
         for b in out_bufs.iter().skip(2) {
             if !b.mData.is_null() {
@@ -327,9 +318,7 @@ impl Playthrough {
     }
 
     /// Times the monitor ring ran dry, and the extra setpoint frames those underruns have bought.
-    ///
-    /// The counter used to be incremented and never read, which made the one signal that says the
-    /// monitoring latency is set too low invisible. The control thread reports it.
+    /// The control thread reports both.
     pub fn underruns(&self) -> (u32, usize) {
         if self.ctx.is_null() {
             return (0, 0);

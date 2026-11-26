@@ -50,23 +50,21 @@ const CODEC_TYPE_H264: u32 = 0x6176_6331;
 
 /// How many encoded access units may wait for the drain thread.
 ///
-/// The channel used to be unbounded, which meant a drain thread that fell behind turned into
-/// latency instead of into a visible drop: every queued frame is one the client will be shown
-/// late. Four is one frame being written, one being read and two of slack.
+/// Bounded so a drain thread that falls behind shows up as a drop, not as latency: every queued
+/// frame is one the client will be shown late. Four is one frame being written, one being read
+/// and two of slack.
 const OUTPUT_CAPACITY: usize = 4;
 
 /// Frames the encoder may hold at once before the loop stops feeding it.
 ///
-/// VideoToolbox has no queue limit of its own, and a comparable product measured ~8 frames
-/// resident when it was overfed — 130 ms at 60 fps, all of it invisible to every timer we have.
-/// The alternative Apple offers, `MaxFrameDelayCount`, is documented as a *blocking* contract on
-/// the calling thread, and that thread is the deadline-scheduled encode loop; counting here bounds
-/// the same thing without ever blocking it.
+/// VideoToolbox has no queue limit of its own: overfed, about 8 frames sit resident (130 ms at
+/// 60 fps), invisible to every timer here. `MaxFrameDelayCount` would bound it, but it is
+/// documented as a blocking contract on the calling thread, which is the deadline-scheduled
+/// encode loop. Counting here bounds the same thing without ever blocking it.
 pub const MAX_FRAMES_IN_FLIGHT: usize = 2;
 
-/// `AverageBitRate` values tried, in order, for constant QP on the low-latency encoder — the
-/// [`RateTier::ClampCeiling`] tier only. Superseded by [`RateTier::BaseFrameQp`] wherever the
-/// session supports per-frame QP (measured: M1, macOS 26), which needs no ceiling at all.
+/// `AverageBitRate` values tried, in order, for constant QP on the low-latency encoder: the
+/// [`RateTier::ClampCeiling`] tier only.
 ///
 /// Higher is not safer: the value decides the H.264 level the SPS declares, and 1 Gbps declares
 /// 6.2, which many client decoders refuse (300 Mbps declares 5.1). Lower is not safer either: 200
@@ -116,13 +114,8 @@ fn qp_bps_hook() -> Option<String> {
 }
 
 /// The per-frame stamps that ride through VideoToolbox as `sourceFrameRefCon` and come back on
-/// the output callback.
-///
-/// This used to be a `VecDeque` behind a `std::sync::Mutex` shared between the real-time encode
-/// thread and the drain thread, which is a priority inversion waiting to happen and also assumes
-/// submit order equals emit order. VideoToolbox carries an opaque pointer per frame for exactly
-/// this purpose, so the stamps travel with their own frame and neither the lock nor the ordering
-/// assumption is needed.
+/// the output callback. Each frame carries its own, so the real-time encode thread and the drain
+/// thread share no lock and nothing assumes submit order equals emit order.
 pub struct FrameTag {
     pub capture: Instant,
     pub timing: FrameTiming,
@@ -132,7 +125,7 @@ pub struct FrameTag {
 
 pub struct CompressedSample {
     sample: Option<CFRetained<CMSampleBuffer>>,
-    /// `None` only if VideoToolbox emitted a frame we never tagged, which it should not.
+    /// `None` only if VideoToolbox emitted a frame that was never tagged, which it should not.
     pub tag: Option<FrameTag>,
     /// The output callback's `OSStatus`. Non-zero means the frame failed inside the encoder.
     pub status: i32,
@@ -229,7 +222,7 @@ struct SimHold {
 
 /// `SE_VT_SIM_HOLD_COST_MS` (test hook, with `SE_VT_SIM_HOLD=1`): a SERIALISED per-frame encode
 /// cost. Frame k finishes `cost` after the later of its own submit and the previous frame's
-/// finish, and comes out at the later of that and its release (the next submit) — so a push
+/// finish, and comes out at the later of that and its release (the next submit), so a push
 /// delays the next real frame, as on a GPU that cannot do twice the frame rate. Takes precedence
 /// over `SE_VT_SIM_HOLD_DELAY_MS`.
 fn sim_hold_cost() -> std::time::Duration {
@@ -353,7 +346,7 @@ impl OutputCtx {
     }
 
     /// The bookkeeping every emission gets, then the hand-off. Called from the output callback,
-    /// or — under the hold simulation — when the frame is released.
+    /// or, under the hold simulation, when the frame is released.
     fn complete(&self, p: Pending) {
         let n = self.completed.fetch_add(1, Ordering::Relaxed) + 1;
         let slot = (n as usize) % EMIT_LOG_LEN;
@@ -368,7 +361,7 @@ impl OutputCtx {
         if forced_keyframe_lost(p.forced, p.status, p.info_flags, has_sample) {
             self.forced_dropped.fetch_add(1, Ordering::Relaxed);
         }
-        // `fetch_update` is `try_update` from Rust 1.100; kept for older toolchains.
+        // `fetch_update` is `try_update` from Rust 1.100; kept for older toolchains
         #[allow(deprecated)]
         let _ = self
             .in_flight
@@ -393,7 +386,7 @@ impl OutputCtx {
             return;
         };
         let mut g = sim.lock_recover();
-        // A held frame older than this one: a later frame was certainly submitted.
+        // a held frame older than this one: a later frame was certainly submitted
         if g.held.as_ref().is_some_and(|h| h.seq < p.seq) {
             if let Some(h) = g.held.take() {
                 let at = Self::submit_time(&g, h.seq + 1);
@@ -450,7 +443,6 @@ impl OutputCtx {
         }
     }
 
-    /// Teardown: the simulation thread stops.
     fn sim_stop(&self) {
         if let Some(sim) = &self.sim {
             sim.lock_recover().stop = true;
@@ -458,8 +450,8 @@ impl OutputCtx {
         }
     }
 
-    /// Frame `p` was released (the next frame went in at `released_at`): out now, or — with a
-    /// simulated encode time — at `max(real output, released_at + delay)`, never before an
+    /// Frame `p` was released (the next frame went in at `released_at`): out now, or, with a
+    /// simulated encode time, at `max(real output, released_at + delay)`, never before an
     /// earlier frame.
     fn release(&self, g: &mut SimHold, mut p: Pending, released_at: Instant) {
         let delay = sim_hold_delay();
@@ -519,10 +511,9 @@ pub struct Encoder {
     /// Frames accepted by `VTCompressionSessionEncodeFrame` (each gets exactly one callback).
     submits: u64,
     emit_log: Arc<EmitLog>,
-    /// The session was created with the *resolved* `EnableLowLatencyRateControl` specification
-    /// key. Never a literal string: 10.15 has no such symbol, silently ignores the literal key and
-    /// hands back the standard encoder, which is how the old ladder reported `low_latency=true`
-    /// on `h264.gva`.
+    /// The session was created with the resolved `EnableLowLatencyRateControl` specification
+    /// key. Never a literal string: 10.15 has no such symbol, silently ignores the literal key
+    /// and hands back the standard encoder.
     low_latency: bool,
     /// `kVTVideoEncoderSpecification_EnableLowLatencyRateControl` resolved in this process.
     low_latency_key: bool,
@@ -539,13 +530,13 @@ pub struct Encoder {
     flush_each_frame: bool,
     identity: EncoderIdentity,
     supports_ltr: bool,
-    /// Whether *this* session is on software because the user asked, which is the difference
-    /// between an expected outcome and the loud warning below it.
+    /// Whether this session is on software because the user asked: an expected outcome then, a
+    /// loud warning otherwise.
     software_requested: bool,
     /// Set only when the session was built from a [`Recipe`].
     recipe: Option<RecipeState>,
     /// Per-frame options changed mid-session by [`Encoder::set_frame_opt`]. `None` until then,
-    /// so the shipped path builds its frame dictionaries exactly as it always has.
+    /// so the shipped path builds its frame dictionaries unchanged.
     frame_override: Option<FrameOverride>,
 }
 
@@ -610,7 +601,7 @@ pub struct SubmitStatus {
 }
 
 /// `SE_VT_RECIPE=<file.json>`: put every production session on one recipe. Read once, and only
-/// with `SE_TEST_HOOKS=1` beside it — a recipe replaces the whole shipped configuration, so a
+/// with `SE_TEST_HOOKS=1` beside it: a recipe replaces the whole shipped configuration, so a
 /// stray variable in a user's environment must not be able to do that.
 fn env_recipe() -> Option<Arc<Recipe>> {
     static RECIPE: OnceLock<Option<Arc<Recipe>>> = OnceLock::new();
@@ -673,16 +664,12 @@ impl Encoder {
         OutputCtx::start_sim_thread(&ctx);
         let refcon = Arc::into_raw(ctx) as *mut OutputCtx;
 
-        // The rungs, best first. The low-latency rung exists only when the specification key's
-        // SYMBOL resolves (`low_latency_key_resolves`): that is the capability probe. A literal
-        // "EnableLowLatencyRateControl" string is not one — 10.15 has no such key, ignores it
-        // without an error and creates the standard encoder, so the rung "succeeded" there and
-        // the session was configured as a low-latency one it was not.
+        // Rungs, best first. The low-latency rung exists only when the specification key's SYMBOL
+        // resolves (`low_latency_key_resolves`): 10.15 has no such key, ignores a literal
+        // "EnableLowLatencyRateControl" string without an error and creates the standard encoder.
         //
-        // When the user has asked for software encode there is no ladder: one rung that forbids
-        // the hardware encoder outright. Falling back to hardware here would be the setting
-        // silently refusing to do the one thing it says on the tin, so a failure to create that
-        // session is reported as a failure rather than worked around.
+        // Software encode is one rung that forbids the hardware encoder. Falling back to hardware
+        // would silently ignore the setting, so a failed create is reported as a failure.
         let low_latency_key = low_latency_key_resolves();
         let ladder: Vec<(bool, HwPolicy)> = if cfg.software_encode {
             vec![(false, HwPolicy::Forbid)]
@@ -866,8 +853,8 @@ impl Encoder {
             frame_index: 0,
             submits: 0,
             emit_log: Arc::clone(&emit_log),
-            // Only when the key actually went into the specification: a recipe naming it on an OS
-            // where the symbol does not resolve builds a standard session (`missing_symbol`).
+            // only when the key went into the specification: a recipe naming it on an OS where
+            // the symbol does not resolve builds a standard session (`missing_symbol`)
             low_latency: recipe.spec_flag("EnableLowLatencyRateControl")
                 && spec_report.iter().any(|r| {
                     r.key == "EnableLowLatencyRateControl"
@@ -987,8 +974,8 @@ impl Encoder {
     fn configure(&mut self, cfg: &EncoderConfig) -> Result<()> {
         let advertised = supported_properties(cfg);
         let mut report = PropReport::default();
-        // Identity first: whether this really is a low-latency session, the profile, the rate
-        // tier and the per-family extras are all chosen from it.
+        // identity first: the low-latency check, the profile, the rate tier and the per-family
+        // extras are all chosen from it
         self.read_identity();
         self.confirm_low_latency();
         {
@@ -1060,9 +1047,8 @@ impl Encoder {
                 &advertised,
             );
 
-            // Keyframes are for joining clients and for loss recovery, both of which arrive as an
-            // explicit request. A periodic IDR on top of that is a bitrate spike every interval
-            // that buys nothing: 10 s was frequent enough to be visible on a constrained link.
+            // Keyframes come on request (a joining client, loss recovery). A periodic IDR on top
+            // is a bitrate spike that buys nothing: every 10 s was visible on a constrained link.
             let n = CFNumber::new_i32((cfg.fps as i32).saturating_mul(600).max(1));
             report.note(
                 "MaxKeyFrameInterval",
@@ -1084,11 +1070,10 @@ impl Encoder {
                 &advertised,
             );
 
-            // No `MaxFrameDelayCount`. Apple defines it as a hard contract on the *calling*
-            // thread — "before the call to encode frame N returns, frame N-M must have been
-            // emitted" — so the value that looks like the lowest latency (1) is the one that
-            // blocks the deadline-scheduled encode loop on the encoder. `MAX_FRAMES_IN_FLIGHT`
-            // bounds the same queue from outside without ever blocking.
+            // No `MaxFrameDelayCount`: Apple defines it as a contract on the calling thread
+            // ("before the call to encode frame N returns, frame N-M must have been emitted"), so
+            // 1 would block the deadline-scheduled encode loop on the encoder.
+            // `MAX_FRAMES_IN_FLIGHT` bounds the same queue from outside without blocking.
             report.note(
                 "MaximizePowerEfficiency",
                 set_optional_bool(s, "MaximizePowerEfficiency", false),
@@ -1102,11 +1087,9 @@ impl Encoder {
             report.note("BaseLayerFrameRate", PropOutcome::NotRequested, &advertised);
             report.note("ConstantBitRate", PropOutcome::NotRequested, &advertised);
 
-            // Long-term reference frames would let a lost frame be repaired against an
-            // acknowledged older one instead of a full IDR. The encoder half is one property;
-            // the other half is a client that acknowledges tokens over the control channel,
-            // which belongs to the transport. Probe and report so the transport knows whether
-            // the machine can do it at all.
+            // Long-term references would repair a loss against an acknowledged older frame
+            // instead of an IDR, but need a client that acknowledges tokens. Only probed and
+            // reported, so the transport knows whether this machine can do it.
             self.supports_ltr = advertised.contains("EnableLTR");
             report.note("EnableLTR", PropOutcome::NotRequested, &advertised);
 
@@ -1129,7 +1112,7 @@ impl Encoder {
     /// Constant quality (`cfg.qp = Some(q)`) takes the first tier the session supports, in the
     /// order of [`select_rate_tier`]; every capability is probed on this session, never inferred
     /// from the OS version. Adaptive mode (`cfg.qp = None`) keeps the loss-based controller's
-    /// `AverageBitRate`, with the QP floor and ceiling only on a low-latency session — on the
+    /// `AverageBitRate`, with the QP floor and ceiling only on a low-latency session: on the
     /// standard encoders QP limits are rejected or, on `ave.avc`, stall `EncodeFrame`.
     fn configure_rate_control(
         &mut self,
@@ -1139,8 +1122,7 @@ impl Encoder {
     ) {
         let mut caps = Capabilities {
             low_latency_key_resolved: self.low_latency_key,
-            // What was asked for; `select_rate_tier` confirms it against the read-back exactly as
-            // `confirm_low_latency` did.
+            // what was asked for: `select_rate_tier` confirms it against the read-back
             low_latency_session: self.low_latency_requested,
             supports_base_frame_qp: self.identity.supports_base_frame_qp,
             frame_qp_key_resolved: vt_recipe::resolve_key(KeyKind::FrameOpt, "BaseFrameQP").is_ok(),
@@ -1159,8 +1141,8 @@ impl Encoder {
         let q = qp.clamp(1, 51);
         let mut tier = select_rate_tier(&caps, true);
         if tier == RateTier::LowLatencyBitrate {
-            // A low-latency session without per-frame QP: the QP clamp is the next best thing,
-            // and whether it holds is only known by setting it and reading it back.
+            // no per-frame QP: the QP clamp is the next best thing, and whether it holds is only
+            // known by setting it and reading it back
             let (max_qp, min_qp) = self.try_qp_clamp(q, report, advertised);
             caps.max_qp = max_qp;
             caps.min_qp = min_qp;
@@ -1171,9 +1153,8 @@ impl Encoder {
             match self.set_constant_qp_ceiling(report, advertised) {
                 Ceiling::Accepted(_) | Ceiling::ForcedUncapped => {}
                 Ceiling::NoneAccepted => {
-                    // A clamp with no ceiling is the configuration measured to drop 86 % of a
-                    // window drag: the rate controller keeps running with no budget to spend. The
-                    // clamp comes off again and the session takes the next tier down.
+                    // a clamp with no ceiling dropped 86 % of a window drag (the rate controller
+                    // runs with no budget), so it comes off and the session takes the next tier
                     let s = self.vt_session();
                     clear_optional(s, "MaxAllowedFrameQP");
                     clear_optional(s, "MinAllowedFrameQP");
@@ -1188,8 +1169,8 @@ impl Encoder {
         }
         match tier {
             RateTier::BaseFrameQp => {
-                // No `AverageBitRate`, no QP limits, no `Quality`: the per-frame QP is the whole
-                // of the rate control, and with no budget the encoder has nothing to drop for.
+                // no `AverageBitRate`, no QP limits, no `Quality`: the per-frame QP is the whole
+                // of the rate control, and with no budget the encoder has nothing to drop for
                 let r = self.set_frame_opt("BaseFrameQP", Some(Val::Int(q as i64)));
                 if r.as_ref().map(|r| r.outcome) != Some(vt_recipe::Outcome::Included) {
                     teprintln!("[vt] BaseFrameQP was not put in the frame options: {r:?}");
@@ -1241,10 +1222,8 @@ impl Encoder {
             set_named(s, unsafe { kVTCompressionPropertyKey_AverageBitRate }, &n),
             advertised,
         );
-        // No `DataRateLimits`. It is a hard cap enforced by stuffing or by dropping quality
-        // inside a short window, layered on top of a target the loss-based controller is already
-        // steering from the network's own signal. Two controllers on one knob, and the fast one
-        // could not see what the slow one had done.
+        // no `DataRateLimits`: a hard cap enforced inside a short window, on top of a target the
+        // loss-based controller already steers from the network, is two controllers on one knob
         if self.low_latency {
             let n = CFNumber::new_i32(45);
             report.note(
@@ -1452,8 +1431,8 @@ impl Encoder {
             )
         };
         if status != 0 {
-            // A rejected frame never reaches the output callback, so its tag and its slot come
-            // back here or they leak.
+            // a rejected frame never reaches the output callback, so its tag and its slot come
+            // back here or they leak
             self.in_flight.fetch_sub(1, Ordering::AcqRel);
             drop(unsafe { Box::from_raw(source_refcon.cast::<SubmittedTag>()) });
             return SubmitStatus {
@@ -1500,7 +1479,7 @@ impl Encoder {
     /// The host-clock time (`streamer::audio::host_now_ns`) of emission number `n` (1-based,
     /// counting every callback this encoder made), if the slot still holds it. VideoToolbox makes
     /// exactly one output callback per accepted frame, in decode order, and with
-    /// `AllowFrameReordering = false` that is submit order — so emission `n` is submit `n`.
+    /// `AllowFrameReordering = false` that is submit order, so emission `n` is submit `n`.
     pub fn emit_time_ns(&self, n: u64) -> Option<u64> {
         let slot = (n as usize) % EMIT_LOG_LEN;
         (self.emit_log.seq[slot].load(Ordering::Acquire) == n)
@@ -1576,7 +1555,7 @@ impl Encoder {
 
     /// Retarget the loss-based controller (adaptive mode only).
     ///
-    /// Every constant-quality tier ignores it and says so with `IgnoredConstantQp` — including
+    /// Every constant-quality tier ignores it and says so with `IgnoredConstantQp`, including
     /// [`RateTier::LowLatencyBitrate`] and [`RateTier::StandardBitrate`], which do set an
     /// `AverageBitRate`: there it is derived from the quality slider
     /// ([`constant_quality_bitrate`]), so the slider, not the network, owns the rate.
@@ -1615,19 +1594,16 @@ impl Encoder {
     }
 
     /// Whether this session's encoder advertises long-term reference frames. The transport needs
-    /// it to decide between a PLI→IDR and a token-acknowledged refresh.
+    /// it to decide between a PLI -> IDR and a token-acknowledged refresh.
     pub fn supports_ltr(&self) -> bool {
         self.supports_ltr
     }
 
-    /// Keep `low_latency` only if VideoToolbox's answer agrees.
+    /// Keep `low_latency` only if VideoToolbox's answer agrees ([`low_latency_confirmed`]).
     ///
-    /// "Created with the resolved key" is what we *asked* for. An OS that resolves the symbol but
-    /// does not honour it for this size or this machine hands back a standard encoder without an
-    /// error — the same failure the literal-string ladder had on 10.15. So the session counts as
-    /// low-latency only when its `EncoderID` is the low-latency family (`rtvc`) or it reads
-    /// `SupportsBaseFrameQP` true; otherwise it is a standard session everywhere (profile, rate
-    /// tier, adaptive configuration). Reads `SupportsBaseFrameQP` once, for the tier as well.
+    /// An OS that resolves the key but does not honour it for this size or this machine hands
+    /// back a standard encoder without an error. Such a session is standard everywhere (profile,
+    /// rate tier, adaptive configuration). Reads `SupportsBaseFrameQP` once, for the tier as well.
     fn confirm_low_latency(&mut self) {
         let bfq = read_bool_prop(self.vt_session(), "SupportsBaseFrameQP");
         self.identity.supports_base_frame_qp = bfq;
@@ -1649,11 +1625,11 @@ impl Encoder {
 
     /// Ask the session what it actually became.
     ///
-    /// VideoToolbox picks the encoder implementation for us and the choice is worth more than
-    /// any property: forum 748918 measured one-in/one-out on `…h264.gva` against a 4-to-16-frame
-    /// hold on `…h264.ave.avc` under an identical configuration. `EncoderID` (10.13) names it,
+    /// VideoToolbox picks the encoder implementation, and the choice is worth more than any
+    /// property: forum 748918 measured one-in/one-out on `h264.gva` against a 4-to-16-frame hold
+    /// on `h264.ave.avc` under an identical configuration. `EncoderID` (10.13) names it,
     /// `UsingHardwareAcceleratedVideoEncoder` (10.9) says whether it is hardware at all, and
-    /// `UsingGPURegistryID` (10.15) says which GPU it landed on — NULL there means *either* an
+    /// `UsingGPURegistryID` (10.15) says which GPU it landed on. NULL there means either an
     /// integrated-GPU encoder or software, so it can never stand in for the hardware flag.
     fn read_identity(&mut self) {
         let s = self.vt_session();
@@ -1729,10 +1705,6 @@ pub struct EncoderIdentity {
     pub supports_base_frame_qp: Option<bool>,
 }
 
-// ---------------------------------------------------------------------------
-// Rate-control tiers: chosen per session from what the session can do.
-// ---------------------------------------------------------------------------
-
 /// What rides through VideoToolbox as `sourceFrameRefCon`: the caller's stamps plus whether the
 /// frame carried `ForceKeyFrame`, so the output callback can tell a lost keyframe from a lost
 /// frame.
@@ -1749,7 +1721,7 @@ fn is_rate_drop_raw(status: i32, info_flags: u32, has_sample: bool) -> bool {
 }
 
 /// A frame submitted with `ForceKeyFrame` was dropped by rate control: the IDR never happened and
-/// must be asked for again. An ordinary dropped frame needs nothing — it never became a
+/// must be asked for again. An ordinary dropped frame needs nothing: it never became a
 /// reference, so the chain is intact. (WebKit re-requests in exactly this case.)
 fn forced_keyframe_lost(forced: bool, status: i32, info_flags: u32, has_sample: bool) -> bool {
     forced && is_rate_drop_raw(status, info_flags, has_sample)
@@ -1829,7 +1801,7 @@ pub struct Capabilities {
     /// The session was created with that resolved key. Only counts as low-latency when the
     /// read-back confirms it ([`low_latency_confirmed`]).
     pub low_latency_session: bool,
-    /// `SupportsBaseFrameQP` read back from the session (`None`: no symbol, or the read failed —
+    /// `SupportsBaseFrameQP` read back from the session (`None`: no symbol, or the read failed:
     /// `ave.avc` answers -12900).
     pub supports_base_frame_qp: Option<bool>,
     /// `kVTEncodeFrameOptionKey_BaseFrameQP` resolves by `dlsym`.
@@ -1883,19 +1855,19 @@ pub fn low_latency_confirmed(
 
 /// `AverageBitRate` standing in for constant quality `q` on an encoder with no QP control.
 ///
-/// `base = clamp(w·h·fps / 10, 6 Mbps, 30 Mbps)` (the adaptive default, `live_encoder_config`),
-/// then `base · 1.6 · 2^((15 − q) / 6)` — the usual "6 QP steps double the bits" — clamped to
-/// 2 … 62.5 Mbps. **The constants are a first fit, to be refined from data**: on the 2012 Intel
-/// MacBook Pro (`h264.gva`, 10.15.8) 20 Mbps gave 47.6 dB luma PSNR on the synthetic stress clip,
-/// the picture quality the M1 reaches at QP 15; 1080p60 at q = 15 lands at 19.9 Mbps here.
+/// `base = clamp(w*h*fps / 10, 6 Mbps, 30 Mbps)` (the adaptive default, `live_encoder_config`),
+/// then `base * 1.6 * 2^((15 - q) / 6)` (6 QP steps double the bits), clamped to 2..62.5 Mbps.
+/// The constants are a first fit: on `h264.gva` (2012 Intel, 10.15.8) 20 Mbps gave 47.6 dB luma
+/// PSNR on the synthetic stress clip, the picture quality the M1 reaches at QP 15. 1080p60 at
+/// q = 15 lands at 19.9 Mbps here.
 pub fn constant_quality_bitrate(width: u32, height: u32, fps: u32, q: u8) -> u32 {
     let base = ((width as u64 * height as u64 * fps as u64) / 10).clamp(6_000_000, 30_000_000);
     let scale = 1.6 * 2f64.powf((15.0 - q.clamp(1, 51) as f64) / 6.0);
     (base as f64 * scale).clamp(2_000_000.0, 62_500_000.0) as u32
 }
 
-/// `EncoderID` without the common prefix: `com.apple.videotoolbox.videoencoder.h264.rtvc` →
-/// `h264.rtvc`. `unknown` when it was not readable.
+/// `EncoderID` without the common prefix: `com.apple.videotoolbox.videoencoder.h264.rtvc` is
+/// reported as `h264.rtvc`. `unknown` when it was not readable.
 pub fn short_encoder_id(id: Option<&str>) -> &str {
     match id {
         Some(id) => id
@@ -1956,11 +1928,11 @@ fn describe_rate_tier(tier: RateTier, c: &Capabilities, q: Option<u8>, bps: Opti
 /// The encoder families the per-family extras table is keyed by.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EncoderFamily {
-    /// `…h264.rtvc`, the low-latency encoder (Apple silicon, recent Intel).
+    /// `h264.rtvc`, the low-latency encoder (Apple silicon, recent Intel).
     Rtvc,
-    /// `…ave.avc` and siblings, Apple silicon's standard hardware encoder.
+    /// `ave.avc` and siblings, Apple silicon's standard hardware encoder.
     Ave,
-    /// `…h264.gva`, Intel Quick Sync.
+    /// `h264.gva`, Intel Quick Sync.
     Gva,
     Software,
     Other,
@@ -2028,7 +2000,7 @@ pub struct FamilyExtras {
     pub flush_each_frame: bool,
 }
 
-/// Per-family extras. **Ships empty**: to be filled from a quiet-machine latency round.
+/// Per-family extras. **Ships empty**: an entry has to be measured on that exact family first.
 /// `SE_VT_RECIPE` still overrides everything.
 pub const FAMILY_EXTRAS: &[FamilyExtras] = &[];
 
@@ -2056,7 +2028,6 @@ fn read_bool_prop(session: &VTSession, short_key: &str) -> Option<bool> {
     }
 }
 
-/// An integer compression property by short name.
 fn read_i64_prop(session: &VTSession, short_key: &str) -> Option<i64> {
     let key = vt_optional_cfstring(&format!("kVTCompressionPropertyKey_{short_key}"))?;
     copy_i64(session, key)
@@ -2082,9 +2053,9 @@ fn clamp_probe(session: &VTSession, short_key: &str, outcome: PropOutcome, q: u8
     }
 }
 
-/// Take a QP limit off again: back to its default (NULL), or — where the encoder refuses NULL, as
-/// `h264.rtvc` does (-50 / -12902, measured on M1 / macOS 26) — to the widest value, 51 for the
-/// ceiling and 1 for the floor, read back. Raise the ceiling before lowering the floor.
+/// Take a QP limit off again: back to its default (NULL), or, where the encoder refuses NULL as
+/// `h264.rtvc` does (-50 / -12902 on M1 / macOS 26), to the widest value, 51 for the ceiling and
+/// 1 for the floor, read back. Raise the ceiling before lowering the floor.
 fn clear_optional(session: &VTSession, short_key: &str) {
     let Some(k) = vt_optional_cfstring(&format!("kVTCompressionPropertyKey_{short_key}")) else {
         return;
@@ -2106,7 +2077,7 @@ fn clear_optional(session: &VTSession, short_key: &str) {
     if held {
         tprintln!("{line}");
     } else {
-        teprintln!("{line} — the limit may still be in force");
+        teprintln!("{line}. The limit may still be in force");
     }
 }
 
@@ -2145,15 +2116,11 @@ pub fn encoder_backend_detail() -> String {
     s
 }
 
-// ---------------------------------------------------------------------------
-// Asking VideoToolbox what it can do, instead of asking `sw_vers` what year it is.
-// ---------------------------------------------------------------------------
-
 /// What `VTCopyVideoEncoderList` says this Mac has, enumerated and logged once.
 ///
 /// The hardware encoder is a machine-wide resource with a per-encoder instance limit, so "why did
-/// my session land on software" is usually answered by this list plus the identity read back after
-/// creation — and neither was ever printed.
+/// my session land on software" is usually answered by this list plus the identity read back
+/// after creation.
 #[derive(Default)]
 struct EncoderCatalog {
     has_hardware: bool,
@@ -2188,8 +2155,7 @@ fn encoder_catalog() -> &'static EncoderCatalog {
             found += 1;
             let hardware = key_hw.and_then(|k| dict_bool(entry, k));
             // `InstanceLimit` is a CFBoolean, not a count: present and true means "this encoder is
-            // a scarce resource which may potentially be unavailable". That is the documented
-            // mechanism behind "it only works when I quit everything else".
+            // a scarce resource which may potentially be unavailable"
             let capped = key_limit.and_then(|k| dict_bool(entry, k)).unwrap_or(false);
             catalog.has_hardware |= hardware.unwrap_or(false);
             catalog.instance_limited |= capped;
@@ -2214,11 +2180,10 @@ fn encoder_catalog() -> &'static EncoderCatalog {
     })
 }
 
-/// The encoder tier this Mac *has*, answered without creating a session.
-///
-/// `CompatibilityReport` is built before any device joins, so this is the honest answer there. The
-/// tier a given session actually got is separate, read back per session and reported through the
-/// telemetry `encoder` slot, because a busy hardware encoder makes the two differ.
+/// The encoder tier this Mac *has*, answered without creating a session: `CompatibilityReport`
+/// is built before any device joins. The tier a session actually got is read back per session
+/// and reported through the telemetry `encoder` slot, because a busy hardware encoder makes the
+/// two differ.
 pub fn probe_encoder_backend() -> &'static str {
     if encoder_catalog().has_hardware {
         "videotoolbox-hardware"
@@ -2241,10 +2206,9 @@ fn video_encoder_list() -> Option<CFRetained<CFArray>> {
 
 /// The property keys this encoder advertises for this exact frame size.
 ///
-/// `VTCopySupportedPropertyDictionaryForEncoder` has existed since 10.13 and answers directly what
-/// the code used to infer from the OS version — and inference was wrong in both directions, since
-/// the property set depends on the encoder VideoToolbox picks, which depends on the size and the
-/// machine, not on the year.
+/// `VTCopySupportedPropertyDictionaryForEncoder` (10.13+) answers it directly. The property set
+/// depends on the encoder VideoToolbox picks, which depends on the size and the machine, not on
+/// the OS version.
 fn supported_properties(cfg: &EncoderConfig) -> HashSet<String> {
     type CopySupportedFn = unsafe extern "C" fn(
         i32,
@@ -2305,15 +2269,12 @@ enum PropOutcome {
     Set,
     Rejected(i32),
     MissingSymbol,
-    /// Deliberately not set. The report still names it, so the log answers "was this tried?"
-    /// rather than leaving the reader to grep the source.
+    /// Deliberately not set. The report still names it, so the log answers "was this tried?".
     NotRequested,
 }
 
-/// One line per session saying what each latency-relevant property actually did.
-///
-/// Every optional property used to be set through a helper whose `bool` return was discarded, so
-/// a key whose symbol did not resolve on this OS was indistinguishable from one that applied.
+/// One line per session saying what each latency-relevant property actually did, so a key whose
+/// symbol did not resolve on this OS is not mistaken for one that applied.
 #[derive(Default)]
 struct PropReport {
     entries: Vec<(&'static str, PropOutcome, bool)>,
@@ -2375,8 +2336,7 @@ fn dict_value<'a>(dict: &'a CFDictionary, key: &CFString) -> Option<&'a CFType> 
 
 /// A dictionary's keys, for the ones that are CFStrings.
 ///
-/// Turns VideoToolbox's supported-property dictionary into something a membership test can run
-/// against once per session rather than a CF call per property.
+/// Read once per session, so a membership test replaces a CF call per property.
 fn dictionary_keys(dict: &CFDictionary) -> Vec<String> {
     let count = dict.count();
     if count <= 0 {
@@ -2445,8 +2405,8 @@ unsafe extern "C-unwind" fn output_callback(
             sample.is_null()
         );
     }
-    // Reclaim the per-frame stamps first: they were boxed in `submit` and this is the only place
-    // that frees them, whatever else the callback decides to do.
+    // reclaim the per-frame stamps first: they were boxed in `submit` and this is the only
+    // place that frees them
     let submitted = NonNull::new(src_frame_refcon.cast::<SubmittedTag>())
         .map(|p| *unsafe { Box::from_raw(p.as_ptr()) });
     if refcon.is_null() {
@@ -2560,15 +2520,15 @@ fn sample_to_annexb_into(sample: &CMSampleBuffer, out: &mut Vec<u8>) -> bool {
 
 /// What the session specification should say about the hardware encoder.
 ///
-/// Three states, not two, because "prefer hardware" and "refuse hardware" are different requests
-/// and VideoToolbox spells them with different keys. The middle rung exists so a machine whose
-/// hardware encoder is busy still gets a session; the last one exists because the user asked.
+/// Three states, not two: "prefer hardware" and "refuse hardware" are different requests and
+/// VideoToolbox spells them with different keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HwPolicy {
     /// `RequireHardwareAcceleratedVideoEncoder` - fail the create rather than land quietly on
     /// software. This is what makes the fallback a logged decision instead of an invisible one.
     Require,
-    /// `EnableHardwareAcceleratedVideoEncoder = true` - take hardware if any is free.
+    /// `EnableHardwareAcceleratedVideoEncoder = true` - take hardware if any is free, so a
+    /// machine whose hardware encoder is busy still gets a session.
     Enable,
     /// `EnableHardwareAcceleratedVideoEncoder = false` - the user asked for software encode.
     Forbid,
@@ -2585,7 +2545,7 @@ fn build_encoder_spec(
         unsafe { kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder }
     };
     // The resolved constant, never a literal string (see `low_latency_key_resolves`). A missing
-    // symbol — or `SE_VT_DENY spec:EnableLowLatencyRateControl` — makes the rung not exist.
+    // symbol (or `SE_VT_DENY spec:EnableLowLatencyRateControl`) makes the rung not exist.
     let ll_key = if low_latency {
         match vt_recipe::resolve_key(KeyKind::Spec, "EnableLowLatencyRateControl") {
             Ok((k, _)) => Some(k),
@@ -2606,7 +2566,7 @@ fn build_encoder_spec(
         },
     );
     // `Preferred`, never `Required`: the header says Required silently overrides Preferred and
-    // would defeat the fallback ladder on a machine whose chosen GPU has no encoder.
+    // would defeat the fallback ladder on a machine whose chosen GPU has no encoder
     let gpu_key =
         vt_optional_cfstring("kVTVideoEncoderSpecification_PreferredEncoderGPURegistryID");
     let gpu_num = gpu_registry_id.map(|id| CFNumber::new_i64(id as i64));
@@ -2830,13 +2790,9 @@ mod tests {
         None
     }
 
-    // -----------------------------------------------------------------------
-    // A minimal SPS reader.
-    //
-    // `AllowFrameReordering = false` is a request; `max_num_reorder_frames` in the SPS VUI is
-    // what a decoder actually obeys, and a non-zero value there costs the client that many frames
-    // of output delay no matter how fast the encoder is. Only the bitstream can answer it.
-    // -----------------------------------------------------------------------
+    // A minimal SPS reader. `AllowFrameReordering = false` is a request; `max_num_reorder_frames`
+    // in the SPS VUI is what a decoder obeys, and a non-zero value there costs the client that
+    // many frames of output delay however fast the encoder is. Only the bitstream can answer it.
 
     struct BitReader {
         data: Vec<u8>,
@@ -3108,16 +3064,10 @@ mod tests {
             }
         }
 
-        // Per-submit timing, so this test produces a number as well as a verdict. Until now the
-        // only encode timing in the repo came from the Windows x264 test, which is why the CI
-        // perf gate had no macOS row at all — not a platform judgement, a data problem.
-        // `scripts/perf-gate.mjs` parses the `vt_encode_p95=<n>us` printed below as
-        // `vt_p95_encode_us`.
-        //
-        // `submit` hands the frame to the compression session and returns; the encode itself is
-        // asynchronous, which is exactly what makes this the right thing to watch. It is the
-        // cost the capture thread pays per frame, and a regression in it stalls capture whatever
-        // the encoder does afterwards. End-to-end latency is `pipeline.rs`'s `end_to_end_latency`.
+        // Per-submit timing: `scripts/perf-gate.mjs` parses the `vt_encode_p95=<n>us` printed
+        // below as `vt_p95_encode_us`. `submit` returns before the asynchronous encode, so this is
+        // the cost the capture thread pays per frame, and a regression in it stalls capture.
+        // End-to-end latency is `pipeline.rs`'s `end_to_end_latency`.
         let mut submit_us: Vec<u128> = Vec::with_capacity(60);
         let started = std::time::Instant::now();
         for i in 0..60usize {
@@ -3319,10 +3269,6 @@ mod tests {
         drop(held);
     }
 
-    // -----------------------------------------------------------------------
-    // Rate-control tiers (pure; no session).
-    // -----------------------------------------------------------------------
-
     fn caps(ll_key: bool, ll: bool, bfq: Option<bool>, frame_key: bool) -> Capabilities {
         Capabilities {
             low_latency_key_resolved: ll_key,
@@ -3380,34 +3326,34 @@ mod tests {
 
     #[test]
     fn the_measured_machines_land_on_their_measured_tiers() {
-        // M1, macOS 26: rtvc, SupportsBaseFrameQP true, frame key resolves.
+        // M1, macOS 26: rtvc, SupportsBaseFrameQP true, frame key resolves
         assert_eq!(
             select_rate_tier(&caps(true, true, Some(true), true), true),
             RateTier::BaseFrameQp
         );
         // 10.15: the spec symbol does not exist. Even a session that "succeeded" with the key is
-        // not low-latency (the old bug), and the result is the standard tier.
+        // not low-latency, and the result is the standard tier.
         assert_eq!(
             select_rate_tier(&caps(false, true, None, false), true),
             RateTier::StandardBitrate
         );
-        // ave.avc (create:lowlatency / spec deny): SupportsBaseFrameQP reads -12900.
+        // ave.avc (create:lowlatency / spec deny): SupportsBaseFrameQP reads -12900
         assert_eq!(
             select_rate_tier(&caps(true, false, None, true), true),
             RateTier::StandardBitrate
         );
-        // read:SupportsBaseFrameQP deny, clamp holds.
+        // read:SupportsBaseFrameQP deny, clamp holds
         let mut c = caps(true, true, None, true);
         assert_eq!(select_rate_tier(&c, true), RateTier::LowLatencyBitrate);
         c.max_qp = Probe::Applied;
         c.min_qp = Probe::Applied;
         assert_eq!(select_rate_tier(&c, true), RateTier::ClampCeiling);
-        // frame:BaseFrameQP deny, clamp holds.
+        // frame:BaseFrameQP deny, clamp holds
         let mut c = caps(true, true, Some(true), false);
         c.max_qp = Probe::Applied;
         c.min_qp = Probe::Applied;
         assert_eq!(select_rate_tier(&c, true), RateTier::ClampCeiling);
-        // Half a clamp is not a clamp.
+        // half a clamp is not a clamp
         c.min_qp = Probe::Refused;
         assert_eq!(select_rate_tier(&c, true), RateTier::LowLatencyBitrate);
     }
@@ -3427,24 +3373,24 @@ mod tests {
 
     #[test]
     fn constant_quality_bitrate_follows_the_first_fit() {
-        // 1080p60: base 12.44 Mbps, x1.6 at q = 15.
+        // 1080p60: base 12.44 Mbps, x1.6 at q = 15
         assert_eq!(constant_quality_bitrate(1920, 1080, 60, 15), 19_906_560);
-        // Six QP steps halve / double it.
+        // six QP steps halve / double it
         let b21 = constant_quality_bitrate(1920, 1080, 60, 21);
         assert!((b21 as i64 - 9_953_280).abs() <= 1, "{b21}");
         let b9 = constant_quality_bitrate(1920, 1080, 60, 9);
         assert!((b9 as i64 - 39_813_120).abs() <= 1, "{b9}");
-        // The base clamps (6 .. 30 Mbps) and the output clamps (2 .. 62.5 Mbps).
+        // the base clamps (6 .. 30 Mbps) and the output clamps (2 .. 62.5 Mbps)
         assert_eq!(constant_quality_bitrate(640, 360, 30, 15), 9_600_000);
         assert_eq!(constant_quality_bitrate(3840, 2160, 120, 15), 48_000_000);
         assert_eq!(constant_quality_bitrate(3840, 2160, 120, 1), 62_500_000);
         assert_eq!(constant_quality_bitrate(1920, 1080, 60, 51), 2_000_000);
-        // q is clamped to 1..=51 like BaseFrameQP.
+        // q is clamped to 1..=51 like BaseFrameQP
         assert_eq!(
             constant_quality_bitrate(1920, 1080, 60, 0),
             constant_quality_bitrate(1920, 1080, 60, 1)
         );
-        // Monotonic in q.
+        // monotonic in q
         let mut last = u32::MAX;
         for q in 1..=51u8 {
             let b = constant_quality_bitrate(1920, 1080, 60, q);
@@ -3455,15 +3401,15 @@ mod tests {
 
     #[test]
     fn a_dropped_forced_keyframe_is_rearmed_and_an_ordinary_drop_is_not() {
-        // Rate-control drop: status 0, kVTEncodeInfo_FrameDropped, no sample.
+        // rate-control drop: status 0, kVTEncodeInfo_FrameDropped, no sample
         assert!(forced_keyframe_lost(true, 0, 2, false));
-        // Status 0 with no sample and no flag counts as a drop too.
+        // status 0 with no sample and no flag counts as a drop too
         assert!(forced_keyframe_lost(true, 0, 0, false));
-        // An ordinary dropped frame never became a reference: no IDR.
+        // an ordinary dropped frame never became a reference: no IDR
         assert!(!forced_keyframe_lost(false, 0, 2, false));
-        // A forced frame that came out: nothing to re-arm.
+        // a forced frame that came out: nothing to re-arm
         assert!(!forced_keyframe_lost(true, 0, 0, true));
-        // An encoder error is not a rate-control drop.
+        // an encoder error is not a rate-control drop
         assert!(!forced_keyframe_lost(true, -12903, 0, false));
     }
 
@@ -3531,8 +3477,8 @@ mod tests {
     fn a_low_latency_create_counts_only_when_the_read_back_confirms_it() {
         let gva = Some("com.apple.videotoolbox.videoencoder.h264.gva".to_string());
         let ave = Some("com.apple.videotoolbox.videoencoder.ave.avc".to_string());
-        // Created with the resolved key, but VideoToolbox handed back Quick Sync with no
-        // per-frame QP: a standard session for every decision.
+        // created with the resolved key, but VideoToolbox handed back Quick Sync with no
+        // per-frame QP: a standard session for every decision
         let c = Capabilities {
             encoder_id: gva.clone(),
             ..caps(true, true, None, true)
@@ -3544,14 +3490,14 @@ mod tests {
             ..caps(true, true, Some(false), true)
         };
         assert_eq!(select_rate_tier(&c, true), RateTier::StandardBitrate);
-        // Per-frame QP support confirms it whatever the id says.
+        // per-frame QP support confirms it whatever the id says
         let c = Capabilities {
             encoder_id: gva,
             ..caps(true, true, Some(true), true)
         };
         assert_eq!(select_rate_tier(&c, true), RateTier::BaseFrameQp);
-        // The rtvc family confirms it even with SupportsBaseFrameQP unreadable (the
-        // `read:SupportsBaseFrameQP` deny case, which must still reach ClampCeiling).
+        // the rtvc family confirms it even with SupportsBaseFrameQP unreadable (the
+        // `read:SupportsBaseFrameQP` deny case, which must still reach ClampCeiling)
         let mut c = caps(true, true, None, true);
         c.max_qp = Probe::Applied;
         c.min_qp = Probe::Applied;
@@ -3562,7 +3508,7 @@ mod tests {
         ));
         assert!(!low_latency_confirmed(None, None));
         assert!(!low_latency_confirmed(ave.as_deref(), Some(false)));
-        // The tier line says why.
+        // the tier line says why
         let c = Capabilities {
             encoder_id: Some("com.apple.videotoolbox.videoencoder.h264.gva".into()),
             ..caps(true, true, None, true)
@@ -3575,13 +3521,13 @@ mod tests {
     fn the_qp_ceiling_hook_parses_to_a_plan() {
         let shipped = CeilingPlan::Try(CONSTANT_QP_CEILINGS_BPS.to_vec());
         assert_eq!(ceiling_plan(None), shipped);
-        // 0 names no ceiling: the session must fall to LowLatencyBitrate, not run uncapped.
+        // 0 names no ceiling: the session must fall to LowLatencyBitrate, not run uncapped
         assert_eq!(ceiling_plan(Some("0")), CeilingPlan::Try(Vec::new()));
         assert_eq!(
             ceiling_plan(Some("150000000")),
             CeilingPlan::Try(vec![150_000_000])
         );
-        // The only way to the measured-bad configuration is to ask for it by name.
+        // the only way to the measured-bad configuration is to ask for it by name
         assert_eq!(ceiling_plan(Some("uncapped")), CeilingPlan::Uncapped);
         assert_eq!(ceiling_plan(Some("-5")), shipped);
         assert_eq!(ceiling_plan(Some("lots")), shipped);

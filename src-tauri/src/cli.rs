@@ -21,6 +21,647 @@ pub fn attach_console() {
 #[cfg(not(windows))]
 pub fn attach_console() {}
 
+/// How a headless host (`serve`) and the probe harness hear that they must stop on Windows, plus
+/// the elevated-child and hosted-network readbacks the Windows CLI verbs use.
+#[cfg(windows)]
+pub(crate) mod win_host {
+    use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use windows::core::{w, BOOL, HSTRING, PCWSTR};
+    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::System::Console::{
+        SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT, CTRL_LOGOFF_EVENT,
+        CTRL_SHUTDOWN_EVENT,
+    };
+
+    /// How long a console-close, logoff or shutdown notification is held open for the teardown
+    /// (BYE, display removal). A ceiling, not a delay: Windows ends the process about 5 s after
+    /// the notification whatever the handler does, and the teardown exits sooner.
+    pub(crate) const SESSION_END_HOLD: Duration = Duration::from_millis(4500);
+
+    /// What a console control event means to `serve`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct CtrlResponse {
+        /// The exit breadcrumb.
+        pub reason: &'static str,
+        /// Typed by a person. A second one while the first is still being handled is passed on
+        /// to the default handler, which ends the process: the way out of a wedged teardown.
+        pub interactive: bool,
+        /// The process ends when the handler returns, so the handler must not return until the
+        /// teardown has had its chance.
+        pub hold: bool,
+    }
+
+    pub(crate) fn classify_ctrl(ctrl: u32) -> CtrlResponse {
+        let (reason, interactive, hold) = match ctrl {
+            CTRL_C_EVENT => ("serve: Ctrl+C", true, false),
+            CTRL_BREAK_EVENT => ("serve: Ctrl+Break", true, false),
+            CTRL_CLOSE_EVENT => ("serve: its console window was closed", false, true),
+            // a process that loads user32 is not sent these two (the session-end window below
+            // hears a logoff or shutdown); kept so a build that is sent them gets the same
+            // teardown, not the default handler's immediate ExitProcess
+            CTRL_LOGOFF_EVENT => ("serve: the user is logging off", false, true),
+            CTRL_SHUTDOWN_EVENT => ("serve: Windows is shutting down", false, true),
+            _ => ("serve: an unrecognised console control event", false, true),
+        };
+        CtrlResponse {
+            reason,
+            interactive,
+            hold,
+        }
+    }
+
+    /// The one stop request a `serve` host acts on, wherever it came from.
+    ///
+    /// The console handler is installed before the channel the main thread waits on exists, so
+    /// an early request is remembered and delivered when the channel is armed.
+    pub(crate) struct StopSignal {
+        inner: Mutex<StopState>,
+    }
+
+    struct StopState {
+        tx: Option<Sender<()>>,
+        reason: Option<&'static str>,
+    }
+
+    impl StopSignal {
+        pub(crate) const fn new() -> Self {
+            Self {
+                inner: Mutex::new(StopState {
+                    tx: None,
+                    reason: None,
+                }),
+            }
+        }
+
+        /// Ask the host to stop. `true` for the first request, which is the one whose reason is
+        /// kept; every request is still sent, so a close that follows a Ctrl+C reaches a waiter.
+        pub(crate) fn request(&self, reason: &'static str) -> bool {
+            let mut s = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let first = s.reason.is_none();
+            if first {
+                s.reason = Some(reason);
+            }
+            if let Some(tx) = &s.tx {
+                let _ = tx.send(());
+            }
+            first
+        }
+
+        /// Hand over the channel the main thread waits on. A request that came in before it is
+        /// delivered now.
+        pub(crate) fn arm(&self, tx: Sender<()>) {
+            let mut s = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if s.reason.is_some() {
+                let _ = tx.send(());
+            }
+            s.tx = Some(tx);
+        }
+
+        /// Why the host was asked to stop, if it was asked through this signal. `None` after a
+        /// wake-up means the control server's `QUIT` sent it.
+        pub(crate) fn reason(&self) -> Option<&'static str> {
+            self.inner.lock().unwrap_or_else(|e| e.into_inner()).reason
+        }
+    }
+
+    pub(crate) static SERVE_STOP: StopSignal = StopSignal::new();
+
+    unsafe extern "system" fn serve_console_routine(ctrl: u32) -> BOOL {
+        let response = classify_ctrl(ctrl);
+        let first = SERVE_STOP.request(response.reason);
+        if !first && response.interactive {
+            return BOOL(0);
+        }
+        if response.hold {
+            std::thread::sleep(SESSION_END_HOLD);
+        }
+        BOOL(1)
+    }
+
+    /// Install `serve`'s console handler. Replaces the `ctrlc` crate on Windows: its handler
+    /// returns at once for every event, and for a console close the system ends the process as
+    /// soon as the handler returns, before the BYE and the display removal can run.
+    pub(crate) fn install_serve_console_handler() -> bool {
+        unsafe { SetConsoleCtrlHandler(Some(serve_console_routine), true).is_ok() }
+    }
+
+    /// Install a console handler that does its own work synchronously: the probe's, whose
+    /// cleanup is a plain function and whose way out is `exit(130)`.
+    pub(crate) fn install_console_handler(routine: unsafe extern "system" fn(u32) -> BOOL) -> bool {
+        unsafe { SetConsoleCtrlHandler(Some(routine), true).is_ok() }
+    }
+
+    unsafe extern "system" fn session_end_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            DefWindowProcW, ENDSESSION_LOGOFF, WM_ENDSESSION, WM_QUERYENDSESSION,
+        };
+        match msg {
+            WM_QUERYENDSESSION => LRESULT(1),
+            WM_ENDSESSION => {
+                if wparam.0 != 0 {
+                    let reason = if (lparam.0 as u32) & ENDSESSION_LOGOFF != 0 {
+                        "serve: the Windows session is ending (logoff)"
+                    } else {
+                        "serve: the Windows session is ending (shutdown, restart, or an \
+                         installer closing the app)"
+                    };
+                    SERVE_STOP.request(reason);
+                    // the process ends once this returns; the main thread exits it sooner
+                    std::thread::sleep(SESSION_END_HOLD);
+                }
+                LRESULT(0)
+            }
+            _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+        }
+    }
+
+    /// A hidden top-level window on a thread of its own, so a logoff, shutdown or Restart
+    /// Manager close reaches `serve` as `WM_ENDSESSION` and runs the same teardown Ctrl+C does.
+    ///
+    /// A process that loads user32 is never sent `CTRL_LOGOFF_EVENT` / `CTRL_SHUTDOWN_EVENT`,
+    /// and the main thread is parked inside Tauri's `setup` for the life of the host. Top-level
+    /// on purpose: a message-only window is not sent the session-end messages.
+    pub(crate) fn spawn_session_end_watcher() {
+        let spawned = std::thread::Builder::new()
+            .name("serve-session-end".into())
+            .spawn(|| unsafe {
+                use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+                use windows::Win32::UI::WindowsAndMessaging::{
+                    CreateWindowExW, DispatchMessageW, GetMessageW, RegisterClassW,
+                    TranslateMessage, MSG, WINDOW_EX_STYLE, WNDCLASSW, WS_OVERLAPPED,
+                };
+                const CLASS: PCWSTR = w!("ScreenExtendServeSessionEnd");
+                let Ok(instance) = GetModuleHandleW(None) else {
+                    teprintln!("[serve] session-end watcher: no module handle");
+                    return;
+                };
+                let class = WNDCLASSW {
+                    lpfnWndProc: Some(session_end_proc),
+                    hInstance: instance.into(),
+                    lpszClassName: CLASS,
+                    ..Default::default()
+                };
+                RegisterClassW(&class);
+                if let Err(e) = CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    CLASS,
+                    w!("ScreenExtend host"),
+                    WS_OVERLAPPED,
+                    0,
+                    0,
+                    0,
+                    0,
+                    None,
+                    None,
+                    Some(instance.into()),
+                    None,
+                ) {
+                    teprintln!(
+                        "[serve] session-end watcher: could not create its window ({e}); a \
+                         logoff or shutdown will end the host without removing its displays"
+                    );
+                    return;
+                }
+                let mut msg = MSG::default();
+                while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            });
+        if let Err(e) = spawned {
+            teprintln!("[serve] could not start the session-end watcher: {e}");
+        }
+    }
+
+    /// How often the parked main thread answers messages that other threads and processes have
+    /// sent to its windows.
+    const PUMP_INTERVAL: Duration = Duration::from_millis(100);
+
+    const TAO_EVENT_TARGET_CLASS: &str = "Tao Thread Event Target";
+
+    const SESSION_FILTER_ID: usize = 0x5345_454E;
+
+    /// Keeps tao's event target from acting on a session end while its event handler is the one
+    /// parked: tao answers `WM_ENDSESSION` by calling its handler again, which is re-entrant
+    /// here and panics inside tao. The session-end watcher above is what acts on it.
+    unsafe extern "system" fn tao_session_filter(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+        _id: usize,
+        _data: usize,
+    ) -> LRESULT {
+        use windows::Win32::UI::Shell::DefSubclassProc;
+        use windows::Win32::UI::WindowsAndMessaging::{WM_ENDSESSION, WM_QUERYENDSESSION};
+        match msg {
+            WM_QUERYENDSESSION => LRESULT(1),
+            WM_ENDSESSION => LRESULT(0),
+            _ => unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) },
+        }
+    }
+
+    fn class_name(hwnd: HWND) -> String {
+        use windows::Win32::UI::WindowsAndMessaging::GetClassNameW;
+        let mut buf = [0u16; 128];
+        let n = unsafe { GetClassNameW(hwnd, &mut buf) };
+        String::from_utf16_lossy(&buf[..n.max(0) as usize])
+    }
+
+    /// Every top-level window the calling thread owns.
+    fn thread_windows() -> Vec<HWND> {
+        use windows::Win32::System::Threading::GetCurrentThreadId;
+        use windows::Win32::UI::WindowsAndMessaging::EnumThreadWindows;
+        unsafe extern "system" fn collect(hwnd: HWND, lparam: LPARAM) -> BOOL {
+            let out = unsafe { &mut *(lparam.0 as *mut Vec<HWND>) };
+            out.push(hwnd);
+            BOOL(1)
+        }
+        let mut out: Vec<HWND> = Vec::new();
+        unsafe {
+            let _ = EnumThreadWindows(
+                GetCurrentThreadId(),
+                Some(collect),
+                LPARAM(&mut out as *mut Vec<HWND> as isize),
+            );
+        }
+        out
+    }
+
+    /// Park `serve`'s main thread until `rx` fires, answering sent messages while it waits.
+    ///
+    /// `serve` runs inside Tauri's `setup`, so the thread never pumps again, and tao's
+    /// event-target window on it is a top-level popup, hence a broadcast target. Unanswered,
+    /// every `SendMessage(HWND_BROADCAST, ...)` from another process blocks or pays the
+    /// hung-window timeout, and the window reads as hung to the whole desktop.
+    ///
+    /// Only *sent* messages are dispatched (`PM_QS_SENDMESSAGE`, nothing removed): posted ones
+    /// stay queued, so tao's own wake-up messages never re-enter its runner. Of the sent
+    /// messages tao's target acts on, only `WM_ENDSESSION` reaches its handler, and the
+    /// subclass above swallows it.
+    pub(crate) fn wait_for_stop(rx: &Receiver<()>) {
+        use windows::Win32::UI::Shell::SetWindowSubclass;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            PeekMessageW, MSG, PEEK_MESSAGE_REMOVE_TYPE, PM_NOREMOVE, PM_QS_SENDMESSAGE,
+        };
+
+        if !crate::windows_utils::streamer::tune::on("serve_main_thread_pump") {
+            let _ = rx.recv();
+            return;
+        }
+        let mut filtered = 0usize;
+        for hwnd in thread_windows() {
+            if class_name(hwnd) == TAO_EVENT_TARGET_CLASS
+                && unsafe {
+                    SetWindowSubclass(hwnd, Some(tao_session_filter), SESSION_FILTER_ID, 0)
+                }
+                .as_bool()
+            {
+                filtered += 1;
+            }
+        }
+        tprintln!(
+            "[serve] the main thread answers sent window messages while it waits \
+             ({filtered} event-target window(s) filtered)"
+        );
+        let flags = PEEK_MESSAGE_REMOVE_TYPE(PM_NOREMOVE.0 | PM_QS_SENDMESSAGE.0);
+        let mut msg = MSG::default();
+        loop {
+            match rx.recv_timeout(PUMP_INTERVAL) {
+                Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
+                Err(RecvTimeoutError::Timeout) => {}
+            }
+            unsafe {
+                let _ = PeekMessageW(&mut msg, None, 0, 0, flags);
+            }
+        }
+    }
+
+    /// Quote one argument so the child's command-line parser (the MSVC rules, which Rust's
+    /// `std::env::args` follows) reads it back unchanged. `elevated-command` joins its arguments
+    /// with a bare space, which splits an SSID or a passphrase that contains one.
+    pub(crate) fn quote_arg(arg: &str) -> String {
+        if !arg.is_empty() && !arg.contains([' ', '\t', '\n', '\x0b', '"']) {
+            return arg.to_string();
+        }
+        let mut out = String::with_capacity(arg.len() + 2);
+        out.push('"');
+        let mut backslashes = 0usize;
+        for c in arg.chars() {
+            match c {
+                '\\' => backslashes += 1,
+                '"' => {
+                    out.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+                    out.push('"');
+                    backslashes = 0;
+                }
+                _ => {
+                    out.extend(std::iter::repeat_n('\\', backslashes));
+                    out.push(c);
+                    backslashes = 0;
+                }
+            }
+        }
+        out.extend(std::iter::repeat_n('\\', backslashes * 2));
+        out.push('"');
+        out
+    }
+
+    /// How an elevated child ended.
+    #[derive(Debug, PartialEq, Eq)]
+    pub(crate) enum Elevated {
+        Exited(u32),
+        /// The administrator prompt was dismissed.
+        Declined,
+        TimedOut,
+        Failed(String),
+    }
+
+    /// Run this executable elevated with `args` and wait for it, returning its exit code.
+    ///
+    /// The `elevated-command` crate cannot: it is a bare `ShellExecuteW("runas")`, which returns
+    /// once the child is created, and its "status" is ShellExecute's instance value, not an
+    /// exit code. Same route as `driver_health::restart_elevated`.
+    pub(crate) fn run_elevated_and_wait(args: &[&str], timeout: Duration) -> Elevated {
+        use windows::Win32::Foundation::{CloseHandle, ERROR_CANCELLED, WAIT_OBJECT_0};
+        use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+        use windows::Win32::UI::Shell::{
+            ShellExecuteExW, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS,
+            SHELLEXECUTEINFOW,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
+
+        let exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => return Elevated::Failed(format!("cannot resolve the executable: {e}")),
+        };
+        let params = args
+            .iter()
+            .map(|a| quote_arg(a))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let file = HSTRING::from(exe.as_os_str());
+        let params = HSTRING::from(params);
+        let verb = HSTRING::from("runas");
+        let mut info = SHELLEXECUTEINFOW {
+            cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+            fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
+            lpVerb: PCWSTR(verb.as_ptr()),
+            lpFile: PCWSTR(file.as_ptr()),
+            lpParameters: PCWSTR(params.as_ptr()),
+            nShow: SW_HIDE.0,
+            ..Default::default()
+        };
+        if let Err(e) = unsafe { ShellExecuteExW(&mut info) } {
+            if e.code() == ERROR_CANCELLED.to_hresult() {
+                return Elevated::Declined;
+            }
+            return Elevated::Failed(format!("could not start the elevated child: {e}"));
+        }
+        if info.hProcess.is_invalid() {
+            return Elevated::Failed("the elevated child returned no process handle".into());
+        }
+        let waited = unsafe { WaitForSingleObject(info.hProcess, timeout.as_millis() as u32) };
+        if waited != WAIT_OBJECT_0 {
+            let _ = unsafe { CloseHandle(info.hProcess) };
+            return Elevated::TimedOut;
+        }
+        let mut code = 0u32;
+        let got = unsafe { GetExitCodeProcess(info.hProcess, &mut code) };
+        let _ = unsafe { CloseHandle(info.hProcess) };
+        match got {
+            Ok(()) => Elevated::Exited(code),
+            Err(e) => Elevated::Failed(format!("could not read the child's exit code: {e}")),
+        }
+    }
+
+    /// Whether the legacy (`netsh`) hosted network is running, asked of the WLAN service.
+    /// `None` when the service cannot answer (no WLAN service, no adapter).
+    ///
+    /// `WLAN_HOSTED_NETWORK_STATE` carries no string, so this reads the same in every display
+    /// language; the `netsh` status line is localized.
+    pub(crate) fn legacy_hosted_network_active() -> Option<bool> {
+        crate::windows_utils::hosted_network::legacy_hosted_network_active()
+    }
+
+    /// Whether Windows' Mobile Hotspot is on. `None` when there is no connection profile to ask
+    /// the tethering manager through, or it will not say.
+    pub(crate) fn mobile_hotspot_on() -> Option<bool> {
+        use windows::Networking::Connectivity::NetworkInformation;
+        use windows::Networking::NetworkOperators::{
+            NetworkOperatorTetheringManager, TetheringOperationalState,
+        };
+        let profile = match NetworkInformation::GetInternetConnectionProfile() {
+            Ok(p) => p,
+            Err(_) => NetworkInformation::GetConnectionProfiles()
+                .ok()?
+                .into_iter()
+                .next()?,
+        };
+        let manager =
+            NetworkOperatorTetheringManager::CreateFromConnectionProfile(&profile).ok()?;
+        Some(manager.TetheringOperationalState().ok()? == TetheringOperationalState::On)
+    }
+
+    /// 802.11's SSID and WPA2 passphrase bounds, checked before anything asks for elevation.
+    pub(crate) fn validate_hotspot_credentials(ssid: &str, password: &str) -> Result<(), String> {
+        if ssid.is_empty() || ssid.len() > 32 {
+            return Err("the network name must be 1 to 32 bytes".to_string());
+        }
+        // same rule the elevated child applies before it changes anything
+        crate::windows_utils::hosted_network::validate_passphrase(password)
+    }
+
+    /// What a `serve` host last replayed, per device token: a fingerprint of the saved row.
+    ///
+    /// `None` until the first replay, and never used in the desktop app, whose UI writes the
+    /// live overrides itself and would leave this out of date.
+    static LAST_REPLAY: Mutex<Option<std::collections::BTreeMap<String, String>>> =
+        Mutex::new(None);
+    static HEADLESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// Mark this process as the headless host, whose live overrides are written only by the
+    /// config replay and the join path.
+    pub(crate) fn mark_headless() {
+        HEADLESS.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[derive(Debug, Default, PartialEq, Eq)]
+    pub(crate) struct ReplayPlan {
+        /// Rows identical to what the last replay applied: leave the live state alone.
+        pub skip: std::collections::BTreeSet<String>,
+        /// Tokens the last replay applied that `config.json` no longer has.
+        pub removed: Vec<String>,
+    }
+
+    /// Decide which saved rows a replay must touch.
+    ///
+    /// Replaying an unchanged row is not a no-op: the join path writes the device's live
+    /// orientation into the same override map, so a saved row compared against it can read as a
+    /// change and renegotiate (rotate) a display nobody edited.
+    pub(crate) fn plan_replay(
+        previous: Option<&std::collections::BTreeMap<String, String>>,
+        current: &[(String, String)],
+    ) -> ReplayPlan {
+        let Some(previous) = previous else {
+            return ReplayPlan::default();
+        };
+        let skip = current
+            .iter()
+            .filter(|(token, print)| previous.get(token) == Some(print))
+            .map(|(token, _)| token.clone())
+            .collect();
+        let removed = previous
+            .keys()
+            .filter(|token| !current.iter().any(|(t, _)| t == *token))
+            .cloned()
+            .collect();
+        ReplayPlan { skip, removed }
+    }
+
+    /// [`plan_replay`] against what this process last applied, recording `current` as the new
+    /// baseline. An empty plan outside `serve`.
+    pub(crate) fn replay_plan(current: &[(String, String)]) -> ReplayPlan {
+        if !HEADLESS.load(std::sync::atomic::Ordering::Relaxed) {
+            return ReplayPlan::default();
+        }
+        let mut last = LAST_REPLAY.lock().unwrap_or_else(|e| e.into_inner());
+        let plan = plan_replay(last.as_ref(), current);
+        *last = Some(current.iter().cloned().collect());
+        plan
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn close_logoff_and_shutdown_hold_ctrl_c_does_not() {
+            for ctrl in [CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT] {
+                let r = classify_ctrl(ctrl);
+                assert!(r.hold, "{ctrl} must hold the process open for the teardown");
+                assert!(!r.interactive);
+            }
+            for ctrl in [CTRL_C_EVENT, CTRL_BREAK_EVENT] {
+                let r = classify_ctrl(ctrl);
+                assert!(!r.hold && r.interactive);
+            }
+            // the hold must fit inside the system's ~5 s grace
+            assert!(SESSION_END_HOLD < Duration::from_secs(5));
+        }
+
+        #[test]
+        fn a_stop_requested_before_the_channel_exists_is_delivered_on_arm() {
+            let signal = StopSignal::new();
+            assert!(signal.request("serve: Ctrl+C"));
+            let (tx, rx) = std::sync::mpsc::channel();
+            signal.arm(tx);
+            assert!(rx.try_recv().is_ok(), "the early request was lost");
+            // a second request keeps the first reason but still wakes the waiter
+            assert!(!signal.request("serve: its console window was closed"));
+            assert!(rx.try_recv().is_ok());
+            assert_eq!(signal.reason(), Some("serve: Ctrl+C"));
+        }
+
+        #[test]
+        fn an_unrequested_signal_names_no_reason() {
+            let signal = StopSignal::new();
+            let (tx, rx) = std::sync::mpsc::channel();
+            signal.arm(tx);
+            assert!(rx.try_recv().is_err());
+            assert_eq!(signal.reason(), None);
+        }
+
+        /// Round-trip through the system's own parser.
+        fn parse(cmdline: &str) -> Vec<String> {
+            use windows::Win32::Foundation::{LocalFree, HLOCAL};
+            use windows::Win32::UI::Shell::CommandLineToArgvW;
+            let full = HSTRING::from(format!("prog.exe {cmdline}"));
+            let mut n = 0i32;
+            let argv = unsafe { CommandLineToArgvW(&full, &mut n) };
+            assert!(!argv.is_null());
+            let out = (1..n as usize)
+                .map(|i| unsafe { (*argv.add(i)).to_string().unwrap() })
+                .collect();
+            unsafe {
+                let _ = LocalFree(Some(HLOCAL(argv as *mut core::ffi::c_void)));
+            }
+            out
+        }
+
+        #[test]
+        fn quoted_arguments_survive_the_child_parser() {
+            let cases = [
+                "plain",
+                "my network",
+                "pass word with  two spaces",
+                "quote\"inside",
+                "trailing\\",
+                "trailing space\\",
+                "back\\\\slashes\\\"quote",
+                "",
+                "tab\tseparated",
+            ];
+            let line = cases
+                .iter()
+                .map(|c| quote_arg(c))
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert_eq!(
+                parse(&line),
+                cases.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+            );
+            // what `elevated-command` sends for the same pair: split on the space
+            assert_eq!(parse(&["my network", "pw"].join(" ")).len(), 3);
+        }
+
+        #[test]
+        fn hotspot_credentials_are_checked_before_elevation() {
+            assert!(validate_hotspot_credentials("net", "12345678").is_ok());
+            assert!(validate_hotspot_credentials("net", "1234567").is_err());
+            assert!(validate_hotspot_credentials("net", &"x".repeat(64)).is_err());
+            assert!(validate_hotspot_credentials("", "12345678").is_err());
+            assert!(validate_hotspot_credentials(&"n".repeat(33), "12345678").is_err());
+            assert!(validate_hotspot_credentials("net", "p\u{e4}sswort1").is_err());
+        }
+
+        fn rows(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect()
+        }
+
+        #[test]
+        fn the_first_replay_applies_every_row() {
+            let plan = plan_replay(None, &rows(&[("a", "1"), ("b", "2")]));
+            assert_eq!(plan, ReplayPlan::default());
+        }
+
+        #[test]
+        fn a_reload_touches_only_the_rows_that_changed_and_the_ones_removed() {
+            let previous: std::collections::BTreeMap<String, String> =
+                rows(&[("a", "1"), ("b", "2"), ("gone", "3")])
+                    .into_iter()
+                    .collect();
+            let plan = plan_replay(Some(&previous), &rows(&[("a", "1"), ("b", "changed")]));
+            assert_eq!(
+                plan.skip.into_iter().collect::<Vec<_>>(),
+                vec!["a".to_string()]
+            );
+            assert_eq!(plan.removed, vec!["gone".to_string()]);
+        }
+    }
+}
+
 fn generate_session_id() -> String {
     use rand::Rng;
     const ALPHA: &[u8] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
@@ -64,7 +705,7 @@ fn print_version() {
 
 fn print_help() {
     print!(
-        r#"ScreenExtend {version} — turn any device into a wireless second monitor.
+        r#"ScreenExtend {version}: turn any device into a wireless second monitor.
 
 USAGE:
     ScreenExtend [SUBCOMMAND]
@@ -108,15 +749,14 @@ SUBCOMMANDS:
 SERVE OPTIONS:
     --http-port <n>       Override the HTTP port
     --https-port <n>      Override the HTTPS port
-    --session-id <id>     Use a specific session id (default: random). `-` reads stdin;
-                          SCREENEXTEND_SESSION_ID is read when the flag is absent.
+    --session-id <id>     Use a specific session id (default: random). `-` reads stdin.
     --otp <code>          Use a specific OTP (default: random). `-` reads stdin.
-    --otp-file <path>     Read the OTP from a file. Prefer this or SCREENEXTEND_OTP:
+    --otp-file <path>     Read the OTP from a file. Prefer this or `--otp -`:
                           a command line is readable by every process on the machine.
     --no-cloud            Do not register a public "Anywhere (Internet)" session
     --no-qr               Do not render QR codes in the terminal
     --encoder <v>         Video encoder: auto | nvidia | intel | amd | software
-                          (default: auto — NVENC, then Quick Sync, then AMD AMF, then x264)
+                          (default: auto - NVENC, then AMD AMF, then Quick Sync, then x264)
     --software-encode     Force CPU (software) video encoding; alias for --encoder software
     -v, --verbose         Print internal diagnostic logs to the terminal
 
@@ -155,11 +795,9 @@ pub fn fast_path() {
     let Some(first) = raw.first().map(String::as_str) else {
         return;
     };
-    // Only the first token counts. Scanning the whole vector meant `config set key -h` printed
-    // the global help and exited 0 instead of storing `-h`, which a script cannot tell from
-    // success — and every value-taking flag had the same hole. Per-subcommand help still works:
-    // `tauri-plugin-cli` injects `help`/`version` into each declared subcommand, and `probe`
-    // parses its own.
+    // Only the first token counts, or `config set key -h` would print the global help and exit
+    // 0 instead of storing `-h`. Per-subcommand help still works: `tauri-plugin-cli` injects
+    // `help`/`version` into each declared subcommand, and `probe` parses its own.
     if first == "help" || first == "-h" || first == "--help" {
         attach_console();
         print_help();
@@ -170,8 +808,8 @@ pub fn fast_path() {
         print_version();
         exit(0);
     }
-    // The encoder benchmark runs before Tauri on purpose: none of its stages needs a runtime,
-    // a window or AppKit, and every unit of work is a child process of this same binary.
+    // the bench runs before Tauri on purpose: these stages need no runtime, window or AppKit,
+    // and every unit of work is a child process of this same binary
     #[cfg(feature = "bench")]
     if first == "bench" && !crate::bench::wants_tauri(&raw[1..]) {
         crate::bench::main(&raw[1..]);
@@ -185,9 +823,8 @@ pub fn fast_path() {
 
 pub fn dispatch(app: &tauri::AppHandle) -> Outcome {
     use crate::single_instance;
-    // Before the GUI early-return, because the desktop app needs it too: it is what lets the
-    // display-driver probe — a plain Tauri command with no `AppHandle` of its own in reach —
-    // ask the control socket which process is holding the driver's pipe.
+    // before the GUI early-return: the desktop app's display-driver probe (a Tauri command with
+    // no `AppHandle` in reach) needs it to ask the control socket who holds the driver's pipe
     if let Ok(dir) = crate::data_dir::local_data_dir(app) {
         single_instance::remember_ctrl_path(dir.join(single_instance::CTRL_FILE));
     }
@@ -196,18 +833,15 @@ pub fn dispatch(app: &tauri::AppHandle) -> Outcome {
         return Outcome::LaunchGui;
     }
     attach_console();
-    // `probe` is intercepted here rather than declared in `tauri.conf.json` under
-    // `plugins.cli`. The harness has ~25 tuning flags parsed by hand in
-    // `streamer::config::Config::from_args`, and `tauri-plugin-cli` rejects any argument it has
-    // not been told about — declaring them twice, in two different syntaxes, to have them
-    // parsed twice would be the worse trade. It stays undocumented in `--help` because it is a
-    // developer tool, not a shipped command.
+    // `probe` is intercepted here, not declared under `plugins.cli`: its ~25 tuning flags are
+    // parsed by `streamer::config::Config::from_args`, and `tauri-plugin-cli` rejects any
+    // argument it has not been told about. It stays out of `--help`: a developer tool.
     if args[0] == "probe" {
         return probe::run(app);
     }
-    // The bench's `live` child: the one bench unit that needs the Tauri runtime (a virtual display
-    // needs `platform::setup`). `fast_path` let it through; everything else `bench` exited there.
-    #[cfg(all(feature = "bench", target_os = "macos"))]
+    // the bench's `live` child, the one unit that needs the Tauri runtime (a virtual display
+    // needs `platform::setup`); every other `bench` run exited in `fast_path`
+    #[cfg(all(feature = "bench", any(target_os = "macos", windows)))]
     if args[0] == "bench" {
         crate::bench::live_child(app);
     }
@@ -225,9 +859,7 @@ mod probe {
 /// The developer probe harness, reachable as `ScreenExtend probe`.
 ///
 /// It runs inside the Tauri app on purpose: `--live` and `--whep-selftest` need a real virtual
-/// display, which means `platform::setup` and the `AppState` it builds. There used to be a
-/// standalone entry point in `streamer/cli.rs` that could never do that; it was never wired into
-/// `main.rs`, bit-rotted into unreachable code, and has been deleted.
+/// display, which means `platform::setup` and the `AppState` it builds.
 #[cfg(any(windows, target_os = "macos"))]
 mod probe {
     use super::exit;
@@ -244,7 +876,7 @@ mod probe {
 
     fn print_probe_help() {
         println!(
-            r#"ScreenExtend probe — developer capture/encode/transport harness (not a shipped command)
+            r#"ScreenExtend probe: developer capture/encode/transport harness (not a shipped command)
 
 USAGE:
     ScreenExtend probe <MODE> [TUNING FLAGS]
@@ -283,7 +915,7 @@ TUNING FLAGS are the streamer's own and are parsed straight off the command line
                           --synthetic-pattern): a still desktop, scrolling text, full-frame
                           60 fps motion, or a rigid block translating like a dragged window
     --counter             overlay a large frame number + elapsed ms clock, so a 240 fps
-                          camera shot of host and client can be differenced (docs/BASELINE.md)
+                          camera shot of host and client can be differenced
     --turn-url/--turn-username/--turn-credential/--turn-urls/--turn-secret/--turn-ttl
     --stun <a,b,..>   --port <n>   --https-port <n>   --bind-ip <ip>   --lan-ip <ip>
 
@@ -358,8 +990,8 @@ The self-test prints its per-stage telemetry summary on exit; `--whep-selftest` 
             local_ips: Some(state.local_ips.clone()),
             virtual_display: Some(state.virtual_display.clone()),
             session_auth: Some(state.session_auth.clone()),
-            // No override map: the probe runs exactly what its flags say (`apply_join_quality`
-            // gives a device with no row the join defaults, QP 15 and scale 100).
+            // no override map: the probe runs exactly what its flags say (`apply_join_quality`
+            // gives a device with no row the join defaults, QP 15 and scale 100)
             device_overrides: None,
             sessions: Some(state.sessions.clone()),
             disconnect_grace: Some(state.disconnect_grace.clone()),
@@ -372,17 +1004,12 @@ The self-test prints its per-stage telemetry summary on exit; `--whep-selftest` 
         }
     }
 
-    /// Measure the host-side audio path end to end, the way a joined device sees it.
+    /// Measure the host-side audio path the way a joined device sees it: how often the endpoint
+    /// actually delivers, and how old a packet is by the time a session could send it.
     ///
-    /// It drives an `AudioHub` — the same type `AppState` holds, subscribed the same way a
-    /// session's forwarder subscribes — so it exercises the shipping capture backend, the
-    /// shipping Opus encoder and the shipping fan-out rather than a parallel harness that
-    /// could drift from them. Its own hub rather than `AppState`'s, because audio needs no
-    /// virtual display and this must stay runnable on a host with no display driver installed.
-    ///
-    /// It answers the two questions the audio budget is made of: how often the endpoint
-    /// actually delivers (the engine period as realised, not as requested), and how old a
-    /// packet is by the time a session could put it on the wire.
+    /// It drives a real `AudioHub` (the shipping capture backend, Opus encoder and fan-out). Its
+    /// own hub, not `AppState`'s: audio needs no virtual display, and this must stay runnable on
+    /// a host with no display driver installed.
     fn audio_probe(secs: u64) -> anyhow::Result<()> {
         use std::time::{Duration, Instant};
 
@@ -401,9 +1028,9 @@ The self-test prints its per-stage telemetry summary on exit; `--whep-selftest` 
             sub.lookahead_samples as f64 * 1000.0 / sub.format.sample_rate.max(1) as f64,
         );
 
-        // Consumer-side view: the gap between packets arriving here, and the age of each packet
-        // measured against its own `capture_ns`. The capture thread records its own halves into
-        // `AudioDiagnostics`; printing both is how a scheduling hop shows up as a difference.
+        // Consumer side: the gap between arrivals here, and each packet's age against its own
+        // `capture_ns`. The capture thread records its halves in `AudioDiagnostics`; a
+        // scheduling hop shows up as the difference.
         let arrival = Histogram::new();
         let age = Histogram::new();
         let mut packets = 0u64;
@@ -419,9 +1046,8 @@ The self-test prints its per-stage telemetry summary on exit; `--whep-selftest` 
         let mut skew_sum_ns: i128 = 0;
         let mut ahead_of_clock = 0u64;
 
-        // Bounded, because a tier that delivers nothing is a result the probe has to be able
-        // to report — `blocking_recv` on a silent capture would simply never return, and
-        // "the probe printed nothing" is the least useful possible answer.
+        // bounded: a tier that delivers nothing is a result to report, and `blocking_recv` on a
+        // silent capture would never return
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
@@ -507,8 +1133,8 @@ The self-test prints its per-stage telemetry summary on exit; `--whep-selftest` 
         }
         if packets == 0 {
             anyhow::bail!(
-                "no audio packets in {secs}s — the endpoint delivered nothing, which is the \
-                 silent-companion failure mode (`docs/recovered/AUDIO_NOTES.md` §3.2)"
+                "no audio packets in {secs}s: the endpoint delivered nothing, which is the \
+                 silent-companion failure mode"
             );
         }
         Ok(())
@@ -517,16 +1143,13 @@ The self-test prints its per-stage telemetry summary on exit; `--whep-selftest` 
     /// The display controller the probe's `platform::setup` created, so every exit path can
     /// take its virtual displays away again.
     ///
-    /// A measurement harness that leaves a display attached poisons the *next* run: a leftover
-    /// virtual monitor was enough to make the following `probe --live` fail with "Failed to
-    /// convert item to `GraphicsCaptureItem`", and the run after that succeeded once the
-    /// leftover had gone. One bad run silently changing the next run's numbers is the worst
-    /// failure mode a baseline can have.
+    /// A display left attached poisons the *next* run: the following `probe --live` fails with
+    /// "Failed to convert item to `GraphicsCaptureItem`".
     static PROBE_DISPLAY: std::sync::Mutex<Option<crate::streamer::session::SharedVirtualDisplay>> =
         std::sync::Mutex::new(None);
 
     /// Remove whatever the probe created. Idempotent, and safe to call from a signal handler or
-    /// a panic hook — it takes the controller out, so a second call does nothing.
+    /// a panic hook: it takes the controller out, so a second call does nothing.
     fn cleanup_displays() {
         let display = PROBE_DISPLAY
             .lock()
@@ -545,9 +1168,22 @@ The self-test prints its per-stage telemetry summary on exit; `--whep-selftest` 
             *PROBE_DISPLAY.lock().unwrap_or_else(|e| e.into_inner()) =
                 Some(state.virtual_display.clone());
         }
+        // Windows: the cleanup runs inside the console handler itself. `ctrlc` returns from the
+        // handler at once, and on a console close the system ends the process as it returns.
+        #[cfg(windows)]
+        {
+            unsafe extern "system" fn probe_console_routine(_ctrl: u32) -> windows::core::BOOL {
+                cleanup_displays();
+                exit(130)
+            }
+            if !super::win_host::install_console_handler(probe_console_routine) {
+                teprintln!("[probe] could not install the console control handler");
+            }
+        }
+        #[cfg(not(windows))]
         let _ = ctrlc::set_handler(|| {
             cleanup_displays();
-            // 130 is the conventional "terminated by SIGINT", and the harness scripts read it.
+            // 130 is the conventional "terminated by SIGINT", and the harness scripts read it
             exit(130);
         });
         let previous = std::panic::take_hook();
@@ -559,8 +1195,8 @@ The self-test prints its per-stage telemetry summary on exit; `--whep-selftest` 
 
     fn finish(result: anyhow::Result<()>) -> ! {
         cleanup_displays();
-        // `exit()` skips destructors, and a piped stdout is block-buffered, so without this
-        // the whole report can be lost — which reads as "the probe printed nothing".
+        // `exit()` skips destructors and a piped stdout is block-buffered: without this flush
+        // the whole report can be lost
         let flush = || {
             use std::io::Write;
             let _ = std::io::stdout().flush();
@@ -595,7 +1231,7 @@ The self-test prints its per-stage telemetry summary on exit; `--whep-selftest` 
             exit(0);
         }
 
-        // The harness is a diagnostic tool: everything it learns should reach the terminal.
+        // a diagnostic tool: everything it logs should reach the terminal
         crate::logbus::set_verbose(true);
         let mode = parse_mode(&args);
         let base = Config::from_args();
@@ -708,19 +1344,17 @@ pub fn saved_stun_urls(_app: &tauri::AppHandle) -> Option<Vec<String>> {
 /// What `status` and `doctor` print for the display driver.
 ///
 /// A free function so the busy wording can be asserted without a running host: the shipped
-/// driver does not enter that state on demand, so the only way to check the sentence a user
-/// would read is to build it from the backend value directly.
+/// driver does not enter that state on demand.
 #[cfg(windows)]
 pub fn driver_line(backend: crate::windows_utils::virtual_display::DisplayBackend) -> String {
     use crate::windows_utils::virtual_display::DisplayBackend;
     match backend {
         DisplayBackend::IddDriver => "installed and answering".to_string(),
         DisplayBackend::DriverNotInstalled => {
-            "NOT INSTALLED — run `ScreenExtend drivers install` (Administrator)".to_string()
+            "NOT INSTALLED: run `ScreenExtend drivers install` (Administrator)".to_string()
         }
         // Not a fault, and not worth an exit code: a host that is already running has the
-        // driver, and `doctor` run beside one has to say so in those words. Saying "not
-        // answering" here is what sent the desktop app reinstalling a healthy driver.
+        // driver. Never "not answering" here: that sends the reader to reinstall a healthy one.
         DisplayBackend::DriverBusy { holder: Some(pid) } => {
             format!("installed, in use by ScreenExtend (pid {pid})")
         }
@@ -736,8 +1370,8 @@ pub fn driver_line(backend: crate::windows_utils::virtual_display::DisplayBacken
 mod test {
     use crate::windows_utils::virtual_display::DisplayBackend;
 
-    /// `doctor` used to have one sentence for two states. The busy one has to name the process
-    /// to close, because "not answering" sends the reader to reinstall a driver that is fine.
+    /// The busy line has to name the process to close: "not answering" sends the reader to
+    /// reinstall a driver that is fine.
     #[test]
     fn the_driver_line_distinguishes_busy_from_dead() {
         assert_eq!(
@@ -791,8 +1425,6 @@ mod desktop {
     const CLOUD_SESSION_DOMAIN: &str = "session.screenextend.app";
     const CONFIG_STORE: &str = "config.json";
 
-    // small helpers over the plugin's matches
-
     fn arg_str(m: &Matches, key: &str) -> Option<String> {
         m.args
             .get(key)
@@ -820,8 +1452,6 @@ mod desktop {
             .map(|s| (s.name.as_str(), &s.matches))
     }
 
-    // config store access
-
     type Cfg = Store<tauri::Wry>;
 
     fn open_store(app: &tauri::AppHandle) -> Arc<Cfg> {
@@ -836,9 +1466,7 @@ mod desktop {
 
     /// The saved `stunUrls` setting, for the per-OS `setup` command.
     ///
-    /// Read through the same store the CLI writes, so `ScreenExtend stun set` and the headless
-    /// `serve` and the desktop app all see one value. Returns `None` when the key is absent, which
-    /// is every install predating the setting and means "keep the built-in default"; `Some(vec![])`
+    /// `None` when the key is absent, which means "keep the built-in default"; `Some(vec![])`
     /// is the distinct, deliberate "no STUN at all".
     pub fn saved_stun_urls(app: &tauri::AppHandle) -> Option<Vec<String>> {
         let store = app.store(crate::data_dir::config_store()).ok()?;
@@ -847,18 +1475,11 @@ mod desktop {
         Some(crate::streamer::session::parse_stun_urls(&raw))
     }
 
-    // the declared shape of config.json
-    //
-    // The container half of `src/lib/config-schema.ts`, and deliberately only that half: types,
-    // no ranges and no enums. The host clamps every value again on its own side, so a second
-    // copy of the ranges would be a second thing to drift; a container type is the one thing a
-    // reader cannot absorb, because an object where an array belongs is not iterable and a
-    // string where an object belongs cannot be indexed.
-    //
-    // `scripts/test-config-editor.mjs` parses the tables below straight out of this file and
-    // asserts them against `configJsonSchema`, so the two cannot disagree about what is an
-    // array. Keep the `const NAME: &Shape = …` / `const NAME_FIELDS: &[(&str, &Shape)] = …`
-    // form — that parser is a regex, not a Rust compiler.
+    // The declared shape of config.json: the container half of `src/lib/config-schema.ts` only
+    // (types, no ranges, no enums: the host clamps values itself, and a second copy would drift).
+    // `scripts/test-config-editor.mjs` regex-parses the tables below out of this file and checks
+    // them against `configJsonSchema`, so keep the `const NAME: &Shape = ...` /
+    // `const NAME_FIELDS: &[(&str, &Shape)] = ...` form.
 
     #[derive(Debug, Clone, Copy, PartialEq)]
     enum Shape {
@@ -978,8 +1599,8 @@ mod desktop {
         fn accepts(&self, value: &Value) -> bool {
             match self {
                 Shape::Str => value.is_string(),
-                // A whole-number float is still an integer to every reader here; JSON does not
-                // distinguish them and `serde_json` parses `30` and `30.0` differently.
+                // a whole-number float is still an integer to every reader here: JSON does not
+                // distinguish them, but `serde_json` parses `30` and `30.0` differently
                 Shape::Int => value.as_f64().is_some_and(|n| n.fract() == 0.0),
                 Shape::Num => value.is_number(),
                 Shape::Bool => value.is_boolean(),
@@ -1000,8 +1621,7 @@ mod desktop {
         }
 
         /// Every place `value` disagrees with this shape, as one `[migrate]`-style sentence per
-        /// problem. Used by the host's replay to say out loud what it is ignoring, and by the
-        /// tests to pin the wording.
+        /// problem.
         fn faults(&'static self, value: &Value, label: &str, out: &mut Vec<String>) {
             if !self.accepts(value) {
                 out.push(format!(
@@ -1051,10 +1671,9 @@ mod desktop {
 
     /// Walk a dotted path through a snapshot of the store.
     ///
-    /// A numeric segment indexes an array, because `Value::get("0")` on an array is `None` and
-    /// `config get devices.0.refreshRate` used to answer "key not found" about a row that was
-    /// plainly there — the write half indexes arrays, so the read half has to. Anything whose
-    /// container type does not match the path is simply not there: no error, no panic.
+    /// A numeric segment indexes an array (`Value::get("0")` on an array is `None`), as the
+    /// write half does. Anything whose container type does not match the path is simply not
+    /// there: no error, no panic.
     fn dig(saved: &Saved, key: &str) -> Option<Value> {
         let mut parts = key.split('.');
         let head = parts.next()?;
@@ -1077,18 +1696,13 @@ mod desktop {
 
     /// Write one dotted key, or refuse and change nothing.
     ///
-    /// The refusals are the point. `config.json` is written by three parties — the desktop UI,
-    /// this CLI and whichever version of the app last ran — and read by all of them plus
-    /// `serve`. A write that changes a key's **container type** is the one edit no reader can
-    /// absorb: `devices` became `{"0": {"refreshRate": 30}}`, and the bootstrap's
-    /// `for (const d of config.devices ?? [])` threw `object is not iterable`, which the startup
-    /// path then reported to the owner as a missing display driver.
+    /// `config.json` has three writers (the desktop UI, this CLI and whichever app version last
+    /// ran). A write that changes a key's **container type** is the one edit no reader can absorb:
+    /// `devices` as `{"0": {...}}` is not iterable, and the app does not start.
     ///
-    /// The shape came from here. The old `set_path` created an *object* for every missing
-    /// segment, numeric or not, so `config set devices.0.refreshRate 30` on a store whose
-    /// `devices` key was absent wrote exactly that. Now a numeric segment under an array is an
-    /// index, a segment that would change a container's type is refused, and the value itself
-    /// has to match the type the schema declares.
+    /// So a numeric segment under an array is an index, a segment that would change a
+    /// container's type is refused, and the value itself has to match the type the schema
+    /// declares.
     fn set_nested(store: &Cfg, key: &str, value: Value) -> Result<(), String> {
         let parts: Vec<&str> = key.split('.').collect();
         if parts.iter().any(|p| p.is_empty()) {
@@ -1101,8 +1715,7 @@ mod desktop {
     }
 
     /// The pure half of [`set_nested`]: given whatever the store currently holds for `path[0]`,
-    /// produce what it should hold afterwards, or say why the write is refused. Split out so the
-    /// index and refusal semantics are testable without a `Store`, an `AppHandle` or a file.
+    /// produce what it should hold afterwards, or say why the write is refused.
     fn plan_set(existing: Option<Value>, path: &[&str], value: Value) -> Result<Value, String> {
         let head = path[0];
         place(
@@ -1150,7 +1763,7 @@ mod desktop {
                 };
                 let Ok(index) = segment.parse::<usize>() else {
                     return Err(format!(
-                        "{label} is an array, so `{segment}` is not a key in it — the next part \
+                        "{label} is an array, so `{segment}` is not a key in it: the next part \
                          of the path has to be a row number (0 … {}).",
                         items.len()
                     ));
@@ -1209,10 +1822,9 @@ mod desktop {
                 "{label} is {}, so `{label}.{segment}` names nothing.",
                 scalar.article()
             )),
-            // A key the table does not describe. Unknown keys are inert — `readStore` drops
-            // anything not in `defaultConfig` and the editor reports it as a warning — so the
-            // write is allowed, but it still must not turn an array into an object underneath
-            // itself, which is the defect this whole path exists to prevent.
+            // a key the table does not describe is inert (`readStore` drops anything not in
+            // `defaultConfig`), so the write is allowed, but it still must not turn an array
+            // into an object underneath itself
             None => match node {
                 Some(Value::Array(mut items)) => {
                     let Ok(index) = segment.parse::<usize>() else {
@@ -1272,15 +1884,12 @@ mod desktop {
         get_nested(store, key).and_then(|v| v.as_bool())
     }
 
-    // host / instance detection
-
     /// Is a host process up?
     ///
     /// The control socket is asked first, because the lock test is destructive: taking the
     /// exclusive lock and dropping it races a starting GUI, which is not holding it between
-    /// `acquire_lock` and `std::mem::forget` — a concurrent `status` could win the lock there
-    /// and make the real instance believe it is the second one. The lock is still the
-    /// authority, so it is the fallback when no control file answers.
+    /// `acquire_lock` and `std::mem::forget`, and winning it there makes the real instance
+    /// believe it is the second one. The lock is the fallback when no control file answers.
     fn host_running(app: &tauri::AppHandle) -> bool {
         let Ok(dir) = crate::data_dir::local_data_dir(app) else {
             return false;
@@ -1306,17 +1915,11 @@ mod desktop {
         }
     }
 
-    // the live session, both ways over the control socket
-
     /// The `SESSION` control verb's read half, run **inside** the host process.
     ///
-    /// A session id lives only in memory: the desktop app mints one in its bootstrap and `serve`
-    /// mints or takes one at startup, and neither writes it to `config.json` — it is a
-    /// per-run credential, not a setting. So this is the only place another process can learn
-    /// it, and before it existed `qr`, `status` and `session new` had nothing to read.
-    ///
-    /// An empty `session_id` is the honest answer while a host is still starting: `AppState` is
-    /// managed by `setup`, and the desktop app mints its credentials a moment after that.
+    /// A session id lives only in memory (a per-run credential, never written to `config.json`),
+    /// so this is the only place another process can learn it. An empty `session_id` is the
+    /// honest answer while a host is still starting.
     pub fn live_session_info(app: &tauri::AppHandle) -> single_instance::SessionInfo {
         let Some(state) = app.try_state::<platform::AppState>() else {
             return single_instance::SessionInfo::default();
@@ -1324,9 +1927,8 @@ mod desktop {
         let (cloud_state, cloud_detail) = state.cloud_status.lock_recover().clone();
         let session_id = state.session_auth.session_id.lock_recover().clone();
         let otp = state.session_auth.otp.lock_recover().clone();
-        // What "public sessions" means to a *running* host: it holds a relay client. The
-        // persisted `publicSessionsEnabled` is only the intent, and `serve --no-cloud` overrides
-        // it for one run.
+        // "public sessions" for a *running* host means it holds a relay client: the persisted
+        // `publicSessionsEnabled` is only the intent, and `serve --no-cloud` overrides it
         let public_sessions = state.cloud.lock_recover().is_some();
         single_instance::SessionInfo {
             session_id,
@@ -1339,11 +1941,10 @@ mod desktop {
 
     /// The `SESSION` control verb's write half, run **inside** the host process.
     ///
-    /// Three things have to happen together or the printed credentials are a lie: the host's
-    /// `SessionAuth` has to accept the new pair, the relay has to be re-registered under the new
-    /// id (a client joining the cloud URL for an id nobody registered gets `503 host offline`),
-    /// and the desktop UI has to follow, because it mirrors both values and pushes its own copy
-    /// back through `set_session_credentials` whenever either changes.
+    /// Three things have to happen together: `SessionAuth` accepts the new pair, the relay is
+    /// re-registered under the new id (a client joining the cloud URL for an unregistered id
+    /// gets `503 host offline`), and the desktop UI follows, because it mirrors both values and
+    /// pushes its own copy back through `set_session_credentials` whenever either changes.
     pub fn apply_session_credentials(
         app: &tauri::AppHandle,
         session_id: &str,
@@ -1356,9 +1957,8 @@ mod desktop {
         }
         platform::set_session_credentials(app.state(), session_id.to_string(), otp.to_string());
 
-        // Only when this host actually holds a relay client. Registering one here on a host
-        // started with `--no-cloud`, or with public sessions turned off in the UI, would put a
-        // session on the internet that nobody asked to publish.
+        // only when this host already holds a relay client: on a host started with `--no-cloud`
+        // or with public sessions off, registering here would publish a session nobody asked for
         let public = app
             .state::<platform::AppState>()
             .cloud
@@ -1398,9 +1998,9 @@ mod desktop {
 
     /// Where the session id a command is about to print came from.
     ///
-    /// The whole defect this exists to close is `Generated` being reached while a host is
-    /// running: every URL and QR built on a minted id is for a session that does not exist, and
-    /// the failure only shows up on the client, as `503 host offline` from the relay.
+    /// `Generated` must never be reached while a host is running: every URL and QR built on a
+    /// minted id is for a session that does not exist, and the failure only shows up on the
+    /// client, as `503 host offline` from the relay.
     #[derive(Debug, Clone, Copy, PartialEq)]
     enum IdSource {
         Flag,
@@ -1431,12 +2031,9 @@ mod desktop {
         }
     }
 
-    /// How long `session new` waits for the relay to answer a re-registration.
-    ///
-    /// The point of waiting at all is that the printed "Anywhere (Internet)" URL is only good
-    /// once the relay has the id, and the round trip is over the public internet. The wait is
-    /// bounded and the outcome is printed either way: a timeout says "still connecting", which
-    /// is the truth, rather than presenting an unregistered URL as ready.
+    /// How long `session new` waits for the relay to answer a re-registration (a round trip over
+    /// the public internet): the printed "Anywhere (Internet)" URL is only good once the relay
+    /// has the id. A timeout prints "still connecting", never an unregistered URL as ready.
     const CLOUD_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
     const CLOUD_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
@@ -1455,11 +2052,9 @@ mod desktop {
 
     /// Hand new credentials to the running host, then read back what it is serving.
     ///
-    /// The read-back is not ceremony. The desktop UI mirrors the session id and the OTP in React
-    /// state and pushes its own copy back through `set_session_credentials` whenever either
-    /// changes, so a set that returned `OK` can still be overwritten a moment later by a host
-    /// that did not follow the change — which is precisely the shape of the bug this command is
-    /// being fixed for, seen from the other side.
+    /// The desktop UI mirrors the session id and the OTP in React state and pushes its own copy
+    /// back through `set_session_credentials` whenever either changes, so a set that returned
+    /// `OK` can still be overwritten a moment later by a host that did not follow the change.
     fn push_session_credentials(
         app: &tauri::AppHandle,
         session_id: &str,
@@ -1481,7 +2076,7 @@ mod desktop {
         }
         if !single_instance::is_ok_reply(reply) {
             return Err(format!(
-                "the running host answered {reply:?} — an older build that does not know the \
+                "the running host answered {reply:?}: an older build that does not know the \
                  SESSION verb. Quit it and start the host from this build."
             ));
         }
@@ -1490,7 +2085,7 @@ mod desktop {
         })?;
         if info.session_id != session_id || info.otp != otp {
             return Err(format!(
-                "the host is serving session {} — something replaced the credentials as they \
+                "the host is serving session {}: something replaced the credentials as they \
                  were applied",
                 info.session_id
             ));
@@ -1504,7 +2099,7 @@ mod desktop {
             "registered" if !info.cloud_detail.is_empty() => info.cloud_detail.clone(),
             "registered" => "registered".to_string(),
             "connecting" => {
-                "still connecting — the \"Anywhere (Internet)\" URL is not live yet".to_string()
+                "still connecting, the \"Anywhere (Internet)\" URL is not live yet".to_string()
             }
             "" => "not registered".to_string(),
             other if info.cloud_detail.is_empty() => other.to_string(),
@@ -1512,14 +2107,11 @@ mod desktop {
         }
     }
 
-    // driver state
-
     /// What `status` and `doctor` report about the drivers this host depends on.
     ///
     /// Read-only and unelevated on both platforms: Windows probes the display driver's named
     /// pipe and asks `certutil` whether the signing certificate is still trusted, macOS reads
-    /// the legacy audio driver's health and whether the installer package made it into the
-    /// bundle. `status`'s own help text has promised driver state since it was written.
+    /// the legacy audio driver's health and whether the installer package is in the bundle.
     struct DriverState {
         rows: Vec<(&'static str, String)>,
         json: Value,
@@ -1529,9 +2121,9 @@ mod desktop {
     fn windows_certificate_trusted() -> Option<bool> {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        // `certutil -store root <id>` matches the certificate's CN exactly; the bundled
-        // certificate's subject is "ScreenExtend App", so ask for that first, then fall back
-        // to scanning the store listing so a renamed certificate is still found.
+        // `certutil -store root <id>` matches the certificate's CN exactly: ask for the bundled
+        // subject "ScreenExtend App" first, then scan the store listing so a renamed
+        // certificate is still found
         let exact = std::process::Command::new("certutil")
             .args(["-store", "root", "ScreenExtend App"])
             .creation_flags(CREATE_NO_WINDOW)
@@ -1558,54 +2150,71 @@ mod desktop {
             let cert_text = match cert {
                 Some(true) => "trusted in the machine root store".to_string(),
                 Some(false) => {
-                    "NOT in the root store — the driver will fail to load after a reboot"
-                        .to_string()
+                    "NOT in the root store: the driver will fail to load after a reboot".to_string()
                 }
                 None => "could not query (certutil unavailable)".to_string(),
             };
-            // The leak gate: unelevated, so `doctor` can always say it.
+            // the leak gate: read unelevated, so `doctor` can always report it
             let health = platform::driver_health::read_health();
             let health_text = if health.needs_restart {
                 format!(
-                    "{} — run `ScreenExtend drivers restart` as Administrator with no host running",
+                    "{}. Run `ScreenExtend drivers restart` as Administrator with no host running",
                     health.detail
                 )
             } else {
                 health.detail.clone()
             };
-            DriverState {
-                rows: vec![
-                    ("Virtual display driver", display),
-                    ("Signing certificate", cert_text),
-                    ("Driver host memory", health_text),
-                ],
-                json: serde_json::json!({
-                    "virtualDisplay": backend.as_str(),
-                    "virtualDisplayHolderPid": backend.holder(),
-                    "displayDriverHealth": health,
-                    "signingCertificate": match cert {
-                        Some(true) => "trusted",
-                        Some(false) => "absent",
-                        None => "unknown",
-                    },
-                }),
+            let mut rows = vec![
+                ("Virtual display driver", display),
+                ("Signing certificate", cert_text),
+                ("Driver host memory", health_text),
+            ];
+            let mut json = serde_json::json!({
+                "virtualDisplay": backend.as_str(),
+                "virtualDisplayHolderPid": backend.holder(),
+                "displayDriverHealth": health,
+                "signingCertificate": match cert {
+                    Some(true) => "trusted",
+                    Some(false) => "absent",
+                    None => "unknown",
+                },
+            });
+            // only a driver that answers on its versioned pipe adds anything here
+            if let Some(protocol) = platform::virtual_display::driver_protocol_report() {
+                rows.push((
+                    "Driver protocol",
+                    format!(
+                        "v{} (driver {} build {}): {}",
+                        protocol["protocol"],
+                        protocol["driver"].as_str().unwrap_or("?"),
+                        protocol["build"].as_str().unwrap_or("?"),
+                        protocol["capabilities"]
+                            .as_array()
+                            .map(|c| c
+                                .iter()
+                                .filter_map(|v| v.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", "))
+                            .unwrap_or_default()
+                    ),
+                ));
+                json["driverProtocol"] = protocol;
             }
+            DriverState { rows, json }
         }
         #[cfg(target_os = "macos")]
         {
             let status = platform::audio_driver_status();
             let audio = match status.as_str() {
                 "ready" => "installed and healthy".to_string(),
-                "needs_install" => {
-                    "not installed — System Audio on 10.15-12.x needs it".to_string()
-                }
+                "needs_install" => "not installed: System Audio on 10.15-12.x needs it".to_string(),
                 "installed_but_unhealthy" => {
                     "installed but not answering; reinstall it".to_string()
                 }
                 other => other.to_string(),
             };
-            // A build whose bundle is missing the package can only ever fail the install, so
-            // say so here rather than letting the user discover it from a generic error.
+            // a build whose bundle is missing the package can only ever fail the install: say
+            // so here, not through a generic error
             let pkg = _app
                 .path()
                 .resolve("resources/ScreenExtendAudio.pkg", BaseDirectory::Resource)
@@ -1630,8 +2239,6 @@ mod desktop {
             }
         }
     }
-
-    // QR / join URLs
 
     fn cloud_url(session_id: &str) -> String {
         format!("https://{CLOUD_SESSION_DOMAIN}/?id={session_id}")
@@ -1667,8 +2274,6 @@ mod desktop {
         }
     }
 
-    // dispatch
-
     pub fn route(app: &tauri::AppHandle) -> Outcome {
         let matches = match app.cli().matches() {
             Ok(m) => m,
@@ -1682,10 +2287,9 @@ mod desktop {
             }
         };
 
-        // `fast_path` only claims help/version when they are the *first* token, so
-        // `serve --help` reaches the plugin. clap reports those as a match with no subcommand
-        // and a `help`/`version` arg; without this they would fall through to `LaunchGui` and
-        // open a window instead of printing anything.
+        // `serve --help` reaches the plugin, because `fast_path` only claims help/version as
+        // the *first* token. clap reports it as a match with no subcommand and a
+        // `help`/`version` arg, which would otherwise fall through to `LaunchGui`.
         if let Some(text) = matches.args.get("help").and_then(|d| d.value.as_str()) {
             println!("{text}");
             exit(0);
@@ -1726,8 +2330,6 @@ mod desktop {
         }
     }
 
-    // serve (headless host)
-
     fn run_serve(app: &tauri::AppHandle, m: &Matches) -> ! {
         crate::logbus::set_verbose(arg_flag(m, "verbose"));
 
@@ -1739,8 +2341,8 @@ mod desktop {
             }
         };
         let _ = std::fs::create_dir_all(&lock_dir);
-        // Same as the desktop branch: a headless host that vanishes must leave a reason behind,
-        // and the reason the *last* one left belongs in this one's log.
+        // same as the desktop branch: a headless host must leave its exit reason behind, and
+        // the reason the *last* one left belongs in this one's log
         crate::exit_reason::set_dir(lock_dir.clone());
         crate::exit_reason::report_previous(&lock_dir);
         let lock_path = lock_dir.join(single_instance::LOCK_FILE);
@@ -1761,6 +2363,17 @@ mod desktop {
             }
         }
 
+        // Windows: from here on, a Ctrl+C, a closed console, a logoff or a shutdown each reach
+        // the teardown at the end of this function. Installed before any server accepts a join.
+        #[cfg(windows)]
+        {
+            if !win_host::install_serve_console_handler() {
+                teprintln!("[serve] could not install the console control handler");
+            }
+            win_host::spawn_session_end_watcher();
+            win_host::mark_headless();
+        }
+
         println!("Starting the ScreenExtend host…");
         let ready = tauri::async_runtime::block_on(platform::setup(app.clone()));
         if !ready {
@@ -1771,10 +2384,9 @@ mod desktop {
         let state = app.state::<platform::AppState>();
         crate::streamer::input::prime();
         platform::permissions::prime();
-        // The one first Screen Recording request. Nothing else in a headless host asks, so
-        // without it the app never appears in the Screen Recording list at all. `prompt_gate`
-        // enforces "once": a request already on record makes this a silent read. Off the
-        // main thread because the macOS dialog blocks the caller.
+        // The one first Screen Recording request: nothing else in a headless host asks, and
+        // without it the app never appears in the Screen Recording list. `prompt_gate` enforces
+        // "once". Off the main thread because the macOS dialog blocks the caller.
         #[cfg(target_os = "macos")]
         {
             platform::permissions::remember_marker_dir(app);
@@ -1816,11 +2428,9 @@ mod desktop {
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
 
-        // `--encoder` picks the vendor the pipelines try first; `--software-encode` and the
-        // persisted `disableGpuEncode` are the older, narrower way of saying `--encoder
-        // software`, and they still win, because that toggle is also what the desktop UI sets.
-        // `tauri-plugin-cli` validates the value against `possibleValues`, so an unparseable one
-        // never reaches here.
+        // `--encoder` picks the vendor the pipelines try first. `--software-encode` and the
+        // persisted `disableGpuEncode` still win, because that toggle is also what the desktop
+        // UI sets. `tauri-plugin-cli` has already validated the value against `possibleValues`.
         if let Some(vendor) = arg_str(m, "encoder").and_then(|v| EncoderVendor::parse(&v)) {
             *state.encoder_vendor.lock_recover() = vendor;
             if software && vendor != EncoderVendor::Software {
@@ -1836,10 +2446,7 @@ mod desktop {
         if let Some(store) = store.as_deref() {
             apply_saved_config(app, store);
         }
-        // The last thing before the session id and the join banner. It is here because the step
-        // *above* it hung with no output at all — `set_device_override` deadlocked on itself once
-        // there was a device row to replay — and a host that stops between two silent steps gives
-        // nobody anything to go on.
+        // logged so a hang in the replay above does not sit between two silent steps
         tprintln!("[serve] saved configuration applied");
 
         let session_id = match read_credential(m, "session-id", "SCREENEXTEND_SESSION_ID", None) {
@@ -1860,14 +2467,12 @@ mod desktop {
         };
         platform::set_session_credentials(app.state(), session_id.clone(), otp.clone());
 
-        // Before the adapter servers start. It used to come last, after the banner, so `/health`
-        // answered ~300 ms before `stop`, `logs` and `status` could reach the host: a script that
-        // waited for health and then asked for `status --json` (the test handler does) saw no
-        // control server, and stopped the host by PID — skipping the BYE and the display removal.
-        // `AppState` exists by now, which the RELOAD/STATS/SESSION verbs need. Without the
-        // control server at all, `ScreenExtend stop` reports "no running instance" or dials a
-        // stale port left by an earlier GUI run.
+        // Before the adapter servers start: a script that sees `/health` answer must also find
+        // the control server, or it stops the host by PID and skips the BYE and display removal.
+        // Not earlier: the RELOAD/STATS/SESSION verbs need `AppState`.
         let (tx, rx) = std::sync::mpsc::channel();
+        #[cfg(windows)]
+        win_host::SERVE_STOP.arm(tx.clone());
         let ctrl_path = lock_dir.join(single_instance::CTRL_FILE);
         let quit_tx = std::sync::Mutex::new(tx.clone());
         if let Err(e) = single_instance::start_control_server(
@@ -1899,22 +2504,49 @@ mod desktop {
 
         install_device_listeners(app);
 
+        // Windows, `-v`: from here on a thread of its own echoes each log line, so the capture,
+        // encode, audio and transport threads pay a queue push, not a console write (which
+        // blocks while a console selection is active). The teardown below flushes the queue.
+        #[cfg(windows)]
+        if arg_flag(m, "verbose") && crate::windows_utils::streamer::tune::on("logbus_async_echo") {
+            crate::logbus::enable_async_echo();
+        }
+
+        // Windows: `println!` panics on a closed stdout (`serve | Select-Object -First 3`), and
+        // here that would end the host with joins already being accepted: no BYE, no display
+        // removal, no breadcrumb. The banner is the one thing lost.
+        #[cfg(windows)]
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            print_serve_banner(http, https, &session_id, &otp, cloud, !arg_flag(m, "no-qr"));
+        }))
+        .is_err()
+        {
+            teprintln!("[serve] stdout is closed; the join banner was not printed");
+        }
+        #[cfg(not(windows))]
         print_serve_banner(http, https, &session_id, &otp, cloud, !arg_flag(m, "no-qr"));
 
-        // Only in verbose mode: the summary is one logbus line per active session every 5 s, and
-        // every logbus line is a JSON IPC event, so it stays off unless somebody is watching.
+        // verbose only: one logbus line per active session every 5 s, so it stays off unless
+        // somebody is watching
         let telemetry_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         if arg_flag(m, "verbose") {
             crate::streamer::telemetry::spawn_summary_printer(Arc::clone(&telemetry_stop));
         }
 
+        #[cfg(windows)]
+        let _ = writeln!(
+            std::io::stdout(),
+            "\nHost is running. Press Ctrl+C to stop."
+        );
+        #[cfg(not(windows))]
         println!("\nHost is running. Press Ctrl+C to stop.");
         let _ = std::io::stdout().flush();
 
+        #[cfg(not(windows))]
         let _ = ctrlc::set_handler(move || {
             let _ = tx.send(());
         });
-        // Opt-in and unproven; see `main_pump_enabled`.
+        // opt-in and unproven; see `main_pump_enabled`
         #[cfg(target_os = "macos")]
         if platform::virtual_display::main_pump_enabled() {
             while matches!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)) {
@@ -1923,9 +2555,19 @@ mod desktop {
         } else {
             let _ = rx.recv();
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(windows)]
+        win_host::wait_for_stop(&rx);
+        #[cfg(not(any(windows, target_os = "macos")))]
         let _ = rx.recv();
 
+        // the first reason recorded wins, so on Windows this names what actually stopped the
+        // host and the "Ctrl+C" record below is a no-op
+        #[cfg(windows)]
+        crate::exit_reason::record(
+            win_host::SERVE_STOP
+                .reason()
+                .unwrap_or("serve: `ScreenExtend stop` (the control server's QUIT)"),
+        );
         crate::logbus::echo_stdout("\nStopping…");
         crate::exit_reason::record("serve: Ctrl+C");
         telemetry_stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1936,16 +2578,18 @@ mod desktop {
             crate::BYE_FLUSH_TIMEOUT,
         );
         platform::remove_all_displays(&state.virtual_display);
+        #[cfg(windows)]
+        crate::logbus::flush_async_echo(std::time::Duration::from_millis(500));
         exit(0);
     }
 
     /// Read a join credential without requiring it on the command line.
     ///
     /// Precedence: the flag, then the `--*-file` path if one is declared for this credential,
-    /// then the environment variable. `-` as the flag's value means "read one line from stdin".
-    /// argv is readable by every process on the machine and lands in shell history, and the OTP
-    /// is the only gate on a join once the session id is known — so a value that arrives that
-    /// way is used but warned about.
+    /// then the environment variable, which only a developer build reads ([`crate::envcfg`]).
+    /// `-` as the flag's value means "read one line from stdin".
+    /// argv is readable by every process on the machine and lands in shell history, so a value
+    /// that arrives that way is used but warned about.
     fn read_credential(
         m: &Matches,
         flag: &str,
@@ -1966,8 +2610,8 @@ mod desktop {
             }
             eprintln!(
                 "warning: --{flag} on the command line is visible to every process on this \
-                 machine and is written to shell history. Prefer {env_key}, --{flag} - (stdin){}.",
-                file_flag.map(|f| format!(", or --{f}")).unwrap_or_default()
+                 machine and is written to shell history. Prefer --{flag} - (stdin){}.",
+                file_flag.map(|f| format!(" or --{f}")).unwrap_or_default()
             );
             return Ok(Some(value));
         }
@@ -1980,30 +2624,19 @@ mod desktop {
             }
             return Ok(Some(value));
         }
-        match std::env::var(env_key) {
+        match crate::envcfg::var(env_key) {
             Ok(value) if !value.trim().is_empty() => Ok(Some(value.trim().to_string())),
             _ => Ok(None),
         }
     }
 
-    /// Everything in `config.json` that can be pushed into a live `AppState`.
-    ///
-    /// `serve` runs this at startup and the `RELOAD` control verb runs it again, so a change
-    /// made by `devices set` / `turn set` / `config set` from another shell reaches a host that
-    /// is already streaming. Server ports and the encoder choice are deliberately absent: they
-    /// are read once when the servers and pipelines are built.
-    /// Say out loud every saved value whose container type is not the one the config declares.
-    ///
-    /// Every reader below already survives a malformed value — `cfg_str`, `cfg_u64`, `cfg_bool`
-    /// and the two `Value::Array` matches all fall back to the default — but they did it in
-    /// silence, so a host that had quietly dropped the whole `devices` array looked exactly like
-    /// one that had none. One line per problem, in the same `[migrate]` form the desktop UI's
-    /// normaliser uses, so `ScreenExtend logs` reads the same on both sides.
+    /// One `[migrate]` line, in the form the desktop UI's normaliser uses, for every saved value
+    /// whose type is not the one the config declares. The readers below fall back to the default
+    /// in silence, so without it a dropped `devices` array looks like an empty one.
     fn config_faults(saved: &Saved) -> Vec<String> {
         let mut faults = Vec::new();
         for (key, value) in saved {
-            // Unknown keys are inert: `readStore` drops anything not in `defaultConfig` and the
-            // editor reports it as a warning, not an error.
+            // unknown keys are inert: `readStore` drops anything not in `defaultConfig`
             if let Some(shape) = config_shape().field(key) {
                 shape.faults(value, key, &mut faults);
             }
@@ -2019,11 +2652,9 @@ mod desktop {
         dig(saved, path).and_then(|v| v.as_str().map(str::to_string))
     }
 
-    /// The rows of an array-valued key, or nothing at all when it holds something else.
-    ///
-    /// This is the reader half of the rule: a value of the wrong container type is *absent*,
-    /// never an error and never a panic. `config_faults` has already named it in the log by the
-    /// time anything gets here.
+    /// The rows of an array-valued key, or nothing at all when it holds something else: a value
+    /// of the wrong container type is *absent*, never an error and never a panic. `config_faults`
+    /// has already named it in the log.
     fn saved_rows<'a>(saved: &'a Saved, key: &str) -> &'a [Value] {
         match saved.get(key) {
             Some(Value::Array(rows)) => rows,
@@ -2032,8 +2663,8 @@ mod desktop {
     }
 
     /// Everything `apply_saved_config` pushes into `AppState` that is not a device row. A
-    /// malformed value reads as absent, so every *other* key still applies — which is the whole
-    /// requirement: one bad setting may not cost the user the rest of their configuration.
+    /// malformed value reads as absent, so one bad setting does not cost the user the rest of
+    /// their configuration.
     #[derive(Debug, PartialEq)]
     struct SavedGlobals {
         turn_urls: String,
@@ -2078,17 +2709,16 @@ mod desktop {
     /// Replay the ban and auto-join sets from `knownDevices[]`.
     ///
     /// Trust is keyed on the per-device token, not the IP (`streamer/session.rs`). Without this
-    /// a headless host started from the same `config.json` as the GUI is *less* restrictive
-    /// than the GUI: every previously banned device is un-banned and can rejoin with the OTP,
-    /// and every approved device has to retype it.
+    /// a headless host is *less* restrictive than the GUI on the same `config.json`: every
+    /// banned device can rejoin with the OTP, and every approved device has to retype it.
     fn apply_saved_trust(app: &tauri::AppHandle, saved: &Saved) {
         let entries = parse_saved_trust(saved_rows(saved, "knownDevices"));
         let banned = entries.iter().filter(|e| e.banned).count();
         let approved = entries.len() - banned;
         for entry in entries {
             platform::set_device_banned(app.state(), entry.token.clone(), entry.ip, entry.banned);
-            // A banned device is never also auto-join approved; the GUI models the two as
-            // exclusive and the join path checks the ban first either way.
+            // a banned device is never also auto-join approved: the GUI models the two as
+            // exclusive and the join path checks the ban first either way
             platform::set_device_approved(app.state(), entry.token, !entry.banned);
         }
         if banned > 0 || approved > 0 {
@@ -2144,9 +2774,9 @@ mod desktop {
             .reload()
             .map_err(|e| format!("cannot re-read config store: {e}"))?;
         apply_saved_config(app, &store);
-        // Only on a reload, never at `serve` startup, where `--software-encode` has already
-        // decided it: this is what lets `config set disableGpuEncode` reach a running host the
-        // way the desktop toggle does.
+        // only on a reload, never at `serve` startup, where `--software-encode` has already
+        // decided it: lets `config set disableGpuEncode` reach a running host the way the
+        // desktop toggle does
         if let Some(software) = store.get("disableGpuEncode").and_then(|v| v.as_bool()) {
             platform::set_disable_gpu_encode(app.state(), software);
         }
@@ -2174,23 +2804,53 @@ mod desktop {
         if request_reload(app) {
             println!("(The running host reloaded its configuration.)");
         } else {
-            println!("(A host is running but did not answer — restart it to apply.)");
+            println!("(A host is running but did not answer. Restart it to apply.)");
         }
     }
 
     fn apply_saved_devices(app: &tauri::AppHandle, saved: &Saved) {
+        // Windows `serve`: a RELOAD replays only the rows that changed since the last replay,
+        // and forgets the live override of a row that is gone (`win_host::plan_replay`)
+        #[cfg(windows)]
+        let plan = win_host::replay_plan(
+            &parse_saved_devices(saved_rows(saved, "devices"))
+                .iter()
+                .filter_map(|d| Some((d.token.clone()?, format!("{d:?}"))))
+                .collect::<Vec<_>>(),
+        );
+        #[cfg(windows)]
+        for token in &plan.removed {
+            let state = app.state::<platform::AppState>();
+            let had = state
+                .device_overrides
+                .lock_recover()
+                .remove(token)
+                .is_some();
+            state.audio_sinks.lock_recover().remove(token);
+            if had {
+                tprintln!(
+                    "[devices] the saved row for {token} was removed; its live override is \
+                     forgotten, and a stream it has open keeps its current geometry until it \
+                     joins again"
+                );
+            }
+        }
         for d in parse_saved_devices(saved_rows(saved, "devices")) {
-            // Keyed by the device token. A row saved before tokens existed carries none, and
-            // there is nothing to replay it onto until that device joins again and is minted
-            // one — replaying it onto an address would be replaying it onto whoever holds that
-            // address now.
+            // keyed by the device token: a row saved before tokens existed waits until that
+            // device joins again and is minted one, because replaying it onto an address
+            // would reach whoever holds that address now
             let Some(key) = d.token.clone() else {
                 tprintln!(
-                    "[devices] the saved row for {} has no device token, so its settings wait                      for that device to join once more",
+                    "[devices] the saved row for {} has no device token, so its settings wait \
+                     for that device to join once more",
                     d.ip
                 );
                 continue;
             };
+            #[cfg(windows)]
+            if plan.skip.contains(&key) {
+                continue;
+            }
             platform::set_device_override(
                 app.state(),
                 key.clone(),
@@ -2212,8 +2872,8 @@ mod desktop {
                 d.native_dpr,
                 d.auto_orientation,
             );
-            // Without this a device pinned to a specific host output in the GUI reverts to the
-            // default output under `serve`, which is audible rather than theoretical.
+            // without this a device pinned to a specific host output in the GUI reverts to the
+            // default output under `serve`
             if let Some(output) = d.audio_output {
                 platform::set_device_audio_output(app.state(), key, output);
             }
@@ -2292,10 +2952,9 @@ mod desktop {
                         .get("systemAudio")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false),
-                    // Absent means the default, which is the unrestricted reach: a device saved
-                    // before the setting existed must not be fenced in by the upgrade. The host
-                    // re-reads it through `PointerScope::from_str`, so an unknown string is the
-                    // default too.
+                    // absent means the default, the unrestricted reach: a device saved before
+                    // the setting existed must not be fenced in by the upgrade. The host reads
+                    // it through `PointerScope::from_str`, so an unknown string is the default too
                     pointer_scope: device
                         .get("pointerScope")
                         .and_then(|v| v.as_str())
@@ -2305,8 +2964,8 @@ mod desktop {
                         .get("autoFrameRate")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false),
-                    // Absent is the default form: quality fixed at the slider, ratio and
-                    // orientation following the device.
+                    // absent is the default form: quality fixed at the slider, ratio and
+                    // orientation following the device
                     adaptive_quality: device
                         .get("adaptiveQuality")
                         .and_then(|v| v.as_bool())
@@ -2334,7 +2993,7 @@ mod desktop {
                 let ip = v.get("ip").and_then(|x| x.as_str()).unwrap_or("?");
                 let os = v.get("os").and_then(|x| x.as_str()).unwrap_or("");
                 let size = v.get("screenSize").and_then(|x| x.as_str()).unwrap_or("");
-                // On the thread that emitted the join, so it must not panic on a closed pipe.
+                // runs on the thread that emitted the join, so it must not panic on a closed pipe
                 crate::logbus::echo_stdout(&format!("+ device connected: {ip}  {os} {size}"));
             }
         });
@@ -2362,15 +3021,14 @@ mod desktop {
         let adapters = platform::networking::cli_adapters();
         let lan = lan_entries(&adapters, http_port, session_id);
         if lan.is_empty() {
-            println!("\nNo local networks found yet — connect to Wi-Fi/Ethernet, or start a hosted network.");
+            println!("\nNo local networks found yet. Connect to Wi-Fi/Ethernet, or start a hosted network.");
         }
         for (title, url) in &lan {
             print_join(title, url, qr);
         }
-        // The HTTPS endpoint is served on every adapter too and is the one that gets a secure
-        // context (SharedArrayBuffer audio, clipboard), but it carries a self-signed
-        // certificate — so it is printed as text and never as a QR, which would put a scanner
-        // straight into a certificate warning.
+        // the HTTPS endpoint is the one that gets a secure context (SharedArrayBuffer audio,
+        // clipboard), but its certificate is self-signed, so it is printed as text and never
+        // as a QR, which would put a scanner straight into a certificate warning
         if !lan.is_empty() {
             println!("\nHTTPS (self-signed certificate; accept the warning once):");
             for (title, url) in &lan {
@@ -2386,8 +3044,6 @@ mod desktop {
             print_join("Anywhere (Internet)", &cloud_url(session_id), qr);
         }
     }
-
-    // status
 
     /// Live per-session telemetry, asked of the running host over the single-instance control
     /// socket. `status` is a separate process, so this is the only path to counters that exist
@@ -2410,7 +3066,7 @@ mod desktop {
             println!("  (none connected)");
             return;
         }
-        // Keyed by join id: one row per browser tab, so a device with two open shows two.
+        // keyed by join id: one row per browser tab, so a device with two open shows two
         for (join, s) in sessions {
             println!(
                 "  {join}: capture={} encoder={} frames={}",
@@ -2476,8 +3132,7 @@ mod desktop {
                     tier("key_tier"),
                     tier("sink_tier"),
                 );
-                // The one line a support conversation should start from: every bit here was a
-                // swallowed error or an untaken branch on the device.
+                // every bit here was a swallowed error or an untaken branch on the device
                 let degraded: Vec<&str> = c
                     .get("degraded")
                     .and_then(|v| v.as_array())
@@ -2500,9 +3155,8 @@ mod desktop {
         let running = host_running(app);
         let telemetry = if running { live_telemetry(app) } else { None };
         let live = if running { live_session(app) } else { None };
-        // `--session-id` still wins, so a URL can be built for a session this machine is not
-        // serving; otherwise the id is the one the running host answered with. It used to be
-        // the flag or nothing, so `status` beside a live host reported no session at all.
+        // `--session-id` wins, so a URL can be built for a session this machine is not
+        // serving; otherwise the id is the one the running host answered with
         let session_id =
             arg_str(m, "session-id").or_else(|| live.as_ref().map(|info| info.session_id.clone()));
         let http = cfg_u64(&store, "serverPorts.http").unwrap_or(DEFAULT_HTTP_PORT as u64) as u16;
@@ -2523,10 +3177,9 @@ mod desktop {
                 .collect();
             let out = serde_json::json!({
                 "hostRunning": running,
-                // The session the host is actually serving, not one this process invented. The
-                // OTP is deliberately absent: it is on the control socket so a setter can read
-                // back what it applied, and `status` output is the kind of thing that gets
-                // pasted into a bug report.
+                // The session the host is actually serving, never one minted here. The OTP is
+                // deliberately absent: `status` output is the kind of thing that gets pasted
+                // into a bug report.
                 "sessionId": session_id,
                 "cloudState": live.as_ref().map(|info| info.cloud_state.clone()),
                 "publicSession": live.as_ref().map(|info| info.public_sessions),
@@ -2615,7 +3268,7 @@ mod desktop {
         if session_id.is_none() {
             if running {
                 println!(
-                    "\nThe host is up but did not report a session — it is still starting (the desktop\napp mints one a moment after launch), or it predates this build's SESSION control\nverb. Run this again, or `ScreenExtend session new` to set one."
+                    "\nThe host is up but did not report a session. It is still starting (the desktop\napp mints one a moment after launch), or it predates this build's SESSION control\nverb. Run this again, or `ScreenExtend session new` to set one."
                 );
             } else {
                 println!(
@@ -2626,17 +3279,10 @@ mod desktop {
         exit(0);
     }
 
-    // qr / session
-
     fn run_qr(app: &tauri::AppHandle, m: &Matches) -> ! {
-        // The running host first. `qr` used to mint a fresh id on every invocation and print
-        // join URLs for it, so three runs beside one host printed three ids and none of them was
-        // the one the host was serving.
-        //
-        // "a host is running" and "a host told me its session" are two different questions, and
-        // the answer to the second can be no while the first is yes: a host still starting, or
-        // one from a build that predates the SESSION verb. The output has to separate them or a
-        // minted id would be presented as the considered answer.
+        // The running host's id first; one is minted only when nothing answered. A host can be
+        // running and still report no session (still starting, or older than the SESSION verb),
+        // so the output keeps the two answers apart.
         let running = host_running(app);
         let live = live_session(app);
         let (session_id, source) = resolve_session_id(
@@ -2681,14 +3327,14 @@ mod desktop {
         match source {
             IdSource::Host => println!("  (the session the running host is serving)"),
             IdSource::Generated if running => println!(
-                "  NOTE: a host is running but did not report a session — it is still starting,\n  \
+                "  NOTE: a host is running but did not report a session. It is still starting,\n  \
                  or it predates this build's SESSION control verb. The id above was generated\n  \
                  here and is NOT the one being served; run `ScreenExtend session new` to set it."
             ),
             IdSource::Generated => println!(
                 "  NOTE: no host is running, so this id was generated here and nothing is\n  \
                  serving it yet. Start the host with it:\n    \
-                 SCREENEXTEND_SESSION_ID={session_id} ScreenExtend serve\n  \
+                 ScreenExtend serve --session-id {session_id}\n  \
                  or run `ScreenExtend session new`, which also mints the OTP."
             ),
             IdSource::Flag => {}
@@ -2726,9 +3372,8 @@ mod desktop {
                     .and_then(|s| cfg_u64(s, "serverPorts.http"))
                     .unwrap_or(DEFAULT_HTTP_PORT as u64) as u16;
 
-                // Apply them to the running host before printing anything. A credential this
-                // command minted and did not hand over is one the host has never heard of, and
-                // every URL below it would be for a session that does not exist.
+                // applied to the running host before anything is printed: a credential the
+                // host never heard of makes every URL below a session that does not exist
                 let applied = if host_running(app) {
                     match push_session_credentials(app, &session_id, &otp) {
                         Ok(info) => Some(info),
@@ -2746,8 +3391,8 @@ mod desktop {
                     None
                 };
 
-                // With a host up, whether the relay carries this session is a fact about that
-                // host; with none, it is the saved intent the next `serve` will read.
+                // with a host up, whether the relay carries this session is a fact about that
+                // host; with none, it is the saved intent the next `serve` will read
                 let cloud = match applied.as_ref() {
                     Some(info) => info.public_sessions,
                     None => store
@@ -2795,12 +3440,12 @@ mod desktop {
                     print_join(&title, &url, render);
                 }
                 if applied.is_none() {
-                    // The env-var form is what is printed, because `--otp` on a command line is
-                    // readable by every process on the machine and is written to shell history.
+                    // the OTP on stdin, because `--otp` on a command line is readable by every
+                    // process on the machine and is written to shell history
                     println!(
                         "\nStart the host with these credentials:\n  \
-                         SCREENEXTEND_SESSION_ID={session_id} SCREENEXTEND_OTP={otp} ScreenExtend serve\n\
-                         (PowerShell: $env:SCREENEXTEND_SESSION_ID='{session_id}'; $env:SCREENEXTEND_OTP='{otp}'; ScreenExtend serve)"
+                         ScreenExtend serve --session-id {session_id} --otp -\n\
+                         and type the OTP ({otp}) when it waits for input."
                     );
                 }
                 exit(0);
@@ -2811,8 +3456,6 @@ mod desktop {
             }
         }
     }
-
-    // devices
 
     /// Live joins, asked of the running host over the control socket. Empty when no host is up.
     fn live_joins(app: &tauri::AppHandle) -> Vec<Value> {
@@ -2857,8 +3500,8 @@ mod desktop {
     /// Turn whatever the user typed into the device token the settings are stored under.
     ///
     /// A token is used as-is. Anything else is treated as an address and resolved against the
-    /// live joins — and only while exactly one device is connected from it, because an address
-    /// is a place and is handed on to the next device that asks for it.
+    /// live joins, and only while exactly one device is connected from it: an address is a
+    /// place, and is handed on to the next device that asks for it.
     fn resolve_device_key(app: &tauri::AppHandle, saved: &[Value], key: &str) -> Option<String> {
         let key = key.trim();
         if key.is_empty() {
@@ -2894,8 +3537,8 @@ mod desktop {
                 return None;
             }
         }
-        // Nothing connected. A saved row that still carries this as its last-seen address is the
-        // only remaining hint, and only while exactly one does.
+        // nothing connected: a saved row that still carries this as its last-seen address is
+        // the only remaining hint, and only while exactly one does
         let rows: Vec<String> = saved
             .iter()
             .filter(|d| d.get("ip").and_then(|v| v.as_str()) == Some(key))
@@ -2915,10 +3558,9 @@ mod desktop {
 
     /// The saved `devices[]` rows, or an empty list if the key holds something else.
     ///
-    /// Saying so on stderr matters more here than anywhere else: `devices set` writes the list
-    /// back, so a `devices` key holding an object is *replaced* by a proper array with one row
-    /// in it. That is the right repair — nothing could read the object anyway — but it must not
-    /// happen quietly, because the rows in it are settings the user thought they had.
+    /// The warning matters: `devices set` writes the list back, so a `devices` key holding an
+    /// object is *replaced* by a proper array with one row in it. That must not happen quietly,
+    /// because the rows in it are settings the user thought they had.
     fn saved_device_rows(store: &Cfg) -> Vec<Value> {
         match get_nested(store, "devices") {
             Some(Value::Array(rows)) => rows,
@@ -2976,7 +3618,7 @@ mod desktop {
                     let s = |k: &str| d.get(k).cloned().unwrap_or(Value::Null);
                     let token = match s("token").as_str() {
                         Some(t) if !t.is_empty() => t.to_string(),
-                        _ => "(none — rejoin once)".to_string(),
+                        _ => "(none: rejoin once)".to_string(),
                     };
                     let ip = s("ip").as_str().unwrap_or("").to_string();
                     let scale = s("scale").as_u64().unwrap_or(100);
@@ -3005,6 +3647,16 @@ mod desktop {
                     eprintln!("usage: ScreenExtend devices set <device> [--scale N] [--orientation Portrait|Landscape] [--refresh-rate N] [--video-scale N] [--video-quality N] [--control on|off] [--audio on|off] [--pointer-scope display|all] [--auto-framerate on|off] [--adaptive-quality on|off] [--native-dpr on|off] [--auto-orientation on|off]");
                     eprintln!("  <device> is a device token (see `devices list`); an IP is accepted and resolved to whichever device is connected from it");
                     exit(2);
+                };
+                let auto_orientation = match orientation_write(
+                    arg_str(sm, "orientation").as_deref(),
+                    arg_str(sm, "auto-orientation").as_deref(),
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        exit(2);
+                    }
                 };
                 let mut existing = saved_device_rows(&store);
                 let Some(token) = resolve_device_key(app, &existing, &key) else {
@@ -3065,8 +3717,8 @@ mod desktop {
                 if let Some(v) = arg_str(sm, "native-dpr") {
                     obj.insert("nativeDpr".into(), Value::Bool(v == "on"));
                 }
-                if let Some(v) = arg_str(sm, "auto-orientation") {
-                    obj.insert("autoOrientation".into(), Value::Bool(v == "on"));
+                if let Some(v) = auto_orientation {
+                    obj.insert("autoOrientation".into(), Value::Bool(v));
                 }
 
                 existing
@@ -3113,7 +3765,26 @@ mod desktop {
         }
     }
 
-    // network
+    /// What `devices set` writes to `autoOrientation`, given its two orientation flags.
+    ///
+    /// While auto-orientation is on the device's own rotation is followed and a saved
+    /// orientation is ignored, so an explicit `--orientation` turns it off in the same write;
+    /// asking for both at once is refused rather than guessed at.
+    fn orientation_write(
+        orientation: Option<&str>,
+        auto: Option<&str>,
+    ) -> Result<Option<bool>, String> {
+        match (orientation, auto) {
+            (Some(o), Some("on")) => Err(format!(
+                "--orientation {o} and --auto-orientation on contradict: with auto-orientation \
+                 on the device's own rotation is followed and the orientation is ignored. Pass \
+                 one of them."
+            )),
+            (_, Some(a)) => Ok(Some(a == "on")),
+            (Some(_), None) => Ok(Some(false)),
+            (None, None) => Ok(None),
+        }
+    }
 
     fn run_network(app: &tauri::AppHandle, m: &Matches) -> ! {
         let Some((name, sm)) = sub(m) else {
@@ -3122,7 +3793,11 @@ mod desktop {
         };
         match name {
             "wifi-on" => {
-                if platform::hosted_network::turn_on_wifi() {
+                #[cfg(windows)]
+                let on = platform::hosted_network::turn_on_wifi_blocking();
+                #[cfg(not(windows))]
+                let on = platform::hosted_network::turn_on_wifi();
+                if on {
                     println!("Wi-Fi is on.");
                     exit(0);
                 } else {
@@ -3171,8 +3846,14 @@ mod desktop {
         }
     }
 
+    /// Whether the legacy (`netsh`) hosted network is running: asked of the WLAN service, with
+    /// the `netsh` status line as the fallback when that will not answer. The line is
+    /// English-only: on a localized Windows a running network reads as stopped there.
     #[cfg(windows)]
     fn network_started() -> bool {
+        if let Some(active) = win_host::legacy_hosted_network_active() {
+            return active;
+        }
         std::process::Command::new("netsh")
             .args(["wlan", "show", "hostednetwork"])
             .output()
@@ -3184,49 +3865,115 @@ mod desktop {
             .unwrap_or(false)
     }
 
+    /// `network start` drives the legacy `netsh` tier only. The two modern tiers cannot be run
+    /// from a process that exits: a Wi-Fi Direct access point lives exactly as long as the
+    /// process that publishes it, and the Mobile Hotspot start is private to the host's
+    /// `hosted_network` module. Both start from the desktop app.
     #[cfg(windows)]
     fn network_start(app: &tauri::AppHandle, m: &Matches) -> ! {
         let (Some(ssid), Some(password)) = (arg_str(m, "ssid"), arg_str(m, "password")) else {
-            eprintln!("usage: ScreenExtend network start <ssid> <password>");
+            eprintln!("usage: ScreenExtend network start <ssid> <password|->");
             exit(2);
         };
-        let exe = std::env::current_exe().unwrap_or_default();
-        let mut cmd = std::process::Command::new(exe);
-        cmd.arg("hostednetwork").arg(&ssid).arg(&password);
-        println!("Requesting elevation to start the hosted network…");
-        let _ = elevated_command::Command::new(cmd).output();
+        // `-` reads the passphrase from stdin, so it is on neither this process's argv nor the
+        // shell's history
+        let password = if password == "-" {
+            let mut line = String::new();
+            if std::io::stdin().read_line(&mut line).is_err() {
+                eprintln!("error: could not read the password from stdin");
+                exit(2);
+            }
+            line.trim_end_matches(['\r', '\n']).to_string()
+        } else {
+            eprintln!(
+                "warning: a password on the command line is visible to every process on this \
+                 machine and is written to shell history. Pass `-` to read it from stdin."
+            );
+            password
+        };
+        if let Err(e) = win_host::validate_hotspot_credentials(&ssid, &password) {
+            eprintln!("error: {e}");
+            exit(2);
+        }
+        println!("Requesting elevation to start the legacy (netsh) hosted network…");
+        // the passphrase goes to the elevated child in a file it deletes, not on its command
+        // line, where every process on the machine could read it
+        use crate::windows_utils::hosted_network::{run_elevated_hostednetwork, ElevatedRun};
+        match run_elevated_hostednetwork(app, &ssid, &password, std::time::Duration::from_secs(120))
+        {
+            ElevatedRun::Exited(_) => {}
+            ElevatedRun::Declined => {
+                eprintln!("The administrator prompt was dismissed; nothing was started.");
+                exit(1);
+            }
+            ElevatedRun::TimedOut => {
+                eprintln!("The elevated `hostednetwork` step did not finish within 120 s.");
+                exit(1);
+            }
+            ElevatedRun::Failed(e) => {
+                eprintln!("error: {e}");
+                exit(1);
+            }
+        }
+        // the child's exit code says only that it ran; whether an access point is up is asked
+        // of the WLAN service
         if network_started() {
             println!("Hosted network '{ssid}' started.");
-            let _ = app;
             exit(0);
         }
-        eprintln!("Could not start the hosted network. Your Wi-Fi adapter may not support it.");
+        let best = platform::hosted_network::probe_backend(Some(app));
+        eprintln!(
+            "Could not start the legacy hosted network. `network start` drives only the netsh \
+             tier; this machine's best tier is {}. Start the network from the desktop app.",
+            best.as_str()
+        );
         exit(1);
     }
 
     #[cfg(windows)]
     fn network_stop() -> ! {
-        let ok = std::process::Command::new("netsh")
+        let _ = std::process::Command::new("netsh")
             .args(["wlan", "stop", "hostednetwork"])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if ok {
-            println!("Hosted network stopped.");
-            exit(0);
+            .status();
+        // success is "not running afterwards", read back, not netsh's exit status: stopping a
+        // network that was not running is not a failure
+        if network_started() {
+            eprintln!("Could not stop the legacy hosted network.");
+            exit(1);
         }
-        eprintln!("Could not stop the hosted network.");
-        exit(1);
+        println!("Legacy hosted network stopped.");
+        if win_host::mobile_hotspot_on() == Some(true) {
+            println!(
+                "(Windows Mobile Hotspot is on. `network stop` leaves it alone, since it may not \
+                 be ScreenExtend's; turn it off in Settings > Network & internet > Mobile hotspot.)"
+            );
+        }
+        exit(0);
     }
 
     #[cfg(windows)]
     fn network_status(m: &Matches) -> ! {
-        let started = network_started();
+        let legacy = network_started();
+        let hotspot = win_host::mobile_hotspot_on();
+        let started = legacy || hotspot == Some(true);
         if wants_json(m) {
-            println!("{}", serde_json::json!({"started": started}));
-        } else {
             println!(
-                "Hosted network: {}",
+                "{}",
+                serde_json::json!({
+                    "started": started,
+                    "legacyHostedNetwork": legacy,
+                    "mobileHotspot": hotspot,
+                })
+            );
+        } else {
+            let tier = match (legacy, hotspot == Some(true)) {
+                (true, true) => " (legacy netsh network and Mobile Hotspot)",
+                (true, false) => " (legacy netsh network)",
+                (false, true) => " (Mobile Hotspot)",
+                (false, false) => "",
+            };
+            println!(
+                "Hosted network: {}{tier}",
                 if started { "started" } else { "stopped" }
             );
         }
@@ -3235,7 +3982,7 @@ mod desktop {
 
     #[cfg(not(windows))]
     fn network_start(_app: &tauri::AppHandle, _m: &Matches) -> ! {
-        eprintln!("On macOS the hosted network is tied to the running host — start it from the app or `ScreenExtend serve` (it stops when the host exits).");
+        eprintln!("On macOS the hosted network is tied to the running host: start it from the app or `ScreenExtend serve` (it stops when the host exits).");
         exit(1);
     }
 
@@ -3252,8 +3999,6 @@ mod desktop {
         eprintln!("On macOS the hosted-network state lives in the running host (app or `serve`).");
         exit(1);
     }
-
-    // config
 
     fn run_config(app: &tauri::AppHandle, m: &Matches) -> ! {
         let Some((name, sm)) = sub(m) else {
@@ -3281,7 +4026,7 @@ mod desktop {
                         serde_json::to_string_pretty(&Value::Object(map)).unwrap()
                     );
                 } else if entries.is_empty() {
-                    println!("(config is empty — run the app once to create it)");
+                    println!("(config is empty: run the app once to create it)");
                 } else {
                     for (k, v) in entries {
                         println!("{k} = {v}");
@@ -3312,11 +4057,8 @@ mod desktop {
                 };
                 let parsed = serde_json::from_str::<Value>(&value)
                     .unwrap_or_else(|_| Value::String(value.clone()));
-                // A refusal changes nothing — not the store's in-memory cache and not the file,
-                // because `store.save()` is below this and never runs. `config set
-                // devices.0.refreshRate 30` on a store with no `devices` array is the write that
-                // produced `{"0": {"refreshRate": 30}}` and took the owner's GUI down at
-                // startup; it now says so and exits 2.
+                // a refusal changes nothing: not the store's in-memory cache, and not the file,
+                // because `store.save()` below never runs
                 if let Err(e) = set_nested(&store, &key, parsed) {
                     eprintln!("error: {e}");
                     eprintln!("note: nothing was changed.");
@@ -3331,10 +4073,10 @@ mod desktop {
                     get_nested(&store, &key).unwrap_or(Value::Null)
                 );
                 report_live_apply(app);
-                // The reload replays everything that can reach a live `AppState`; these two
-                // are read once, when the servers and the pipelines are built.
+                // the reload replays everything that can reach a live `AppState`; these two
+                // are read once, when the servers and the pipelines are built
                 if key.starts_with("serverPorts") || key == "disableGpuEncode" {
-                    println!("(This one is read at startup — restart the host to apply it.)");
+                    println!("(This one is read at startup. Restart the host to apply it.)");
                 }
                 exit(0);
             }
@@ -3344,8 +4086,6 @@ mod desktop {
             }
         }
     }
-
-    // turn
 
     fn run_stun(app: &tauri::AppHandle, m: &Matches) -> ! {
         use crate::streamer::config::DEFAULT_STUN_URL;
@@ -3395,8 +4135,8 @@ mod desktop {
                 exit(0);
             }
             "clear" => {
-                // The empty string, not a removed key: "no STUN at all" is a setting, and a
-                // same-subnet-only host has no use for a reflexive candidate.
+                // the empty string, not a removed key: "no STUN at all" is a setting, and an
+                // absent key means the built-in default
                 store.set("stunUrls", Value::String(String::new()));
                 if let Err(e) = store.save() {
                     eprintln!("error: failed to save config: {e}");
@@ -3485,8 +4225,6 @@ mod desktop {
         }
     }
 
-    // account
-
     fn run_account(app: &tauri::AppHandle, m: &Matches) -> ! {
         let Some((name, sm)) = sub(m) else {
             eprintln!("usage: ScreenExtend account <name|whoami|avatar>");
@@ -3574,8 +4312,6 @@ mod desktop {
         }
     }
 
-    // autostart
-
     fn run_autostart(app: &tauri::AppHandle, m: &Matches) -> ! {
         use tauri_plugin_autostart::ManagerExt;
         let Some((name, _)) = sub(m) else {
@@ -3619,8 +4355,6 @@ mod desktop {
         }
     }
 
-    // drivers
-
     fn run_drivers(app: &tauri::AppHandle, m: &Matches) -> ! {
         let Some((name, sm)) = sub(m) else {
             eprintln!("usage: ScreenExtend drivers <install|remove|restart>");
@@ -3628,12 +4362,18 @@ mod desktop {
         };
         match name {
             "restart" => run_drivers_restart(app, sm),
+            #[cfg(windows)]
+            "install" => run_drivers_change(true),
+            #[cfg(windows)]
+            "remove" => run_drivers_change(false),
+            #[cfg(not(windows))]
             "install" => {
                 println!("Requesting elevation to install the virtual display driver…");
                 platform::install_drivers(app.clone());
                 println!("Driver install requested.");
                 exit(0);
             }
+            #[cfg(not(windows))]
             "remove" => {
                 println!("Requesting elevation to remove the virtual display driver…");
                 platform::remove_drivers(app.clone());
@@ -3647,13 +4387,93 @@ mod desktop {
         }
     }
 
+    /// Whether the driver now answers the way a finished install (or removal) should.
+    ///
+    /// Busy counts as installed: the pipe exists and another process holds it. A pipe that
+    /// exists and does not answer is neither, and is waited on, because a freshly installed
+    /// driver host takes a moment to start serving.
+    #[cfg(windows)]
+    fn driver_change_landed(
+        install: bool,
+        backend: crate::windows_utils::virtual_display::DisplayBackend,
+    ) -> bool {
+        use crate::windows_utils::virtual_display::DisplayBackend;
+        match backend {
+            DisplayBackend::IddDriver | DisplayBackend::DriverBusy { .. } => install,
+            DisplayBackend::DriverNotInstalled => !install,
+            DisplayBackend::DriverNotResponding => false,
+        }
+    }
+
+    /// `drivers install` / `drivers remove` on Windows: run the legacy subcommand elevated, wait
+    /// for it, then ask the driver itself whether the change landed.
+    ///
+    /// The exit code is the verdict: 0 only when the driver answers as installed (or, for
+    /// `remove`, is gone), so a script can tell "installed" from "the prompt was dismissed".
+    #[cfg(windows)]
+    fn run_drivers_change(install: bool) -> ! {
+        use crate::windows_utils::virtual_display::probe_display_backend_fresh;
+        use std::time::{Duration, Instant};
+
+        let (verb, legacy) = if install {
+            ("install", "installdrivers")
+        } else {
+            ("remove", "removedrivers")
+        };
+        println!("Requesting elevation to {verb} the virtual display driver…");
+        // the child's exit code is reported, but the driver's own answer below is the verdict:
+        // a `nefconc` step can fail on a machine whose driver was already there and still works
+        let code = match win_host::run_elevated_and_wait(&[legacy], Duration::from_secs(180)) {
+            win_host::Elevated::Exited(code) => code,
+            win_host::Elevated::Declined => {
+                eprintln!("The administrator prompt was dismissed; nothing was changed.");
+                exit(1);
+            }
+            win_host::Elevated::TimedOut => {
+                eprintln!("The elevated `{legacy}` step did not finish within 180 s.");
+                exit(1);
+            }
+            win_host::Elevated::Failed(e) => {
+                eprintln!("error: {e}");
+                exit(1);
+            }
+        };
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let backend = loop {
+            let backend = probe_display_backend_fresh();
+            if driver_change_landed(install, backend) || Instant::now() >= deadline {
+                break backend;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        };
+        if driver_change_landed(install, backend) {
+            if code != 0 {
+                eprintln!(
+                    "note: the elevated `{legacy}` step exited {code}, but the driver answers \
+                     as {}.",
+                    backend.as_str()
+                );
+            }
+            println!(
+                "Virtual display driver {}.",
+                if install { "installed" } else { "removed" }
+            );
+            exit(0);
+        }
+        eprintln!(
+            "The elevated `{legacy}` step exited {code}, and the driver now answers as {}; the \
+             {verb} did not take effect.",
+            backend.as_str()
+        );
+        exit(1);
+    }
+
     /// `drivers restart`: restart the virtual display driver in place to free what it has leaked.
     ///
-    /// The order is deliberate. Nothing that could be refused for a reason the user can fix
-    /// (a host in the way) waits behind the elevation check, so the unelevated run tells the
-    /// whole story; and the elevated run checks the same things again, because it is the one
-    /// that acts. Every exit writes `--report` when given, which is the only channel back to a
-    /// desktop app that started this through UAC.
+    /// The order is deliberate: every refusal the user can fix (a host in the way) comes before
+    /// the elevation check, so the unelevated run tells the whole story, and the elevated run
+    /// checks the same things again because it is the one that acts. Every exit writes
+    /// `--report` when given: the only channel back to a desktop app that started this via UAC.
     #[cfg(windows)]
     fn run_drivers_restart(app: &tauri::AppHandle, m: &Matches) -> ! {
         use crate::windows_utils::driver_health as dh;
@@ -3685,7 +4505,6 @@ mod desktop {
         let report = arg_str(m, "report").map(std::path::PathBuf::from);
         let rep = report.as_deref();
 
-        // 1. Is there a driver to restart at all?
         let devices = match dh::find_driver_devices() {
             Ok(d) => d,
             Err(e) => finish_with(
@@ -3715,8 +4534,8 @@ mod desktop {
         let before = dh::read_health();
         println!("Before: {}", before.detail);
 
-        // 2. Would it take displays away from a host? Ask the instance this data directory
-        //    belongs to, then the driver's own (machine-wide) display list.
+        // refused if it would take displays from a host: this data directory's instance, or any
+        // other one (the driver's display list is machine-wide)
         let ctrl = crate::data_dir::local_data_dir(app)
             .ok()
             .map(|d| d.join(single_instance::CTRL_FILE));
@@ -3738,7 +4557,7 @@ mod desktop {
             );
         }
 
-        // 3. Only now, elevation.
+        // elevation only now: every refusal the user can fix has already been reported
         if !elevated_command::Command::is_elevated() {
             finish_with(
                 rep,
@@ -3752,7 +4571,6 @@ mod desktop {
             );
         }
 
-        // 4. Restart, then wait for the driver to answer from a new host process.
         println!("Restarting…");
         match dh::restart_driver_devices() {
             Ok(n) => tprintln!(
@@ -3814,8 +4632,6 @@ mod desktop {
         exit(2);
     }
 
-    // doctor
-
     /// `doctor` exits 1 for an unsupported OS and 3 when the OS is fine but a
     /// required permission is denied, so a support script can tell the two apart.
     const DOCTOR_EXIT_PERMISSION: i32 = 3;
@@ -3849,10 +4665,9 @@ mod desktop {
         let probes = platform::permissions::raw_probes();
         #[cfg(target_os = "macos")]
         let identity = platform::permissions::identity_report();
-        // Only on the AirPlay tier, and only there because that backend drives the real
-        // Displays picker: when it fails, it fails by macOS quietly not creating a display,
-        // and "does the picker list us at all?" is the one question a user could otherwise
-        // never answer. `probe()` carries its own deadline.
+        // AirPlay tier only: that backend drives the real Displays picker, and it fails by
+        // macOS quietly not creating a display, so "does the picker list us at all?" is the one
+        // question a user could otherwise never answer. `probe()` carries its own deadline.
         #[cfg(target_os = "macos")]
         let airplay = if platform::virtual_display::probe_display_backend()
             == platform::virtual_display::DisplayBackend::AirPlayFallback
@@ -3926,7 +4741,7 @@ mod desktop {
         }
 
         println!(
-            "Operating system: {} — {}",
+            "Operating system: {} - {}",
             report.os_name, report.os_version
         );
         println!("Minimum required: {}", report.min_os_version);
@@ -3947,7 +4762,7 @@ mod desktop {
             println!("\nCapability notes:");
             for api in &report.unsupported_apis {
                 println!(
-                    "  [{}] {} ({}) — {}",
+                    "  [{}] {} ({}): {}",
                     api.severity, api.name, api.key, api.description
                 );
             }
@@ -3988,7 +4803,7 @@ mod desktop {
             println!(
                 "  Translocated: {}",
                 if identity.translocated {
-                    "YES — Gatekeeper is running a read-only copy; move the app to /Applications"
+                    "YES (Gatekeeper is running a read-only copy; move the app to /Applications)"
                 } else {
                     "no"
                 }
@@ -4006,12 +4821,12 @@ mod desktop {
             }
             println!("\nmacOS raw probes (read them against each other, not on their own):");
             println!(
-                "  CGPreflightScreenCaptureAccess: {:<8} ({} us) — cached per process; a false here means nothing on its own",
+                "  CGPreflightScreenCaptureAccess: {:<8} ({} us), cached per process; a false here means nothing on its own",
                 tribool(probes.preflight),
                 probes.preflight_us
             );
             println!(
-                "  window-list name probe:         {:<8} ({} us) — the live read; unknown means no other window was on screen",
+                "  window-list name probe:         {:<8} ({} us), the live read; unknown means no other window was on screen",
                 tribool(probes.window_name),
                 probes.window_name_us
             );
@@ -4067,13 +4882,11 @@ mod desktop {
         }
     }
 
-    // logs
-
     /// Print the running host's log backlog.
     ///
-    /// This process's own ring is empty by construction — it started a moment ago — so the
-    /// lines have to come from the host over the single-instance control socket. Without a
-    /// host there is nothing to print and that is an error, not an empty success.
+    /// This process's own ring is empty (it started a moment ago), so the lines have to come
+    /// from the host over the single-instance control socket. Without a host there is nothing
+    /// to print and that is an error, not an empty success.
     fn run_logs(app: &tauri::AppHandle, m: &Matches) -> ! {
         let take = arg_str(m, "lines")
             .and_then(|s| s.trim().parse::<usize>().ok())
@@ -4093,8 +4906,8 @@ mod desktop {
                  The backlog lives in the host process; start one with `ScreenExtend serve` \
                  or open the app."
             );
-            // The backlog died with the host, but the reason it ended did not. Without this
-            // line, a host that quit on request and one that vanished read identically here.
+            // the backlog died with the host, but the reason it ended did not: this is what
+            // tells a host that quit on request from one that vanished
             match crate::exit_reason::previous_summary(&dir) {
                 Some(summary) => eprintln!("{summary}"),
                 None => eprintln!(
@@ -4116,8 +4929,6 @@ mod desktop {
         }
         exit(0);
     }
-
-    // update
 
     fn run_update(app: &tauri::AppHandle, m: &Matches) -> ! {
         use tauri_plugin_updater::UpdaterExt;
@@ -4185,17 +4996,14 @@ mod desktop {
         }
     }
 
-    // stop
-
     fn run_stop(app: &tauri::AppHandle) -> ! {
         let Ok(dir) = crate::data_dir::local_data_dir(app) else {
             eprintln!("error: could not resolve app data directory");
             exit(1);
         };
         let ctrl_path = dir.join(single_instance::CTRL_FILE);
-        // The lock is the authority on whether anything is running. Without this check a
-        // control file left behind by a crashed run would have us dial whatever now owns that
-        // recycled port and report success.
+        // the lock is the authority on whether anything is running: a control file left behind
+        // by a crashed run would otherwise have us dial whatever now owns that recycled port
         if !host_running(app) {
             single_instance::clear_control_file(&ctrl_path);
             eprintln!("No running ScreenExtend instance found.");
@@ -4208,8 +5016,6 @@ mod desktop {
         eprintln!("A ScreenExtend host is running but is not answering on its control port.");
         exit(1);
     }
-
-    // display settings
 
     fn run_display_settings() -> ! {
         #[cfg(windows)]
@@ -4234,22 +5040,42 @@ mod desktop {
     mod tests {
         use super::*;
 
-        // ---- config.json's shape: writers may not change a container's type ----
+        #[cfg(windows)]
+        #[test]
+        fn a_driver_change_lands_only_on_the_drivers_own_answer() {
+            use crate::windows_utils::virtual_display::DisplayBackend as B;
+            assert!(driver_change_landed(true, B::IddDriver));
+            assert!(driver_change_landed(
+                true,
+                B::DriverBusy { holder: Some(4) }
+            ));
+            assert!(!driver_change_landed(true, B::DriverNotInstalled));
+            assert!(!driver_change_landed(true, B::DriverNotResponding));
+            assert!(driver_change_landed(false, B::DriverNotInstalled));
+            assert!(!driver_change_landed(false, B::IddDriver));
+            assert!(!driver_change_landed(false, B::DriverNotResponding));
+        }
+
+        #[test]
+        fn an_explicit_orientation_turns_auto_orientation_off() {
+            assert_eq!(orientation_write(Some("Portrait"), None), Ok(Some(false)));
+            assert_eq!(
+                orientation_write(Some("Portrait"), Some("off")),
+                Ok(Some(false))
+            );
+            assert!(orientation_write(Some("Landscape"), Some("on")).is_err());
+            assert_eq!(orientation_write(None, Some("on")), Ok(Some(true)));
+            assert_eq!(orientation_write(None, None), Ok(None));
+        }
 
         fn set(existing: Option<Value>, key: &str, value: Value) -> Result<Value, String> {
             let parts: Vec<&str> = key.split('.').collect();
             plan_set(existing, &parts, value)
         }
 
-        /// The write that took the owner's GUI down.
-        ///
-        /// `ScreenExtend config set devices.0.refreshRate 30` on a store whose `devices` key was
-        /// absent produced `"devices": {"0": {"refreshRate": 30}}` — an object where the schema
-        /// says array — because the old `set_path` created an object for every missing segment,
-        /// numeric or not. The bootstrap then did `for (const d of config.devices ?? [])`, threw
-        /// `object is not iterable`, and the startup path reported it as a missing display
-        /// driver. Two things have to hold: the object shape is never produced, and the write
-        /// that used to produce it now lands in the array as row 0.
+        /// `config set devices.0.refreshRate 30` on a store with no `devices` key must write
+        /// row 0 of an array, never `{"0": {...}}`: an object where the schema says array is not
+        /// iterable, and the app does not start.
         #[test]
         fn a_numeric_segment_under_an_array_is_an_index_and_never_an_object_key() {
             let written = set(None, "devices.0.refreshRate", Value::from(30)).unwrap();
@@ -4258,7 +5084,7 @@ mod desktop {
                 "devices must stay an array, got {written}"
             );
             assert_eq!(written, serde_json::json!([{ "refreshRate": 30 }]));
-            // The exact shape that broke startup, for the record.
+            // the shape that breaks startup
             assert_ne!(written, serde_json::json!({ "0": { "refreshRate": 30 } }));
         }
 
@@ -4287,20 +5113,20 @@ mod desktop {
         }
 
         /// A path that would turn one container into another is refused, and refused *before*
-        /// anything is written — `set_nested` returns the error and `store.set` never runs.
+        /// anything is written: `set_nested` returns the error and `store.set` never runs.
         #[test]
         fn a_write_may_not_change_a_container_type() {
             let cases: [(Option<Value>, &str, Value, &str); 6] = [
-                // An array cannot be addressed by name...
+                // an array cannot be addressed by name...
                 (
                     Some(serde_json::json!([])),
                     "devices.first.refreshRate",
                     Value::from(30),
                     "not a key in it",
                 ),
-                // ...and cannot be replaced by an object.
+                // ...and cannot be replaced by an object
                 (None, "devices", serde_json::json!({ "0": {} }), "an array"),
-                // An object cannot be replaced by an array, or by a scalar.
+                // an object cannot be replaced by an array, or by a scalar
                 (None, "serverPorts", serde_json::json!([8080]), "an object"),
                 (
                     None,
@@ -4308,10 +5134,10 @@ mod desktop {
                     Value::String("8080".into()),
                     "an object",
                 ),
-                // A scalar has nothing underneath it.
+                // a scalar has nothing underneath it
                 (None, "name.first", Value::from(1), "names nothing"),
-                // And a key whose stored value is the wrong container type is not quietly
-                // rebuilt underneath the caller.
+                // a stored value of the wrong container type is not quietly rebuilt
+                // underneath the caller
                 (
                     Some(serde_json::json!({ "0": { "refreshRate": 30 } })),
                     "devices.0.refreshRate",
@@ -4335,16 +5161,16 @@ mod desktop {
             assert!(set(None, "devices.0.remoteControl", Value::from(1)).is_err());
             assert!(set(None, "devices.0.scale", Value::from(1.5)).is_err());
 
-            // Accepted: the right types, including a whole-number float, which is what
-            // `serde_json` makes of `150.0` and is still an integer to every reader here.
+            // accepted: the right types, including a whole-number float, which is what
+            // `serde_json` makes of `150.0`
             assert!(set(None, "disconnectGraceSecs", Value::from(30)).is_ok());
             assert!(set(None, "devices.0.scale", Value::from(150.0)).is_ok());
             assert!(set(None, "zoomFactor", Value::from(1.25)).is_ok());
             assert!(set(None, "turnConfig.urls", Value::String("turn:x".into())).is_ok());
         }
 
-        /// A key the table does not name is inert — `readStore` drops it and the editor reports
-        /// it as a warning — so writing one is allowed. It still may not break a container.
+        /// A key the table does not name is inert (`readStore` drops it), so writing one is
+        /// allowed. It still may not break a container.
         #[test]
         fn an_unknown_key_is_writable_but_still_cannot_break_a_container() {
             assert_eq!(
@@ -4360,12 +5186,8 @@ mod desktop {
             assert!(err.contains("holds an array"), "{err}");
         }
 
-        // ---- config.json's shape: readers treat a wrong type as absent ----
-
-        /// The owner's file, as it was: `devices` an object, everything else fine. The replay has
-        /// to apply everything else and say one line about what it dropped. A malformed setting
-        /// is not a reason to lose the rest of the configuration, and it is certainly not a
-        /// reason to stop.
+        /// `devices` an object, everything else fine: the replay has to apply everything else
+        /// and say one line about what it dropped.
         #[test]
         fn a_malformed_key_costs_only_itself() {
             let saved: Saved = serde_json::from_value(serde_json::json!({
@@ -4405,7 +5227,6 @@ mod desktop {
             assert_eq!(faults.len(), 2, "{faults:?}");
         }
 
-        /// Every shape of wrongness, one key at a time, and the defaults that stand in for them.
         #[test]
         fn every_malformed_global_falls_back_to_its_default() {
             let bad = |patch: Value| -> SavedGlobals {
@@ -4453,7 +5274,7 @@ mod desktop {
             assert_eq!(parsed[0].token.as_deref(), Some("a"));
             assert_eq!(parsed[0].refresh_rate, 30);
             assert_eq!(parsed[1].token.as_deref(), Some("b"));
-            // The bad field falls back to the default rather than taking the row with it.
+            // the bad field falls back to its default; the row survives
             assert_eq!(parsed[1].scale, 100);
         }
 
@@ -4468,7 +5289,7 @@ mod desktop {
             .unwrap();
             assert_eq!(dig(&saved, "devices.1.token"), Some(Value::from("b")));
             assert_eq!(dig(&saved, "serverPorts.http"), Some(Value::from(8080)));
-            // Absent, wrong-typed and out-of-range paths are all simply not there.
+            // absent, wrong-typed and out-of-range paths are all simply not there
             assert_eq!(dig(&saved, "devices.9.token"), None);
             assert_eq!(dig(&saved, "devices.token"), None);
             assert_eq!(dig(&saved, "serverPorts.http.deeper"), None);
@@ -4494,11 +5315,8 @@ mod desktop {
             check(config_shape(), "config");
         }
 
-        /// The measured defect: with the GUI host running and serving `WLZ7JHNBC2RG`,
-        /// `qr -t all --json` printed `793LNG2XGM4V`, `session new --json` printed
-        /// `MQZ8VLBXBZPH` and a second `qr` printed `WE9CK24666Q3` — three ids in three
-        /// invocations, none of them the host's, every URL and QR unjoinable. A minted id may
-        /// only ever be reached when no host answered.
+        /// A minted id may only ever be reached when no host answered: any id but the running
+        /// host's makes every URL and QR unjoinable.
         #[test]
         fn a_running_host_is_never_answered_with_an_invented_session_id() {
             let live = || Some("WLZ7JHNBC2RG".to_string());
@@ -4508,14 +5326,13 @@ mod desktop {
             assert_eq!(id, "WLZ7JHNBC2RG");
             assert_eq!(source, IdSource::Host);
 
-            // An explicit --session-id is still the operator's call: it builds URLs for a
-            // session this machine need not be serving at all.
+            // an explicit --session-id is the operator's call: it builds URLs for a session
+            // this machine need not be serving at all
             let (id, source) = resolve_session_id(Some("GIVEN1234567".into()), live(), bogus);
             assert_eq!(id, "GIVEN1234567");
             assert_eq!(source, IdSource::Flag);
 
-            // Only with nothing answering is a fresh id the right answer, and the caller has to
-            // be able to say so in the output.
+            // only with nothing answering is a fresh id the right answer, and the source says so
             let (id, source) = resolve_session_id(None, None, bogus);
             assert_eq!(id, "793LNG2XGM4V");
             assert_eq!(source, IdSource::Generated);
@@ -4560,11 +5377,11 @@ mod desktop {
 
         /// The shipped binary beside this test binary, or `SE_TEST_BIN`.
         fn shipped_binary() -> Option<std::path::PathBuf> {
-            if let Ok(explicit) = std::env::var("SE_TEST_BIN") {
+            if let Ok(explicit) = crate::envcfg::var("SE_TEST_BIN") {
                 let path = std::path::PathBuf::from(explicit);
                 return path.exists().then_some(path);
             }
-            // `…/target/<profile>/deps/screenextend-<hash>.exe` -> `…/target/<profile>/`
+            // `.../target/<profile>/deps/screenextend-<hash>.exe` -> `.../target/<profile>/`
             let exe = std::env::current_exe().ok()?;
             let profile_dir = exe.parent()?.parent()?;
             let name = if cfg!(windows) {
@@ -4582,8 +5399,8 @@ mod desktop {
                 .output()
                 .unwrap_or_else(|e| panic!("running `ScreenExtend {}`: {e}", args.join(" ")));
             let text = String::from_utf8_lossy(&out.stdout);
-            // The GUI-subsystem binary attaches to the parent console; a child process captures
-            // its stdout normally, so the JSON is the whole of it.
+            // the GUI-subsystem binary attaches to the parent console, but a child process
+            // has its stdout captured normally, so the JSON is the whole of it
             let value = serde_json::from_str::<Value>(text.trim()).unwrap_or_else(|e| {
                 panic!(
                     "`ScreenExtend {}` did not print JSON ({e}):\n{text}\n{}",
@@ -4594,14 +5411,9 @@ mod desktop {
             (out.status.success(), value)
         }
 
-        /// `qr` and `status` against a real `ScreenExtend serve`, end to end.
-        ///
-        /// `#[ignore]` because it cannot run unattended: `serve` takes the single-instance lock,
-        /// initializes the virtual display driver and binds the streaming ports on every
-        /// adapter. It is the only test that proves the whole path — the host mints an id, the
-        /// control socket answers `SESSION` with it, and the two reporting commands print *that*
-        /// id rather than one of their own. The script is in
-        /// `docs/manual-tests/core-closeout.md`.
+        /// `qr` and `status` against a real `ScreenExtend serve`. The only test of the whole
+        /// path: the host mints an id, the control socket answers `SESSION` with it, and the
+        /// reporting commands print that id.
         #[test]
         #[ignore = "spawns a real headless host (single-instance lock, display driver, ports); run with --ignored --nocapture"]
         fn qr_and_status_report_the_session_a_live_serve_host_is_serving() {
@@ -4623,10 +5435,20 @@ mod desktop {
 
             let session_id = generate_session_id();
             let otp = generate_otp();
+            // by flag and file: a shipped build reads no environment variable
+            let otp_file =
+                std::env::temp_dir().join(format!("screenextend-test-otp-{}", std::process::id()));
+            std::fs::write(&otp_file, &otp).expect("writing the OTP file");
             let mut host = std::process::Command::new(&bin)
-                .args(["serve", "--no-cloud", "--no-qr"])
-                .env("SCREENEXTEND_SESSION_ID", &session_id)
-                .env("SCREENEXTEND_OTP", &otp)
+                .args([
+                    "serve",
+                    "--no-cloud",
+                    "--no-qr",
+                    "--session-id",
+                    &session_id,
+                ])
+                .arg("--otp-file")
+                .arg(&otp_file)
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()
@@ -4644,6 +5466,7 @@ mod desktop {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(500));
             }
+            let _ = std::fs::remove_file(&otp_file);
 
             let verdict = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 assert_eq!(
@@ -4669,8 +5492,8 @@ mod desktop {
                     );
                 }
 
-                // And the write half: `session new` replaces the pair on the running host, and
-                // the next `qr` reads the replacement back.
+                // the write half: `session new` replaces the pair on the running host, and
+                // the next `qr` reads the replacement back
                 let (ok, minted) = run_cli(&bin, &["session", "new", "--no-render", "--json"]);
                 assert!(ok, "`session new` failed: {minted}");
                 assert_eq!(minted.get("applied").and_then(|v| v.as_bool()), Some(true));
@@ -4699,8 +5522,8 @@ mod desktop {
             }
         }
 
-        /// `serve` used to replay only the display overrides, so a headless host started from
-        /// the same `config.json` as the GUI un-banned every banned device.
+        /// `serve` has to replay trust as well as the display overrides, or a headless host
+        /// started from the GUI's `config.json` un-bans every banned device.
         #[test]
         fn saved_trust_keys_on_the_token_and_skips_entries_that_address_nothing() {
             let known = serde_json::json!([
@@ -4776,18 +5599,16 @@ mod desktop {
             assert_eq!(parsed[1].refresh_rate, 120);
             assert!(!parsed[1].control);
             assert!(parsed[1].audio);
-            // A saved restriction survives the replay; an absent one is the default, which is
-            // the unrestricted reach — a device saved before the setting existed must not be
-            // fenced in by the upgrade.
+            // a saved restriction survives the replay; an absent one is the unrestricted default
             assert_eq!(parsed[1].pointer_scope, "display");
             assert!(parsed[1].auto_frame_rate);
             assert_eq!(parsed[1].audio_output.as_deref(), Some("speaker-1"));
             assert_eq!(parsed[1].token.as_deref(), Some("tok-b"));
         }
 
-        /// A row written before device tokens existed still parses — it just cannot be replayed
-        /// onto anything, because the only thing it names is an address, and an address is
-        /// handed on to the next device that asks for it.
+        /// A row written before device tokens existed still parses, but cannot be replayed onto
+        /// anything: the only thing it names is an address, and an address is handed on to the
+        /// next device that asks for it.
         #[test]
         fn a_saved_row_with_no_token_parses_but_names_no_device() {
             let devices = serde_json::json!([{ "ip": "10.0.0.5", "scale": 150 }]);

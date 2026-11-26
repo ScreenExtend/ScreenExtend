@@ -1,17 +1,9 @@
 //! A borderless window that paints a scripted workload onto a real display.
 //!
-//! `--workload` implies `--synthetic-pattern`, which feeds the generated buffer straight to the
-//! encoder: no `Duplicator`, no WGC frame pool, no GPU texture, no scaler. That measures encode,
-//! packetize and socket, and by construction leaves the `capture_delivery` and `scale`
-//! histograms empty — so the four workloads, whose whole point is that different content
-//! stresses *capture* and encode differently, only ever exercised the encode half.
-//!
-//! `--live` captures the real desktop, which does go through the whole path but takes whatever
-//! happens to be on screen and cannot be scripted or repeated.
-//!
-//! This closes the gap the cheap way: put the same generated frames on the actual display, in a
-//! borderless top-most window covering it, and let the real capture backend pick them up. The
-//! content stays repeatable, and every stage from `capture_delivery` onwards is now measured.
+//! `--synthetic-pattern` feeds the generated buffer straight to the encoder, which leaves the
+//! `capture_delivery` and `scale` histograms empty, and `--live` cannot be scripted or repeated.
+//! Painting the same generated frames in a top-most window lets the real capture backend pick
+//! them up: repeatable content, measured from `capture_delivery` onwards.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -19,22 +11,51 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, EndPaint, GetDC, ReleaseDC, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-    DIB_RGB_COLORS, PAINTSTRUCT, SRCCOPY,
+    BeginPaint, EndPaint, GetDC, GetMonitorInfoW, MonitorFromPoint, ReleaseDC, StretchDIBits,
+    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, MONITORINFO, MONITOR_DEFAULTTOPRIMARY,
+    PAINTSTRUCT, SRCCOPY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, PeekMessageW,
-    PostQuitMessage, RegisterClassW, SetWindowPos, ShowWindow, TranslateMessage, HWND_TOPMOST, MSG,
-    PM_REMOVE, SWP_NOACTIVATE, SW_SHOWNOACTIVATE, WM_DESTROY, WM_PAINT, WNDCLASSW,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+    PostQuitMessage, RegisterClassW, SetLayeredWindowAttributes, SetWindowPos, ShowWindow,
+    TranslateMessage, HWND_TOPMOST, LWA_ALPHA, MSG, PM_REMOVE, SWP_NOACTIVATE, SW_SHOWNOACTIVATE,
+    WM_DESTROY, WM_PAINT, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
 };
 
 use crate::streamer::synthetic::{self, Workload};
 
 const CLASS_NAME: PCWSTR = w!("ScreenExtendWorkload");
+
+/// A developer hook (honoured only with `SE_TEST_HOOKS=1`) that lets the window cover the
+/// primary display, for a harness run on a machine nobody is using.
+const ALLOW_PRIMARY_VAR: &str = "SE_WORKLOAD_ALLOW_PRIMARY";
+
+/// Whether two `(left, top, right, bottom)` rectangles share any pixel. Right and bottom are
+/// exclusive, as in a Win32 `RECT`.
+pub(crate) fn rects_overlap(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> bool {
+    a.0 < b.2 && b.0 < a.2 && a.1 < b.3 && b.1 < a.3
+}
+
+/// The primary monitor's rectangle in desktop coordinates. The primary display always has its
+/// top-left corner at the desktop origin, so `(0, 0)` finds it.
+fn primary_monitor_rect() -> Option<(i32, i32, i32, i32)> {
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    unsafe {
+        let monitor = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+            return None;
+        }
+    }
+    let r = info.rcMonitor;
+    Some((r.left, r.top, r.right, r.bottom))
+}
 
 /// A running workload window. Dropping it closes the window and joins its thread.
 pub struct WorkloadWindow {
@@ -43,12 +64,11 @@ pub struct WorkloadWindow {
 }
 
 impl WorkloadWindow {
-    /// Cover `(left, top, width, height)` — desktop coordinates — with a window painting
+    /// Cover `(left, top, width, height)`, in desktop coordinates, with a window painting
     /// `workload` at `fps`.
     ///
-    /// The window is created on its own thread because a Win32 window belongs to the thread that
-    /// created it and needs that thread's message loop; the probe's own thread is busy draining
-    /// encoded frames.
+    /// The window gets its own thread: a Win32 window belongs to the thread that created it and
+    /// needs that thread's message loop, and the probe's thread is busy draining encoded frames.
     pub fn spawn(
         left: i32,
         top: i32,
@@ -60,6 +80,22 @@ impl WorkloadWindow {
     ) -> Result<Self> {
         if width < 2 || height < 2 {
             return Err(anyhow!("workload window needs a real display rect"));
+        }
+        // Never cover the user's own screen unasked: a missing or mistyped `--monitor` makes
+        // `select_monitor` fall back to display 0. An unreadable primary rect is refused too.
+        let rect = (
+            left,
+            top,
+            left.saturating_add(width.min(i32::MAX as u32) as i32),
+            top.saturating_add(height.min(i32::MAX as u32) as i32),
+        );
+        let on_primary = primary_monitor_rect().is_none_or(|p| rects_overlap(rect, p));
+        if on_primary && super::tune::hook_var(ALLOW_PRIMARY_VAR).is_none() {
+            return Err(anyhow!(
+                "refusing to cover the primary display with the workload window \
+                 ({width}x{height} at ({left},{top})); point it at a virtual display, or set \
+                 {ALLOW_PRIMARY_VAR}=1 with SE_TEST_HOOKS=1 on a machine nobody is using"
+            ));
         }
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
@@ -82,8 +118,8 @@ impl WorkloadWindow {
                     let _ = report.send(Err(format!("{e:#}")));
                 }
             })?;
-        // The window has to exist before capture starts, or the first frames measure an empty
-        // desktop and the histograms open with a transient nobody asked for.
+        // the window has to exist before capture starts, or the first frames measure an empty
+        // desktop
         match ready_rx.recv_timeout(Duration::from_secs(5)) {
             Ok(Ok(())) => {}
             Ok(Err(e)) => return Err(anyhow!("workload window: {e}")),
@@ -112,8 +148,8 @@ unsafe extern "system" fn wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
-        // Painting happens from the render loop, which owns the frame counter. Answering the
-        // paint request keeps Windows from asking again on every iteration.
+        // the render loop paints; answering the paint request keeps Windows from asking again
+        // on every iteration
         WM_PAINT => {
             let mut ps = PAINTSTRUCT::default();
             let _ = BeginPaint(hwnd, &mut ps);
@@ -128,7 +164,7 @@ unsafe extern "system" fn wnd_proc(
     }
 }
 
-/// Marks the window's lifetime; dropping it is what the render loop's exit does.
+/// Destroys the window on drop, however the render loop exits.
 struct Window(HWND);
 
 impl Drop for Window {
@@ -153,8 +189,8 @@ fn run_window(
 ) -> Result<()> {
     unsafe {
         let instance = GetModuleHandleW(None)?;
-        // Registering twice returns ERROR_CLASS_ALREADY_EXISTS, which is fine — the class is
-        // process-wide and a second probe run in the same process would hit it.
+        // the `RegisterClassW` result is ignored: the class is process-wide, so a second probe
+        // run in this process gets ERROR_CLASS_ALREADY_EXISTS
         let class = WNDCLASSW {
             lpfnWndProc: Some(wnd_proc),
             hInstance: instance.into(),
@@ -163,8 +199,10 @@ fn run_window(
         };
         RegisterClassW(&class);
 
+        // `WS_EX_LAYERED | WS_EX_TRANSPARENT` makes it click-through: input goes to whatever is
+        // underneath
         let hwnd = CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+            WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT,
             CLASS_NAME,
             w!("ScreenExtend workload"),
             WS_POPUP | WS_VISIBLE,
@@ -178,9 +216,12 @@ fn run_window(
             None,
         )?;
         let window = Window(hwnd);
+        // a layered window shows nothing until it is given its attributes; fully opaque, so the
+        // pixels captured are exactly the pixels painted
+        SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA)?;
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         // `WS_EX_NOACTIVATE` keeps focus where it was; this keeps the window in front of
-        // whatever already had it.
+        // whatever already had it
         let _ = SetWindowPos(
             hwnd,
             Some(HWND_TOPMOST),
@@ -190,12 +231,11 @@ fn run_window(
             height as i32,
             SWP_NOACTIVATE,
         );
-        // The window exists and is on screen; capture can start.
         let _ = ready.send(Ok(()));
 
         let mut buf = vec![0u8; (width as usize) * (height as usize) * 4];
-        // Negative height: a top-down DIB, matching the row order `synthetic::fill` writes and
-        // the order the capture backends hand the encoders.
+        // negative height: a top-down DIB, matching the row order `synthetic::fill` writes and
+        // the order the capture backends hand the encoders
         let info = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,

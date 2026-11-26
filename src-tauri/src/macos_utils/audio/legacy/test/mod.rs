@@ -9,7 +9,7 @@ mod gain {
     /// The setpoint *is* the host's own monitoring latency, so the untroubled case must be small.
     #[test]
     fn the_monitor_setpoint_starts_at_a_few_output_periods() {
-        // a 512-frame output IO cycle: three periods, 32 ms — not the 85 ms a fixed 4096 was
+        // a 512-frame output IO cycle: three periods, 32 ms (a fixed 4096 would be 85 ms)
         assert_eq!(setpoint_frames(512, 0), 1536);
         // a very short cycle is floored so the drift loop still has something to work with
         assert_eq!(setpoint_frames(16, 0), 128);
@@ -40,7 +40,6 @@ mod gain {
 
     #[test]
     fn ramp_moves_toward_target_without_overshoot() {
-        // monotonic, never overshoots the target, converges
         let mut g = 0.0f32;
         let mut prev = -1.0f32;
         for _ in 0..2000 {
@@ -71,7 +70,6 @@ mod gain {
         // too empty → negative trim (consume slower to refill)
         let down = drift_trim(0.0, 0, setpoint);
         assert!(down < 0.0, "drained ring should lower the trim, got {down}");
-        // at the setpoint → no change
         assert_eq!(drift_trim(0.0, setpoint, setpoint), 0.0);
     }
 

@@ -39,8 +39,7 @@ const onHost = (args, env = {}) => (LOCAL ? run('/bin/bash', [LAUNCHER, ...args]
 const kv = (t) => Object.fromEntries(t.split('---LSOF---')[0].split('\n').filter((l) => /^[A-Z_]+=/.test(l)).map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]));
 
 const MODE = opt('mode', 'leak');
-// A local host creates a virtual display on this Mac and reflows whatever its user has open, so it
-// has to be allowed explicitly.
+// opt-in only: a local host creates a virtual display on this Mac and reflows its user's windows
 if (LOCAL && process.env.E2E_ALLOW_LOCAL_DISPLAY !== '1') { console.error('refusing --host local: it creates a virtual display on this Mac. Set E2E_ALLOW_LOCAL_DISPLAY=1 only when its user has agreed.'); process.exit(65); }
 const SIZES = (opt('sizes', '1280x720,2560x1440,1920x1080,800x600,3840x2160,1920x1080')).split(',');
 const MOTION_LOCAL = path.resolve(here, '../../src-tauri/target/e2e/motion-window');
@@ -49,7 +48,7 @@ if (!LOCAL) for (;;) {
   if (/FREE/.test(q.out)) break;
   await sleep(30000);
 }
-// The lock is a child process holding it until its stdin closes.
+// the lock is a child process that holds it until its stdin closes
 let lockChild = null;
 async function lock() {
   if (lockChild) return;
@@ -101,7 +100,7 @@ async function cdp(url) {
   const ws = new WebSocket(url); await new Promise((a, b) => { ws.onopen = a; ws.onerror = b; });
   let id = 0; const pend = new Map();
   ws.onmessage = (m) => { const d = JSON.parse(m.data);
-    // A live page asks before it is left (beforeunload); an unanswered prompt blocks the leave.
+    // a live page asks before it is left (beforeunload); an unanswered prompt blocks the leave
     if (d.method === 'Page.javascriptDialogOpening') ws.send(JSON.stringify({ id: ++id, method: 'Page.handleJavaScriptDialog', params: { accept: true } })); const p = pend.get(d.id); if (p) { pend.delete(d.id); p(d); } };
   return { send: (method, params = {}) => new Promise((res) => { const n = ++id; pend.set(n, res); ws.send(JSON.stringify({ id: n, method, params })); setTimeout(() => { if (pend.delete(n)) res({ error: { message: 'timeout ' + method } }); }, 10000); }), close: () => ws.close() };
 }
@@ -119,7 +118,7 @@ async function join(n, w = 1280, h = 720) {
       for (const [a, b] of [['sameDeviceModal','sameDeviceDismiss'],['compatModal','compatContinue'],['permModal','permContinue']]) if (shown(a)) document.getElementById(b).click();
       const c = document.getElementById('connect'); return { ready: document.readyState === 'complete' && !!document.getElementById('joinForm') && c && !c.disabled, form: !!(document.getElementById('joinForm') || {}).offsetParent, painted: window.SEVideo ? SEVideo.getStats().framesPainted : 0, err: (document.getElementById('errorMessage') || {}).textContent || '' }; })()`);
     last = s;
-    // Again after 4 s if the form is still up: a submit while a modal (same-device) was open is swallowed.
+    // again after 4 s if the form is still up: a submit while a modal (same-device) is open is swallowed
     if (s && s.ready && s.form && i > 6 && Date.now() - submittedAt > 4000) { await ev('document.getElementById("joinForm").requestSubmit()'); submittedAt = Date.now(); }
     painted = (s && s.painted) || 0;
     if (!painted) await sleep(150);

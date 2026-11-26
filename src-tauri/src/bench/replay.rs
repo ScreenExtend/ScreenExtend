@@ -1,14 +1,10 @@
 //! The replay engine: one clip, one encoder configuration, real time, through the production
 //! `Encoder` type. Runs inside a child process (`bench --child run`).
 //!
-//! Three threads: a read-ahead reader that copies records into IOSurface-backed `420f` buffers
-//! from a `CVPixelBufferPool` (so disk and allocation never delay a submit), the submit loop on
-//! the deadline scheduler with absolute-deadline pacing (sleep, then spin the last ~1.5 ms), and a
-//! collector draining the encoder's output channel that only stamps and counts.
-//!
-//! `sessions: N` runs N encoders in the one child, each fed the same pixel buffer in turn on the
-//! submit thread and drained by its own collector: N client devices sharing the machine's encoder
-//! hardware. The top-level metrics are session 0's; `per_session` and `aggregate` hold the rest.
+//! Three threads: a read-ahead reader copying records into pooled IOSurface-backed `420f` buffers
+//! (so disk and allocation never delay a submit), the submit loop on the deadline scheduler
+//! (sleep, then spin the last ~1.5 ms), and a collector that only stamps and counts.
+//! `sessions: N` runs N encoders in the one child; the top-level metrics are session 0's.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -77,8 +73,8 @@ unsafe impl Send for Collected {}
 pub(super) fn fault(kind: &str) {
     eprintln!("[bench] test fault '{kind}' requested");
     match kind {
-        // std installs its own SIGSEGV handler (stack-overflow detection) that returns for a
-        // signal that is not a guard-page fault, so a bare `raise` is survived. Default it first.
+        // std's SIGSEGV handler (stack-overflow detection) returns for anything that is not a
+        // guard-page fault, so a bare `raise` is survived: reset to SIG_DFL first
         "crash" => unsafe {
             libc::signal(libc::SIGSEGV, libc::SIG_DFL);
             libc::raise(libc::SIGSEGV);
@@ -409,7 +405,7 @@ fn session_metrics(cx: &Ctx, d: &SessDone) -> SessOut {
         out_events.push((ns_since(o.at), o.bytes));
         pic_times.push(ns_since(o.at));
     }
-    // A frame submitted and never called back is an error in the time series too.
+    // a frame submitted and never called back is an error in the time series too
     for g in 0..total {
         if !seen[g] && d.enc_status[g] == 0 && d.submit_at[g].is_some() {
             rows.push(Row {
@@ -628,7 +624,6 @@ pub fn run(spec: &RunSpec) -> Json {
     let fps = ((spec.workload.fps as f64) * speed).round().max(1.0) as u32;
     let fire = event_schedule(&spec.events, &at);
 
-    // The encoders.
     let cfg = production_config(spec, ow as u32, oh as u32, fps);
     let codec = if spec.recipe.production.is_some() {
         Codec::H264
@@ -691,7 +686,6 @@ pub fn run(spec: &RunSpec) -> Json {
         }
     }
 
-    // Reader.
     let frame_bytes = ow * oh * 3 / 2;
     let depth = (256_000_000 / frame_bytes.max(1)).clamp(8, 64);
     let pool = match cf::Pool::new(ow, oh, depth + 8) {
@@ -729,7 +723,7 @@ pub fn run(spec: &RunSpec) -> Json {
             .expect("spawn reader")
     };
 
-    // Collectors, one per encoder. Only session 0 keeps samples for the PSNR pass.
+    // only session 0 keeps samples for the PSNR pass
     for (k, s) in sessions.iter_mut().enumerate() {
         s.collector = Some(spawn_collector(
             s.enc.output(),
@@ -741,7 +735,7 @@ pub fn run(spec: &RunSpec) -> Json {
         ));
     }
 
-    // Prefill the read-ahead before the clock starts.
+    // prefill the read-ahead before the clock starts
     let pre = Instant::now();
     while rx.len() < depth.min(total)
         && !reader.is_finished()
@@ -750,15 +744,14 @@ pub fn run(spec: &RunSpec) -> Json {
         std::thread::sleep(Duration::from_millis(2));
     }
 
-    // Submit loop.
     crate::macos_utils::streamer::qos::pin_current_thread_time_constraint(
         1_000_000_000 / fps as u64,
     );
     let t_start = Instant::now() + Duration::from_millis(20);
     let mut late_ns: Vec<u64> = Vec::with_capacity(total);
-    // A late frame whose deadline passed while the previous `EncodeFrame` call was still running
+    // a late frame whose deadline passed while the previous `EncodeFrame` call was still running
     // was held up by the encoder (a blocking contract such as the non-low-latency encoder's), not
-    // by this harness. Both are reported; only the harness's share can invalidate a run.
+    // by this harness: both are reported, only the harness's share can invalidate a run
     let mut late_by_encoder = 0usize;
     let mut prev_call_end: Option<Instant> = None;
     let mut underruns = 0usize;
@@ -825,7 +818,7 @@ pub fn run(spec: &RunSpec) -> Json {
         }
 
         for s in sessions.iter_mut() {
-            // LTR: hand back the tokens that are due, and the refresh, on this frame only.
+            // LTR: hand back the tokens that are due, and the refresh, on this frame only
             let mut frame_keys: Vec<&str> = Vec::new();
             if let Some(l) = s.ltr.as_mut() {
                 while let Ok(t) = l.rx.try_recv() {
@@ -870,8 +863,8 @@ pub fn run(spec: &RunSpec) -> Json {
                 capture: Instant::now(),
                 hold_push: false,
                 timing: FrameTiming {
-                    // The bench's own tags: this field carries the source index, so a callback
-                    // can be paired with its frame even when the encoder reorders.
+                    // the bench's own tag: this field carries the source index, so a callback
+                    // can be paired with its frame even when the encoder reorders
                     capture_available_ns: g as u64,
                     ..FrameTiming::entering_capture()
                 },
@@ -945,7 +938,6 @@ pub fn run(spec: &RunSpec) -> Json {
         .join()
         .unwrap_or_else(|_| Err("reader panicked".into()));
 
-    // ---- metrics -------------------------------------------------------------------------
     let cx = Ctx {
         at: &at,
         total,

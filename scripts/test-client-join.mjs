@@ -1,10 +1,7 @@
 // The join path of index.html: what a failed setup leads to, and the load-time warm-up that keeps
-// two first-use costs off the path between Connect and the offer.
-//
-// A lost WHEP answer used to demote the session to <video> for good (`fallbackToVideo` on
-// "The host did not answer in time"), although nothing about the video path had failed. And on a
-// browser's first join the offer left 1.9-2.3 s after the click, nearly all of it the first
-// `enumerateDevices()` and the first `new RTCPeerConnection()` (docs/overhaul-new/G07.md).
+// two first-use costs off the path between Connect and the offer. Unwarmed, a browser's first
+// offer left 1.9-2.3 s after the click, nearly all of it the first `enumerateDevices()` and the
+// first `new RTCPeerConnection()`.
 //
 // Functions are lifted out of the page by name, as test-client-reconfig.mjs does.
 //
@@ -37,7 +34,6 @@ function takeFunction(name) {
   throw new Error('function ' + name + ' is unbalanced');
 }
 
-// ---- setupFailureAction
 {
   const ctx = vm.createContext({});
   vm.runInContext(takeConst('ANSWER_TIMEOUT_TEXT') + '\n' + takeFunction('setupFailureAction') + '\nthis.f = setupFailureAction; this.T = ANSWER_TIMEOUT_TEXT;', ctx);
@@ -47,8 +43,8 @@ function takeFunction(name) {
   const refused = new Error('WHEP POST failed: 500 join failed: virtual display 0 did not attach within timeout');
   eq('lost answer on the WebCodecs tier', f(timeout, base), 'retry');
   eq('lost answer on <video>', f(timeout, { ...base, webcodecsTier: false }), 'retry');
-  // A host-side failure is retried once and then ends the session; it never demotes to <video>,
-  // which was a third offer (and a third display attempt) on a host that was already failing.
+  // A host-side failure is retried once and then ends the session. It never demotes to <video>:
+  // that would be a third offer (and a third display attempt) on a host already failing.
   eq('second lost answer on the WebCodecs tier ends, no demotion', f(timeout, { ...base, answerRetried: true }), 'error');
   eq('second lost answer on <video>', f(timeout, { ...base, answerRetried: true, webcodecsTier: false }), 'error');
   eq('host refused the POST (5xx)', f(refused, base), 'retry');
@@ -77,7 +73,6 @@ function takeFunction(name) {
   else fail('the retry budget is not reset by an answer and by Connect');
 }
 
-// ---- warmJoinPath
 function runWarm(env) {
   const calls = [];
   const ctx = vm.createContext({ calls, noteSuppressed: () => calls.push('suppressed'), navigator: env.navigator, RTCPeerConnection: env.RTCPeerConnection });
@@ -124,11 +119,11 @@ function runWarm(env) {
   else fail('the submit handler references warmJoinPath');
 }
 
-// ---- the join settles every prompt before the offer
-// The owner's rule: permission work (output detection, the microphone card, the browser's output
-// chooser) completes before the stream starts, so nothing is raised over a live stage and the
-// host builds no display for someone still reading a card. The card has no timeout of its own
-// (Skip ends it), so no join-path deadline may be running while it is up.
+// The join settles every prompt before the offer: permission work (output detection, the
+// microphone card, the browser's output chooser) completes before the stream starts, so nothing
+// is raised over a live stage and the host builds no display for someone still reading a card.
+// The card has no timeout of its own (Skip ends it), so no join-path deadline may run while it
+// is up.
 {
   const submit = page.slice(page.indexOf("addEventListener('submit'"));
   const at = (s) => submit.indexOf(s);
@@ -140,8 +135,8 @@ function runWarm(env) {
     else fail(what + ' starts before the card wait');
   }
   const firstAwait = at('await ');
-  // Output discovery API 1 (owner spec): the chooser is started on every Connect, inside the
-  // click, and its promise is handed to the preparation rather than started there.
+  // the chooser is started on every Connect, inside the click, and its promise is handed to
+  // the preparation rather than started there
   const picker = at('SEAudio.startPicker()');
   if (picker > 0 && picker < firstAwait) ok("the browser's chooser is started before the first await (inside the click's activation)");
   else fail('the chooser is started after an await, or not at all');
@@ -157,21 +152,15 @@ function runWarm(env) {
   else fail('the join does not hand the card to the output preparation');
 }
 
-// ---- the whole page: what a join arms, and that every way it ends gives all of it back
+// The whole page: what a join arms, and that every way it ends gives all of it back. A live
+// stream arms input.js's capture-phase keydown (which `preventDefault()`s, so no Ctrl+C and no
+// typing), the wake lock, fullscreen, pointer/keyboard lock, the leave prompt, pollers,
+// watchdogs and the audio session, and a failed join must pass through `teardownSession` or
+// input.js stays armed for the life of the page.
 //
-// The owner's report: "WHEP POST failed: 500 join failed: virtual display 0 did not attach within
-// timeout … when connection failed i couldnt copy and screen wake lock was still enabled". The
-// page arms things for a stream — input.js's capture-phase keydown (which `preventDefault()`s, so
-// no Ctrl+C and no typing), the wake lock, fullscreen, pointer/keyboard lock, the leave prompt,
-// pollers and watchdogs, the audio session — and a join that failed reached `showError` without
-// `teardownSession`, so input.js stayed armed for the life of the page.
-//
-// Here the real input.js and the page's inline script run together in one realm against fake
-// DOM, WebRTC, fetch and timer surfaces (SEAudio is a recording stub; audio.js's own `endSession`
-// is covered in test-client-audio.mjs). Page actions are DOM-method equivalents: the form's
-// submit handler is called, worker and peer-connection callbacks are invoked. The one key event
-// below is a plain object handed to the page's own listener inside this Node realm, as
-// test-client-input.mjs does: no browser, no host, and input.js's data channels never open.
+// The real input.js and the page's inline script run in one realm against fake DOM, WebRTC,
+// fetch and timer surfaces. SEAudio is a recording stub (audio.js's own `endSession` is covered
+// in test-client-audio.mjs), and input.js's data channels never open.
 const SCRIPT = (() => {
   const re = /<script>([\s\S]*?)<\/script>/g;
   let m;
@@ -388,8 +377,8 @@ function bootPage(o) {
     await submit({ preventDefault() {} });
     await realFlush();
   }
-  // Fires the page's own window listeners with a Ctrl+C keydown and reports whether any of them
-  // swallowed it — which is what made copying, and typing, impossible after a failed join.
+  // fires the page's own window listeners with a Ctrl+C keydown and reports whether any of them
+  // swallowed it: a swallowed one means no copying and no typing on the form
   function ctrlCBlocked() {
     let prevented = false;
     const e = {
@@ -462,7 +451,7 @@ async function assertRestored(p, what, errRe) {
   eq(what + ': page errors', p.log.errors.length ? p.log.errors.join(' | ') : 0, 0);
 }
 
-// 1. A 500 from /whep, and the same-tier retry refused too (the owner's case).
+// 1. A 500 from /whep, and the same-tier retry refused too.
 {
   const p = bootPage({ whep: [500, 500] });
   await p.advance(10);
@@ -529,8 +518,8 @@ async function assertRestored(p, what, errRe) {
 }
 
 // 5. A renegotiation that fails for good: live, the host bumps the epoch, the new offer is refused
-// twice. It used to end in 'poll' — a frozen frame with the wake lock, fullscreen and the leave
-// prompt still held, kept "alive" by a /reconfig poll the host kept answering.
+// twice. It must not end on a frozen frame with the wake lock, fullscreen and the leave prompt
+// still held, kept "alive" by a /reconfig poll the host keeps answering.
 {
   const p = bootPage({ whep: ['ok', 500, 500] });
   await p.advance(10);
@@ -545,7 +534,7 @@ async function assertRestored(p, what, errRe) {
   await assertRestored(p, 'failed renegotiation', /^WHEP POST failed: 500/);
 }
 
-// ---- attemptId: one per page load, on every offer
+// attemptId: one per page load, on every offer
 {
   const m = /var attemptId = (\(function \(\) \{[\s\S]*?\}\)\(\));/.exec(page);
   if (!m) fail('attemptId not found');

@@ -1,28 +1,10 @@
 //! Send-side congestion control from transport-wide feedback.
 //!
-//! Before this the host had no delay signal at all. It advertised `transport-cc` and `goog-remb`
-//! in the answer, ran `register_default_interceptors` — which installs the TWCC *receiver*, the
-//! half a send-only peer has no use for — and drove the bitrate off RTCP receiver-report
-//! `fraction_lost`, a number the browser refreshes about once a second. A loss-only controller
-//! sampling a 1 Hz signal reacts only after the queue is already full, which on Wi-Fi (where
-//! 802.11 link-layer ARQ hides loss until the queue is deep) is far too late.
-//!
-//! Two things changed. The writer now stamps the transport-wide sequence number itself, in the
-//! same `write_rtp_with_extensions` call that already carries the playout-delay extension, so we
-//! know exactly which transport sequence a given packet got — the thing
-//! `interceptor::twcc::sender` will not tell us, because its counter is private. And this module
-//! turns the resulting `TransportLayerCc` reports into the two signals that matter:
-//!
-//! - **Loss**, exactly and immediately: the status chunks name every sequence number the client
-//!   did not receive, at the browser's ~50-100 ms feedback cadence rather than once a second.
-//! - **Delay gradient**: pairing each feedback arrival time with the send time we recorded gives
-//!   the one-way delay *variation* per packet, which is what rises while a queue is filling and
-//!   before anything is dropped. The filter is libwebrtc's trendline estimator, reduced to its
-//!   load-bearing parts and with its published constants.
-//!
-//! [`RembTracker`] stays alongside as a fallback: a client that ignores the extension makes
-//! Chrome run its own receive-side estimator and report it as REMB, and that estimate is worth
-//! having for free.
+//! The writer stamps the transport-wide sequence number itself (`interceptor::twcc::sender`
+//! keeps its counter private), so each `TransportLayerCc` report yields exact loss and a
+//! one-way delay gradient at the browser's ~50-100 ms cadence. RTCP `fraction_lost` refreshes
+//! about once a second, and on Wi-Fi link-layer ARQ hides loss until the queue is deep.
+//! [`RembTracker`] is the fallback for a client that reports REMB instead.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -51,14 +33,10 @@ struct SentPacket {
 /// How many in-flight frames to keep a per-frame tally for.
 const FRAME_TALLIES: usize = 256;
 
-/// One access unit's packets, until every one of them has been reported on.
-///
-/// Transport-wide feedback names every sequence number the client did and did not receive, so it
-/// answers a question RTCP receiver reports cannot: *did this whole frame arrive?* That is exactly
-/// the acknowledgement an encoder needs to use a long-term reference frame instead of an IDR for
-/// loss recovery — VideoToolbox's `kVTEncodeFrameOptionKey_AcknowledgedLTRTokens` and NVENC's
-/// reference invalidation both want it — and getting it here means it costs no client change, no
-/// new control-channel opcode and no round trip beyond the one TWCC already pays.
+/// One access unit's packets, until every one of them has been reported on. Transport-wide
+/// feedback says whether a whole frame arrived, which is the acknowledgement an encoder needs
+/// to recover from loss with a long-term reference instead of an IDR, at no client change
+/// (VideoToolbox `kVTEncodeFrameOptionKey_AcknowledgedLTRTokens`, NVENC reference invalidation).
 #[derive(Debug, Clone, Copy)]
 struct FrameTally {
     ordinal: u32,
@@ -97,11 +75,9 @@ impl SendHistory {
         }
     }
 
-    /// Claim the next transport-wide sequence number for a packet about to be written.
-    ///
-    /// `frame` is the writer's own per-session access-unit ordinal and `capture_ns` the host-clock
-    /// instant that frame was captured — the identity the encoder already stamped on it, so an
-    /// acknowledgement can be matched back to a reference frame without inventing a second one.
+    /// Claim the next transport-wide sequence number for a packet about to be written. `frame`
+    /// is the writer's per-session access-unit ordinal and `capture_ns` the host-clock capture
+    /// time the encoder stamped on it, so an acknowledgement maps back to a reference frame.
     pub fn record(&mut self, bytes: u32, now: Instant, frame: u32, capture_ns: u64) -> u16 {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
@@ -143,11 +119,9 @@ impl SendHistory {
         }
     }
 
-    /// The newest frame every packet of which the client has now reported receiving.
-    ///
-    /// A frame with even one lost packet is never acknowledged: the point of the signal is that
-    /// the encoder may keep referencing that picture, and a decoder missing a slice of it cannot.
-    /// Decided frames are dropped either way, so a lossy stretch does not accumulate tallies.
+    /// The newest frame the client has reported receiving in full. A frame with even one lost
+    /// packet is never acknowledged (a decoder missing a slice cannot reference it). Decided
+    /// frames are dropped either way, so a lossy stretch does not accumulate tallies.
     fn take_decided_frames(&mut self, lost_out: &mut Vec<u64>) -> Option<(u32, u64)> {
         let mut newest: Option<(u32, u64)> = None;
         while let Some(front) = self.frames.front().copied() {
@@ -165,17 +139,10 @@ impl SendHistory {
     }
 
     fn lookup(&self, seq: u16) -> Option<SentPacket> {
-        // `record` claims `next_seq` and increments by one, so the ring is dense: `ring[i].seq` is
-        // always `ring[0].seq + i` modulo 2^16. That makes the position arithmetic rather than a
-        // search, and the verification is the equality check on the slot it names — if the ring is
-        // ever not dense the check fails and the scan below answers instead.
-        //
-        // It used to be only the scan, from the back, on the reasoning that "a linear scan from the
-        // back finds a recent packet immediately". A TWCC report does not start at a recent packet:
-        // it starts at `base_sequence_number`, the *oldest* sequence it has anything to say about,
-        // so the first lookups walked most of the ring's 4096 entries — and `interpret` calls this
-        // twice per reported symbol, with `feedback.history`'s blocking mutex held, on the same
-        // mutex the RTP writer takes once per packet.
+        // `record` increments by one, so the ring is dense and `ring[i].seq == ring[0].seq + i`
+        // (mod 2^16): index, then verify, with the scan as the fallback. A report starts at its
+        // oldest sequence, so a scan from the back walks most of the ring, twice per symbol, under
+        // the mutex the RTP writer takes per packet.
         let front = *self.ring.front()?;
         let idx = seq.wrapping_sub(front.seq) as usize;
         if let Some(p) = self.ring.get(idx) {
@@ -200,7 +167,7 @@ impl SendHistory {
 /// What one `TransportLayerCc` report said.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct FeedbackSummary {
-    /// Packets the report covered and we had a send time for.
+    /// Packets the report covered that have a send time on record.
     pub matched: u32,
     /// Packets the report covered at all.
     pub reported: u32,
@@ -215,6 +182,31 @@ pub struct FeedbackSummary {
     /// picture the encoder must stop referencing, or every frame predicted from it is undecodable
     /// on this client.
     pub lost_capture_ns: Vec<u64>,
+    /// The same report as the Windows QP governor reads it.
+    #[cfg(windows)]
+    pub path: PathSample,
+}
+
+/// One report's packets on both clocks: what was sent over what span, what arrived over what
+/// span, and the one-way delay (client arrival clock minus host send clock, so offset by an
+/// unknown constant; only its changes mean anything).
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PathSample {
+    pub reported: u32,
+    pub lost: u32,
+    /// Reported packets with a send record, lost or not, and their bytes and send times.
+    pub known: u32,
+    pub sent_bytes: u64,
+    pub first_send_us: i64,
+    pub last_send_us: i64,
+    /// Packets that arrived with an arrival time, and their bytes and arrival times.
+    pub matched: u32,
+    pub recv_bytes: u64,
+    pub first_arrival_us: i64,
+    pub last_arrival_us: i64,
+    pub owd_min_us: i64,
+    pub owd_last_us: i64,
 }
 
 impl FeedbackSummary {
@@ -280,8 +272,7 @@ pub fn interpret(
     let mut last_arrival = 0i64;
     let mut bytes = 0u64;
 
-    // Every symbol, received or not, is also a verdict on the frame its packet belonged to. That
-    // is what makes a whole access unit acknowledgeable without a client change.
+    // every symbol, received or not, is a verdict on the frame its packet belonged to
     let mut verdicts: Vec<(u32, bool)> = Vec::with_capacity(symbols.len());
 
     for (i, sym) in symbols.iter().enumerate() {
@@ -290,6 +281,8 @@ pub fn interpret(
         let received = !matches!(sym, SymbolTypeTcc::PacketNotReceived);
         if let Some(p) = history.lookup(seq) {
             verdicts.push((p.frame, received));
+            #[cfg(windows)]
+            summary.path.note_sent(p.bytes, p.send_us);
         }
         match sym {
             SymbolTypeTcc::PacketNotReceived => {
@@ -297,8 +290,7 @@ pub fn interpret(
                 continue;
             }
             SymbolTypeTcc::PacketReceivedWithoutDelta => {
-                // Received, but the report carries no arrival time for it. It still counts
-                // against loss; it just cannot contribute a gradient sample.
+                // received, but with no arrival time: counts for loss, gives no gradient sample
                 continue;
             }
             _ => {}
@@ -316,11 +308,15 @@ pub fn interpret(
         bytes += sent.bytes as u64;
         first_arrival.get_or_insert(arrival_us);
         last_arrival = arrival_us;
+        #[cfg(windows)]
+        summary
+            .path
+            .note_arrived(sent.bytes, sent.send_us, arrival_us);
 
         if let Some((prev_send, prev_arrival)) = prev {
             let inter_departure = sent.send_us - prev_send;
             let inter_arrival = arrival_us - prev_arrival;
-            // Reordered or duplicated feedback would otherwise inject a huge spurious gradient.
+            // reordered or duplicated feedback would inject a huge spurious gradient
             if inter_departure >= 0 {
                 deltas_out.push((inter_arrival - inter_departure) as f64 / 1000.0);
             }
@@ -335,7 +331,7 @@ pub fn interpret(
         }
     }
 
-    // After the lookups, because `retire_through` drops the packets the verdicts came from.
+    // after the lookups: `retire_through` drops the packets the verdicts came from
     for (frame, received) in verdicts {
         history.note(frame, received);
     }
@@ -347,7 +343,39 @@ pub fn interpret(
         fb.base_sequence_number
             .wrapping_add(symbols.len().saturating_sub(1) as u16),
     );
+    #[cfg(windows)]
+    {
+        summary.path.reported = summary.reported;
+        summary.path.lost = summary.lost;
+    }
     summary
+}
+
+#[cfg(windows)]
+impl PathSample {
+    fn note_sent(&mut self, bytes: u32, send_us: i64) {
+        if self.known == 0 {
+            (self.first_send_us, self.last_send_us) = (send_us, send_us);
+        }
+        self.known += 1;
+        self.sent_bytes += bytes as u64;
+        self.first_send_us = self.first_send_us.min(send_us);
+        self.last_send_us = self.last_send_us.max(send_us);
+    }
+
+    fn note_arrived(&mut self, bytes: u32, send_us: i64, arrival_us: i64) {
+        let owd = arrival_us - send_us;
+        if self.matched == 0 {
+            (self.first_arrival_us, self.last_arrival_us) = (arrival_us, arrival_us);
+            self.owd_min_us = owd;
+        }
+        self.matched += 1;
+        self.recv_bytes += bytes as u64;
+        self.first_arrival_us = self.first_arrival_us.min(arrival_us);
+        self.last_arrival_us = self.last_arrival_us.max(arrival_us);
+        self.owd_min_us = self.owd_min_us.min(owd);
+        self.owd_last_us = owd;
+    }
 }
 
 /// What the delay filter currently thinks the path is doing.
@@ -361,11 +389,9 @@ pub enum NetworkState {
     Underuse,
 }
 
-/// libwebrtc's trendline estimator, reduced to the parts that decide the state.
-///
-/// The published constants are kept verbatim so the behaviour is comparable with the reference
-/// implementation: smoothing 0.9, threshold gain 4.0, adaptive-threshold gains k_up 0.0087 and
-/// k_down 0.039, an over-use dwell of 10 ms, and the threshold clamped to [6, 600] ms.
+/// libwebrtc's trendline estimator, reduced to the parts that decide the state. The constants
+/// below are its published values, kept verbatim so the behaviour stays comparable with the
+/// reference implementation.
 #[derive(Debug, Clone)]
 pub struct DelayDetector {
     smoothed_ms: f64,
@@ -429,8 +455,8 @@ impl DelayDetector {
             return;
         }
         self.samples += 1;
-        // The estimator's own clock advances with the samples it sees, which is what makes the
-        // dwell time and the threshold adaptation independent of the feedback cadence.
+        // the clock advances per sample, so the dwell time and the threshold adaptation are
+        // independent of the feedback cadence
         self.now_ms += delta_ms.abs().clamp(1.0, 50.0);
         self.smoothed_ms = TREND_SMOOTHING * self.smoothed_ms + (1.0 - TREND_SMOOTHING) * delta_ms;
 
@@ -459,8 +485,7 @@ impl DelayDetector {
         let dt_ms = (self.now_ms - self.last_update_ms).clamp(0.0, MAX_THRESHOLD_STEP_MS);
         self.last_update_ms = self.now_ms;
         if modified.abs() > self.threshold_ms + 15.0 {
-            // Way outside the band: this is a spike, not a trend. Do not let it drag the
-            // threshold up, or the detector goes deaf.
+            // a spike, not a trend: letting it drag the threshold up makes the detector deaf
             return;
         }
         let k = if modified.abs() < self.threshold_ms {
@@ -503,14 +528,12 @@ impl DelayBasedEstimate {
         self.estimate_bps
     }
 
-    /// Advance one control interval.
-    ///
-    /// `delivered_bps` is what the receiver actually got — the correct base for a multiplicative
-    /// decrease, because cutting a fraction of a target we were never achieving does nothing.
+    /// Advance one control interval. `delivered_bps` is what the receiver actually got, the
+    /// right base for a multiplicative decrease: cutting a target never achieved does nothing.
     pub fn update(&mut self, state: NetworkState, delivered_bps: u32, now: Instant) -> u32 {
         let next = match state {
             NetworkState::Overuse => {
-                // One decrease per round of over-use, not one per feedback packet.
+                // one decrease per round of over-use, not one per feedback packet
                 let too_soon = self
                     .last_decrease
                     .is_some_and(|t| now.saturating_duration_since(t) < Duration::from_millis(250));
@@ -535,12 +558,9 @@ impl DelayBasedEstimate {
     }
 }
 
-/// The browser's own receive-side estimate, when it sends one.
-///
-/// Chrome picks between send-side and receive-side estimation per packet, on whether the
-/// transport-wide sequence number is physically present. Once the writer stamps it, Chrome stops
-/// emitting REMB — so this is the path for a client that does not negotiate the extension, and
-/// its silence is not a fault.
+/// The browser's own receive-side estimate, when it sends one. Chrome stops emitting REMB
+/// once the transport-wide sequence number is on the packets, so this is the path for a
+/// client that does not negotiate the extension, and its silence is not a fault.
 #[derive(Debug, Clone, Default)]
 pub struct RembTracker {
     last_bps: Option<u32>,
@@ -565,12 +585,9 @@ impl RembTracker {
     }
 }
 
-/// The one place the RTCP reader, the RTP writer and the bitrate driver meet.
-///
-/// Three tasks, three cadences: feedback arrives on the sender's RTCP read loop whenever the
-/// client emits it, packets are stamped in the writer, and the controller runs on its own timer.
-/// Everything crossing between them is an atomic or a short critical section — no task may ever
-/// wait on another to make progress on the frame path.
+/// Where the RTCP reader, the RTP writer and the bitrate driver meet. Everything crossing
+/// between the three tasks is an atomic or a short critical section: none may wait on
+/// another to make progress on the frame path.
 #[derive(Debug, Default)]
 pub struct SharedFeedback {
     /// Send times of packets still awaiting feedback. Written per packet by the writer, read per
@@ -585,12 +602,10 @@ pub struct SharedFeedback {
     twcc_reports: std::sync::atomic::AtomicU64,
     remb_reports: std::sync::atomic::AtomicU64,
     /// Times the local broadcast dropped frames on this viewer. A lagging viewer is an
-    /// oversubscribed link, so the controller treats it as a congestion signal in its own right
-    /// rather than only asking for a keyframe, which would make it worse.
+    /// oversubscribed link, so it is a congestion signal, not only a reason for a keyframe.
     lag_events: std::sync::atomic::AtomicU64,
     /// Host-clock capture time of the newest access unit the client has confirmed receiving in
-    /// full. Zero until one has been. This is the acknowledgement a long-term-reference encoder
-    /// needs; nothing consumes it yet, which is why it is published rather than acted on.
+    /// full; zero until one has been. The acknowledgement a long-term-reference encoder needs.
     acked_capture_ns: std::sync::atomic::AtomicU64,
 }
 
@@ -603,21 +618,15 @@ impl SharedFeedback {
             self.received_bps.store(s.received_bps, Relaxed);
         }
         if let Some(ns) = s.acked_capture_ns {
-            // Monotonic: a later report can only ever move this forward, and reports can be
-            // reordered on the wire.
+            // fetch_max: reports can be reordered on the wire
             self.acked_capture_ns.fetch_max(ns, Relaxed);
         }
         self.twcc_reports.fetch_add(1, Relaxed);
     }
 
-    /// The newest frame the client has confirmed receiving whole, by its host-clock capture time.
-    ///
-    /// Transport-wide feedback names every sequence number that did and did not arrive, so a whole
-    /// access unit can be acknowledged from it with no client change, no new control-channel
-    /// opcode and no round trip beyond the one TWCC already pays. That is exactly the input
-    /// VideoToolbox's `kVTEncodeFrameOptionKey_AcknowledgedLTRTokens` and NVENC's reference
-    /// invalidation want, and it is why the capture instant is the identity: the encoder already
-    /// stamped it on the frame, so nothing new has to be carried to match it back.
+    /// The newest frame the client has confirmed receiving whole, by its host-clock capture
+    /// time. The capture instant is the identity because the encoder already stamped it on the
+    /// frame, so nothing new is carried to match an acknowledgement back.
     pub fn acked_frame_capture_ns(&self) -> Option<u64> {
         let ns = self
             .acked_capture_ns
@@ -721,8 +730,8 @@ mod tests {
         assert_eq!(h.ring.len(), SEND_HISTORY);
     }
 
-    /// A clean run: every packet received, inter-arrival exactly matching inter-departure, so the
-    /// gradient is flat and the detector must stay Normal.
+    /// Every packet received and inter-arrival equal to inter-departure: the gradient is flat
+    /// and the detector must stay Normal.
     #[test]
     fn a_clean_path_yields_no_gradient_and_no_loss() {
         let e = epoch();
@@ -767,7 +776,7 @@ mod tests {
         for i in 0..20 {
             h.record(1200, e + Duration::from_micros(i * 1000), 0, 0);
         }
-        // Sent 1 ms apart, arriving 4 ms apart: 3 ms of queue growth per packet, no loss.
+        // sent 1 ms apart, arriving 4 ms apart: 3 ms of queue growth per packet, no loss
         let fb = TransportLayerCc {
             sender_ssrc: 1,
             media_ssrc: 2,
@@ -858,8 +867,8 @@ mod tests {
     fn overuse_cuts_against_the_delivered_rate_not_the_wishful_target() {
         let now = Instant::now();
         let mut e = DelayBasedEstimate::new(20_000_000, 1_000_000, 40_000_000);
-        // We wanted 20 Mbps; only 8 Mbps is arriving. The cut must land near 0.85 * 8 Mbps,
-        // floored so one interval cannot collapse the session.
+        // target 20 Mbps, 8 Mbps arriving: the cut aims at 0.85 * 8 Mbps, floored so one interval
+        // cannot collapse the session
         let out = e.update(NetworkState::Overuse, 8_000_000, now);
         assert_eq!(out, 14_000_000, "a single cut is floored at 0.7x");
         let out = e.update(
@@ -955,7 +964,7 @@ mod tests {
     fn a_frame_is_acknowledged_only_when_every_one_of_its_packets_arrived() {
         let e = Instant::now();
         let mut h = SendHistory::new(e);
-        // Frame 1: three packets, all received. Frame 2: three packets, one lost.
+        // frame 1: three packets, all received; frame 2: three packets, one lost
         for _ in 0..3 {
             h.record(1200, e, 1, 1_000);
         }
@@ -1003,7 +1012,7 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(f.acked_frame_capture_ns(), Some(5_000));
-        // Reports can be reordered on the wire; an older one must not walk it backwards.
+        // reports can be reordered on the wire: an older one must not walk it backwards
         f.record_report(&FeedbackSummary {
             acked_capture_ns: Some(1_000),
             ..Default::default()
@@ -1016,23 +1025,19 @@ mod tests {
         assert_eq!(f.acked_frame_capture_ns(), Some(9_000));
     }
 
-    /// The indexed lookup has to agree with the scan it replaced on every entry of a full ring,
-    /// across the `u16` wrap, and after a retire has moved the front — which is the only state in
-    /// which index arithmetic can be wrong.
+    /// The indexed lookup must agree with a linear scan on every entry of a full ring, across the
+    /// `u16` wrap and after a retire has moved the front (where index arithmetic can go wrong).
     #[test]
     fn the_indexed_lookup_finds_what_a_scan_would() {
         let e = Instant::now();
         let mut h = SendHistory::new(e);
-        // Past the wrap and past the ring's capacity, so `next_seq` has wrapped and the front has
-        // moved off zero.
+        // past the wrap and the ring's capacity: `next_seq` has wrapped and the front is off zero
         for i in 0..(SEND_HISTORY + 5000) {
             h.record(1200, e, (i / 10) as u32, i as u64);
         }
         assert_eq!(h.ring.len(), SEND_HISTORY);
 
-        // `SentPacket` is a private POD with no `PartialEq`, and adding one to production code so a
-        // test can use `assert_eq!` is the tail wagging the dog. The whole record as a tuple is the
-        // same comparison.
+        // `SentPacket` has no `PartialEq`; the whole record as a tuple is the same comparison
         fn key(p: Option<SentPacket>) -> Option<(u16, i64, u32, u32)> {
             p.map(|p| (p.seq, p.send_us, p.bytes, p.frame))
         }
@@ -1045,14 +1050,14 @@ mod tests {
             assert_eq!(key(h.lookup(*seq)), key(scan(&h, *seq)), "seq {seq}");
             assert_eq!(h.lookup(*seq).map(|q| q.seq), Some(*seq));
         }
-        // A sequence the ring no longer holds must answer nothing, not the slot its index names.
+        // a sequence the ring no longer holds must answer nothing, not the slot its index names
         let front = *h.ring.front().unwrap();
         let gone = front.seq.wrapping_sub(1);
         assert_eq!(key(h.lookup(gone)), None, "a retired sequence is not here");
         let unsent = h.ring.back().unwrap().seq.wrapping_add(1);
         assert_eq!(key(h.lookup(unsent)), None, "nor is an unsent one");
 
-        // And after a retire, when the front is no longer where it was.
+        // and after a retire has moved the front
         h.retire_through(front.seq.wrapping_add(100));
         let seqs: Vec<u16> = h.ring.iter().map(|p| p.seq).collect();
         for seq in &seqs {

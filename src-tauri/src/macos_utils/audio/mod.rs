@@ -26,16 +26,14 @@ const DIAG_LOG_INTERVAL: Duration = Duration::from_secs(2);
 
 /// nanoseconds of audio in one interleaved stereo Opus frame (5 ms at 48 kHz)
 const FRAME_NS: u64 = 5_000_000;
-/// interleaved stereo samples per second — the ring's unit
+/// interleaved stereo samples per second (the ring's unit)
 const RING_SAMPLES_PER_SEC: i128 = 48_000 * format::OUT_CHANNELS as i128;
 /// how far the hardware clock may run ahead of the sample counter before the timeline is re-seated
 const RESYNC_NS: u64 = 50_000_000;
 
-/// Host-clock time of the sample at absolute ring index `pos`, extrapolated from `anchor`.
-///
-/// The rate is exact by construction (every backend delivers 48 kHz stereo), so this is a
-/// sample-counter timestamp seated on a real hardware stamp rather than a reading of the wall
-/// clock at drain time.
+/// Host-clock time of the sample at absolute ring index `pos`, extrapolated from `anchor`. The
+/// rate is exact (every backend delivers 48 kHz stereo), so this is a sample-counter timestamp
+/// seated on a hardware stamp, not a wall-clock reading at drain time.
 fn anchored_ns(anchor: ring::Anchor, pos: u64) -> u64 {
     let delta = pos as i128 - anchor.pos as i128;
     let ns = anchor.host_ns as i128 + (delta * 1_000_000_000i128) / RING_SAMPLES_PER_SEC;
@@ -48,11 +46,10 @@ fn anchored_ns(anchor: ring::Anchor, pos: u64) -> u64 {
 
 /// Pick the capture time of the frame about to be encoded, and say whether the timeline jumped.
 ///
-/// `next` is where the sample counter says this frame belongs — one frame period after the last
-/// packet — and `hw` is what the capture hardware's own stamp says. The counter wins, so the
-/// sequence is exactly one frame apart and can never regress; the hardware only takes over when it
-/// has run more than [`RESYNC_NS`] ahead, which means samples were lost and the two would otherwise
-/// stay apart for good.
+/// `next` is the sample counter's answer (one frame period after the last packet), `hw` the
+/// capture hardware's stamp. The counter wins, so stamps are exactly one frame apart and never
+/// regress; the hardware takes over only once it is more than [`RESYNC_NS`] ahead, which means
+/// samples were lost.
 fn choose_capture_ns(next: Option<u64>, hw: Option<u64>) -> (u64, bool) {
     match (next, hw) {
         (Some(n), Some(h)) if h > n.saturating_add(RESYNC_NS) => (h, true),
@@ -115,13 +112,8 @@ pub trait AudioSource: Send {
     }
 }
 
-/// What each capability probe answered, as plain data.
-///
-/// This is the seam that makes the tiering testable. The probes themselves `dlsym` the Process
-/// Tap entry points, look up `CATapDescription` and `SCStream`, and stat an installed driver —
-/// none of which exist on the 10.15 dev box, and only some of which exist on any one CI runner.
-/// The *ranking* is a separate decision with no I/O in it at all, and it is the piece that
-/// decides what every supported Mac gets, so it is the piece worth asserting exhaustively.
+/// What each capability probe answered, as plain data, so the ranking can be tested without the
+/// probes' I/O (`dlsym`, class lookups, a driver stat).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AudioProbes {
     /// `AudioHardwareCreateProcessTap` and `CATapDescription` both resolved (14.2+).
@@ -156,9 +148,8 @@ pub(crate) fn rank_backend(probes: AudioProbes) -> AudioBackend {
     if probes.driver_healthy {
         return AudioBackend::VirtualDevice;
     }
-    // Below 12.3 there is no native system-audio API at all and the driver is the answer, so
-    // there is nothing to report as unsupported: the app's own floor is 10.15 and the driver
-    // covers it.
+    // never `Unsupported`: below the native tiers the driver is the answer, and it covers the
+    // app's 10.15 floor
     AudioBackend::NeedsDriverInstall
 }
 
@@ -171,9 +162,8 @@ pub(crate) fn rank_capable_backends(probes: AudioProbes) -> Vec<AudioBackend> {
     if probes.sck {
         v.push(AudioBackend::ScreenCaptureKitAudio);
     }
-    // The driver is a real fallback, not a below-13.0-only tier. On 13.x with Screen Recording
-    // denied, SCK is selected, fails to start, and there is nothing after it — even when the
-    // driver is installed and would have worked.
+    // The driver is a real fallback, not a below-13.0-only tier: on 13.x with Screen Recording
+    // denied, SCK is selected and fails to start.
     if probes.driver_healthy {
         v.push(AudioBackend::VirtualDevice);
     }
@@ -186,12 +176,9 @@ pub fn probe_audio_backend() -> AudioBackend {
 
 /// The native tiers this Mac can run, best first.
 ///
-/// Probed by capability alone — `runtime_available()` dlsyms the Process Tap entry points and
-/// looks up `CATapDescription`, and the SCK one looks up `SCStream` and friends. There is
-/// deliberately no OS-version conjunct: a version gate adds a `sw_vers` subprocess and a
-/// fail-open path (`macos_at_least` returns true when it cannot read the version) to a question
-/// the class lookup already answers exactly. Cached, because neither answer can change while the
-/// process runs.
+/// Probed by capability alone (`dlsym` and class lookups), with no OS-version conjunct: a version
+/// gate adds a `sw_vers` subprocess and a fail-open path to a question the class lookup already
+/// answers. Cached, because neither answer can change while the process runs.
 fn native_backends() -> &'static [AudioBackend] {
     static NATIVE: OnceLock<Vec<AudioBackend>> = OnceLock::new();
     NATIVE.get_or_init(|| {
@@ -223,13 +210,11 @@ fn make_backend(kind: AudioBackend) -> Box<dyn AudioSource> {
 
 /// Ceiling on how long `start_capture` will wait for a backend to come up.
 ///
-/// `AudioHub::subscribe` holds the hub mutex across this call, so an unbounded wait here freezes
-/// every other session's audio subscribe and unsubscribe. The candidate loop can try three
-/// backends, each of which now bounds its own blocking calls; this is the backstop for a backend
-/// that wedges somewhere none of them cover.
+/// `AudioHub::subscribe` keeps every other session's subscribe and unsubscribe waiting until
+/// this call returns, so it must be bounded. Each backend bounds its own blocking calls; this
+/// is the backstop for one that wedges somewhere none of them cover.
 const SETUP_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Say so when the worker thread died of a panic rather than returning an error.
 fn report_worker_panic(result: std::thread::Result<()>) {
     if let Err(payload) = result {
         let what = payload
@@ -367,9 +352,8 @@ fn worker(
     let mut last_diag = Instant::now();
     let mut warned_silent = false;
     let start_instant = Instant::now();
-    // Host-clock time of the next sample to be popped. Seeded from the capture hardware's own
-    // stamp and then advanced one frame at a time, so the sequence is exactly 5 ms apart and can
-    // never regress no matter how the drain loop is scheduled.
+    // Host-clock time of the next sample to be popped: seeded from the capture hardware's stamp,
+    // then advanced one frame at a time, so stamps are exactly 5 ms apart and never regress.
     let mut next_capture_ns: Option<u64> = None;
     let mut resyncs: u64 = 0;
 
@@ -397,8 +381,7 @@ fn worker(
             if jumped {
                 resyncs += 1;
                 pending_flags |= FLAG_DISCONTINUITY;
-                // The summary reported `discontinuity=0` through a re-seat, because nothing but
-                // the local counter recorded one.
+                // a re-seat counts as a discontinuity in the summary too
                 diagnostics
                     .discontinuity_count
                     .fetch_add(1, Ordering::Relaxed);
@@ -436,11 +419,9 @@ fn worker(
             produced = true;
         }
 
-        // `dropped_backpressure` is owned by the producers. Every capture callback already
-        // `fetch_add`s what `Producer::push` could not fit, and the legacy reader adds the samples
-        // it lost to a lapped shared-memory ring — a different loss with a different cause. The
-        // unconditional `store(consumer.overruns())` that used to sit here erased the second on
-        // the very next drain pass, reporting legacy-tier loss as zero.
+        // `dropped_backpressure` is owned by the producers (capture callbacks and the legacy shm
+        // reader both `fetch_add` their own losses). Do not `store(consumer.overruns())` here:
+        // it would erase the legacy reader's count.
 
         if last_diag.elapsed() >= DIAG_LOG_INTERVAL {
             crate::tprintln!(
@@ -452,13 +433,11 @@ fn worker(
                 && start_instant.elapsed() >= Duration::from_secs(5)
                 && backend.nonsilent_samples() == 0
             {
-                // The classic cause — an aggregate device whose tap-list UID does not match the
-                // `CATapDescription` UUID, which makes the tap return `noErr` and pure silence —
-                // cannot happen here: `process_tap.rs` builds the sub-tap dictionary from the
-                // description's own `UUIDString`. What is left for the user to check is consent
-                // and exclusivity.
+                // not the classic tap-list UID mismatch (`noErr` and pure silence):
+                // `process_tap.rs` builds the sub-tap dictionary from the description's own
+                // `UUIDString`. That leaves consent and exclusivity.
                 crate::teprintln!(
-                    "audio: {} has produced only silence for 5s — if the host IS playing audio, \
+                    "audio: {} has produced only silence for 5s. If the host IS playing audio, \
                      check Screen Recording / audio permissions and whether another process \
                      holds an exclusive tap on the output device",
                     backend.backend_name()

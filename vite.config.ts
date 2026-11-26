@@ -10,9 +10,7 @@ function monacoDeps(): string[] {
   const pattern = /["'](monaco-editor\/esm\/[^"']+)["']/g;
   for (const file of ["src/lib/monaco-setup.ts", "src/components/json-editor.tsx"]) {
     const full = resolve(__dirname, file);
-    // Without this, renaming either file kills every vite command -- dev, build, tauri
-    // dev, tauri build -- with a bare ENOENT thrown from inside the config, before any
-    // project code is reached. The path is in the message but the reason is not.
+    // otherwise a renamed file kills every vite command with a bare ENOENT from the config
     if (!existsSync(full)) {
       throw new Error(
         `vite.config: monacoDeps() lists ${file}, which does not exist. ` +
@@ -32,10 +30,9 @@ const WORKER_ENTRIES: Record<string, string> = {
   "monaco-json.worker": "src/lib/monaco-json.worker.ts",
 };
 
-// Vite's dev server serves `?worker` as a module worker and safari 13.1 cannot construct
-// one, so the two monaco language services are bundled here as classic IIFE scripts and
-// served from `/@classic-worker/`. Production does not go through this at all -- there the
-// same guarantee comes from `worker.format: "iife"` below.
+// dev only: vite serves `?worker` as a module worker, which Safari 13.1 cannot construct,
+// so the monaco workers are bundled as classic IIFE scripts (production relies on
+// `worker.format: "iife"` below)
 function classicWorkers(): Plugin {
   const bundled = new Map<string, string>();
   return {
@@ -91,8 +88,7 @@ function classicWorkers(): Plugin {
         })();
       });
     },
-    // The bundle is memoised for the life of the dev server, so without this an edit to a
-    // worker entry keeps serving the stale build until the server is restarted.
+    // drop the memoised bundle, or an edited worker entry keeps serving the stale build
     handleHotUpdate({ file }) {
       for (const [name, entry] of Object.entries(WORKER_ENTRIES)) {
         if (file === path.resolve(__dirname, entry)) bundled.delete(name);
@@ -101,12 +97,9 @@ function classicWorkers(): Plugin {
   };
 }
 
-// The webfont is declared inside the 50 KB render-blocking stylesheet (`non.geist` is
-// imported from App.tsx), so the browser only starts fetching it after parsing all of
-// that CSS -- and `font-display: swap` means the fallback is painted first and then
-// replaced. A preload link starts the fetch with the rest of the head instead. The
-// filename carries a content hash, so it is read out of the emitted bundle rather than
-// hardcoded; if the font is ever renamed or dropped this simply emits nothing.
+// preload the webfont: declared in the 50 KB render-blocking stylesheet, its fetch would
+// otherwise wait for that CSS to parse while the fallback paints (`font-display: swap`).
+// The filename carries a content hash, so it is read from the emitted bundle
 function preloadWebfont(): Plugin {
   return {
     name: "screenextend:preload-webfont",
@@ -141,8 +134,7 @@ export default defineConfig(async () => ({
 
   build: {
     target: ["es2020", "chrome87", "safari13"],
-    // Left at rollup's default on purpose: the monaco chunk is expected to trip it, and
-    // the warning is how a new oversized chunk becomes visible in the build output.
+    // the default, kept so a new oversized chunk shows up as a warning (monaco trips it)
     chunkSizeWarningLimit: 500,
     rollupOptions: {
       input: {
@@ -151,14 +143,12 @@ export default defineConfig(async () => ({
     },
   },
 
-  // Safari 13.1 cannot construct `new Worker(url, { type: "module" })`, and the monaco
-  // language services are workers. `classicWorkers` below only covers the dev server;
-  // production correctness rested entirely on vite's default happening to be "iife".
+  // pinned rather than left to vite's default: Safari 13.1 cannot construct a module
+  // worker, and `classicWorkers` only covers the dev server
   worker: { format: "iife" },
 
-  // esbuild's "safari13" means 13.0, while browserslist in package.json says 13.1. The
-  // difference is `?.` and `??`, which landed in 13.1: esbuild therefore lowers slightly
-  // more than strictly necessary, which errs in the safe direction and should stay.
+  // esbuild's "safari13" is 13.0 while browserslist says 13.1, so `?.` and `??` (13.1) are
+  // lowered needlessly. That errs on the safe side: keep it
   esbuild: { target: "safari13" },
   optimizeDeps: {
     include: monacoDeps(),
@@ -172,11 +162,9 @@ export default defineConfig(async () => ({
     },
   },
 
-  // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
-  //
-  // 1. prevent vite from obscuring rust errors
+  // keep vite from clearing rust errors off the terminal
   clearScreen: false,
-  // 2. tauri expects a fixed port, fail if that port is not available
+  // tauri expects a fixed port: fail if it is taken
   server: {
     port: 1420,
     strictPort: true,
@@ -189,7 +177,6 @@ export default defineConfig(async () => ({
         }
       : undefined,
     watch: {
-      // 3. tell vite to ignore watching `src-tauri`
       ignored: ["**/src-tauri/**"],
     },
   },

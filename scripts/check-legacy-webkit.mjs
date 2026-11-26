@@ -1,18 +1,12 @@
 // Re-derives the post-floor API list from a build and fails on anything unpatched.
 //
-// Two contracts are checked, because the repo ships two frontends:
+//   dist/     the desktop control UI; its floor is Safari 13.1 (the WKWebView on macOS 10.15)
+//   static/   the client web page; an older floor still, and no build step, so anything
+//             modern in it ships verbatim
 //
-//   dist/         the desktop control UI, whose floor is Safari 13.1 -- the WKWebView on
-//                 macOS 10.15. JS, CSS and HTML.
-//   static/       the client web page, served to whatever browser a phone happens to have.
-//                 Its floor is older still and it has no build step, so anything modern in
-//                 it ships verbatim.
-//
-// A check is satisfied either by a `cover` (a shim, a fallback, or an argument that the
-// construct is unreachable) or by not matching. `cover: "shim"` additionally names the
-// function in src/lib/legacy-webview-polyfills.ts that provides it, and the run fails if
-// that function is no longer defined and called -- otherwise deleting a shim would leave
-// the checker cheerfully printing the coverage it no longer has.
+// A check passes by not matching or by a `cover` (a shim, a fallback, or an argument that the
+// construct is unreachable). `cover: "shim"` names a function in
+// src/lib/legacy-webview-polyfills.ts; the run fails if it is no longer defined and called.
 
 import { readdirSync, readFileSync, existsSync, statSync } from "node:fs";
 import { join, extname, relative, sep } from "node:path";
@@ -20,9 +14,8 @@ import { join, extname, relative, sep } from "node:path";
 const POLYFILLS = "src/lib/legacy-webview-polyfills.ts";
 const CLIENT_DIR = join("src-tauri", "src", "streamer", "static");
 
-// Hits that are accounted for but whose reason is specific to one file rather than to the
-// check. `file` is matched as a basename prefix, so it survives the content hash; `max` is
-// a ceiling, so a new hit in the same file still fails while fixing them all does not.
+// accepted hits whose reason is specific to one file. `file` is a basename prefix (survives
+// the content hash); `max` is a ceiling, so a new hit in the same file still fails
 const KNOWN_DEBT = {
   ":has()": [
     { file: "main-", max: 1, why: "the table kit's [&:has([role=checkbox])]; nothing in src/ renders role=checkbox" },
@@ -83,10 +76,8 @@ const JS_CHECKS = [
   { label: "Promise.withResolvers", re: /\bwithResolvers\s*\(/g, since: "17.4" },
   { label: "URL.canParse", re: /\bURL\s*\.\s*canParse\b/g, since: "17" },
   { label: "checkVisibility", re: /\.checkVisibility\s*\(/g, since: "17.4" },
-  // Anchored on the write, not on the identifier: `inert` is also a React prop name that
-  // react-remove-scroll passes around, and that is not the DOM attribute. This is the one
-  // Base UI reaches for in every focus-managing component (`floating-ui-react/utils/
-  // markOthers`), and it degrades silently -- focus simply is not trapped, no error.
+  // anchored on the write: `inert` is also a React prop name (react-remove-scroll). Base UI
+  // sets it in every focus-managing component, and without it focus is silently not trapped
   { label: "inert attribute", re: /(?:set|toggle|remove)Attribute\s*\(\s*["']inert["']|\.inert\s*=[^=]/g, since: "15.5" },
   { label: "scrollend", re: /["']scrollend["']/g, since: "18" },
   {
@@ -102,8 +93,7 @@ const JS_CHECKS = [
   { label: "static init block", re: /\bstatic\s*\{/g, since: "16.4", hard: true },
   { label: "class field", re: /\bclass\b[^{;()]{0,60}\{\s*(?:static\s+)?[A-Za-z_$][\w$]*\s*[;=][^=>]/g, since: "14", hard: true },
   { label: "private class member", re: /[{;]\s*#[A-Za-z_$]/g, since: "14.1", hard: true },
-  // A parse-time SyntaxError in a regex literal: it kills the whole chunk before any of it
-  // runs, so no amount of runtime guarding helps.
+  // a parse-time SyntaxError in a regex literal kills the whole chunk: no runtime guard helps
   { label: "RegExp lookbehind", re: /\(\?<[=!]/g, since: "16.4", hard: true, cover: "unreachable", why: "monaco's only use is behind its own lazy `new RegExp` wrapper with a try/catch" },
   { label: "module worker", re: /new Worker\([^)]{0,200}?type\s*:\s*["']module["']/g, since: "15", hard: true },
   { label: "import.meta.resolve", re: /import\s*\.\s*meta\s*\.\s*resolve/g, since: "16.4", hard: true },
@@ -158,7 +148,7 @@ const CSS_CHECKS = [
   { label: ":focus-within", re: /:focus-within/g, since: "10.1", cover: "supported", why: "shipped in safari 10.1, below the floor" },
 ];
 
-// The client page is hand-written and unbundled, so syntax matters as much as APIs.
+// the client page is unbundled, so syntax matters as much as APIs
 const CLIENT_JS_CHECKS = [
   { label: "optional chaining", re: /\?\.[\w[(]/g, since: "13.4", hard: true },
   { label: "nullish coalescing", re: /\?\?[^=]/g, since: "13.4", hard: true },
@@ -194,9 +184,8 @@ const CLIENT_CSS_CHECKS = [
   { label: "gap in flex", re: /display\s*:\s*(?:inline-)?flex[^}]*?[;{]\s*(?:row-|column-)?gap\s*:/g, since: "14.1" },
 ];
 
-// Reading a class attribute is the only way to see a flex container and a gap utility in
-// the same box: tailwind emits .flex and .gap-4 as separate rules, so the built CSS cannot
-// answer this. Safari 13.1 has gap for grid but not for flex.
+// tailwind emits .flex and .gap-4 as separate rules, so only the class attribute shows a
+// flex container with a gap. Safari 13.1 has gap for grid but not for flex
 const FLEX_GAP_RE = /className\s*=\s*(?:"([^"]*)"|'([^']*)'|\{`([^`]*)`\}|\{"([^"]*)"\})/g;
 
 function walk(dir, out = []) {
@@ -208,8 +197,8 @@ function walk(dir, out = []) {
   return out;
 }
 
-// The statement the hit sits in, so a guard cannot be satisfied by an unrelated `&&` sixty
-// characters away in minified output.
+// the statement the hit sits in, so an unrelated `&&` nearby in minified output cannot
+// satisfy a guard
 function statementAround(source, index) {
   let start = index;
   while (start > 0 && index - start < 400 && !";{}".includes(source[start - 1])) start--;
@@ -257,7 +246,7 @@ function report(label, rows) {
   return failed;
 }
 
-// A `cover: "shim"` claim is only worth anything while the shim is still there.
+// a `cover: "shim"` claim only holds while the shim is still defined and called
 function verifyShims(checks) {
   const named = [...new Set(checks.filter(c => c.cover === "shim").map(c => c.shim))];
   const missingName = checks.find(c => c.cover === "shim" && !c.shim);

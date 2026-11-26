@@ -29,14 +29,9 @@ unsafe extern "C" {
         keycode: u16,
         key_down: bool,
     ) -> CGEventRef;
-    // The fixed-arity twin of CGEventCreateScrollWheelEvent (10.13+, below our 10.15 floor).
-    //
-    // The variadic original takes `wheel1` as a *named* parameter and only `wheel2`/`wheel3`
-    // through the ellipsis. Declaring `wheel1` past the `...` compiles and works on x86_64,
-    // where named and variadic integers share one register sequence, but breaks on Apple
-    // arm64: named arguments go in registers and variadic ones on the stack, so the callee
-    // reads `wheel1` out of `w3` while the caller wrote it to the stack. Using the non-
-    // variadic entry point removes the class of bug rather than restating the prototype.
+    // fixed-arity twin of CGEventCreateScrollWheelEvent (10.13+). The variadic original takes
+    // `wheel1` as a named parameter; declaring it past the `...` works on x86_64 but breaks on
+    // Apple arm64, where named arguments go in registers and variadic ones on the stack.
     fn CGEventCreateScrollWheelEvent2(
         source: CGEventSourceRef,
         units: u32,
@@ -118,14 +113,10 @@ fn modifier_self_flag(vk: u16) -> u64 {
     }
 }
 
-/// The modifier row, which is the only part of the table that depends on who is typing.
-///
-/// A PC keyboard's Ctrl is the command modifier — Ctrl+C copies — and macOS spells that Command,
-/// so a PC client's Ctrl has to become Command and its Windows key has to become Control.
-/// An Apple keyboard already has both in the right places, and swapping them there is exactly
-/// backwards: the user presses Command+C, the browser reports `MetaLeft`, and a swapped table
-/// injects Control+C, which is not copy. Their muscle-memory Ctrl+A (start of line in Cocoa)
-/// becomes Command+A, select-all.
+/// The modifier row, the only part of the table that depends on who is typing. A PC client's
+/// Ctrl is the command modifier (Ctrl+C copies), so it becomes Command and its Windows key
+/// becomes Control. An Apple client already has both in the right places and must not be
+/// swapped: Command+C would inject Control+C.
 fn modifier_keycode(code: &str, apple_client: bool) -> Option<u16> {
     Some(match code {
         "ShiftLeft" => VK_SHIFT,
@@ -282,10 +273,9 @@ fn code_to_keycode(code: &str, apple_client: bool) -> Option<u16> {
     Some(vk as u16)
 }
 
-/// `AXIsProcessTrusted` is the whole tier: with it, `CGEventPost` reaches the desktop; without
-/// it the OS drops every event and returns `void`, so nothing downstream can tell the difference
-/// between "not granted" and "the network is down". `AXIsProcessTrusted` is 10.9 API, present on
-/// the floor, and cheap enough to call on the geometry cadence.
+/// `AXIsProcessTrusted` is the whole tier: without it the OS drops every `CGEventPost` and
+/// returns `void`, so nothing downstream can tell. 10.9 API, cheap enough to call on the
+/// geometry cadence.
 pub fn probe() -> super::InputBackend {
     if crate::macos_utils::permissions::accessibility_trusted() {
         super::InputBackend::CgEvent
@@ -314,14 +304,12 @@ pub struct Injector {
     /// The client holds pointer lock, so `MOUSE_DELTA` drives the cursor and the frozen
     /// coordinates an absolute frame still carries must be ignored.
     mouse_relative: bool,
-    /// The two settings the user can move under a live session: whether remote control is on at
-    /// all, and what a locked cursor is clamped against. Shared with the command that writes
-    /// them, so a change reaches the next event rather than the next join.
+    /// Remote control on/off and the pointer-lock clamp scope, shared with the command that
+    /// writes them so a change reaches the next event, not the next join.
     live: SharedLiveInput,
     warned_drop: bool,
-    /// Last probed injection tier. TCC can be granted or revoked while we run, and the check
-    /// used to happen once in the constructor — which is why its own warning told the user to
-    /// relaunch.
+    /// Last probed injection tier. TCC can be granted or revoked at runtime, so it is
+    /// re-probed with the geometry.
     tier: super::InputBackend,
 }
 
@@ -349,7 +337,7 @@ impl Injector {
         if !tier.injects() {
             teprintln!(
                 "input: Accessibility (TCC) is not granted, so every injected event is dropped \
-                 by the OS — enable ScreenExtend in System Settings > Privacy & Security > \
+                 by the OS. Enable ScreenExtend in System Settings > Privacy & Security > \
                  Accessibility; it takes effect immediately, no relaunch"
             );
         }
@@ -370,10 +358,8 @@ impl Injector {
             down_keys: HashSet::new(),
             mods: 0,
             pos,
-            // No lock until the client says so. Starting at `true` meant the first frame of a
-            // session was treated as relative, and since this backend has no touch injection at
-            // all — every tap becomes `mouse_pointer(.., Phase::Down)` — a touch client's
-            // opening tap landed wherever the host cursor already was.
+            // no lock until the client says so: this backend injects every tap as a mouse press,
+            // so a first frame read as relative lands wherever the host cursor already was
             mouse_relative: false,
             live,
             warned_drop: false,
@@ -387,16 +373,14 @@ impl Injector {
         if fresh {
             return;
         }
-        // Re-probe on the same cadence. Granting Accessibility takes effect for a running
-        // process, so a session that started muted starts working within half a second of the
-        // user flipping the switch — and one whose permission is revoked says so.
+        // re-probe on the same cadence: an Accessibility grant or revoke applies while running
         let tier = probe();
         if tier != self.tier {
             if tier.injects() {
-                tprintln!("input: Accessibility granted — remote control is live");
+                tprintln!("input: Accessibility granted, remote control is live");
             } else {
                 teprintln!(
-                    "input: Accessibility was revoked — injected events are being dropped by the OS"
+                    "input: Accessibility was revoked, injected events are being dropped by the OS"
                 );
             }
             self.tier = tier;
@@ -467,7 +451,7 @@ impl Injector {
             InputEvent::Lifecycle(l) => self.lifecycle(*l),
             InputEvent::Drag { .. } => {}
             InputEvent::Drop { .. } => self.unsupported_drop(),
-            // Handled by the transport before dispatch: none of these inject anything.
+            // handled by the transport before dispatch; none of these inject anything
             InputEvent::Ping { .. }
             | InputEvent::Pong { .. }
             | InputEvent::ClientStats(_)
@@ -494,7 +478,7 @@ impl Injector {
                 self.buttons = 0;
                 return;
             }
-            // An absolute move is proof the client is not locked, for clients that never send
+            // an absolute move is proof the client is not locked, for clients that never send
             // `POINTERLOCK_STATE`. A `Down`/`Up` is not: those still arrive while locked.
             Phase::Move | Phase::Enter | Phase::Over => self.mouse_relative = false,
             _ => {}
@@ -511,12 +495,10 @@ impl Injector {
         self.buttons = buttons;
     }
 
-    /// The rectangle a pointer-locked cursor may not leave.
-    ///
-    /// `PointerScope::Display` is this session's own screen — what the client is looking at —
-    /// and `All` is every screen attached to this Mac. An unresolved display rect falls back to
-    /// the desktop rather than trapping the cursor inside a guess. The Windows backend clamps
-    /// against the same choice, so the two agree.
+    /// The rectangle a pointer-locked cursor may not leave: this session's own screen for
+    /// `PointerScope::Display`, every screen for `All`. An unresolved display rect falls back
+    /// to the desktop rather than trapping the cursor inside a guess. The Windows backend
+    /// clamps against the same choice.
     fn pointer_bounds(&self) -> DisplayRect {
         match (self.live.pointer_scope(), self.target) {
             (PointerScope::Display, Some(r)) => r,
@@ -527,9 +509,8 @@ impl Injector {
     fn mouse_delta(&mut self, dx: i16, dy: i16, buttons: u16) {
         self.mouse_relative = true;
         let b = self.pointer_bounds();
-        // A delta from where the cursor really is, not from where this injector last put it:
-        // the host's own trackpad moves the cursor between client frames, and advancing from
-        // the remembered point snapped it straight back. Same rule as the Windows backend.
+        // from where the cursor really is, not where this injector last put it: the host's own
+        // trackpad moves it between client frames. Same rule as the Windows backend.
         let base = current_mouse_location().unwrap_or(self.pos);
         let nx = (base.x + dx as f64).clamp(b.left as f64, (b.left + b.width as i32) as f64);
         let ny = (base.y + dy as f64).clamp(b.top as f64, (b.top + b.height as i32) as f64);
@@ -772,9 +753,8 @@ impl Injector {
             return;
         };
         match source {
-            // A stroke is a shape, so every real sample is posted. Predicted ones are not: a
-            // guess the next real sample corrects still leaves a kink in the ink. There is no
-            // batch form of `CGEventPost`, so this is genuinely one Mach round trip per sample.
+            // a stroke is a shape, so every real sample is posted; a predicted one would leave a
+            // kink in the ink. `CGEventPost` has no batch form: one Mach round trip per sample.
             SRC_PEN | SRC_TOUCH => {
                 let real = samples.len() - predicted as usize;
                 for s in &samples[..real] {
@@ -785,10 +765,8 @@ impl Injector {
                     }
                 }
             }
-            // The cursor is last-value-wins: only the final position is observable, and every
-            // earlier one costs a Mach IPC round trip to WindowServer for a location overwritten
-            // microseconds later. Post the last sample and carry the whole run's delta on it, so
-            // anything reading `kCGMouseEventDeltaX/Y` still sees the full movement.
+            // the cursor is last-value-wins, and each post is a Mach round trip to WindowServer:
+            // post only the last sample, with the whole run's delta for `kCGMouseEventDeltaX/Y`
             _ => {
                 self.mouse_relative = false;
                 let prev = self.pos;
@@ -813,9 +791,7 @@ impl Injector {
                 self.paste_hotkey();
             }
         } else {
-            // Silence here reads to the user as "paste from my phone does nothing", with no
-            // way to tell it from a network problem. the macOS pasteboard can refuse for reasons
-            // outside our control -- another process holding it, a format it will not take.
+            // the pasteboard can refuse (held by another process, or a format it will not take)
             teprintln!(
                 "clipboard: could not set {mime} ({} bytes); the paste will not carry it",
                 data.len()
@@ -973,7 +949,7 @@ mod tests {
                 "{code} from a Mac"
             );
         }
-        // Everything else is the same table for everyone.
+        // everything else is the same table for every client
         for code in ["ShiftLeft", "AltLeft", "CapsLock", "KeyC", "F5", "ArrowUp"] {
             assert_eq!(
                 code_to_keycode(code, false),
@@ -997,7 +973,7 @@ mod tests {
         ] {
             assert_eq!(ClientPlatform::from_reported(s).is_apple(), apple, "{s}");
         }
-        // The client sends its own capitalisation; the parse must not care.
+        // the client sends its own capitalisation; the parse must not care
         assert_eq!(
             ClientPlatform::from_reported("MACOS"),
             ClientPlatform::MacOs
@@ -1007,9 +983,9 @@ mod tests {
     const FIELD_SCROLL_DELTA_AXIS_1: u32 = 11;
     const FIELD_SCROLL_DELTA_AXIS_2: u32 = 12;
 
-    /// Pins the arity. Binding the symbol to a fully spelled-out fixed-arity pointer type is
-    /// what fails the build if anyone reintroduces a `...` or drops a wheel argument — the
-    /// variadic form of this call is an arm64 ABI mismatch that x86_64 cannot detect.
+    /// Pins the arity: binding the symbol to a fixed-arity pointer type fails the build if a
+    /// `...` comes back or a wheel argument is dropped. The variadic form is an arm64 ABI
+    /// mismatch that x86_64 cannot detect.
     #[test]
     fn the_scroll_constructor_stays_fixed_arity() {
         let f: unsafe extern "C" fn(CGEventSourceRef, u32, u32, i32, i32, i32) -> CGEventRef =
@@ -1017,9 +993,8 @@ mod tests {
         assert_eq!(f as *const (), CGEventCreateScrollWheelEvent2 as *const ());
     }
 
-    /// The behavioural half: `wheel1`/`wheel2` have to arrive as themselves. Under the old
-    /// variadic declaration this reads back junk on Apple Silicon and the right answer on
-    /// Intel, which is exactly why the defect survived a dev box.
+    /// The behavioural half: `wheel1`/`wheel2` have to arrive as themselves. A variadic
+    /// declaration reads back junk on Apple Silicon and the right answer on Intel.
     #[test]
     fn scroll_wheel_arguments_land_on_their_own_axes() {
         unsafe {

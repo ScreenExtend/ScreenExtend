@@ -1,12 +1,11 @@
 //! The AMF property-name catalogue as NUL-terminated UTF-16, plus the component and trace-writer
 //! ids.
 //!
-//! These strings are the API. `SetProperty` on a name AMF does not know returns `AMF_NOT_FOUND`
-//! and is trivially ignored, so a typo here is a silently missing setting rather than a crash —
-//! which is why `test/amd_layout.rs` asserts every one of them against the vendored header.
+//! These strings are the API: `SetProperty` on a name AMF does not know returns `AMF_NOT_FOUND`,
+//! so a typo is a silently missing setting, and `test/amd_layout.rs` asserts every one against
+//! the vendored header.
 //!
-//! Four pairs of header constants share a single string, so setting "both" of a pair configures
-//! one property, not two:
+//! Four pairs of header constants share one string, so setting both of a pair sets one property:
 //! * `PREENCODE_ENABLE` == `RATE_CONTROL_PREANALYSIS_ENABLE` == `RateControlPreanalysisEnable`
 //! * `LOWLATENCY_MODE` == "LOW_LATENCY_INTERNAL" == `LowLatencyInternal`
 //! * `OUTPUT_FULL_RANGE_COLOR` == `FULL_RANGE_COLOR` == `FullRangeColor`
@@ -33,9 +32,9 @@ macro_rules! wide {
     };
 }
 
-/// Component ids passed to `AMFFactory::CreateComponent`. Note that the HEVC and AV1 macros do
-/// **not** expand to their own names (`AMFVideoEncoderHW_HEVC`, `AMFVideoEncoderHW_AV1`) — only
-/// the AVC one does.
+/// Component ids passed to `AMFFactory::CreateComponent`. The HEVC and AV1 macros do **not**
+/// expand to their own names (`AMFVideoEncoderHW_HEVC`, `AMFVideoEncoderHW_AV1`), only the AVC
+/// one does.
 pub mod codec {
     use super::utf16;
     wide! {
@@ -55,7 +54,7 @@ pub mod names {
     use super::utf16;
 
     wide! {
-        // ---- static: settable before Init() ----
+        // static: settable before Init()
         /// **Set this first.** It re-defaults most other rate-control and GOP properties, so
         /// anything written before it is lost.
         AMF_VIDEO_ENCODER_USAGE = "Usage";
@@ -84,7 +83,7 @@ pub mod names {
         AMF_VIDEO_ENCODER_OUTPUT_MATRIX_COEFF = "OutMatrixCoeff";
         AMF_VIDEO_ENCODER_OUTPUT_MODE = "OutputMode";
 
-        // ---- dynamic: settable on a running component, applied at the next SubmitInput ----
+        // dynamic: settable on a running component, applied at the next SubmitInput
         AMF_VIDEO_ENCODER_FRAMERATE = "FrameRate";
         AMF_VIDEO_ENCODER_ENFORCE_HRD = "EnforceHRD";
         AMF_VIDEO_ENCODER_FILLER_DATA_ENABLE = "FillerDataEnable";
@@ -99,6 +98,7 @@ pub mod names {
         AMF_VIDEO_ENCODER_MAX_QP = "MaxQP";
         AMF_VIDEO_ENCODER_QP_I = "QPI";
         AMF_VIDEO_ENCODER_QP_P = "QPP";
+        AMF_VIDEO_ENCODER_QP_B = "QPB";
         AMF_VIDEO_ENCODER_TARGET_BITRATE = "TargetBitrate";
         AMF_VIDEO_ENCODER_PEAK_BITRATE = "PeakBitrate";
         AMF_VIDEO_ENCODER_RATE_CONTROL_SKIP_FRAME_ENABLE = "RateControlSkipFrameEnable";
@@ -118,21 +118,31 @@ pub mod names {
         AMF_VIDEO_ENCODER_INPUT_QUEUE_SIZE = "InputQueueSize";
         AMF_VIDEO_ENCODER_ENABLE_SMART_ACCESS_VIDEO = "EnableEncoderSmartAccessVideo";
 
-        // ---- per-submission: set on the input AMFSurface, not the component ----
+        // per-submission: set on the input AMFSurface, not the component
         AMF_VIDEO_ENCODER_FORCE_PICTURE_TYPE = "ForcePictureType";
         AMF_VIDEO_ENCODER_INSERT_SPS = "InsertSPS";
         AMF_VIDEO_ENCODER_INSERT_PPS = "InsertPPS";
         AMF_VIDEO_ENCODER_INSERT_AUD = "InsertAUD";
         AMF_VIDEO_ENCODER_MARK_CURRENT_WITH_LTR_INDEX = "MarkCurrentWithLTRIndex";
         AMF_VIDEO_ENCODER_FORCE_LTR_REFERENCE_BITFIELD = "ForceLTRReferenceBitfield";
+        /// Asks for this picture's statistics on its output buffer (RX 5000 / Ryzen 2000 U/H
+        /// and newer).
+        AMF_VIDEO_ENCODER_STATISTICS_FEEDBACK = "StatisticsFeedback";
+        /// Not an AMF property: the encoder's own picture identity, written on the input surface.
+        /// AMF carries surface properties to the output buffer, where it is read back.
+        FRAME_IDENTITY = "ScreenExtendFrameId";
 
-        // ---- set by the encoder on the output buffer ----
+        // set by the encoder on the output buffer
         AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE = "OutputDataType";
         AMF_VIDEO_ENCODER_OUTPUT_BUFFER_TYPE = "OutputBufferType";
         AMF_VIDEO_ENCODER_OUTPUT_MARKED_LTR_INDEX = "MarkedLTRIndex";
         AMF_VIDEO_ENCODER_OUTPUT_REFERENCED_LTR_INDEX_BITFIELD = "ReferencedLTRIndexBitfield";
+        /// With `StatisticsFeedback`: the rate controller's base QP for the picture.
+        AMF_VIDEO_ENCODER_STATISTIC_FRAME_QP = "StatisticsFeedbackFrameQP";
+        /// With `StatisticsFeedback`: the average QP over the picture's encoded macroblocks.
+        AMF_VIDEO_ENCODER_STATISTIC_AVERAGE_QP = "StatisticsFeedbackAvgQP";
 
-        // ---- capabilities: read from AMFCaps with GetProperty ----
+        // capabilities: read from AMFCaps with GetProperty
         AMF_VIDEO_ENCODER_CAP_MAX_BITRATE = "MaxBitrate";
         AMF_VIDEO_ENCODER_CAP_NUM_OF_STREAMS = "NumOfStreams";
         AMF_VIDEO_ENCODER_CAP_MAX_PROFILE = "MaxProfile";

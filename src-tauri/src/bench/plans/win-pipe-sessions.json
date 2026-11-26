@@ -1,0 +1,187 @@
+{
+ "version": 1,
+ "name": "win-pipe-sessions",
+ "workloads": [
+  {
+   "id": "take",
+   "kind": "recording",
+   "max_frames": 2900
+  },
+  {
+   "id": "mixed-1080p",
+   "kind": "synthetic",
+   "pattern": "mixed",
+   "width": 1920,
+   "height": 1080,
+   "fps": 60,
+   "seconds": 30
+  }
+ ],
+ "recipes": [
+  {
+   "name": "mix1-nvenc",
+   "production": {
+    "qp": 15
+   },
+   "mix": [
+    {
+     "label": "nvenc-1080p60",
+     "vendor": "nvenc",
+     "transform": "fps:60",
+     "fps": 60
+    }
+   ]
+  },
+  {
+   "name": "mix2-nvenc",
+   "production": {
+    "qp": 15
+   },
+   "mix": [
+    {
+     "label": "nvenc-1080p60",
+     "vendor": "nvenc",
+     "transform": "fps:60",
+     "fps": 60
+    },
+    {
+     "label": "nvenc-1440p120",
+     "vendor": "nvenc",
+     "transform": "fps:120,tile2x2,crop:2560x1440",
+     "fps": 120
+    }
+   ]
+  },
+  {
+   "name": "mix2-nvenc-qsv",
+   "production": {
+    "qp": 15
+   },
+   "mix": [
+    {
+     "label": "nvenc-1080p60",
+     "vendor": "nvenc",
+     "transform": "fps:60",
+     "fps": 60
+    },
+    {
+     "label": "qsv-1080p60",
+     "vendor": "qsv",
+     "transform": "fps:60",
+     "fps": 60
+    }
+   ]
+  },
+  {
+   "name": "mix3",
+   "production": {
+    "qp": 15
+   },
+   "mix": [
+    {
+     "label": "nvenc-1080p60",
+     "vendor": "nvenc",
+     "transform": "fps:60",
+     "fps": 60
+    },
+    {
+     "label": "nvenc-1440p120",
+     "vendor": "nvenc",
+     "transform": "fps:120,tile2x2,crop:2560x1440",
+     "fps": 120
+    },
+    {
+     "label": "qsv-1080p60",
+     "vendor": "qsv",
+     "transform": "fps:60",
+     "fps": 60
+    }
+   ]
+  },
+  {
+   "name": "mix4",
+   "production": {
+    "qp": 15
+   },
+   "mix": [
+    {
+     "label": "nvenc-1080p60",
+     "vendor": "nvenc",
+     "transform": "fps:60",
+     "fps": 60
+    },
+    {
+     "label": "nvenc-1440p120",
+     "vendor": "nvenc",
+     "transform": "fps:120,tile2x2,crop:2560x1440",
+     "fps": 120
+    },
+    {
+     "label": "qsv-1080p60",
+     "vendor": "qsv",
+     "transform": "fps:60",
+     "fps": 60
+    },
+    {
+     "label": "qsv-1080p30",
+     "vendor": "qsv",
+     "transform": "fps:30",
+     "fps": 30
+    }
+   ]
+  },
+  {
+   "name": "mix4-nvenc",
+   "production": {
+    "qp": 15
+   },
+   "mix": [
+    {
+     "label": "nvenc-1080p60-0",
+     "vendor": "nvenc",
+     "transform": "fps:60",
+     "fps": 60
+    },
+    {
+     "label": "nvenc-1080p60-1",
+     "vendor": "nvenc",
+     "transform": "fps:60",
+     "fps": 60
+    },
+    {
+     "label": "nvenc-1080p60-2",
+     "vendor": "nvenc",
+     "transform": "fps:60",
+     "fps": 60
+    },
+    {
+     "label": "nvenc-1080p60-3",
+     "vendor": "nvenc",
+     "transform": "fps:60",
+     "fps": 60
+    }
+   ]
+  }
+ ],
+ "groups": [
+  {
+   "name": "several sessions in one process",
+   "stage": "pipe",
+   "recipes": [
+    "mix1-nvenc",
+    "mix2-nvenc",
+    "mix2-nvenc-qsv",
+    "mix3",
+    "mix4",
+    "mix4-nvenc"
+   ],
+   "workloads": [
+    "take",
+    "mixed-1080p"
+   ]
+  }
+ ],
+ "order": {
+  "cooldown_ms": 2000
+ }
+}

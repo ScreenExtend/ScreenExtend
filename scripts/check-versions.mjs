@@ -1,8 +1,7 @@
 #!/usr/bin/env node
-// The app version is written out in four places and they have to agree: an installer built
-// from a tree where they disagree ships a bundle whose CFBundleVersion, Cargo metadata and
-// updater manifest name different releases, and `finalize-release` renames assets by the
-// version it reads from tauri.conf.json alone.
+// The app version is written in four files and they must agree: otherwise the bundle's
+// CFBundleVersion, Cargo metadata and updater manifest name different releases, and
+// `finalize-release` renames assets by the version in tauri.conf.json alone.
 
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";

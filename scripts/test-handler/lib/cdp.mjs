@@ -5,6 +5,9 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 
 export const CHROME = process.env.CHROME || 'C:/Program Files/Google/Chrome/Application/chrome.exe';
+export const EDGE = process.env.EDGE || 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
+/** 'chrome' | 'edge' | an absolute path -> the executable. */
+export const browserBinary = (b) => (!b || b === 'chrome' ? CHROME : b === 'edge' ? EDGE : b);
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const FORBIDDEN = /^Input\./;
@@ -13,7 +16,7 @@ export async function connect(wsUrl) {
   const ws = new WebSocket(wsUrl);
   await new Promise((res, rej) => { ws.onopen = res; ws.onerror = () => rej(new Error('CDP websocket failed: ' + wsUrl)); });
   let id = 0; const pending = new Map(); const events = []; const hooks = [];
-  let closed = false;
+  let closed = false; let allowInput = false;
   ws.onclose = () => { closed = true; for (const p of pending.values()) p.rej(new Error('CDP closed')); pending.clear(); };
   ws.onmessage = (m) => {
     const d = JSON.parse(m.data);
@@ -21,7 +24,7 @@ export async function connect(wsUrl) {
     else if (d.method) { events.push(d); if (events.length > 20000) events.splice(0, 5000); hooks.forEach((h) => { try { h(d); } catch { /* observer */ } }); }
   };
   const send = (method, params = {}, sessionId, timeoutMs = 20000) => {
-    if (FORBIDDEN.test(method)) return Promise.reject(new Error('refused: ' + method + ' would inject input'));
+    if (FORBIDDEN.test(method) && !allowInput) return Promise.reject(new Error('refused: ' + method + ' would inject input'));
     if (closed) return Promise.reject(new Error('CDP closed'));
     return new Promise((res, rej) => {
       const my = ++id; pending.set(my, { res, rej });
@@ -29,27 +32,28 @@ export async function connect(wsUrl) {
       setTimeout(() => { if (pending.delete(my)) rej(new Error('CDP timeout: ' + method)); }, timeoutMs);
     });
   };
-  return { events, send, on: (fn) => hooks.push(fn), close: () => { try { ws.close(); } catch { /* gone */ } }, get closed() { return closed; } };
+  // only a request that sets allow_real_input turns this on, for its own page
+  return { events, send, enableInput: () => { allowInput = true; }, on: (fn) => hooks.push(fn), close: () => { try { ws.close(); } catch { /* gone */ } }, get closed() { return closed; } };
 }
 
 /** Launch a fresh Chrome on `port` with `profile` (deleted first). */
-export async function launchChrome({ port, profile, flags = [], headed = false }) {
+export async function launchChrome({ port, profile, flags = [], headed = false, binary = CHROME }) {
   fs.rmSync(profile, { recursive: true, force: true });
   const args = [
-    ...(headed ? ['--window-position=80,80'] : ['--headless=new']),
+    ...(headed ? (flags.some((f) => /^--window-position=/.test(f)) ? [] : ['--window-position=80,80']) : ['--headless=new']),
     `--remote-debugging-port=${port}`, `--user-data-dir=${profile}`,
     '--ignore-certificate-errors', '--autoplay-policy=no-user-gesture-required',
     '--use-fake-device-for-media-stream', '--mute-audio', '--no-first-run', '--no-default-browser-check',
     '--disable-background-timer-throttling', '--disable-renderer-backgrounding', '--disable-backgrounding-occluded-windows',
     ...flags.filter((f) => f !== '--se-unmute-audio'), 'about:blank',
   // `--se-unmute-audio` (a handler pseudo-flag, never passed to Chrome) drops `--mute-audio`, so
-  // the client's playback reaches the machine's speakers — and therefore the host's loopback
-  // capture. Only for measuring that path (the same-machine echo); it is audible.
+  // the client's playback reaches the speakers and therefore the host's loopback capture.
+  // Audible: only for measuring that path (the same-machine echo).
   ].filter((f) => !(f === '--mute-audio' && flags.includes('--se-unmute-audio')));
-  const proc = spawn(CHROME, args, { stdio: 'ignore' });
+  const proc = spawn(binary, args, { stdio: 'ignore' });
   let exited = false; proc.on('exit', () => { exited = true; });
   let ver = null;
-  for (let i = 0; i < 75 && !ver && !exited; i++) {
+  for (let i = 0; i < 150 && !ver && !exited; i++) {
     try { ver = await (await fetch(`http://127.0.0.1:${port}/json/version`)).json(); } catch { await sleep(200); }
   }
   if (!ver) { try { proc.kill(); } catch { /* gone */ } throw new Error('chrome debugging port never answered on ' + port); }
@@ -59,7 +63,8 @@ export async function launchChrome({ port, profile, flags = [], headed = false }
 
 export async function newPage(port) {
   const tgt = await (await fetch(`http://127.0.0.1:${port}/json/new?about:blank`, { method: 'PUT' })).json();
-  const page = await connect(tgt.webSocketDebuggerUrl);
+  // a forwarded port (a remote browser) names the far end's port in this URL
+  const page = await connect(tgt.webSocketDebuggerUrl.replace(/^ws:\/\/[^/]+/, `ws://127.0.0.1:${port}`));
   page.targetId = tgt.id;
   const ev = async (expr, { gesture = false, timeout = 20000 } = {}) => {
     const r = await page.send('Runtime.evaluate', { expression: expr, awaitPromise: true, returnByValue: true, userGesture: gesture }, undefined, timeout);
@@ -67,7 +72,7 @@ export async function newPage(port) {
     return r.result.value;
   };
   page.ev = ev;
-  // An unanswered beforeunload dialog hangs the run (TEST-WORKFLOW §5.6).
+  // an unanswered beforeunload dialog hangs the run
   page.dialogs = [];
   page.on((d) => { if (d.method === 'Page.javascriptDialogOpening') { page.dialogs.push(d.params.type + ': ' + d.params.message); page.send('Page.handleJavaScriptDialog', { accept: true }).catch(() => {}); } });
   return page;

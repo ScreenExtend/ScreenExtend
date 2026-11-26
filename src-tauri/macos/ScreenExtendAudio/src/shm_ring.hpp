@@ -11,7 +11,7 @@ namespace se_audio {
 
 inline constexpr uint32_t kShmMagic = 0x31414553u;
 
-// Layout 2 grew the header from 64 to 128 bytes to carry the capture-time anchor and the reader's
+// Layout 2: a 128-byte header (64 in layout 1) carrying the capture-time anchor and the reader's
 // published position. A layout-1 segment left over from an older driver is re-initialised on open.
 inline constexpr uint32_t kLayoutVersion = 2u;
 
@@ -23,7 +23,7 @@ static_assert((kRingCapacity & (kRingCapacity - 1)) == 0, "capacity must be a po
 inline constexpr uint32_t kChannelCount = 2u;
 inline constexpr uint32_t kSampleRate = 48000u;
 
-// ABI with src-tauri/src/macos_utils/audio/legacy/shm_reader.rs — change both together.
+// ABI with src-tauri/src/macos_utils/audio/legacy/shm_reader.rs: change both together
 struct ShmHeader
 {
     uint32_t magic;        // 0   : kShmMagic once initialised (published last on create)

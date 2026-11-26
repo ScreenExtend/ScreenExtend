@@ -1,8 +1,7 @@
-// The script injected into the client page before any of its own scripts run. Observation only:
-// it wraps APIs to record what the page does, and never creates or dispatches an event of any
-// kind (no pointer, keyboard, wheel, touch, focus or synthetic DOM events), so nothing it does
-// can reach the host's input injector. It must work on every page generation (the old page has
-// no SEVideo and keeps its state in top-level lexical bindings).
+// Injected into the client page before any of its own scripts run. Observation only: it wraps
+// APIs to record what the page does and never creates or dispatches an event of any kind, so
+// nothing it does can reach the host's input injector. It must work on every page generation
+// (the old page has no SEVideo and keeps its state in top-level lexical bindings).
 
 export function observerSource(opts = {}) {
   const o = JSON.stringify(opts);
@@ -142,8 +141,7 @@ export function observerSource(opts = {}) {
  * Installed in every worker: an onset detector on decoded audio. It wraps `AudioData.copyTo`
  * (every page generation's decode worker copies plane 0 of each decoded packet out with it) and
  * notes, per onset, when the worker had it decoded and which capture time the packet carried.
- * That splits the audio delay at the decoder: host → decoded, and decoded → rendered. Observation
- * only; the copy itself is untouched.
+ * That splits the audio delay at the decoder. Observation only; the copy itself is untouched.
  */
 export const AUDIO_DECODE_TAP_SOURCE = `(() => {
   if (typeof AudioData !== 'function' || self.__seAudTap) return;

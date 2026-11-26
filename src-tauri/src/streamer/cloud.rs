@@ -157,12 +157,8 @@ pub mod register_error_code {
     pub const UNAUTHORIZED: &str = "unauthorized";
 }
 
-/// A registration the relay refused, carrying the code as a value rather than as spelling.
-///
-/// The reconnect loop used to decide whether to rotate the user's join code by asking whether the
-/// error's *formatted text* contained `SESSION_TAKEN`. Nothing enforced that spelling: one
-/// `format!` that echoed a relay message would have rotated a working session id out from under
-/// the user, and the join code on screen would silently stop matching the one the client has.
+/// A registration the relay refused, carrying the code as a value: whether to rotate the
+/// user's join code must not depend on how an error message happens to be spelled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisterRejected {
     pub code: String,
@@ -280,9 +276,7 @@ impl CloudClient {
         let handle = match handle {
             Ok(h) => Some(h),
             Err(e) => {
-                // Discarding this left `handle` as `None`, so `stop()` silently did nothing and
-                // the desktop UI sat on the "connecting" state it was given at startup forever,
-                // with no line anywhere saying why.
+                // report it, or the desktop UI sits on "connecting" forever with nothing in the log
                 teprintln!("[cloud] could not start the relay client thread: {e}");
                 sink_for_error.report(
                     CloudState::Error,
@@ -354,11 +348,8 @@ async fn run_loop(mut config: CloudConfig, server_config: Config, sink: SharedCl
     }
 }
 
-/// The reconnect schedule: double, then hold at [`MAX_BACKOFF_SECS`].
-///
-/// Extracted so the schedule can be asserted without a relay and without waiting for it. The
-/// caller adds up to a second of jitter on top, which is what stops every host that lost the
-/// same relay from reconnecting in lockstep.
+/// The reconnect schedule: double, then hold at [`MAX_BACKOFF_SECS`]. The caller adds up to
+/// a second of jitter so hosts that lost the same relay do not reconnect in lockstep.
 fn next_backoff_secs(current: u64) -> u64 {
     current.saturating_mul(2).min(MAX_BACKOFF_SECS)
 }
@@ -474,10 +465,6 @@ fn handle_relay_message(
             ice_servers,
             ..
         } => {
-            // The relay splits the client's URL into `path` and `query`. `dispatch` matches the
-            // route on the path and reads `?join=` from the query, so the two are put back
-            // together here; dropping the query is what made every relayed `/audio-outputs`
-            // (and a `/leave` naming its join) arrive with no join to attach to.
             let path = request_path(&path, &query);
             let state = state.clone();
             let tx = tx.clone();
@@ -494,8 +481,7 @@ fn handle_relay_message(
                 .await;
                 match serde_json::to_string(&resp) {
                     Ok(text) => {
-                        // The writer loop breaks on its first send error, so a dropped
-                        // `signal_response` is a join that hangs with nothing logged.
+                        // the writer loop exits on its first send error: log it, or the join hangs
                         if tx.send(Message::Text(text)).is_err() {
                             teprintln!(
                                 "[cloud] relay writer is gone; the WHEP answer for {client_id} was not delivered"
@@ -543,8 +529,7 @@ async fn dispatch(
 ) -> HostToRelay {
     use crate::streamer::server;
 
-    // The relay hands the path through as the client wrote it, so a `?join=` rides along with
-    // it and has to be split off before the route is matched.
+    // split `?join=` off before matching the route
     let (route, query) = match path.split_once('?') {
         Some((r, q)) => (r, q),
         None => (path, ""),
@@ -573,7 +558,7 @@ async fn dispatch(
                     .collect()
             };
             let ice = state.ice_with_turn(base);
-            let r = server::process_whep(
+            let r = server::process_whep_detached(
                 state,
                 server::JoinOrigin::relayed(client_id),
                 body.as_bytes(),
@@ -591,19 +576,16 @@ async fn dispatch(
         ),
         ("POST", "/leave") => {
             if relay_join.is_empty() {
-                // A client that names no join is one that predates the id. The relay knows
-                // which of its clients this is, and that maps onto joins without ever touching
-                // an address.
+                // a client that predates join ids names none: resolve by the relay's own client
+                // id, never by address
                 server::process_relay_client_gone(state, client_id);
             } else {
                 server::process_leave(state, &relay_join);
             }
             (204, "text/plain", String::new(), None, None)
         }
-        // The live relay is not known to forward this today (its page is older, and the routes
-        // above are what it was measured to tunnel). Handled anyway, so a relay or page that
-        // does send it gets the device's speakers onto the host's sheet instead of a 404; a
-        // body that names no join has nothing to attach to.
+        // the live relay is not known to forward this (its page is older); handled so one that
+        // does gets the device's speakers listed instead of a 404
         ("POST", "/audio-outputs") => {
             if !relay_join.is_empty() {
                 server::process_audio_outputs(state, &relay_join, body.as_bytes());
@@ -621,8 +603,8 @@ async fn dispatch(
     if let Some(token) = device_token {
         headers.insert("x-device-token".to_string(), token);
     }
-    // The relay has no URL space, so there is no `Location` to read the id out of; the header is
-    // how a tunnelled client learns which session it is.
+    // the relay has no URL space, so no `Location`: the header is how a tunnelled client learns
+    // its join id
     if let Some(join) = join_id {
         headers.insert("x-join-id".to_string(), join);
     }
@@ -638,10 +620,9 @@ async fn dispatch(
 mod tests {
     use super::*;
 
-    // The relay is a separate service that this repo does not build, so the wire format is a
-    // contract with something nothing here can compile against. Every field name below is the
-    // JSON key the relay reads or writes; renaming one is a silent protocol break — serde will
-    // happily serialise the new name and the relay will read a default.
+    // The relay is a separate service this repo does not build. Every field name below is the
+    // JSON key it reads or writes: renaming one is a silent protocol break (serde serialises the
+    // new name and the relay reads a default).
 
     fn field<'a>(v: &'a serde_json::Value, key: &str) -> &'a serde_json::Value {
         v.get(key).unwrap_or_else(|| panic!("no `{key}` in {v}"))
@@ -682,8 +663,7 @@ mod tests {
 
     #[test]
     fn an_absent_display_name_is_omitted_rather_than_sent_as_null() {
-        // `skip_serializing_if` is what keeps a host with no name from advertising `null` as
-        // one; the relay treats a present key as a name.
+        // the relay treats a present key as a name, so `null` must not be sent
         let msg = HostToRelay::Register {
             protocol: RELAY_PROTOCOL_VERSION,
             session_id: "ABCDEFGHJKLM".into(),
@@ -698,8 +678,7 @@ mod tests {
 
     #[test]
     fn a_signal_response_carries_the_request_id_it_answers() {
-        // The relay multiplexes every client's WHEP round trip over one socket, so a response
-        // with the wrong id is a client that never gets an answer.
+        // the relay multiplexes every client's WHEP round trip over one socket by this id
         let mut headers = HashMap::new();
         headers.insert("content-type".to_string(), "application/sdp".to_string());
         let msg = HostToRelay::SignalResponse {
@@ -740,7 +719,7 @@ mod tests {
 
     #[test]
     fn every_relay_frame_this_host_understands_parses() {
-        // Exactly the frames the relay sends, spelled as it sends them.
+        // exactly the frames the relay sends, spelled as it sends them
         let frames = [
             r#"{"type":"registered","sessionId":"ABCDEFGHJKLM","joinUrl":"https://session.screenextend.app/j/ABCDEFGHJKLM","heartbeatSec":20}"#,
             r#"{"type":"register_error","sessionId":"ABCDEFGHJKLM","code":"session_taken","message":"held by another host"}"#,
@@ -788,8 +767,8 @@ mod tests {
 
     #[test]
     fn a_minimal_signal_request_parses_with_defaults() {
-        // Everything but the ids and the method/path is `#[serde(default)]` on purpose: a relay
-        // that stops sending an optional field must not take the host offline.
+        // everything but the ids and the method/path is `#[serde(default)]` on purpose: a relay
+        // that stops sending an optional field must not take the host offline
         let raw = r#"{"type":"signal_request","requestId":"r","clientId":"c","method":"GET","path":"/ice-config"}"#;
         match serde_json::from_str::<RelayToHost>(raw).expect("minimal signal_request") {
             RelayToHost::SignalRequest {
@@ -812,17 +791,14 @@ mod tests {
 
     #[test]
     fn an_unknown_frame_type_is_an_error_the_read_loop_can_skip() {
-        // The read loop logs and continues on a parse failure rather than dropping the
-        // connection, which is what lets the relay add a frame type before the host knows it.
+        // the read loop logs and skips a parse failure, so the relay can add a frame type first
         assert!(serde_json::from_str::<RelayToHost>(r#"{"type":"whats_this","x":1}"#).is_err());
         assert!(serde_json::from_str::<RelayToHost>("not json at all").is_err());
     }
 
     #[test]
     fn the_session_taken_code_is_the_one_the_reconnect_loop_matches_on() {
-        // The reconnect loop rotates the session id off `RegisterRejected`, whose `code` is this
-        // constant, so the constant and the wire spelling have to be the same thing. The three
-        // tests at the end of this module cover the matching; this one covers the parsing.
+        // the reconnect loop rotates the session id off this constant, so it must match the wire
         let raw = r#"{"type":"register_error","code":"session_taken","message":""}"#;
         match serde_json::from_str::<RelayToHost>(raw).expect("register_error") {
             RelayToHost::RegisterError { code, .. } => {
@@ -834,8 +810,7 @@ mod tests {
 
     #[test]
     fn the_backoff_doubles_and_then_holds() {
-        // A relay that is down stays down; the schedule has to stop growing or a host that lost
-        // it overnight comes back hours late.
+        // the schedule must stop growing, or a host that lost the relay overnight is hours late
         let mut secs = 1u64;
         let mut seen = vec![secs];
         for _ in 0..10 {
@@ -845,24 +820,22 @@ mod tests {
         assert_eq!(&seen[..6], &[1, 2, 4, 8, 16, 30]);
         assert!(seen.iter().all(|s| *s <= MAX_BACKOFF_SECS));
         assert_eq!(*seen.last().unwrap(), MAX_BACKOFF_SECS);
-        // And it never overflows back to a tight loop, whatever it is handed.
+        // never overflows back to a tight loop
         assert_eq!(next_backoff_secs(u64::MAX), MAX_BACKOFF_SECS);
         assert_eq!(next_backoff_secs(0), 0);
     }
 
     #[test]
     fn the_heartbeat_timeout_is_longer_than_the_relays_own_interval() {
-        // The relay advertises `heartbeatSec` (20 s in practice) and the host bails when no
-        // frame arrives inside this window. Making them equal would drop a healthy connection
-        // on the first late ping.
+        // the relay advertises `heartbeatSec` (20 s in practice); a timeout equal to it would
+        // drop a healthy connection on the first late ping
         assert!(HEARTBEAT_TIMEOUT >= Duration::from_secs(40));
         assert!(HEARTBEAT_TIMEOUT > Duration::from_secs(MAX_BACKOFF_SECS));
     }
 
     #[test]
     fn a_generated_session_id_has_no_ambiguous_characters() {
-        // The id is read off a QR code or typed from a screen. `0`/`O` and `1`/`I`/`l` are the
-        // pairs people get wrong, and a mistyped id is an unexplained join failure.
+        // the id is typed from a screen: `0`/`O` and `1`/`I`/`l` are the pairs people get wrong
         for _ in 0..64 {
             let id = generate_session_id();
             assert_eq!(id.len(), 12);
@@ -876,7 +849,7 @@ mod tests {
 
     #[test]
     fn the_cloud_state_strings_are_the_ones_the_ui_switches_on() {
-        // These reach the desktop UI through `CloudStatusChange` and are compared as strings.
+        // these reach the desktop UI through `CloudStatusChange` and are compared as strings
         assert_eq!(CloudState::Disabled.as_str(), "disabled");
         assert_eq!(CloudState::Connecting.as_str(), "connecting");
         assert_eq!(CloudState::Registered.as_str(), "registered");
@@ -914,8 +887,7 @@ mod tests {
 
     #[test]
     fn an_unrelated_error_that_merely_spells_the_code_does_not_rotate_it() {
-        // The exact regression the typed error exists to prevent: any future `format!` that
-        // echoes a relay message used to be enough to rotate a working join code.
+        // a `format!` that echoes a relay message must not be enough to rotate a working join code
         let e = anyhow!("websocket error: relay said session_taken about somebody else");
         assert!(!is_session_taken(&e));
         assert!(e.to_string().contains(register_error_code::SESSION_TAKEN));

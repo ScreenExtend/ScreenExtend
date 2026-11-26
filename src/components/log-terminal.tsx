@@ -6,9 +6,8 @@ import { commands, events } from "@/lib/bindings";
 
 const MAX_LINES = 2000;
 
-// A monotonic sequence number as the React key. Keyed by array index, every row's text
-// changed once the 2000-line window started sliding, so React re-painted the whole list
-// on every event instead of appending one node.
+// `seq` is the React key: keyed by array index, every row's text changes once the
+// 2000-line window slides, and React repaints the whole list instead of appending one node
 type LogEntry = { seq: number; text: string };
 
 const stopListening = (unlisten: () => void) => {
@@ -49,8 +48,8 @@ export function LogTerminal() {
       }
       if (!active) return;
       try {
-        // A device join, an encoder negotiation or a cloud reconnect storm arrives as a
-        // burst; coalescing a frame's worth into one commit keeps that off the main thread.
+        // a device join, an encoder negotiation or a cloud reconnect storm arrives as a
+        // burst: one commit per animation frame
         const off = await events.logLine.listen(event => {
           pending.current.push({ seq: nextSeq.current++, text: event.payload });
           if (flushHandle.current === undefined) {
@@ -85,8 +84,8 @@ export function LogTerminal() {
       flushHandle.current = undefined;
       pending.current = [];
       if (unlisten) stopListening(unlisten);
-      // The host cannot see that the listener is gone, so it keeps batching LogLine events
-      // into the void until it is told. Nothing renders differently either way.
+      // the host cannot see that the listener is gone, and keeps batching LogLine events
+      // until it is told
       void commands.setLogStreaming(false).catch(e => console.error("log stream disarm failed", e));
     };
   }, []);

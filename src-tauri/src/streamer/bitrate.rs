@@ -124,12 +124,9 @@ pub const RTT_DELAY_THRESHOLD_MS: f64 = 40.0;
 /// cannot fake.
 const RTT_CONGESTION_POLLS: u32 = 2;
 
-/// Delay-based congestion detector.
-///
-/// Absolute RTT is not a congestion signal: 80 ms is an ordinary uncongested RTT for a
-/// cross-continent link, and clamping on it pins every WAN session at the floor forever.
-/// What indicates a full queue is RTT *above the path's own baseline*, so this tracks a
-/// rolling minimum and reports only sustained excursions above it.
+/// Delay-based congestion detector. Absolute RTT is not a congestion signal (80 ms is an
+/// ordinary cross-continent RTT), so this tracks a rolling minimum for the path and reports
+/// only sustained excursions above it.
 #[derive(Debug, Clone, Default)]
 pub struct RttCongestionMonitor {
     baseline_ms: Option<f64>,
@@ -152,8 +149,7 @@ impl RttCongestionMonitor {
         }
         let baseline = match self.baseline_ms {
             Some(b) if rtt_ms < b => rtt_ms,
-            // Creep upward slowly so a genuinely re-routed path re-baselines instead of
-            // staying pinned to a minimum it will never see again.
+            // creep upward so a re-routed path re-baselines instead of staying pinned low
             Some(b) => b + (rtt_ms - b) * 0.002,
             None => rtt_ms,
         };
@@ -179,18 +175,12 @@ pub const LOSS_SEVERE: f64 = 0.10;
 /// branches meet: at 10 % loss both give a factor of 0.95.
 const LOSS_SLOPE: f64 = (0.5 * LOSS_SEVERE) / (LOSS_SEVERE - LOSS_FLOOR);
 
-/// Loss-driven rate estimate.
-///
-/// The previous version had a **dead band from 2 % to 10 % loss** where it returned its input
-/// unchanged — 5 % packet loss is a visibly broken picture and the controller held the rate flat
-/// through it. That band came from GCC, where it is defensible because a delay-based estimator is
-/// carrying the session in the meantime; here there was nothing else. The response is now
-/// continuous from 1 % upward and meets GCC's own curve at 10 %, so severe loss behaves exactly
-/// as the reference implementation does and moderate loss stops being ignored.
+/// Loss-driven rate estimate. Continuous from 1 % loss upward and meets GCC's curve at
+/// 10 %: with GCC's 2-10 % dead band the rate stays flat through 5 % loss, which is a
+/// visibly broken picture.
 ///
 /// `current_target_bps` is the estimator's own running value, not the emitted target: a cut
-/// smaller than the controller's deadband must still compound across intervals rather than being
-/// recomputed from an unchanged number forever.
+/// smaller than the controller's deadband must still compound across intervals.
 pub fn estimate_from_loss(
     current_target_bps: u32,
     measured_send_bps: u32,

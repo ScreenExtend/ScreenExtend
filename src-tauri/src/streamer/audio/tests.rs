@@ -65,9 +65,8 @@ fn mock_capture_emits_expected_packets() {
 
 #[test]
 fn capture_survives_having_no_subscribers() {
-    // A session toggling audio off drops the last receiver. That is normal, and it must not
-    // stop the host-wide capture: `AudioSink::send` swallows the "no receivers" error and the
-    // stop flag remains the only teardown path.
+    // a session toggling audio off drops the last receiver, which must not stop the
+    // host-wide capture: the stop flag is the only teardown path
     let (tx, rx) = tokio::sync::broadcast::channel::<AudioPacket>(BROADCAST_CAPACITY);
     drop(rx);
     let cap = mock_capture(AudioSink::new(tx), 64);
@@ -76,8 +75,7 @@ fn capture_survives_having_no_subscribers() {
 
 #[test]
 fn a_slow_subscriber_is_lagged_not_backpressured() {
-    // The producer must never block on a reader that has stopped reading. Publish more than
-    // the ring holds and confirm the writer finished and the reader is told it lost packets.
+    // more than the ring holds: the writer must finish and the reader be told it lagged
     let (tx, mut rx) = tokio::sync::broadcast::channel::<AudioPacket>(BROADCAST_CAPACITY);
     let cap = mock_capture(AudioSink::new(tx), BROADCAST_CAPACITY as u32 * 4);
     (cap.stop)(); // returns only if the producer never blocked
@@ -87,23 +85,11 @@ fn a_slow_subscriber_is_lagged_not_backpressured() {
     ));
 }
 
-// The five `seqgate_*` tests that used to live here exercised a `SeqGate` struct defined in
-// this file and used nowhere else. The real sequence gate is the client's, in
-// `streamer/static/audio-worker.js`, and the two had already drifted: the Rust copy treated a
-// gap of exactly 0x7FFF_FFFF as late where the JS treats it as newer. A mirror nothing derives
-// from the implementation is five green tests describing behaviour that may no longer exist,
-// so they were moved to `scripts/test-client-audio.mjs`, which drives the shipped file.
-//
-// The host does not dedup: it is the producer. If a host-side gate is ever wanted, it belongs
-// in `streamer/audio/` as production code, with these tests over that.
+// no sequence-gate tests here: the host is the producer and does not dedup. The gate is the
+// client's (`streamer/static/audio-worker.js`), tested by `scripts/test-client-audio.mjs`.
 
-// ---- the shared host clock: the one number audio and video both ride --------------------
-//
-// `host_ns_to_rtp90k` is the whole A/V sync contract on the host side. The video track is a raw
-// `TrackLocalStaticRTP` — we packetize H.264 ourselves — precisely so each frame's RTP timestamp
-// carries this conversion of the same monotonic epoch the audio `capture_ns` uses, and
-// `transform-worker.js` inverts it on the client. A bug here is drift nobody can localise,
-// because both halves still look internally consistent.
+// `host_ns_to_rtp90k` is the host side of the A/V sync contract: video RTP timestamps and
+// audio `capture_ns` ride the same monotonic epoch, and `transform-worker.js` inverts it.
 
 #[test]
 fn the_rtp_clock_is_90_khz_and_the_conversion_is_exact_at_whole_ticks() {
@@ -112,13 +98,10 @@ fn the_rtp_clock_is_90_khz_and_the_conversion_is_exact_at_whole_ticks() {
     assert_eq!(host_ns_to_rtp90k(0), 0);
     assert_eq!(host_ns_to_rtp90k(1_000_000_000), 90_000, "one second");
     assert_eq!(host_ns_to_rtp90k(1_000_000), 90, "one millisecond");
-    // A 60 Hz frame is 16666666.67 ns, so the conversion lands one tick short of 1500 at the
-    // truncated interval and on it at the real one. Both spellings appear in real timestamps.
+    // a 60 Hz frame is 16666666.67 ns: one tick short of 1500 truncated, 1500 rounded up
     assert_eq!(host_ns_to_rtp90k(16_666_666), 1_499);
     assert_eq!(host_ns_to_rtp90k(16_666_667), 1_500);
-    // One tick is 11111.11 ns. Sub-tick nanoseconds truncate rather than rounding, which is
-    // what keeps the conversion monotonic — a rounding step would let two later stamps come
-    // back in the wrong order.
+    // one tick is 11111.11 ns; sub-tick ns truncate, which keeps the conversion monotonic
     assert_eq!(host_ns_to_rtp90k(11_110), 0);
     assert_eq!(host_ns_to_rtp90k(11_112), 1);
 }
@@ -126,9 +109,7 @@ fn the_rtp_clock_is_90_khz_and_the_conversion_is_exact_at_whole_ticks() {
 #[test]
 fn the_conversion_never_goes_backwards() {
     use super::host_ns_to_rtp90k;
-    // Walk a millisecond cadence for ten seconds and require the 32-bit difference between
-    // consecutive stamps to be the interval every time. A millisecond is a whole number of
-    // ticks, so any deviation is a conversion bug rather than the truncation.
+    // a millisecond is a whole number of ticks, so any deviation over 10 s is a conversion bug
     const STEP_NS: u64 = 1_000_000;
     const STEP_TICKS: u32 = 90;
     let mut previous = host_ns_to_rtp90k(0);
@@ -147,9 +128,7 @@ fn the_conversion_never_goes_backwards() {
 #[test]
 fn the_32_bit_stamp_wraps_after_about_13_hours_of_host_uptime() {
     use super::{host_ns_to_rtp90k, VIDEO_RTP_CLOCK_HZ};
-    // 2^32 ticks at 90 kHz is 47721.858 s. The client unwraps this with a signed 32-bit
-    // difference; the host's only job is to keep the truncation clean so that difference stays
-    // meaningful, which is what these three assertions check.
+    // 2^32 ticks at 90 kHz is 47721.858 s; the client unwraps with a signed 32-bit difference
     const WRAP_NS: u128 = (1u128 << 32) * 1_000_000_000 / VIDEO_RTP_CLOCK_HZ as u128;
     let wrap_ns = WRAP_NS as u64;
     assert!(
@@ -158,13 +137,12 @@ fn the_32_bit_stamp_wraps_after_about_13_hours_of_host_uptime() {
         wrap_ns / 1_000_000_000
     );
 
-    // A stamp 10 ms either side of the wrap.
+    // 10 ms either side of the wrap
     let before = host_ns_to_rtp90k(wrap_ns - 10_000_000);
     let after = host_ns_to_rtp90k(wrap_ns + 10_000_000);
     assert!(before > u32::MAX - 10_000, "before the wrap: {before}");
     assert!(after < 10_000, "after the wrap: {after}");
-    // Wrapping arithmetic still gives the real elapsed ticks, which is the property the client
-    // relies on: 20 ms is 1800 ticks, +/- one from the truncation of the wrap point itself.
+    // 20 ms is 1800 ticks, +/- one from the truncation of the wrap point itself
     let elapsed = after.wrapping_sub(before);
     assert!(
         (1_799..=1_801).contains(&elapsed),
@@ -179,8 +157,8 @@ fn the_host_clock_is_monotonic_and_shared() {
     let b = host_now_ns();
     assert!(b >= a, "host_now_ns went backwards: {a} then {b}");
 
-    // `host_instant_to_ns` has to be the same epoch, or an audio packet stamped from a captured
-    // `Instant` and a video frame stamped from `host_now_ns()` describe two different clocks.
+    // must be the same epoch as `host_now_ns()`, or audio stamped from a captured `Instant`
+    // and video stamped from `host_now_ns()` are on two clocks
     let now = std::time::Instant::now();
     let from_instant = host_instant_to_ns(now);
     let direct = host_now_ns();
@@ -193,7 +171,17 @@ fn the_host_clock_is_monotonic_and_shared() {
         "the two conversions are a second apart, so they are not one epoch"
     );
 
-    // An Instant from before the epoch saturates rather than underflowing into a huge stamp.
+    // an Instant from before the epoch saturates to 0 instead of underflowing
     let long_ago = now - std::time::Duration::from_secs(60 * 60 * 24 * 365);
     assert_eq!(host_instant_to_ns(long_ago), 0);
+}
+
+#[test]
+fn the_capture_tier_is_reported_without_changing_the_summary_line() {
+    let d = AudioDiagnostics::default();
+    assert_eq!(d.tier(), "", "nothing is claimed before a backend reports");
+    let before = d.summary();
+    d.set_tier(&"process-loopback");
+    assert_eq!(d.tier(), "process-loopback");
+    assert_eq!(d.summary(), before);
 }

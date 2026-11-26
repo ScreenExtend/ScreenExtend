@@ -1,49 +1,21 @@
-//! Process loopback: the second Windows capture tier.
+//! Process loopback: the preferred Windows capture tier, tried before endpoint loopback.
 //!
-//! `ActivateAudioInterfaceAsync` on the synthetic device `VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK`
-//! with `AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK` yields an `IAudioClient` that captures a
-//! *process tree* rather than an endpoint. With
-//! `PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE` and our own pid, that reads as "the whole
-//! system except us", which is exactly the semantics this product wants.
+//! `ActivateAudioInterfaceAsync` on `VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK` with
+//! `PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE` and our own pid captures the whole system
+//! except us, in the format we ask for (there is no mix format, so no resampler). It taps the mix
+//! before the endpoint's own buffering, so it measured faster than endpoint loopback (click to
+//! encoded packet, median 59.4 ms against 80.6 ms), and it works on an exclusive-mode endpoint.
 //!
-//! It is not obviously faster — it rides the same shared engine — so it is not the default. What
-//! it buys is robustness the endpoint tier structurally cannot have:
-//!
-//! - **Endpoint independence.** Endpoint loopback dies on `AUDCLNT_E_DEVICE_INVALIDATED` and on
-//!   every default-device change, each of which costs a full re-acquire and a discontinuity. The
-//!   synthetic device does not move when the user switches headphones.
-//! - **It is the only option on an exclusive-mode endpoint**, where loopback is impossible by
-//!   documentation: "A client can enable loopback mode only for a shared-mode stream."
-//! - **Self-exclusion is structural**, rather than resting on us happening never to render.
-//! - **We choose the format.** The virtual device has no mix format of its own, so we ask for
-//!   48 kHz float32 stereo directly and never take the `AUTOCONVERTPCM | SRC_DEFAULT_QUALITY`
-//!   resampler — which, despite its name, is the *expensive* converter and has group delay.
-//!
-//! Availability is Windows 10 build 20348 and up, so this must be probed rather than assumed. It
-//! is probed by **attempting the activation**, never by reading a build number: the API's presence
-//! is the question, and a version test would be both against the tier doctrine and wrong (the
-//! function is exported on builds where the activation type is not supported).
-//!
-//! Two claims in circulation are contradicted by the primary sources and are not implemented
-//! here: that process loopback cannot be event-driven (Microsoft's own `ApplicationLoopback`
-//! sample and OBS both pass `AUDCLNT_STREAMFLAGS_EVENTCALLBACK` with a real handle), and that the
-//! sample rate is fixed by a mix format (there is no mix format; the caller supplies the
-//! `WAVEFORMATEX`). Both hold up: measured on the dev box with
-//! `probe --audio --process-loopback`, the event fires and 199.8 packets/s arrive.
-//!
-//! Two things this tier does *not* need or do, both measured rather than assumed:
-//!
-//! - **No silent render companion.** `docs/research/audio-capture-tiers.md` §5.7 lists this as
-//!   an open question with no published measurement either way. There is none needed: with no
-//!   companion anywhere and an idle host, 999 packets arrived in 5 s. There is no endpoint to
-//!   park, so the endpoint-parking failure that makes the companion mandatory for tier 1
-//!   (measured 0/20 event signals without it) has nothing to act on.
-//! - **No `AUDCLNT_BUFFERFLAGS_SILENT`.** The synthetic device delivers real zeros rather than
-//!   flagging silence, so the drain's silence shortcut never fires here and `FLAG_SILENT`
-//!   never reaches the client on this tier.
+//! Probed by attempting the activation (documented from Windows 10 build 20348), never by build
+//! number: the function is exported on builds where the activation type is not supported. It is
+//! event-driven (199.8 packets/s measured), needs no silent render companion (999 packets in 5 s
+//! on an idle host without one), and delivers real zeros instead of `AUDCLNT_BUFFERFLAGS_SILENT`,
+//! so `FLAG_SILENT` is decided from the samples.
 
+use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use windows::core::{Interface, Ref, HRESULT};
@@ -66,15 +38,24 @@ use super::guards::EventHandle;
 /// round trip to the audio service, not a computation; a second is generous and bounded.
 const ACTIVATION_TIMEOUT_MS: u32 = 1000;
 
-/// Signals the caller when the async activation completes.
+/// After a transient failure (a timeout, an RPC error, a service still starting), how long
+/// acquisitions skip this tier before trying it again.
 ///
-/// `ActivateAudioInterfaceAsync` is the only way to reach the synthetic device and it insists
-/// on a completion handler, so this is machinery rather than design. The handler does nothing
-/// but set an event; the result is collected on the calling thread.
+/// Long enough that a host whose audio service keeps timing out does not pay a one-second
+/// activation on every re-acquire; short enough that one bad moment at an autostart login does
+/// not pin the slower endpoint tier.
+pub const TRANSIENT_RETRY_AFTER: Duration = Duration::from_secs(30);
+
+/// The completion handler `ActivateAudioInterfaceAsync` insists on: it only sets an event, and
+/// the result is collected on the calling thread.
+///
+/// It owns a reference to the event. The async operation holds the handler until it completes,
+/// which can be after `activate` gave up waiting, and a bare `HANDLE` closed by then would let a
+/// late `ActivateCompleted` signal whatever object the recycled handle value names.
 #[windows::core::implement(IActivateAudioInterfaceCompletionHandler)]
 struct ActivationHandler {
     done: Arc<AtomicBool>,
-    event: windows::Win32::Foundation::HANDLE,
+    event: Arc<EventHandle>,
 }
 
 impl IActivateAudioInterfaceCompletionHandler_Impl for ActivationHandler_Impl {
@@ -84,7 +65,7 @@ impl IActivateAudioInterfaceCompletionHandler_Impl for ActivationHandler_Impl {
     ) -> windows::core::Result<()> {
         self.done.store(true, Ordering::Release);
         unsafe {
-            let _ = windows::Win32::System::Threading::SetEvent(self.event);
+            let _ = windows::Win32::System::Threading::SetEvent(self.event.raw());
         }
         Ok(())
     }
@@ -105,11 +86,11 @@ pub unsafe fn activate() -> Result<IAudioClient> {
         },
     };
 
-    // The activation parameters travel as a VT_BLOB PROPVARIANT. Built by hand because the
-    // crate exposes the union rather than a constructor for this shape; `blob.pBlobData` must
-    // outlive the call, which it does — `params` is a local of this function and
-    // `ActivateAudioInterfaceAsync` copies it before returning.
-    let mut variant = PROPVARIANT::default();
+    // VT_BLOB PROPVARIANT: `blob.pBlobData` must outlive the call (`params` is a local, and
+    // `ActivateAudioInterfaceAsync` copies it before returning). The variant points at that local
+    // and owns nothing, so it must never be cleared: `ManuallyDrop` in case the type gains a
+    // `Drop` (`windows` 0.62 has none here, but `windows_core::PROPVARIANT` clears on drop).
+    let mut variant = ManuallyDrop::new(PROPVARIANT::default());
     {
         let inner: &mut PROPVARIANT_0_0 = &mut variant.Anonymous.Anonymous;
         inner.vt = VT_BLOB;
@@ -119,18 +100,18 @@ pub unsafe fn activate() -> Result<IAudioClient> {
         };
     }
 
-    let event = EventHandle::new_auto_reset()?;
+    let event = Arc::new(EventHandle::new_auto_reset()?);
     let done = Arc::new(AtomicBool::new(false));
     let handler: IActivateAudioInterfaceCompletionHandler = ActivationHandler {
         done: Arc::clone(&done),
-        event: event.raw(),
+        event: Arc::clone(&event),
     }
     .into();
 
     let operation = ActivateAudioInterfaceAsync(
         VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
         &IAudioClient::IID,
-        Some(&variant),
+        Some(&*variant),
         &handler,
     )
     .context("ActivateAudioInterfaceAsync(VAD\\Process_Loopback)")?;
@@ -151,41 +132,156 @@ pub unsafe fn activate() -> Result<IAudioClient> {
     let client = unknown
         .cast::<IAudioClient>()
         .context("cast activated interface to IAudioClient")?;
-
-    // Do not let this `PROPVARIANT` be dropped. windows-rs runs destructor logic for it that
-    // assumes the variant owns its payload, and ours points at a stack local — measured, on
-    // this machine, as a hard process kill the instant the variant went out of scope, with
-    // the activation itself having completed successfully. `forget` leaks nothing: the
-    // variant is a stack value whose only pointer is into this frame.
-    std::mem::forget(variant);
     Ok(client)
 }
 
-/// Does this machine support process loopback?
+/// What a failed activation says about the next one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivationVerdict {
+    /// The OS said this activation type, interface or parameter block is not supported here.
+    /// It will say the same next time, so the tier is skipped for the life of the process.
+    Refused,
+    /// Anything else: the 1 s timeout, an RPC failure, the service still starting. Worth
+    /// another attempt later.
+    Transient,
+}
+
+/// Classify an activation failure by the `HRESULT` the API returned, if it returned one.
+pub fn verdict_for_hresult(hr: i32) -> ActivationVerdict {
+    const E_NOTIMPL: i32 = 0x8000_4001u32 as i32;
+    const E_NOINTERFACE: i32 = 0x8000_4002u32 as i32;
+    const E_INVALIDARG: i32 = 0x8007_0057u32 as i32;
+    const REGDB_E_CLASSNOTREG: i32 = 0x8004_0154u32 as i32;
+    // HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)
+    const E_NOT_SUPPORTED: i32 = 0x8007_0032u32 as i32;
+    match hr {
+        E_NOTIMPL | E_NOINTERFACE | E_INVALIDARG | REGDB_E_CLASSNOTREG | E_NOT_SUPPORTED => {
+            ActivationVerdict::Refused
+        }
+        _ => ActivationVerdict::Transient,
+    }
+}
+
+/// Classify an error from [`activate`]. A failure that carries no `HRESULT` (the timeout is the
+/// one that matters) is transient.
+pub fn classify_activation_error(e: &anyhow::Error) -> ActivationVerdict {
+    match e.downcast_ref::<windows::core::Error>() {
+        Some(w) => verdict_for_hresult(w.code().0),
+        None => ActivationVerdict::Transient,
+    }
+}
+
+/// Whether acquisitions should try this tier now.
 ///
-/// Answered by performing a real activation, cached for the process. `ActivateAudioInterfaceAsync`
-/// itself exports on builds that do not support the activation *type*, so its presence proves
-/// nothing and is not what is tested.
+/// Only a refusal is cached for the life of the process: caching a timeout would pin the host to
+/// the endpoint tier (about 21 ms slower) until it restarted.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TierGate {
+    refused: bool,
+    retry_at: Option<Instant>,
+    /// "available" has been logged. Kept apart from failures, so a machine whose first
+    /// activation failed transiently still says so once a later one works.
+    success_announced: bool,
+}
+
+impl TierGate {
+    pub const fn new() -> Self {
+        Self {
+            refused: false,
+            retry_at: None,
+            success_announced: false,
+        }
+    }
+
+    pub fn should_try(&self, now: Instant) -> bool {
+        !self.refused && self.retry_at.is_none_or(|t| now >= t)
+    }
+
+    pub fn is_refused(&self) -> bool {
+        self.refused
+    }
+
+    /// Returns true the first time this process learns the tier works.
+    pub fn on_success(&mut self) -> bool {
+        self.retry_at = None;
+        !std::mem::replace(&mut self.success_announced, true)
+    }
+
+    pub fn on_failure(&mut self, verdict: ActivationVerdict, now: Instant) {
+        match verdict {
+            ActivationVerdict::Refused => self.refused = true,
+            ActivationVerdict::Transient => self.retry_at = Some(now + TRANSIENT_RETRY_AFTER),
+        }
+    }
+}
+
+static GATE: Mutex<TierGate> = Mutex::new(TierGate::new());
+
+fn gate() -> std::sync::MutexGuard<'static, TierGate> {
+    // taken only at acquisition time, never on the packet path; a poisoned gate is a stale
+    // `Option<Instant>` at worst
+    GATE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Should an acquisition attempt process loopback now?
+pub fn worth_trying() -> bool {
+    gate().should_try(Instant::now())
+}
+
+/// Has this machine definitively refused the activation type?
+pub fn refused() -> bool {
+    gate().is_refused()
+}
+
+/// Does process loopback activate here right now? One real activation, recorded like any other;
+/// the client is dropped. For the bench's environment report, which runs before any capture,
+/// on a thread that has initialized COM.
+#[cfg_attr(not(feature = "bench"), allow(dead_code))]
 pub fn available() -> bool {
-    static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *AVAILABLE.get_or_init(|| match unsafe { activate() } {
-        Ok(_client) => {
-            crate::tprintln!("audio: process loopback is available on this machine");
-            true
+    if refused() {
+        return false;
+    }
+    // SAFETY: on a thread without COM the activation returns CO_E_NOTINITIALIZED; nothing
+    // else is required of the caller.
+    unsafe { activate_recorded() }.is_ok()
+}
+
+/// [`activate`], with the outcome recorded for [`worth_trying`].
+///
+/// # Safety
+/// Must be called on a thread with COM initialized.
+pub unsafe fn activate_recorded() -> Result<IAudioClient> {
+    let result = activate();
+    let mut g = gate();
+    match &result {
+        Ok(_) => {
+            if g.on_success() {
+                crate::tprintln!("audio: process loopback is available on this machine");
+            }
         }
         Err(e) => {
-            crate::tprintln!(
-                "audio: process loopback unavailable ({e:#}); endpoint loopback is the only tier"
-            );
-            false
+            let verdict = classify_activation_error(e);
+            g.on_failure(verdict, Instant::now());
+            match verdict {
+                ActivationVerdict::Refused => crate::tprintln!(
+                    "audio: process loopback refused by this machine ({e:#}); endpoint loopback \
+                     is the only tier from now on"
+                ),
+                ActivationVerdict::Transient => crate::tprintln!(
+                    "audio: process loopback activation failed ({e:#}); endpoint loopback for \
+                     now, the process tier is tried again after {} s",
+                    TRANSIENT_RETRY_AFTER.as_secs()
+                ),
+            }
         }
-    })
+    }
+    result
 }
 
 /// The format to ask the synthetic device for.
 ///
-/// There is no mix format to query, so the caller picks — which is the point: 48 kHz float32
-/// stereo is what the Opus encoder wants, so this tier never resamples.
+/// There is no mix format to query, so the caller picks: 48 kHz float32 stereo is what the Opus
+/// encoder wants, so this tier never resamples.
 pub fn target_format() -> WAVEFORMATEX {
     const WAVE_FORMAT_IEEE_FLOAT: u16 = 0x0003;
     let channels: u16 = 2;
@@ -208,8 +304,7 @@ mod tests {
 
     #[test]
     fn target_format_is_the_encoder_format() {
-        // `WAVEFORMATEX` is `#[repr(packed)]`, so every field has to be copied out before it
-        // can be looked at.
+        // `WAVEFORMATEX` is `#[repr(packed)]`: copy every field out before looking at it
         let f = target_format();
         let (rate, channels, bits, block_align, avg) = (
             f.nSamplesPerSec,
@@ -221,21 +316,78 @@ mod tests {
         assert_eq!(rate, crate::streamer::audio::AUDIO_SAMPLE_RATE);
         assert_eq!(channels, 2);
         assert_eq!(bits, 32);
-        // 2 channels x 4 bytes; a wrong block align silently misreads every buffer.
+        // 2 channels x 4 bytes; a wrong block align silently misreads every buffer
         assert_eq!(block_align, 8);
         assert_eq!(avg, rate * block_align as u32);
     }
 
     #[test]
     fn activation_params_carry_our_own_pid_and_the_exclude_mode() {
-        // `EXCLUDE_TARGET_PROCESS_TREE` with our own pid is what makes this "everything except
-        // us" rather than "one app". Getting the mode backwards would capture only ourselves,
-        // i.e. silence, with no error anywhere.
+        // the mode backwards would capture only ourselves: silence, with no error anywhere
         let params = AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
             TargetProcessId: unsafe { GetCurrentProcessId() },
             ProcessLoopbackMode: PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
         };
         assert_ne!(params.TargetProcessId, 0);
         assert_eq!(params.ProcessLoopbackMode.0, 1);
+    }
+
+    #[test]
+    fn a_timeout_is_transient_and_is_retried_after_the_window() {
+        // a timeout must not be cached as "unavailable" for the process lifetime
+        let timeout =
+            anyhow::anyhow!("process loopback activation did not complete within 1000 ms");
+        assert_eq!(
+            classify_activation_error(&timeout),
+            ActivationVerdict::Transient
+        );
+        let t0 = Instant::now();
+        let mut g = TierGate::new();
+        assert!(g.should_try(t0));
+        g.on_failure(ActivationVerdict::Transient, t0);
+        assert!(!g.should_try(t0 + Duration::from_secs(1)));
+        assert!(g.should_try(t0 + TRANSIENT_RETRY_AFTER));
+        assert!(!g.is_refused());
+    }
+
+    #[test]
+    fn an_rpc_failure_is_transient() {
+        // RPC_E_DISCONNECTED and AUDCLNT_E_SERVICE_NOT_RUNNING: the service went away, which a
+        // later attempt can survive
+        for hr in [0x8001_0108u32 as i32, 0x8889_0010u32 as i32] {
+            let e = anyhow::Error::from(windows::core::Error::from_hresult(HRESULT(hr)))
+                .context("GetActivateResult");
+            assert_eq!(classify_activation_error(&e), ActivationVerdict::Transient);
+        }
+    }
+
+    #[test]
+    fn a_definitive_refusal_is_cached_through_context() {
+        let e = anyhow::Error::from(windows::core::Error::from_hresult(HRESULT(
+            0x8000_4001u32 as i32,
+        )))
+        .context("process loopback activation was refused");
+        assert_eq!(classify_activation_error(&e), ActivationVerdict::Refused);
+        let t0 = Instant::now();
+        let mut g = TierGate::new();
+        g.on_failure(ActivationVerdict::Refused, t0);
+        assert!(!g.should_try(t0 + Duration::from_secs(3600)));
+        assert!(g.is_refused());
+    }
+
+    #[test]
+    fn success_clears_a_pending_retry_and_announces_once() {
+        let t0 = Instant::now();
+        let mut g = TierGate::new();
+        g.on_failure(ActivationVerdict::Transient, t0);
+        assert!(
+            g.on_success(),
+            "a success after a transient failure still announces the tier once"
+        );
+        assert!(!g.on_success());
+        assert!(g.should_try(t0));
+        let mut fresh = TierGate::new();
+        assert!(fresh.on_success());
+        assert!(!fresh.on_success());
     }
 }

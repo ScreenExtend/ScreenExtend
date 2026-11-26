@@ -1,12 +1,10 @@
 // Chrome short-circuits a receiver's encoded transform when nothing is installed within one task
-// of the transceiver being created. A transform assigned later still fires `rtctransform`, but no
-// frame ever reaches it: they all go to the built-in decoder, the WebCodecs path paints nothing,
-// and the page's 5 s watchdog demotes the session to <video>. That shipped once, through a single
-// `await makeTransformWorker()` between the two lines (UX-WEBCODECS-START).
+// of the transceiver being created. A transform assigned later still fires `rtctransform`, but
+// every frame goes to the built-in decoder, the WebCodecs path paints nothing and the page's 5 s
+// watchdog demotes the session to <video>.
 //
-// So: in index.html, from `addTransceiver('video'` to the `RTCRtpScriptTransform` assignment,
-// nothing may yield. Checked on the source, comments stripped, because the page has no build step
-// and the only thing that matters is what the browser runs.
+// So in index.html nothing may yield between `addTransceiver('video'` and the
+// `RTCRtpScriptTransform` assignment. Checked on the source with comments stripped.
 import fs from 'node:fs';
 
 const STATIC = process.argv.slice(2).filter((a) => a.charAt(0) !== '-')[0] || 'src-tauri/src/streamer/static';
@@ -29,7 +27,7 @@ if (from < 0 || to < 0) {
   if (yields) fail('the transform is installed after a yield (' + yields.join(', ') + '); Chrome will have short-circuited it');
   else ok('nothing yields between creating the video transceiver and installing its transform');
 
-  // The worker the transform runs in has to be ready before the transceiver exists.
+  // building the worker awaits, so it has to happen before the transceiver exists
   const before = page.slice(page.lastIndexOf('async function start(', from), from);
   if (/await makeTransformWorker\(\)/.test(before)) ok('the transform worker is built before the transceiver');
   else fail('the transform worker is not built before the video transceiver');

@@ -17,6 +17,8 @@ param(
   [string]$NewScreenNotIn = '',   # wait for a screen not in this ';'-list (a join's display) and use it
   [int]$Seconds = 20,
   [switch]$Stamp, [switch]$Mover, [switch]$Large,
+  [switch]$MonitorOnly,           # no window: only the 250 ms monitor list, from the start
+
   [int]$WaitSeconds = 15,
   # Mover motion: one step every MoverStepMs at MoverSpeed px/ms. With MoveSeconds > 0 the mover
   # alternates MoveSeconds of motion with HoldSeconds standing still, and prints
@@ -40,6 +42,12 @@ public class StageForm : Form {
     p.ExStyle |= 0x08000000 /*NOACTIVATE*/ | 0x80 /*TOOLWINDOW*/ | 0x8 /*TOPMOST*/ | 0x20 /*TRANSPARENT*/;
     return p; } }
   protected override void OnPaintBackground(PaintEventArgs e) { }
+  // display-change, device-change, DPI-change and setting-change messages, with the time
+  public static System.Collections.Concurrent.ConcurrentQueue<string> Msgs = new System.Collections.Concurrent.ConcurrentQueue<string>();
+  protected override void WndProc(ref Message m) {
+    if (m.Msg == 0x7E || m.Msg == 0x219 || m.Msg == 0x2E0 || m.Msg == 0x1A) Msgs.Enqueue("[" + m.Msg + "," + Stage.NowMs() + "," + m.WParam.ToInt64() + "]");
+    base.WndProc(ref m);
+  }
 }
 
 public static class Stage {
@@ -58,6 +66,40 @@ public static class Stage {
   [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool EnumDisplaySettingsW(string dev, int mode, byte[] dm);
   // {x, y, width, height} of a display from its current mode (DEVMODEW read as bytes), or null.
   // Read fresh every call, unlike Screen.AllScreens, which caches for the life of the process.
+  [DllImport("user32.dll")] static extern IntPtr MonitorFromWindow(IntPtr h, uint flags);
+  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] struct MONITORINFOEX { public int cbSize; public int l, t, r, b, wl, wt, wr, wb; public uint flags; [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dev; }
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool GetMonitorInfoW(IntPtr m, ref MONITORINFOEX mi);
+  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] struct DISPLAY_DEVICE { public int cb; [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string name; [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string str; public int flags; [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string id; [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string key; }
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool EnumDisplayDevicesW(string dev, uint i, ref DISPLAY_DEVICE dd, uint flags);
+  [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr h, int attr, out int v, int size);
+  [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+  // The monitor a window is on, by device interface path (stable), and whether DWM cloaks it.
+  public static string WhereIs(IntPtr hwnd) {
+    var mi = new MONITORINFOEX(); mi.cbSize = Marshal.SizeOf(typeof(MONITORINFOEX));
+    if (!GetMonitorInfoW(MonitorFromWindow(hwnd, 0), ref mi)) return "{\"monitor\":null}";
+    var dd = new DISPLAY_DEVICE(); dd.cb = Marshal.SizeOf(typeof(DISPLAY_DEVICE));
+    string path = EnumDisplayDevicesW(mi.dev, 0, ref dd, 1) ? dd.id : null;
+    int cloaked = 0; DwmGetWindowAttribute(hwnd, 14, out cloaked, 4);
+    return "{\"gdi\":\"" + mi.dev.Replace("\\", "\\\\") + "\",\"path\":\"" + (path ?? "").Replace("\\", "\\\\") + "\",\"cloaked\":" + cloaked + ",\"visible\":" + (IsWindowVisible(hwnd) ? "true" : "false") + "}";
+  }
+
+  delegate bool MonEnum(IntPtr h, IntPtr dc, IntPtr r, IntPtr d);
+  [DllImport("user32.dll")] static extern bool EnumDisplayMonitors(IntPtr dc, IntPtr clip, MonEnum f, IntPtr d);
+  // every monitor except the primary: [handle, last part of its device path, left, top, right, bottom]
+  public static string Monitors() {
+    var parts = new System.Collections.Generic.List<string>();
+    EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, (h, dc, r, d) => {
+      var mi = new MONITORINFOEX(); mi.cbSize = Marshal.SizeOf(typeof(MONITORINFOEX));
+      if (GetMonitorInfoW(h, ref mi) && (mi.flags & 1) == 0) {
+        var dd = new DISPLAY_DEVICE(); dd.cb = Marshal.SizeOf(typeof(DISPLAY_DEVICE));
+        string path = EnumDisplayDevicesW(mi.dev, 0, ref dd, 1) ? dd.id : "";
+        int u = path.IndexOf("UID"); string tail = u >= 0 ? path.Substring(u, Math.Min(10, path.Length - u)).Split('#')[0] : path;
+        parts.Add("[" + h.ToInt64() + ",\"" + tail + "\"," + mi.l + "," + mi.t + "," + mi.r + "," + mi.b + "]");
+      }
+      return true; }, IntPtr.Zero);
+    return "[" + string.Join(",", parts) + "]";
+  }
+
   public static int[] Bounds(string gdi) {
     var dm = new byte[220]; BitConverter.GetBytes((short)220).CopyTo(dm, 68);
     if (!EnumDisplaySettingsW(gdi, -1, dm)) return null;
@@ -126,6 +168,24 @@ public static class Stage {
 # that appeared with the join): the bundled driver gives every monitor the same EDID name, so
 # the monitor name cannot tell two virtual displays apart.
 $deadline = (Get-Date).AddSeconds($WaitSeconds); $scr = $null
+if ($MonitorOnly) {
+  $sw0 = [System.Diagnostics.Stopwatch]::StartNew()
+  # a hidden top-level window, pumped every 10 ms, so the broadcasts that come before the stamp
+  # stage has found its display are seen too, and so this window never holds a broadcast up
+  $rx = New-Object StageForm; $null = $rx.Handle
+  $nextMon = 0
+  while ($sw0.Elapsed.TotalSeconds -lt $Seconds) {
+    [System.Windows.Forms.Application]::DoEvents()
+    if ($sw0.ElapsedMilliseconds -ge $nextMon) {
+      $nextMon = $sw0.ElapsedMilliseconds + 250
+      $msgs = @(); $mm = $null; while ([StageForm]::Msgs.TryDequeue([ref]$mm)) { $msgs += $mm }
+      "{""mon"":$([Stage]::NowMs()),""list"":$([Stage]::Monitors()),""msgs"":[$($msgs -join ',')]}"; [Console]::Out.Flush()
+    }
+    Start-Sleep -Milliseconds 10
+  }
+  $rx.Dispose()
+  exit 0
+}
 $known = @($NewScreenNotIn -split ';' | Where-Object { $_ })
 $via = if ($Gdi) { 'given name' } else { 'the one new screen' }
 $bounds = $null
@@ -166,9 +226,8 @@ if ($Mover) {
   $mf.Bounds = New-Object System.Drawing.Rectangle(($b.X + 20), ($b.Y + [int]($b.Height * 0.4)), 48, 48)
   $mf.Show(); $forms += $mf
   $mg = $mf.CreateGraphics()
-  # StageForm skips OnPaintBackground, so BackColor alone never reaches the screen: until this
-  # fill the mover showed whatever its redirection surface held (in practice not the orange the
-  # mover_stop reader looks for). Filled once here and again after every move.
+  # StageForm skips OnPaintBackground, so BackColor alone never reaches the screen and the
+  # mover_stop reader would not find its orange: fill here and again after every move
   $mg.Clear([System.Drawing.Color]::OrangeRed)
 }
 if ($Large) {
@@ -194,7 +253,7 @@ Ready-Line
 
 $epoch = [DateTime]::new(1970, 1, 1, 0, 0, 0, [DateTimeKind]::Utc)
 $sw = [System.Diagnostics.Stopwatch]::StartNew(); $draws = 0; $lastSlow = -100
-$lastCheck = 0
+$lastCheck = 0; $lastTick = 0; $lastDraws = 0; $lastMon = 0
 $holding = $false; $phaseStart = 0; $stops = 0; $moveClock = 0
 while ($sw.Elapsed.TotalSeconds -lt $Seconds) {
   if ($Stamp) {
@@ -202,6 +261,17 @@ while ($sw.Elapsed.TotalSeconds -lt $Seconds) {
     [Stage]::BlitStamp($sg, $ms, $cell, $cellH); $draws++
   }
   $now = $sw.ElapsedMilliseconds
+  # every 250 ms: the non-primary monitors by handle and device path, and any display messages
+  if ($now - $lastMon -ge 250) {
+    $lastMon = $now; $msgs = @(); $mm = $null; while ([StageForm]::Msgs.TryDequeue([ref]$mm)) { $msgs += $mm }
+    "{""mon"":$([Stage]::NowMs()),""list"":$([Stage]::Monitors()),""msgs"":[$($msgs -join ',')]}"; [Console]::Out.Flush()
+  }
+  # once a second: how many stamps this process drew and where its window really is
+  if ($Stamp -and $now - $lastTick -ge 1000) {
+    $lastTick = $now
+    "{""tick"":$([Math]::Round($now / 1000.0, 1)),""draws"":$($draws - $lastDraws),""t"":$([Stage]::NowMs()),""where"":$([Stage]::WhereIs($sf.Handle))}"; [Console]::Out.Flush()
+    $lastDraws = $draws
+  }
   # A display just attached is often still changing mode (the host sets the client's resolution
   # right after the attach). Follow it, and say so: the reader's cell geometry must match.
   if ($now - $lastCheck -ge 200) {

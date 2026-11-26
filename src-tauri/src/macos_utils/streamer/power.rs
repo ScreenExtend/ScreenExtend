@@ -13,7 +13,7 @@ unsafe extern "C" {
         level: u32, // IOPMAssertionLevel
         name: CFStringRef,
         out_id: *mut IOPMAssertionID,
-    ) -> i32; // IOReturn; kIOReturnSuccess == 0
+    ) -> i32; // IOReturn
     fn IOPMAssertionRelease(id: IOPMAssertionID) -> i32;
 }
 

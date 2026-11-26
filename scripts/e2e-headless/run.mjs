@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const CHROME = process.env.CHROME || 'C:/Program Files/Google/Chrome/Application/chrome.exe';
-const EXE = process.env.SE_EXE || 'C:/Users/sarve/.cargo/shared_target/ScreenExtend/release/ScreenExtend.exe';
+const EXE = process.env.SE_EXE || path.join(process.env.CARGO_TARGET_DIR || path.join(here, '..', '..', 'src-tauri', 'target'), 'release', 'ScreenExtend.exe');
 const [HOST, SID, OTP] = process.argv.slice(2);
 const ORIGIN = `https://${HOST}:8443`;
 const URL_ = `${ORIGIN}/?id=${SID}&name=HeadlessProbe&otp=${OTP}&fs=0${process.env.DEBUG ? '&debug' : ''}`;
@@ -17,7 +17,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const out = { steps: [] };
 const step = (name, v) => { out.steps.push({ name, ...v }); console.log('STEP', name, JSON.stringify(v)); };
 
-// A fresh profile every run: a new browser, a new device token, nothing cached.
+// a fresh profile every run: a new browser, a new device token, nothing cached
 const PROFILE = path.join(os.tmpdir(), 'screenextend-e2e-profile');
 fs.rmSync(PROFILE, { recursive: true, force: true });
 const chrome = spawn(CHROME, [
@@ -84,8 +84,8 @@ try {
     return r.result.value;
   };
 
-  // Observation only: keep the worker's own stats reply and every peer connection where the
-  // harness can read them. addEventListener runs beside the page's onmessage, never instead.
+  // observation only: keep the worker's own stats reply and every peer connection where the
+  // harness can read them. addEventListener runs beside the page's onmessage, never instead
   await page.send('Page.addScriptToEvaluateOnNewDocument', { source: `(() => {
     ${process.env.NO_SCRIPT_TRANSFORM ? 'delete window.RTCRtpScriptTransform;' : ''}
     ${process.env.NO_TRICKLE ? "const F = window.fetch; window.fetch = function (u, o) { const p = F.apply(this, arguments); return String(u).indexOf('/net-config') >= 0 ? p.then((r) => r.clone().json().then((j) => { j.trickleIce = false; return new Response(JSON.stringify(j), { status: 200, headers: { 'Content-Type': 'application/json' } }); })) : p; };" : ''}
@@ -104,17 +104,17 @@ try {
   for (let i = 0; i < 50; i++) { if (await ev('document.readyState === "complete" && !!document.getElementById("joinForm")').catch(() => false)) break; await sleep(200); }
   step('page-loaded', { title: await ev('document.title'), secure: await ev('isSecureContext'), coi: await ev('crossOriginIsolated') });
 
-  // ---- permission dialog: ungranted state, then accept it through the browser protocol
+  // permission dialog: read the ungranted state, then grant through the browser protocol
   const micQ = 'navigator.permissions.query({name:"microphone"}).then(p=>p.state)';
   const before = await ev(micQ);
-  // Every permission the grant does not name is *denied*, not left at prompt: granting only
-  // audioCapture is what made navigator.wakeLock.request() reject with NotAllowedError.
+  // every permission the grant does not name is denied, not left at prompt: with only
+  // audioCapture granted, navigator.wakeLock.request() rejects with NotAllowedError
   await browser.send('Browser.grantPermissions', { origin: ORIGIN, permissions: process.env.GRANT_ONLY_MIC ? ['audioCapture'] : ['audioCapture', 'wakeLockScreen', 'speakerSelection'] });
   const after = await ev(micQ);
   step('permission-grant', { before, after });
 
-  // ---- what this Chrome actually offers the client page (report only; nothing here is exercised
-  // against the host, and pointer lock is never requested)
+  // what this Chrome offers the client page: report only, nothing is exercised against the
+  // host and pointer lock is never requested
   if (!process.env.NO_FEATURES) {
     const gpu = await browser.send('SystemInfo.getInfo').catch((e) => ({ error: e.message }));
     const fs = (gpu.gpu && gpu.gpu.featureStatus) || {};
@@ -141,7 +141,7 @@ try {
     if (process.env.FEATURES_ONLY) throw new Error('FEATURES_ONLY: stopping before the join');
   }
 
-  // ---- page-level dialogs before the join
+  // dismiss page-level dialogs before the join
   const modals = [];
   const sweep = async () => {
     const hit = await ev(`(() => {
@@ -191,7 +191,7 @@ try {
     tone = spawn('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(here, 'tone.ps1'), '26'], { stdio: 'ignore' });
   }
 
-  // ---- latency: 20 s with a small window moving on the virtual display
+  // latency: 20 s with a small window moving on the virtual display
   const mover = spawn('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(here, 'mover.ps1'), '20'], { stdio: ['ignore', 'pipe', 'pipe'] });
   let moverOut = ''; mover.stdout.on('data', (d) => { moverOut += d; }); mover.stderr.on('data', (d) => { moverOut += d; });
   await sleep(3000);
@@ -237,7 +237,7 @@ try {
   console.log('WORKER-MSGS', JSON.stringify(await ev('window.__wmsgs').catch(() => null)));
   console.log('PAGE-WARNINGS', JSON.stringify(logs, null, 1));
 
-  // ---- leave cleanly, then shut the browser down
+  // navigating away is the clean leave (pagehide); then shut the browser down
   await page.send('Page.navigate', { url: 'about:blank' }); await sleep(1500);
   await browser.send('Browser.close').catch(() => {});
   for (let i = 0; i < 150 && !chromeExited; i++) await sleep(100);

@@ -22,11 +22,8 @@ impl TauriDeviceReporter {
         Arc::new(Self { app, overrides })
     }
 
-    /// A join or a leave does not change the adapter set. The only thing this re-evaluates is
-    /// `display_slot_holder`, which returns `None` immediately unless the display backend caps
-    /// concurrent displays — true only on the macOS AirPlay tier. On the `CGVirtualDisplay` tier
-    /// it was a no-op that still cost a fresh OS thread and three lock acquisitions, once per
-    /// join and once per leave.
+    /// Only a backend that caps concurrent displays (the macOS AirPlay tier) needs this: a join or
+    /// a leave changes nothing else `sync_streamers` reads, so the other tiers skip the thread.
     fn resync_streamers(&self) {
         use tauri::Manager;
         let Some(state) = self.app.try_state::<super::AppState>() else {
@@ -49,9 +46,8 @@ impl TauriDeviceReporter {
     fn row(&self, info: DeviceInfo) -> Device {
         let token = info.token.clone();
         let mut device = Device::defaults(info);
-        // Settings are the device's, not the join's: two tabs of one browser read the same row.
-        // Bound rather than left in the `if let` scrutinee: a guard produced there lives to the
-        // end of the block, which is the shape the project bans near an `.await`.
+        // settings are the device's, not the join's: two tabs of one browser read the same row.
+        // Bound first: a guard in the `if let` scrutinee would live to the end of the block
         let saved = self.overrides.lock().unwrap().get(&token).copied();
         if let Some(o) = saved {
             device.scale = o.scale;
@@ -85,7 +81,7 @@ impl DeviceReporter for TauriDeviceReporter {
         self.resync_streamers();
     }
 
-    /// UNVERIFIED (not compiled) — the Windows sibling is the one that was measured.
+    /// UNVERIFIED (not compiled): mirrors the Windows sibling.
     fn report_modify(&self, info: DeviceInfo) {
         tprintln!(
             "[dashboard] device updated in place: join={} token={} ({})",
@@ -96,7 +92,7 @@ impl DeviceReporter for TauriDeviceReporter {
         if let Err(e) = DeviceModify(self.row(info)).emit(&self.app) {
             teprintln!("[device-reporter] emit DeviceModify failed: {e:?}");
         }
-        // No `resync_streamers`: a renegotiation neither takes a display slot nor frees one.
+        // no `resync_streamers`: a renegotiation neither takes a display slot nor frees one
     }
 
     fn report_remove(&self, join_id: String, token: String) {

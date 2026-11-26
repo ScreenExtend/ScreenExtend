@@ -125,10 +125,13 @@ impl<T: GraphicsCaptureApiHandler + Send + 'static, E> CaptureControl<T, E> {
     }
 
     /// Gets the join handle for the capture thread.
+    ///
+    /// The capture keeps running: once the handle has been taken, dropping this control no longer
+    /// asks the thread to stop.
     #[inline]
     #[must_use]
-    pub fn into_thread_handle(self) -> JoinHandle<Result<(), GraphicsCaptureApiError<E>>> {
-        self.thread_handle.unwrap()
+    pub fn into_thread_handle(mut self) -> JoinHandle<Result<(), GraphicsCaptureApiError<E>>> {
+        self.thread_handle.take().unwrap()
     }
 
     /// Gets the halt handle used to pause the capture thread.
@@ -230,6 +233,63 @@ impl<T: GraphicsCaptureApiHandler + Send + 'static, E> CaptureControl<T, E> {
     }
 }
 
+/// How long a drop keeps re-posting `WM_QUIT` to a capture thread whose message queue does not
+/// exist yet. The window is the few instructions between `start_capture` and the thread's first
+/// `GetMessageW`; a thread that has not reached it in this long is not helped by a longer wait on
+/// a thread that may be an async worker.
+const DROP_POST_DEADLINE: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Dropping a control without [`CaptureControl::stop`] used to detach the capture thread with
+/// nothing asking it to leave: it sat in `GetMessageW` for the life of the process, holding the
+/// WGC session, the pool's surfaces, the D3D11 device and, through the `FrameArrived` delegate,
+/// the handler and everything it owns (an NVENC session, its encode thread, the GPU clock hold).
+///
+/// This only *signals*: it raises the halt flag, so no further frame reaches the handler, and
+/// posts `WM_QUIT`, so the message loop ends and the thread tears the session down itself. It
+/// never joins, because a control is dropped wherever its owner happens to be (a cancelled axum
+/// handler, a tokio worker) and a join there would park that thread for as long as the capture
+/// thread takes to finish a frame. Call [`CaptureControl::stop`] where waiting is acceptable.
+impl<T: GraphicsCaptureApiHandler + Send + 'static, E> Drop for CaptureControl<T, E> {
+    fn drop(&mut self) {
+        let Some(thread_handle) = self.thread_handle.take() else {
+            return;
+        };
+        self.halt_handle.store(true, atomic::Ordering::Relaxed);
+        if thread_handle.is_finished() {
+            return;
+        }
+        let thread_id = unsafe { GetThreadId(HANDLE(thread_handle.as_raw_handle())) };
+        if thread_id == 0 {
+            teprintln!("wgc: dropped capture control could not name its thread; it will not stop");
+            return;
+        }
+        let deadline = std::time::Instant::now() + DROP_POST_DEADLINE;
+        loop {
+            match unsafe {
+                PostThreadMessageW(thread_id, WM_QUIT, WPARAM::default(), LPARAM::default())
+            } {
+                Ok(()) => return,
+                Err(error) => {
+                    if thread_handle.is_finished() {
+                        return;
+                    }
+                    let retry = error.code()
+                        == windows::core::HRESULT::from_win32(ERROR_INVALID_THREAD_ID.0)
+                        && std::time::Instant::now() < deadline;
+                    if !retry {
+                        teprintln!(
+                            "wgc: dropped capture control could not post WM_QUIT ({error}); the \
+                             capture thread is halted but still running"
+                        );
+                        return;
+                    }
+                    thread::yield_now();
+                }
+            }
+        }
+    }
+}
+
 #[derive(thiserror::Error, Eq, PartialEq, Clone, Debug)]
 /// Errors that can occur while initializing and running the Windows Graphics Capture pipeline.
 pub enum GraphicsCaptureApiError<E> {
@@ -326,6 +386,13 @@ pub trait GraphicsCaptureApiHandler: Sized {
         // Get current thread ID
         let thread_id = unsafe { GetCurrentThreadId() };
 
+        // Convert the item before building the handler or the device: a monitor handle that went
+        // stale fails here, and building them first cost a whole encoder per stale-monitor retry.
+        let item = settings
+            .item
+            .try_into()
+            .map_err(|_| GraphicsCaptureApiError::ItemConvertFailed)?;
+
         // Create Direct3D device and context
         let (d3d_device, d3d_device_context, adapter) = create_d3d_device(settings.gpu_preference)?;
 
@@ -342,7 +409,7 @@ pub trait GraphicsCaptureApiHandler: Sized {
         let callback = Arc::new(Mutex::new(
             Self::new(ctx).map_err(GraphicsCaptureApiError::NewHandlerError)?,
         ));
-        let (buffers, stale_frames, cursor) = {
+        let (buffers, stale_frames, cursor, free_threaded) = {
             let handler = callback.lock();
             (
                 handler.frame_pool_buffers(),
@@ -350,16 +417,14 @@ pub trait GraphicsCaptureApiHandler: Sized {
                 handler
                     .cursor_capture_override()
                     .unwrap_or(settings.cursor_capture_settings),
+                handler.frame_pool_free_threaded(),
             )
         };
 
         let mut capture = GraphicsCaptureApi::new(
             d3d_device,
             d3d_device_context,
-            settings
-                .item
-                .try_into()
-                .map_err(|_| GraphicsCaptureApiError::ItemConvertFailed)?,
+            item,
             callback,
             cursor,
             settings.draw_border_settings,
@@ -368,6 +433,7 @@ pub trait GraphicsCaptureApiHandler: Sized {
             settings.dirty_region_settings,
             settings.color_format,
             buffers,
+            free_threaded,
             stale_frames,
             thread_id,
             result.clone(),
@@ -421,7 +487,9 @@ pub trait GraphicsCaptureApiHandler: Sized {
         let (halt_sender, halt_receiver) = mpsc::channel::<Arc<AtomicBool>>();
         let (callback_sender, callback_receiver) = mpsc::channel::<Arc<Mutex<Self>>>();
 
-        let thread_handle = thread::spawn(
+        // Named so a WPR/ETW trace or a debugger can attribute the thread that runs every frame.
+        let builder = thread::Builder::new().name("wgc-capture".to_string());
+        let spawned = builder.spawn(
             move || -> Result<(), GraphicsCaptureApiError<Self::Error>> {
                 // Initialize WinRT
                 let _winrt =
@@ -436,6 +504,14 @@ pub trait GraphicsCaptureApiHandler: Sized {
 
                 // Get current thread ID
                 let thread_id = unsafe { GetCurrentThreadId() };
+
+                // Convert the item before building the handler or the device: a monitor handle
+                // that went stale fails here, and building them first cost a whole encoder (an
+                // NVENC session, its ring thread, the GPU clock hold) per stale-monitor retry.
+                let item = settings
+                    .item
+                    .try_into()
+                    .map_err(|_| GraphicsCaptureApiError::ItemConvertFailed)?;
 
                 // Create direct3d device and context
                 let (d3d_device, d3d_device_context, adapter) =
@@ -454,7 +530,7 @@ pub trait GraphicsCaptureApiHandler: Sized {
                 let callback = Arc::new(Mutex::new(
                     Self::new(ctx).map_err(GraphicsCaptureApiError::NewHandlerError)?,
                 ));
-                let (buffers, stale_frames, cursor) = {
+                let (buffers, stale_frames, cursor, free_threaded) = {
                     let handler = callback.lock();
                     (
                         handler.frame_pool_buffers(),
@@ -462,16 +538,14 @@ pub trait GraphicsCaptureApiHandler: Sized {
                         handler
                             .cursor_capture_override()
                             .unwrap_or(settings.cursor_capture_settings),
+                        handler.frame_pool_free_threaded(),
                     )
                 };
 
                 let mut capture = GraphicsCaptureApi::new(
                     d3d_device,
                     d3d_device_context,
-                    settings
-                        .item
-                        .try_into()
-                        .map_err(|_| GraphicsCaptureApiError::ItemConvertFailed)?,
+                    item,
                     callback.clone(),
                     cursor,
                     settings.draw_border_settings,
@@ -480,6 +554,7 @@ pub trait GraphicsCaptureApiHandler: Sized {
                     settings.dirty_region_settings,
                     settings.color_format,
                     buffers,
+                    free_threaded,
                     stale_frames,
                     thread_id,
                     result.clone(),
@@ -535,6 +610,9 @@ pub trait GraphicsCaptureApiHandler: Sized {
                 Ok(())
             },
         );
+        let Ok(thread_handle) = spawned else {
+            return Err(GraphicsCaptureApiError::FailedToStartCaptureThread);
+        };
 
         let Ok(halt_handle) = halt_receiver.recv() else {
             match thread_handle.join() {
@@ -596,6 +674,40 @@ pub trait GraphicsCaptureApiHandler: Sized {
         None
     }
 
+    /// Whether the frame pool is created with `CreateFreeThreaded` rather than `Create`.
+    ///
+    /// `false`, the default, dispatches `FrameArrived` through the capture thread's
+    /// `DispatcherQueue` and message pump, so every callback runs on the one thread the handler
+    /// was built and tuned on. `true` raises it directly on a WinRT worker thread, which skips
+    /// that hop; the handler then cannot assume which thread it is on and has to tune each thread
+    /// it finds itself on. Read once, alongside [`Self::frame_pool_buffers`], and honoured only
+    /// where the method exists.
+    #[inline]
+    fn frame_pool_free_threaded(&self) -> bool {
+        false
+    }
+
+    /// Called when the pool signalled a frame it then could not hand over: `ContentSize`,
+    /// `Surface`, the DXGI interface or a `Recreate` failed. Those errors used to be returned to
+    /// WinRT, which ignores a delegate's result, so they were invisible, and a `Recreate` that
+    /// keeps failing (a removed device, video memory exhausted at a larger size) failed on every
+    /// frame for the rest of the session.
+    ///
+    /// `consecutive` counts failures since the last frame that did reach
+    /// [`Self::on_frame_arrived`]. Returning `Err` halts the capture exactly as an
+    /// `on_frame_arrived` error does. The default logs the first failure of a run and carries on.
+    #[inline]
+    fn on_frame_pool_error(
+        &mut self,
+        error: &windows::core::Error,
+        consecutive: u32,
+    ) -> Result<(), Self::Error> {
+        if consecutive == 1 {
+            teprintln!("wgc: the frame pool could not deliver a frame: {error}");
+        }
+        Ok(())
+    }
+
     /// Called every time a new frame is available.
     fn on_frame_arrived(
         &mut self,
@@ -607,5 +719,70 @@ pub trait GraphicsCaptureApiHandler: Sized {
     #[inline]
     fn on_closed(&mut self) -> Result<(), Self::Error> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, PM_NOREMOVE};
+
+    use super::*;
+
+    struct Idle;
+
+    impl GraphicsCaptureApiHandler for Idle {
+        type Flags = ();
+        type Error = String;
+
+        fn new(_ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
+            Ok(Self)
+        }
+
+        fn on_frame_arrived(
+            &mut self,
+            _frame: &mut Frame,
+            _capture_control: InternalCaptureControl,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    /// wgc-01: a control dropped without `stop()` used to leave its thread in `GetMessageW` for
+    /// the life of the process, holding everything the capture owned. The drop must end the loop
+    /// without joining.
+    #[test]
+    fn dropping_a_control_ends_its_capture_thread() {
+        let (ready_tx, ready_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let thread_handle =
+            thread::spawn(move || -> Result<(), GraphicsCaptureApiError<String>> {
+                let mut message = MSG::default();
+                // Creates this thread's message queue before the control can post to it.
+                let _ = unsafe { PeekMessageW(&mut message, None, 0, 0, PM_NOREMOVE) };
+                let _ = ready_tx.send(());
+                let result = run_message_loop::<String>();
+                let _ = done_tx.send(());
+                result
+            });
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the test thread started");
+        let halt = Arc::new(AtomicBool::new(false));
+        let control = CaptureControl::<Idle, String>::new(
+            thread_handle,
+            Arc::clone(&halt),
+            Arc::new(Mutex::new(Idle)),
+        );
+        drop(control);
+        assert!(
+            halt.load(atomic::Ordering::Relaxed),
+            "the drop raises the halt flag"
+        );
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the capture thread is still parked in its message loop"
+        );
     }
 }

@@ -70,8 +70,7 @@ for arch in arm64 x86_64; do
 done
 [ "$(otool -arch x86_64 -l "$BIN" | awk '/LC_BUILD_VERSION/{f=1} f&&/minos/{print $2; exit}')" = "10.15" ] || { echo "FAIL: x86_64 minos is not 10.15"; FAIL=1; }
 
-# Frameworks that do not exist on 10.15 (introduced later). A link to any of them makes dyld
-# refuse the whole binary on the floor.
+# frameworks introduced after 10.15: a link to any of them makes dyld refuse the whole binary there
 NEWER="ScreenCaptureKit|UniformTypeIdentifiers|AppTrackingTransparency|MetalFX|SensitiveContentAnalysis|CoreTransferable|BackgroundAssets|ExtensionKit|SharedWithYou|Virtualization|MetricKit|DeviceCheck|Accessibility\.framework|AppIntents|Charts|SwiftUI|Combine|CryptoKit|RealityKit|ShazamKit|GroupActivities"
 for arch in arm64 x86_64; do
   echo "-- $arch linked libraries:"
@@ -80,7 +79,7 @@ for arch in arm64 x86_64; do
     echo "FAIL: $arch links a framework absent on 10.15:"; otool -arch "$arch" -L "$BIN" | grep -E "$NEWER"; FAIL=1
   fi
 done
-# Weak framework links are fine (dyld tolerates them); strong ones are listed above either way.
+# weak framework links are fine (dyld tolerates them); strong ones are listed above either way
 
 BASE_BIN="$CRATE/target/bench-baseline/x86_64-apple-darwin/release/ScreenExtend"
 if [ -f "$BASE_BIN" ]; then

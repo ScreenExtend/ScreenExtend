@@ -1,20 +1,8 @@
 //! The audio tier ranking, exhaustively, on any Mac.
 //!
-//! macOS audio coverage was inverted: the tier that is never selected on 13.0+ carried 20 of the
-//! 34 tests, while the two that run on every supported Mac — Core Audio Process Tap and
-//! ScreenCaptureKit audio — had none. The reason was structural rather than an oversight: the
-//! only dev box is 10.15, where neither tier's classes exist, so nothing about them could be
-//! executed there at all.
-//!
-//! Splitting the probing from the ranking fixes that. `AudioProbes` is what the machine
-//! answered; `rank_backend` and `rank_capable_backends` are what we do about it, with no
-//! `dlsym`, no class lookup and no filesystem in them. The table below is every combination —
-//! including the ones this machine can never reach — so the 14.2 and 13.0 branches are asserted
-//! on the 10.15 floor and on all three CI runners.
-//!
-//! (It is still under `macos_utils`, so it does not run on Windows. Moving the ranking out of
-//! the platform module to gain that would put macOS policy in cross-platform code, which is a
-//! worse trade than losing one runner.)
+//! `AudioProbes` is what the machine answered; `rank_backend` and `rank_capable_backends` are the
+//! policy, with no `dlsym`, class lookup or filesystem access in them, so the 14.2 and 13.0
+//! branches are asserted on a 10.15 machine too.
 
 use crate::macos_utils::audio::{rank_backend, rank_capable_backends, AudioBackend, AudioProbes};
 
@@ -28,9 +16,9 @@ fn probes(process_tap: bool, sck: bool, driver_healthy: bool) -> AudioProbes {
 
 #[test]
 fn the_ranking_is_process_tap_then_sck_then_the_driver() {
-    // Every combination of the three probes. The order is the whole contract: Process Tap is
-    // audio-only and shows no screen-recording indicator, SCK needs the Screen Recording grant
-    // and rides a dummy video stream, and the driver takes over the system output device.
+    // the order is the contract: Process Tap is audio-only and shows no recording indicator, SCK
+    // needs the Screen Recording grant and a dummy video stream, the driver takes over the
+    // system output device
     let cases = [
         // (process_tap, sck, driver, expected)
         (true, true, true, AudioBackend::ProcessTap),
@@ -53,8 +41,8 @@ fn the_ranking_is_process_tap_then_sck_then_the_driver() {
 
 #[test]
 fn no_combination_of_probes_reports_unsupported() {
-    // `Unsupported` is presented in the UI as a dead end. There is always something the user can
-    // do — the driver covers the whole 10.15 floor — so the ranking must never produce it.
+    // the UI presents `Unsupported` as a dead end, and the driver covers the whole 10.15 floor,
+    // so the ranking must never produce it
     for tap in [false, true] {
         for sck in [false, true] {
             for driver in [false, true] {
@@ -70,8 +58,8 @@ fn no_combination_of_probes_reports_unsupported() {
 
 #[test]
 fn the_reported_tier_is_the_first_one_start_capture_would_try() {
-    // Two functions, one decision. If `probe_audio_backend` reported a tier the candidate loop
-    // does not lead with, the compatibility card would describe a session the host never opens.
+    // if `probe_audio_backend` reported a tier the candidate loop does not lead with, the
+    // compatibility card would describe a session the host never opens
     for tap in [false, true] {
         for sck in [false, true] {
             for driver in [false, true] {
@@ -96,8 +84,8 @@ fn the_reported_tier_is_the_first_one_start_capture_would_try() {
 
 #[test]
 fn the_driver_stays_in_the_ladder_behind_a_native_tier() {
-    // The failure this exists for: on 13.x with Screen Recording denied, SCK is selected, fails
-    // to start, and there is nothing after it — even with the driver installed and working.
+    // on 13.x with Screen Recording denied, SCK is selected and fails to start: the installed
+    // driver must still be there behind it
     let ladder = rank_capable_backends(probes(false, true, true));
     assert_eq!(
         ladder,
@@ -121,8 +109,8 @@ fn the_driver_stays_in_the_ladder_behind_a_native_tier() {
 
 #[test]
 fn a_machine_with_nothing_offers_no_candidate_to_start() {
-    // `start_capture` bails with the install prompt rather than constructing a backend that
-    // cannot run; `make_backend` treats those two variants as unreachable and would panic.
+    // `start_capture` bails with the install prompt here: `make_backend` treats the two
+    // non-startable variants as unreachable and would panic
     assert!(rank_capable_backends(probes(false, false, false)).is_empty());
 }
 
@@ -145,8 +133,8 @@ fn the_ladder_never_repeats_a_tier() {
 
 #[test]
 fn the_tier_names_the_ui_switches_on_are_stable() {
-    // These strings reach the desktop UI through `CompatibilityReport.audio_backend` and CI
-    // compares them literally (`.github/workflows/ci.yml`, the macos-smoke job).
+    // these strings reach the desktop UI through `CompatibilityReport.audio_backend`, and the
+    // macos-smoke CI job compares them literally
     assert_eq!(AudioBackend::ProcessTap.as_str(), "process_tap");
     assert_eq!(
         AudioBackend::ScreenCaptureKitAudio.as_str(),
@@ -162,9 +150,8 @@ fn the_tier_names_the_ui_switches_on_are_stable() {
 
 #[test]
 fn this_machine_ranks_the_same_way_the_table_says_it_should() {
-    // The one assertion that touches the real probes: whatever they answered, the live ranking
-    // has to agree with the pure one. That is what keeps the table above from describing a
-    // function nothing calls.
+    // the one assertion on the real probes: whatever they answer, the live ranking must be a
+    // tier the pure one can produce
     use crate::macos_utils::audio::probe_audio_backend;
 
     let live = probe_audio_backend();

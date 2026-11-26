@@ -1,14 +1,11 @@
 // Drives index.html's `/reconfig` epoch handling under Node with a fake fetch.
 //
-// Settings changes apply live through epoch bumps rather than a display teardown
-// (`streamer/session.rs`: `bump_reconfig_epoch`, `bump_kick_epoch`), and the client polling
-// loop is the whole other half of that mechanism. Nothing tested it, and its failure modes are
-// all silent: a missed kick leaves a removed device streaming, a missed reconfig leaves a
-// device on the old resolution forever, and a spurious one tears the session down on a poll.
+// Settings changes apply live through epoch bumps (`streamer/session.rs`: `bump_reconfig_epoch`,
+// `bump_kick_epoch`), and the client polling loop is the other half of that mechanism. Its
+// failure modes are all silent: a missed kick leaves a removed device streaming, a missed
+// reconfig leaves a device on the old resolution, and a spurious one tears the session down.
 //
-// The page has no build step and its script is inline, so the functions are lifted out by name
-// and run directly — the same trick `test-client-ice.mjs` uses, and the reason both exist
-// rather than a browser test.
+// The page's script is inline with no build step, so the functions are lifted out by name.
 //
 //   node scripts/test-client-reconfig.mjs [path/to/static]
 import fs from 'node:fs';
@@ -40,9 +37,8 @@ function takeFunction(name) {
   throw new Error('function ' + name + ' is unbalanced');
 }
 
-// The page's own state, plus the collaborators the lifted functions call into. Every one of
-// those is recorded rather than stubbed away, because the assertions are about which of them
-// runs and in what order.
+// The page's own state, plus the collaborators the lifted functions call into, each recorded
+// rather than stubbed away: the assertions are about which of them runs and in what order.
 const prelude = `
   let currentJoinId = '';
   function setJoinId(id) { currentJoinId = id || ''; }
@@ -97,6 +93,7 @@ const source = [
   takeFunction('withJoin'),
   takeFunction('releaseJoin'),
   takeFunction('clearReconfigWatchdog'),
+  takeFunction('armReconfigWatchdog'),
   takeFunction('startReconfigPoll'),
   takeFunction('armProbe'),
   takeFunction('probeTick'),
@@ -118,10 +115,9 @@ function makePoller() {
   const calls = [];
   const localTimers = [];
   timers = localTimers;
-  // `applyReconfig` tests `window.SEAudio` and then calls the bare global, which is the same
-  // object in a browser and has to be made so here. What it does with the answer is the whole
-  // of cases 9-11: `false` is the engine refusing, and a host that repeats the same request
-  // must not be answered with a second picker.
+  // `applyReconfig` tests `window.SEAudio` and then calls the bare global: the same object in a
+  // browser, so it has to be made so here. Cases 9-11 are about its answer: `false` is the
+  // engine refusing.
   const seAudio = {
     setSpeaker: async (id) => { calls.push('setSpeaker:' + id); return sinkResult; },
     postOutputs: (force) => { calls.push('postOutputs:' + !!force); },
@@ -168,7 +164,7 @@ const calls = api.calls;
 
 const json = (body, status) => ({ ok: status === undefined || status === 200, status: status || 200, json: async () => body });
 const settle = async () => { for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r)); };
-// Fire whichever timer the page armed, as if its deadline had arrived.
+// fire whichever timer the page armed, as if its deadline had arrived
 function runTimers() {
   const due = timers.filter(Boolean);
   timers.length = 0;
@@ -176,9 +172,8 @@ function runTimers() {
   return due.length;
 }
 
-// ── 1. the first poll adopts the host's epochs without reacting to them ──────────────────
-// Adopting them is what makes the *next* difference meaningful. Treating the first read as a
-// change would rebuild the session on every join.
+// 1. The first poll adopts the host's epochs without reacting to them: treating the first
+//    read as a change would rebuild the session on every join.
 calls.length = 0;
 response = json({ epoch: 7, kick: 3 });
 await api.startReconfigPoll();
@@ -189,21 +184,19 @@ else fail('the first /reconfig read rebuilt the session');
 if (api.state().reconfigPoll) ok('the poll is armed after the first read');
 else fail('no poll timer was armed');
 
-// ── 2. an unchanged epoch is a no-op ─────────────────────────────────────────────────────
+// 2. An unchanged epoch is a no-op.
 calls.length = 0;
 api.applyReconfig({ epoch: 7, kick: 3 });
 if (calls.length === 0) ok('an unchanged epoch does nothing at all');
 else fail('an unchanged epoch ran ' + calls.join(', '));
 
-// ── 3. a bumped reconfig epoch rebuilds, once ────────────────────────────────────────────
+// 3. A bumped reconfig epoch rebuilds, once.
 calls.length = 0;
 api.applyReconfig({ epoch: 8, kick: 3 });
 eq('the new epoch is adopted', api.state().reconfigEpoch, 8);
-// `start(true, true)` and not `start(true)`: the second argument is the whole fix for the
-// owner's report. A reconfigure is the same session offering again, so the page presents the
-// join id it already holds, the host keeps that session and its virtual display, and the
-// dashboard never sees a leave followed by a join. Releasing it instead is what made a
-// settings change read as a disconnect.
+// `start(true, true)`, not `start(true)`: a reconfigure is the same session offering again,
+// so the page presents the join id it already holds, the host keeps that session and its
+// virtual display, and the dashboard never sees a leave followed by a join.
 if (calls.includes('start:true:true')) ok('a bumped epoch renegotiates on the same join');
 else fail('a bumped epoch ran ' + calls.join(', '));
 if (!calls.includes('teardownSession:false')) ok('and never tears the join down on the way');
@@ -216,10 +209,10 @@ api.applyReconfig({ epoch: 9, kick: 3 });
 if (!calls.some((c) => c.startsWith('start:'))) ok('a second bump while already reconfiguring does not start a second session');
 else fail('a concurrent bump started an overlapping session');
 
-// ── 4. a rebuild that never completes is not left frozen ─────────────────────────────────
-// While `reconfiguring` is set, the probe tick, the link evaluation, the connection-state
-// handler and the leave beacon all return early — so without its own deadline a stuck rebuild
-// leaves the last decoded frame on screen with no spinner and no reconnect.
+// 4. A rebuild that never completes is not left frozen. While `reconfiguring` is set, the
+//    probe tick, the link evaluation, the connection-state handler and the leave beacon all
+//    return early, so without its own deadline a stuck rebuild leaves the last decoded frame
+//    on screen with no spinner and no reconnect.
 calls.length = 0;
 clock += api.grace.RECONFIG_DEADLINE_MS;
 runTimers();
@@ -228,7 +221,7 @@ else fail('the reconfigure watchdog did not fire: ' + calls.join(', '));
 if (!api.state().reconfiguring) ok('and the page stops standing down so recovery can run');
 else fail('reconfiguring was still set after the watchdog');
 
-// ── 5. a bumped kick epoch removes the device and stops everything ───────────────────────
+// 5. A bumped kick epoch removes the device and stops everything.
 calls.length = 0;
 api.applyReconfig({ epoch: 9, kick: 4 });
 if (calls.includes('restorePreJoinPage:false')) ok('a kick ends the session through the one full restore, releasing the join');
@@ -245,9 +238,8 @@ api.applyReconfig({ epoch: 20, kick: 99 });
 if (calls.length === 0) ok('a kicked page ignores everything that follows');
 else fail('a kicked page still ran ' + calls.join(', '));
 
-// ── 6. a refused poll is counted, a 500 is not ───────────────────────────────────────────
-// The distinction is what the link evaluation is built on: a connection refused fast is the
-// host being gone, while a 500 is a host that is still there and answering.
+// 6. A refused poll is counted, a 500 is not: a connection refused fast is the host being
+//    gone, while a 500 is a host that is still there and answering.
 {
   const p = makePoller();
   const calls = p.calls;
@@ -264,9 +256,8 @@ else fail('a kicked page still ran ' + calls.join(', '));
   eq('a 500 from a host that is still answering resets the streak', p.state().refusedStreak, 0);
 }
 
-// ── 7. the poll backs off differently once the link is suspect ───────────────────────
-// A separate poller per case: `armProbe` returns early once a timer is armed, which is what
-// stops two polls from ever overlapping.
+// 7. The poll backs off differently once the link is suspect. A separate poller per case:
+//    `armProbe` returns early once a timer is armed, which is what stops two polls overlapping.
 {
   const healthyPoller = makePoller();
   healthyPoller.armProbe();
@@ -289,7 +280,7 @@ else fail('a kicked page still ran ' + calls.join(', '));
   else fail('armProbe stacked a second timer on top of a live one');
 }
 
-// ── 8. a page that is not live arms nothing ──────────────────────────────────────────────
+// 8. A page that is not live arms nothing.
 {
   const p = makePoller();
   const timers = p.timers;
@@ -307,18 +298,17 @@ else fail('a kicked page still ran ' + calls.join(', '));
   else fail('a reconfiguring page armed a poll timer');
 }
 
-// ── 9. a sink the engine refuses is reported once, and never offered over the stage ─────
-// `process_reconfig` puts `audioSink` in *every* body, and an engine that cannot route to it
-// answers `false` on every tick. A refusal used to arm the browser's chooser on the next tap,
-// which over a live stage dropped pointer lock, keyboard lock and fullscreen for a request the
-// person at the device never made. It is now reported (log + a forced `/audio-outputs` post
-// carrying the sink actually in use), once per requested id.
+// 9. A sink the engine refuses is reported once, and never offered over the stage.
+//    `process_reconfig` puts `audioSink` in every body, and an engine that cannot route to it
+//    answers `false` on every tick. A chooser raised for that would drop pointer lock, keyboard
+//    lock and fullscreen for a request nobody at the device made, so a refusal is reported (a
+//    log line and a forced `/audio-outputs` post carrying the sink in use), once per requested id.
 {
   const p = makePoller();
   const calls = p.calls;
   sinkResult = false;
-  // Ten polls a second apart, so each refusal has settled before the next one arrives — the
-  // refusal clears the applied latch, so the request is retried rather than treated as done.
+  // Each refusal has settled before the next poll arrives. A refusal clears the applied latch,
+  // so the request is retried rather than treated as done.
   for (let i = 0; i < 10; i++) { p.applyReconfig({ epoch: 1, kick: 1, audioSink: 'sink-A' }); await settle(); }
   eq('a refused sink never arms the picker', calls.filter((c) => c.startsWith('queueOutputPicker')).length, 0);
   eq('ten ticks of the same refused sink report it once', calls.filter((c) => c.startsWith('warn:') && c.indexOf('sink-A') >= 0).length, 1);
@@ -332,7 +322,7 @@ else fail('a kicked page still ran ' + calls.join(', '));
   eq('a new refused sink is reported once', calls.filter((c) => c.startsWith('warn:') && c.indexOf('sink-B') >= 0).length, 1);
 }
 
-// ── 10. a sink that applies never offers a picker ────────────────────────────────────────
+// 10. A sink that applies never offers a picker.
 {
   const p = makePoller();
   const calls = p.calls;
@@ -341,13 +331,12 @@ else fail('a kicked page still ran ' + calls.join(', '));
   if (!calls.some((c) => c.startsWith('queueOutputPicker'))) ok('a sink that applies is never answered with a picker');
   else fail('a working sink change opened a picker: ' + calls.join(', '));
   eq('and the latch is untouched', p.state().lastOfferedSinkId, null);
-  // Class (c) is applied on change, not on every poll: `audioSink` is in *every* `/reconfig`
-  // body, so without the diff this commanded the audio graph about once a second forever.
+  // applied on change, not on every poll: `audioSink` is in every `/reconfig` body, so without
+  // the diff the audio graph is commanded about once a second
   eq('a sink that has not moved is commanded once, not once a poll', calls.filter((c) => c === 'setSpeaker:sink-C').length, 1);
   eq('and the applied latch names it', p.state().appliedSinkId, 'sink-C');
 
-  // Class (c) never renegotiates: a sink change on its own leaves the epoch alone, so nothing
-  // above it in `applyReconfig` fires.
+  // a sink change on its own leaves the epoch alone, so it never renegotiates
   calls.length = 0;
   p.applyReconfig({ epoch: 1, kick: 1, audioSink: 'sink-D' });
   await settle();
@@ -355,9 +344,8 @@ else fail('a kicked page still ran ' + calls.join(', '));
   else fail('an audio-output change rebuilt the session: ' + calls.join(', '));
 }
 
-// ── 11. `null` is "not yet", not a refusal ───────────────────────────────────────────────
-// A sink commanded before the audio graph exists is remembered by audio.js and applied when it
-// does. Reading that as a refusal would open a picker on a device that had not tried anything.
+// 11. `null` is "not yet", not a refusal: a sink commanded before the audio graph exists is
+//     remembered by audio.js and applied when it does.
 {
   const p = makePoller();
   const calls = p.calls;
@@ -369,11 +357,10 @@ else fail('a kicked page still ran ' + calls.join(', '));
 }
 sinkResult = true;
 
-// ── 12. the join id names the session on every request ───────────────────────────────────
-// The host will not resolve a request by the peer's address: an address moves under a live
-// session and is handed to the next device that asks for one. Every session-scoped request
-// therefore carries the id the host minted at `POST /whep`, and a tab that has none names
-// nothing rather than something that happens to be nearby.
+// 12. The join id names the session on every request. The host will not resolve a request by
+//     the peer's address (an address moves under a live session and is handed to the next
+//     device), so every session-scoped request carries the id the host minted at `POST /whep`,
+//     and a tab that has none names nothing.
 {
   const api = makePoller();
   api.setJoinId('0123456789abcdef0123456789abcdef');
@@ -416,20 +403,17 @@ sinkResult = true;
     '11111111222222223333333344444444');
 }
 
-// ── 12. a link that may come back keeps the session ─────────────────────────────────────
-// The owner's report was "when display changes are made, the connected device disappears from
-// my device list, then it reappears". A reconfigure that takes longer than the rebuild deadline
-// ends in `linkLost`, and `linkLost` used to release the join — so the host was told the device
-// had *left*, took the display down, raised `DeviceRemove`, and the reconnect that followed was
-// a brand-new session with a brand-new display and every window shuffled back onto the primary
-// monitor. Only a page that is going away or one the host has kicked releases a join; a lost
-// link is what the disconnect grace exists for.
+// 12. A link that may come back keeps the session. Only a page that is going away, or one the
+//     host has kicked, releases a join. A lost link (including a reconfigure that misses the
+//     rebuild deadline) keeps it: releasing tells the host the device left, so it takes the
+//     display down, raises `DeviceRemove`, and the reconnect is a new session with a new display
+//     and every window back on the primary monitor. The disconnect grace exists for this.
 {
   const calls = [];
   const ctx = vm.createContext({ calls, console });
   vm.runInContext(
     [
-      'let kicked = false; let usingFallback = true;',
+      'let kicked = false; let usingFallback = true; let picturePending = false;',
       'function teardownSession(keepJoin) { calls.push("teardownSession:" + !!keepJoin); }',
       'function showLinkStatus(s) { calls.push("showLinkStatus"); }',
       'function showError(m) { calls.push("showError:" + m); }',
@@ -466,26 +450,24 @@ sinkResult = true;
   else fail('a kick ran ' + calls.join(', '));
 }
 
-// ── 13. one save, two epoch bumps (G04's ledger, item 2) ────────────────────────────────
-// `set_device_override` and then `set_device_adaptive_modes` / `set_device_auto_frame_rate`
-// each bump the epoch. The page stops polling while it rebuilds, so a bump that lands during
-// the rebuild is only seen once the rebuilt stream is live and `onStreamLive` restarts the
-// poll. That poll must act on it — anything else leaves the second change unapplied until
-// some unrelated renegotiation.
+// 13. One save, two epoch bumps. `set_device_override` and then `set_device_adaptive_modes` /
+//     `set_device_auto_frame_rate` each bump the epoch. The page stops polling while it
+//     rebuilds, so a bump that lands during the rebuild is only seen once the rebuilt stream is
+//     live and `onStreamLive` restarts the poll. That poll must act on it, or the second change
+//     stays unapplied until some unrelated renegotiation.
 {
   const p = makePoller();
   response = json({ epoch: 20, kick: 1 });
   await p.startReconfigPoll();
   p.calls.length = 0;
-  // First bump seen: rebuild starts.
   p.applyReconfig({ epoch: 21, kick: 1 });
   if (p.calls.filter((c) => c === 'start:true:true').length === 1) ok('the first bump rebuilds');
   else fail('the first bump ran ' + p.calls.join(', '));
   eq('the rebuild is for epoch', p.state().reconfigEpoch, 21);
-  // While it rebuilds the host bumps again, and nothing polls.
+  // while it rebuilds the host bumps again, and nothing polls
   response = json({ epoch: 22, kick: 1 });
   eq('a tick during the rebuild does nothing', (await p.probeTick(), p.calls.filter((c) => c === 'start:true:true').length), 1);
-  // The rebuilt stream goes live: onStreamLive clears `reconfiguring` and restarts the poll.
+  // the rebuilt stream goes live: onStreamLive clears `reconfiguring` and restarts the poll
   p.setReconfiguring(false);
   p.clearReconfigWatchdog();
   await p.startReconfigPoll();
@@ -499,10 +481,10 @@ sinkResult = true;
   eq('and the page now holds the newer epoch', p.state().reconfigEpoch, 22);
 }
 
-// ── 14. "Choose a speaker on this device…" raises nothing over the live stage ────────────
-// The host operator's request is remembered and answered at the device's next join, before
-// its stream (audio.js `noteOutputChoiceRequest`). Every other value goes through too, since
-// it is what re-arms a later request.
+// 14. "Choose a speaker on this device..." raises nothing over the live stage. The request is
+//     remembered and answered at the device's next join, before its stream (audio.js
+//     `noteOutputChoiceRequest`). Every other value goes through too, since it is what re-arms
+//     a later request.
 {
   const p = makePoller();
   const calls = p.calls;

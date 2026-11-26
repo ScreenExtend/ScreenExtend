@@ -6,32 +6,20 @@ use tokio_stream::StreamExt;
 use super::RUNTIME;
 use crate::driver_ipc::{client::error, Client as AsyncClient, EventCommand, Id, Monitor};
 
-/// Client for interacting with the Virtual Display Driver.
+/// Synchronous wrapper over [AsyncClient], blocking on this module's single-worker tokio runtime.
 ///
-/// Connects via a named pipe to the driver.
-///
-/// You can send changes to the driver and receive continuous events from it.
-///
-/// It is save to clone this client. The connection is shared between all
-/// copies.
-///
-/// This is a synchronous version of [crate::Client]. It uses its own tokio
-/// runtime. This runtime is configured with a single worker thread.
+/// Clones share one connection.
 #[derive(Debug, Clone)]
 pub struct Client(AsyncClient);
 
 impl Client {
-    /// Connect to driver on pipe with default name.
-    ///
-    /// The default name is [crate::DEFAULT_PIPE_NAME].
+    /// Connect on the default pipe name, `DEFAULT_PIPE_NAME`.
     pub fn connect() -> Result<Self, error::ConnectionError> {
         let client = RUNTIME.block_on(AsyncClient::connect())?;
         Ok(Self(client))
     }
 
-    /// Connect to driver on pipe with specified name.
-    ///
-    /// `name` is ONLY the {name} portion of \\.\pipe\{name}.
+    /// Connect on the named pipe. `name` is ONLY the {name} portion of \\.\pipe\{name}.
     pub fn connect_to(name: &str) -> Result<Self, error::ConnectionError> {
         let client = RUNTIME.block_on(AsyncClient::connect_to(name))?;
         Ok(Self(client))
@@ -52,9 +40,7 @@ impl Client {
         RUNTIME.block_on(self.0.remove_all())
     }
 
-    /// Block and receive the next driver event.
-    ///
-    /// Only new events after calling this method will be received.
+    /// Block until the next driver event that arrives after this call.
     pub fn receive_event(&mut self) -> Result<EventCommand, error::ReceiveError> {
         RUNTIME.block_on(async {
             self.0
@@ -65,17 +51,11 @@ impl Client {
         })
     }
 
-    /// Add an event receiver to receive continuous events from the driver.
+    /// Call `cb` for every driver event; the returned object cancels the subscription.
     ///
-    /// Returns an object that can be used to cancel the subscription.
-    ///
-    /// Note: The callback should return as soon as possible. It is called from
-    /// the library's tokio runtime and blocks all other operations. In
-    /// consequence, all other library events will be delayed until the callback
-    /// returns.
-    ///
-    /// Note: If multiple copies of this client exist, the receiver will only be
-    /// closed after all copies are dropped.
+    /// `cb` runs on this module's tokio runtime and blocks every other operation until it
+    /// returns, so it must be quick. The receiver closes only after every copy of this client
+    /// is dropped.
     pub fn add_event_receiver(
         &self,
         cb: impl FnMut(Result<EventCommand, error::ReceiveError>) + Send + panic::UnwindSafe + 'static,
@@ -84,18 +64,14 @@ impl Client {
         EventsSubscription::start_subscriber(cb, stream)
     }
 
-    /// Request the current state of the driver.
-    ///
-    /// Returns [IpcError::Timeout] if the driver does not respond within 5
-    /// seconds.
+    /// Request the current state of the driver; a `Timeout` error if it does not respond within
+    /// 5 seconds.
     pub fn request_state(&self) -> Result<Vec<Monitor>, error::RequestError> {
         RUNTIME.block_on(self.0.request_state())
     }
 
-    /// Write `monitors` to the registry for current user.
-    ///
-    /// Next time the driver is started, it will load this state from the
-    /// registry. This might be after a reboot or a driver restart.
+    /// Write `monitors` to the current user's registry: the driver loads them the next time it
+    /// starts (a reboot or a driver restart).
     pub fn persist(monitors: &[Monitor]) -> Result<(), error::PersistError> {
         AsyncClient::persist(monitors)
     }
@@ -152,63 +128,44 @@ impl EventsSubscription {
         }
     }
 
-    /// Cancel the subscription.
+    /// Cancel the subscription without waiting for the callback.
     ///
-    /// Returns `Ok(true)` if the subscription was not already cancelled.
-    ///
-    /// Returns `Ok(false)` if the subscription was already cancelled.
-    ///
-    /// Returns `Err(e)` if the callback panicked. Any subsequent calls will
-    /// return `Ok(false)`.
-    ///
-    /// Will return immediately. A panic will not be caught if the callback
-    /// panics after calling this method.
+    /// `Ok(true)` if this call cancelled it, `Ok(false)` if it was already cancelled, `Err(e)`
+    /// once if the callback panicked (later calls return `Ok(false)`). A panic in the callback
+    /// after this call is not caught.
     pub fn cancel(&mut self) -> thread::Result<bool> {
         let Some(ref mut rx) = self.result_rx else {
-            // Already cancelled by `cancel_async`
+            // already cancelled by `cancel_async`
             return Ok(false);
         };
 
         match rx.try_recv() {
             Err(oneshot::error::TryRecvError::Empty) => {
-                // Returns error when either buffer is full (buffer size = 1), or
-                // receiver is closed <=> already cancelled
+                // fails if the buffer (size 1) is full or the receiver is closed: already cancelled
                 Ok(self.abort_tx.try_send(()).is_ok())
             }
-            Err(oneshot::error::TryRecvError::Closed) => Ok(false),
-            Ok(e) => Err(e),
+            // the receiver is spent once it has answered: polling it again (`cancel_async`
+            // awaits it) panics inside tokio with "called after complete"
+            Err(oneshot::error::TryRecvError::Closed) => {
+                self.result_rx = None;
+                Ok(false)
+            }
+            Ok(e) => {
+                self.result_rx = None;
+                Err(e)
+            }
         }
     }
 
-    /// Cancel the subscription.
-    ///
-    /// Returns `Ok(true)` if the subscription was not already cancelled.
-    ///
-    /// Returns `Ok(false)` if the subscription was already cancelled.
-    ///
-    /// Returns `Err(e)` if the callback panicked. Any subsequent calls will
-    /// return `Ok(false)`.
-    ///
-    /// This method blocks until the callback either returns or panics.
+    /// [EventsSubscription::cancel], but blocking until the callback either returns or panics.
     pub fn cancel_blocking(&mut self) -> thread::Result<bool> {
         RUNTIME.block_on(self.cancel_async())
     }
 
-    /// Cancel the subscription.
-    ///
-    /// Returns `Ok(true)` if the subscription was not already cancelled.
-    ///
-    /// Returns `Ok(false)` if the subscription was already cancelled.
-    ///
-    /// Returns `Err(e)` if the callback panicked. Any subsequent calls will
-    /// return `Ok(false)`.
-    ///
-    /// This method waits until the callback either returns or panics.
+    /// [EventsSubscription::cancel], but waiting until the callback either returns or panics.
     pub async fn cancel_async(&mut self) -> thread::Result<bool> {
-        // Returns error when either buffer is full (buffer size = 1), or
-        // receiver is closed <=> already cancelled
         let Some(rx) = self.result_rx.take() else {
-            // Already cancelled by `cancel_async`
+            // already cancelled by `cancel_async`
             return Ok(false);
         };
 
@@ -226,7 +183,7 @@ impl Drop for EventsSubscription {
             return;
         };
         // `Ok` is the panic payload the callback sent; `Err` is only "nothing was sent" (the
-        // normal case), which this used to report as a panic on every drop.
+        // normal case), not a panic
         if let Ok(e) = rx.try_recv() {
             teprintln!(
                 "Event receiver panicked, but subscription is dropped without canceling: {:?}",
@@ -268,8 +225,11 @@ mod test {
         client.notify(&[]).unwrap();
         RUNTIME.block_on(server.pump());
 
-        // Give time for the callback to be run
-        sleep(std::time::Duration::from_millis(100));
+        // wait for the callback itself: a fixed sleep loses the race on a loaded machine
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while *call_count.lock().unwrap() == 0 && std::time::Instant::now() < deadline {
+            sleep(std::time::Duration::from_millis(2));
+        }
 
         assert_eq!(*call_count.lock().unwrap(), 1);
     }
@@ -292,7 +252,7 @@ mod test {
         client.notify(&[]).unwrap();
         RUNTIME.block_on(server.pump());
 
-        // Give time for the callback to be run
+        // give the callback time to run
         sleep(std::time::Duration::from_millis(100));
 
         sub1.cancel_blocking().expect_err("Callback should panic");
@@ -302,6 +262,24 @@ mod test {
 
         sub2.cancel().expect_err("Callback should panic");
         assert!(!sub2.cancel().expect("Error should already be handled"));
+    }
+
+    /// The subscriber has already ended when `cancel` is asked again, so the receiver answers
+    /// `Closed`; a later `cancel_async` must not poll that spent receiver.
+    #[test]
+    fn cancelling_after_the_subscriber_ended_does_not_poll_a_spent_receiver() {
+        const PIPE_NAME: &str = "virtualdisplaydriver-sync-cancel_after_end";
+
+        let _server = RUNTIME.block_on(async { MockServer::new(PIPE_NAME) });
+        let client = Client::connect_to(PIPE_NAME).unwrap();
+        let mut sub = client.add_event_receiver(|_| {});
+        assert!(sub.cancel().expect("Callback should not panic"));
+        // let the subscriber task see the abort and drop its sender
+        sleep(std::time::Duration::from_millis(200));
+        assert!(!sub.cancel().expect("Callback should not panic"));
+        assert!(!RUNTIME
+            .block_on(sub.cancel_async())
+            .expect("Callback should not panic"));
     }
 
     #[test]
@@ -323,15 +301,22 @@ mod test {
 
         client.notify(&[]).unwrap();
         RUNTIME.block_on(server.pump());
-        sleep(std::time::Duration::from_millis(100));
+        // wait for the event itself: a fixed sleep loses the race on a loaded machine
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while events.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+            sleep(std::time::Duration::from_millis(2));
+        }
 
         assert!(sub.cancel().expect("Callback should not panic"));
         assert!(!sub.cancel().expect("Callback should not panic"));
         assert!(!sub.cancel().expect("Callback should not panic"));
+        // the subscriber task has ended once this returns, so nothing after it can be delivered
+        RUNTIME
+            .block_on(sub.cancel_async())
+            .expect("Callback should not panic");
 
         client.notify(&[]).unwrap();
         RUNTIME.block_on(server.pump());
-        sleep(std::time::Duration::from_millis(100));
 
         assert!(matches!(
             events.lock().unwrap().as_slice(),

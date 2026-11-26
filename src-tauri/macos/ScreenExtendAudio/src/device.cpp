@@ -105,10 +105,10 @@ void CaptureHandler::OnProcessMixedOutput(const std::shared_ptr<aspl::Stream>& /
     if (ch == kChannels) {
         shm_->Write(frames, frameCount * ch, hostTime);
     } else {
-        // The ring's contract is interleaved stereo — the header says `channels = 2` and the
-        // reader deinterleaves on that basis — so anything else is downmixed here, into scratch
-        // allocated in the constructor. Writing the raw N-channel mix instead would give the
-        // reader channel smear and a writePos advancing N/2 times too fast.
+        // The ring's contract is interleaved stereo (the header says `channels = 2` and the reader
+        // deinterleaves on that basis), so anything else is downmixed here, into scratch allocated
+        // in the constructor. The raw N-channel mix would give the reader channel smear and a
+        // writePos advancing N/2 times too fast.
         const uint32_t n = std::min<uint32_t>(frameCount, kMaxFramesPerCallback);
         for (uint32_t f = 0; f < n; ++f) {
             float l = 0.0f;

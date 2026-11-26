@@ -1,6 +1,5 @@
-// Deliberately the plain-data module and not `@/components/config-provider`: this file is
-// imported under bare `node` by scripts/test-config-editor.mjs, which can strip types but
-// cannot parse JSX or resolve React.
+// the plain-data module, not `@/components/config-provider`: scripts/test-config-editor.mjs
+// imports this file under bare `node`, which strips types but cannot parse JSX or resolve React
 import { DEFAULT_HTTP_PORT, DEFAULT_HTTPS_PORT } from "./config-defaults.ts";
 
 type JsonSchema = Record<string, unknown>;
@@ -34,14 +33,14 @@ const deviceSchema: JsonSchema = {
     ip: str("IP address of the device on the local network. This is what the overrides are matched against when the device rejoins."),
     token: str("Trust token the host minted when this device first joined with the code. Devices with a token skip the code prompt on rejoin. Leave empty for devices that predate tokens."),
     name: str("Display name reported by the device. Saved entries normally leave this empty and take the name the device reports when it joins."),
-    scale: int("Display scale in percent — the DPI scaling Windows/macOS applies to the virtual display. 100 is 1:1.", 25, 200, 100),
+    scale: int("Display scale in percent: the DPI scaling Windows/macOS applies to the virtual display. 100 is 1:1.", 25, 200, 100),
     orientation: {
       type: "string",
       description: "Orientation of the virtual display created for this device.",
       enum: ["Portrait", "Landscape"],
       enumDescriptions: [
-        "Taller than wide — phones held upright.",
-        "Wider than tall — tablets and laptops.",
+        "Taller than wide: phones held upright.",
+        "Wider than tall: tablets and laptops.",
       ],
       default: "Landscape",
     },
@@ -54,7 +53,7 @@ const deviceSchema: JsonSchema = {
       description: "How far this device's pointer may travel when it has taken pointer lock. Only meaningful when remoteControl is on.",
       enum: ["display", "all"],
       enumDescriptions: [
-        "Clamp the cursor to the display created for this device — it cannot reach a monitor the device's user cannot see.",
+        "Clamp the cursor to the display created for this device. It cannot reach a monitor the device's user cannot see.",
         "Clamp to the union of every attached display, so the cursor can cross onto the host's own monitors. The default, and what dragging a window back off the virtual display needs.",
       ],
       default: "all",
@@ -77,7 +76,7 @@ const deviceSchema: JsonSchema = {
     },
     maxDpr: {
       type: "number",
-      description: "Highest device pixel ratio this device reported it can display. Reported by the client — changing it by hand has no effect beyond capping dpr.",
+      description: "Highest device pixel ratio this device reported it can display. Reported by the client: changing it by hand has no effect beyond capping dpr.",
       minimum: 1,
       maximum: 4,
       default: 1,
@@ -165,7 +164,7 @@ export const configJsonSchema: JsonSchema = {
       maximum: 2,
       default: 1,
     },
-    disableGpuEncode: bool("Force CPU-only (software) H.264 encoding instead of the GPU encoder. Not recommended — it raises CPU usage and can cost quality or frame rate.", false),
+    disableGpuEncode: bool("Force CPU-only (software) H.264 encoding instead of the GPU encoder. Not recommended: it raises CPU usage and can cost quality or frame rate.", false),
     legacyVolumeKeyProxy: bool("macOS 10.15-12.x only. Keeps the hardware volume keys working while the ScreenExtend virtual audio device is the system output.", false),
     walkthroughCompleted: bool("Whether the onboarding walkthrough has been finished. Set this to false to see it again on the next launch.", false),
     disconnectGraceSecs: int("How long a device's virtual display survives after it drops off, in seconds. 0 removes the display immediately; the host clamps this to 0-600.", 0, 600, 10),
@@ -241,10 +240,9 @@ export const configJsonSchema: JsonSchema = {
   },
 };
 
-// Every value in config.json worth hiding from a shoulder or a screen share. Paths are the
-// ones `scanJson` produces, with `[]` standing for any array index. It lives beside the
-// schema rather than in the editor component so the node test can check it against a real
-// config without loading React.
+// Values to hide from a shoulder or a screen share. Paths are the ones `scanJson` produces,
+// with `[]` standing for any array index. Lives here, not in the editor component, so the
+// node test can load it without React.
 export const MASKED_CONFIG_PATHS = [
   "hostedNetworkCredentials.password",
   "devices[].token",
@@ -255,12 +253,8 @@ export const MASKED_CONFIG_PATHS = [
 export interface ConfigError {
   path: string;
   message: string;
-  // A key the schema does not name is reported but does not stop a save. `config.json` is
-  // written by three parties -- this editor, `ScreenExtend config set <dotted.key>`, and
-  // whichever version of the app last ran -- and `readStore` drops any key that is not in
-  // `defaultConfig` on the way in, so an unrecognised key is inert rather than harmful.
-  // Refusing to write the whole document because of one made the editor unusable after a
-  // key was added to the config type and not to this schema.
+  // an unknown key is a warning and does not stop a save: config.json has other writers
+  // (`ScreenExtend config set`, older app versions) and `readStore` drops keys it does not know
   severity: "error" | "warning";
 }
 
@@ -380,8 +374,8 @@ export function validateConfig(
 ): ConfigError[] {
   const errors: ConfigError[] = [];
   walk(configJsonSchema, value, "", errors);
-  // Only a real error means the shape below cannot be indexed into; an unknown key is a
-  // warning and must not suppress the cross-field checks that follow it.
+  // only a real error makes the shape below unsafe to index: a warning must not suppress
+  // the cross-field checks
   if (blockingErrors(errors).length > 0) return errors;
 
   const config = value as {
@@ -408,9 +402,8 @@ export function validateConfig(
     });
   }
 
-  // Two rows for one device is the shape that makes a setting silently unreachable: whichever
-  // the host replays last wins and the other is dead weight. The identity is the token; a row
-  // written before tokens existed names only its address, so that is what it is checked by.
+  // two rows for one device make a setting silently unreachable (the host's last replay wins).
+  // Identity is the token; a row written before tokens existed is checked by its address.
   const seen = new Set<string>();
   config.devices.forEach((device, i) => {
     const key = device.token ? `token:${device.token}` : `ip:${device.ip}`;

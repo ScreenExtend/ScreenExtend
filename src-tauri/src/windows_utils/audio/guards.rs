@@ -8,11 +8,8 @@ use windows::Win32::System::Threading::{
     WaitForSingleObject,
 };
 
-/// Owns a `WAVEFORMATEX` that `IAudioClient::GetMixFormat` allocated with `CoTaskMemAlloc`.
-///
-/// Every early return between the `GetMixFormat` and the matching `CoTaskMemFree` used to leak
-/// it — and `acquire` sits on a 200 ms retry loop, so a format the parser rejects leaked about
-/// five times a second for as long as the condition lasted.
+/// Owns a `WAVEFORMATEX` that `IAudioClient::GetMixFormat` allocated with `CoTaskMemAlloc`, so
+/// an early return cannot leak it (`acquire` retries every 200 ms).
 pub struct MixFormatPtr(*mut WAVEFORMATEX);
 
 impl MixFormatPtr {
@@ -38,11 +35,11 @@ impl Drop for MixFormatPtr {
 
 /// The MTA the WASAPI threads run in.
 ///
-/// Both call sites — the MMCSS "Pro Audio" capture thread and the silent render companion — are
-/// threads this crate spawned itself, so they are the one kind that may initialize COM. It still
-/// goes through `windows_utils::com`, which asks `CoGetApartmentType` first: if a future caller
-/// ever reaches this from a Tauri thread the guard becomes inert rather than either failing with
-/// `RPC_E_CHANGED_MODE` or, worse, uninitializing an apartment it never took.
+/// Both callers (the MMCSS "Pro Audio" capture thread and the silent render companion) are
+/// threads this crate spawned, the one kind that may initialize COM. It still goes through
+/// `windows_utils::com`, which asks `CoGetApartmentType` first: on a Tauri thread the guard is
+/// inert instead of failing with `RPC_E_CHANGED_MODE` or uninitializing an apartment it never
+/// took.
 pub struct ComGuard(crate::windows_utils::com::ComScope);
 
 impl ComGuard {
@@ -55,6 +52,13 @@ impl ComGuard {
 }
 
 pub struct EventHandle(HANDLE);
+
+// SAFETY: a Win32 event handle is a process-wide kernel object reference; `SetEvent`,
+// `WaitForSingleObject` and `CloseHandle` may be called on it from any thread. Sharers (the
+// process-loopback completion handler) hold it through an `Arc`, so it stays open until the last
+// one lets go.
+unsafe impl Send for EventHandle {}
+unsafe impl Sync for EventHandle {}
 
 impl EventHandle {
     pub fn new_auto_reset() -> Result<Self> {

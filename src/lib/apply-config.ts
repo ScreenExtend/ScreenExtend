@@ -71,10 +71,8 @@ export async function applyConfig(config: Config): Promise<Config> {
   );
 
   for (const device of applied.devices) {
-    // Settings belong to the device, and a device is its token. A row saved before tokens
-    // existed names only an address, and an address is handed on to the next machine that
-    // asks for one — so it waits for that device to join once more rather than being
-    // replayed onto whoever is there now.
+    // a row saved before tokens existed names only an address, which is recycled between
+    // machines: never replay it onto whoever holds that address now
     if (!device.token) continue;
     await at(`devices[${device.token}]`, async () => {
       await commands.setDeviceOverride(
@@ -88,8 +86,7 @@ export async function applyConfig(config: Config): Promise<Config> {
         device.dpr,
         device.systemAudio
       );
-      // Their own commands rather than `setDeviceOverride` arguments: that one is at
-      // specta's ten-parameter ceiling.
+      // separate commands: setDeviceOverride is at specta's ten-parameter ceiling
       await commands.setDevicePointerScope(device.token, device.pointerScope ?? DEFAULT_POINTER_SCOPE);
       await commands.setDeviceAutoFrameRate(
         device.token,

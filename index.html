@@ -17,20 +17,15 @@
          style-src) rather than from a rule. -->
     <script>
       (function () {
-        // The two literal values of `--background` in src/index.css (`:root` and `.dark`).
-        // The stylesheet that defines the token is render-blocking and 50 KB, so until it
-        // arrives the window paints the WebView's default white canvas in both themes.
-        // Only `html` is painted: `body` takes `bg-background` from the stylesheet and
-        // covers the viewport, so this never competes with the token. Keep the two values
-        // in step with src/index.css. No `color-scheme` -- that would also restyle the
-        // native form controls.
+        // the two values of `--background` in src/index.css (`:root`, `.dark`); keep them in step.
+        // Until that render-blocking 50 KB stylesheet arrives the WebView paints white in both
+        // themes. Only `html` is painted (`body` covers it once styled). No `color-scheme`: it
+        // would also restyle the native form controls
         var LIGHT = "hsl(0 0% 100%)";
         var DARK = "hsl(222.2 84% 4.9%)";
         try {
-          // The user's choice lives in tauri-plugin-store's config.json, which is read
-          // asynchronously over IPC; `se-theme` is a synchronous paint hint written by
-          // ThemeProvider, not a second source of truth. Without it a user on a dark OS
-          // who picked light sees a dark frame until the store round-trips.
+          // `se-theme` is a synchronous paint hint written by ThemeProvider, not a second source
+          // of truth: the real choice is in config.json, which is read asynchronously over IPC
           var stored = null;
           try { stored = window.localStorage.getItem("se-theme"); } catch (e) {}
           var resolved =
@@ -59,26 +54,23 @@
         return !!node.closest(selector);
       }
 
-      // Text fields keep their menu: suppressing it everywhere took cut/copy/paste and
-      // spellcheck off every input in the app and replaced them with nothing.
+      // text fields keep their menu: it is their cut/copy/paste and spellcheck UI
       document.addEventListener("contextmenu", function (event) {
         if (within(event.target, editable)) return;
         event.preventDefault();
       });
 
-      // Only modified clicks on links: those are the ones a webview may answer by opening
-      // a window the app cannot manage. Alt+click is Monaco's multi-cursor, Ctrl/Cmd+click
-      // is add-cursor and go-to-definition, and Shift+click is range-extend for text and
-      // list selection -- all of which the old document-wide guard swallowed.
+      // only modified clicks on links: a webview may answer those by opening a window the app
+      // cannot manage. Anywhere else the modifiers belong to Monaco (multi-cursor,
+      // go-to-definition) and to range selection
       document.addEventListener("click", function (event) {
         if (!(event.ctrlKey || event.metaKey || event.shiftKey || event.altKey)) return;
         if (!within(event.target, "a[href]")) return;
         event.preventDefault();
       });
 
-      // Reload throws away every piece of in-memory state (the router is a memory router)
-      // and re-runs setup. `metaKey` matters most on macOS, whose WKWebView is the one
-      // likeliest to honour Cmd+R.
+      // a reload drops all in-memory state (the router is a memory router) and re-runs setup.
+      // `metaKey` for macOS: WKWebView is the webview likeliest to honour Cmd+R
       document.addEventListener("keydown", function (event) {
         var reload =
           event.key === "F5" ||
@@ -86,7 +78,7 @@
         if (reload) event.preventDefault();
       });
 
-      // A file dropped on the window would otherwise navigate away from the app.
+      // a dropped file would otherwise navigate the window away from the app
       document.addEventListener("dragover", function (event) { event.preventDefault(); });
       document.addEventListener("drop", function (event) { event.preventDefault(); });
       })();

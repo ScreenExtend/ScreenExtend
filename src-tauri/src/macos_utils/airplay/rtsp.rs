@@ -1,12 +1,9 @@
 //! The RTSP/HTTP control socket.
 //!
-//! AirPlay senders speak two protocol tokens down one connection: `RTSP/1.0`
-//! for the mirroring verbs and `HTTP/1.1` for the (unused here) video/HLS ones.
-//! `hyper` can neither parse nor emit `RTSP/1.0` — its parser rejects the
-//! version token and its encoder can only write `HTTP/1.x` status lines — so
-//! axum is not an option and this is a plain `TcpListener` with a hand-rolled
-//! line protocol. `httparse` does the header grind after a four-byte swap of
-//! the version token; the original token is remembered and echoed back.
+//! AirPlay senders speak `RTSP/1.0` (mirroring verbs) and `HTTP/1.1` (video/HLS, unused here)
+//! down one connection. `hyper` can neither parse nor emit `RTSP/1.0`, so this is a plain
+//! `TcpListener` with a hand-rolled line protocol: `httparse` reads the head after a swap of
+//! the version token, and the original token is echoed back.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -14,8 +11,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-/// Ceiling on a single request's headers, mirroring what the reference
-/// receivers cap at. Anything larger is a malformed or hostile peer.
+/// Ceiling on one request's headers, the cap the reference receivers use.
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 /// Ceiling on a request body. The largest legitimate one is a SETUP plist of a
 /// few kilobytes.
@@ -145,11 +141,8 @@ pub async fn read_request(
     stream: &mut TcpStream,
     buf: &mut Vec<u8>,
 ) -> Result<ReadOutcome, String> {
-    // Where the CRLFCRLF scan has already looked. Restarting it from zero on
-    // every read makes a head that arrives in N chunks cost O(N^2) byte
-    // comparisons — at the 64 KiB ceiling, sixteen rescans of up to 64 KiB for
-    // one request. Only the last three bytes of what has been scanned can be
-    // part of a boundary that straddles a read.
+    // where the CRLFCRLF scan has already looked, so a head arriving in N chunks is
+    // not O(N^2); only the last three scanned bytes can belong to a straddling boundary
     let mut searched = 0usize;
     let head_len = loop {
         if let Some(n) = find_head_end(buf, searched) {
@@ -173,8 +166,8 @@ pub async fn read_request(
         buf.extend_from_slice(&chunk[..n]);
     };
 
-    // httparse only accepts HTTP/1.x on the request line. Swap the version
-    // token in a scratch copy of the head and remember which one arrived.
+    // httparse only accepts HTTP/1.x on the request line: swap the version
+    // token in a scratch copy of the head
     let mut head = buf[..head_len].to_vec();
     let proto = normalize_version(&mut head)?;
 
@@ -270,7 +263,7 @@ fn find_head_end(buf: &[u8], from: usize) -> Option<usize> {
 }
 
 /// Rewrites an `RTSP/1.0` version token to `HTTP/1.1` in place so `httparse`
-/// will accept the request line. Only the first line is touched — a body can
+/// will accept the request line. Only the first line is touched: a body can
 /// legitimately contain the same bytes.
 fn normalize_version(head: &mut [u8]) -> Result<Proto, String> {
     let eol = head
@@ -288,9 +281,8 @@ fn normalize_version(head: &mut [u8]) -> Result<Proto, String> {
     }
 }
 
-/// How long a control connection may sit idle before we treat the sender as
-/// gone. The sender polls `POST /feedback` every ~2 s, so anything past this is
-/// a dead session.
+/// How long a control connection may sit idle before the sender is treated as
+/// gone. The sender polls `POST /feedback` every ~2 s.
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[cfg(test)]
@@ -317,8 +309,7 @@ mod tests {
 
     #[test]
     fn a_body_containing_the_token_is_not_rewritten() {
-        // The swap must be bounded to the request line: fp-setup and plist
-        // bodies are binary and can contain anything.
+        // the swap is bounded to the request line: fp-setup and plist bodies are binary
         let mut h = head("POST /fp-setup HTTP/1.1\r\nX: RTSP/1.0\r\n\r\n");
         assert_eq!(normalize_version(&mut h).unwrap(), Proto::Http);
         assert!(h.ends_with(b"X: RTSP/1.0\r\n\r\n"));
@@ -342,13 +333,11 @@ mod tests {
 
     #[test]
     fn resuming_the_scan_still_sees_a_straddling_boundary() {
-        // The boundary sits at 16..20, so a resume that started at 20 would
-        // miss it. `read_request` resumes three bytes back for exactly this.
+        // `read_request` resumes three bytes back so a boundary straddling a read is still seen
         let buf = b"GET / HTTP/1.1\r\nA\r\n\r\nbody";
         let split = buf.len() - 8;
         assert_eq!(find_head_end(buf, 0), Some(21));
         assert_eq!(find_head_end(buf, split.saturating_sub(3)), Some(21));
-        // Past the boundary there is nothing left to find.
         assert_eq!(find_head_end(buf, 21), None);
     }
 }

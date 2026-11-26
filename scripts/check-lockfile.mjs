@@ -1,17 +1,13 @@
 #!/usr/bin/env node
-// A package whose real payload is a native binary ships one npm package per platform and
-// lists them all as `optionalDependencies`; npm and pnpm then install the one that matches.
-// @tauri-apps/cli, esbuild and rollup are all built that way. If the lockfile records the
-// parent without its optional list, `pnpm install --frozen-lockfile` on a fresh clone
-// installs a JS shim with no binary behind it and `pnpm tauri` dies at require() time --
-// while the machine that produced the lockfile keeps working, because its store still holds
-// the platform package from an earlier install. That is exactly how 9a181cb shipped: a
-// lockfile "refresh" dropped all eleven @tauri-apps/cli-* entries and nothing noticed for
-// two days.
+// A package whose payload is a native binary (@tauri-apps/cli, esbuild, rollup) ships one npm
+// package per platform, listed as `optionalDependencies`. If the lockfile records the parent
+// without that list, `pnpm install --frozen-lockfile` on a fresh clone installs a JS shim with
+// no binary and `pnpm tauri` dies at require(), while the machine that wrote the lockfile
+// keeps working off its store.
 //
-// So: for every package actually installed under node_modules/.pnpm, read its own
-// package.json, and assert that every name it declares in optionalDependencies is recorded
-// in the lockfile snapshot for that package. Runs after `pnpm install --frozen-lockfile`.
+// Checks every package installed under node_modules/.pnpm: each name its package.json declares
+// in optionalDependencies must be in the lockfile snapshot for that package. Run after
+// `pnpm install --frozen-lockfile`.
 
 import { readFileSync, readdirSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -20,9 +16,8 @@ import { dirname, join } from "node:path";
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const virtualStore = join(root, "node_modules", ".pnpm");
 
-// Optional deps a registry cannot serve (yanked, or published for a platform the parent
-// still lists). Each entry is "<parent name>@<version> -> <optional dep name>" and needs a
-// reason, because the alternative reading of a missing entry is the bug above.
+// optional deps a registry cannot serve (yanked, or published for a platform the parent
+// still lists). Each entry is "<parent name>@<version> -> <optional dep name>" and needs a reason
 const KNOWN_ABSENT = new Set([]);
 
 if (!existsSync(virtualStore)) {
@@ -32,9 +27,8 @@ if (!existsSync(virtualStore)) {
   process.exit(1);
 }
 
-// pnpm writes this file itself, so its shape is fixed: two-space entries under a
-// column-zero section header, four-space keys inside an entry, six-space leaf values.
-// That is enough structure to read without a YAML dependency.
+// pnpm writes the lockfile, so its shape is fixed: two-space entries under a column-zero
+// section header, four-space keys inside an entry, six-space leaf values. No YAML parser needed
 function readSnapshotOptionalDeps(lockfileText) {
   const byId = new Map();
   let inSnapshots = false;
@@ -69,9 +63,8 @@ function readSnapshotOptionalDeps(lockfileText) {
   return byId;
 }
 
-// "@tauri-apps+cli@2.6.2" -> { name: "@tauri-apps/cli", version: "2.6.2" }, and the peer
-// suffix pnpm appends for a package resolved against several peer sets is dropped: the
-// optional list does not vary with peers.
+// "@tauri-apps+cli@2.6.2" -> { name: "@tauri-apps/cli", version: "2.6.2" }. pnpm's peer suffix
+// is dropped: the optional list does not vary with peers
 function parseStoreDir(dir) {
   const withoutPeers = dir.replace(/\(.*$/, "").replace(/_[a-f0-9]{40,}$/, "");
   const at = withoutPeers.lastIndexOf("@");
@@ -84,8 +77,8 @@ function parseStoreDir(dir) {
 
 const snapshots = readSnapshotOptionalDeps(readFileSync(join(root, "pnpm-lock.yaml"), "utf8"));
 
-// A snapshot id carries the same peer suffix the store dir does; index by the bare
-// name@version so a lookup does not have to reproduce pnpm's suffix spelling.
+// snapshot ids carry the peer suffix too; index by bare name@version so lookups need not
+// reproduce it
 const snapshotsByBareId = new Map();
 for (const [id, optional] of snapshots) {
   const bare = id.replace(/\(.*$/, "");

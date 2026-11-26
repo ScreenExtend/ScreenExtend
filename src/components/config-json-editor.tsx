@@ -288,10 +288,8 @@ export function ConfigJsonEditor({
         );
         return;
       }
-      // A key the schema does not name does not stop the save: `readStore` drops any key
-      // that is not in `defaultConfig` on the way back in, so it is inert, and a document
-      // that cannot be written at all is the worse failure. The user sees it go: `adopt`
-      // below replaces the text with what the store actually kept.
+      // an unknown key does not stop the save: `readStore` drops any key not in
+      // `defaultConfig` on the way back in, and `adopt` below shows what the store kept
       for (const warning of found) console.warn("config.json: " + warning.message);
 
       const applied = await applyConfig(parsed as Config);

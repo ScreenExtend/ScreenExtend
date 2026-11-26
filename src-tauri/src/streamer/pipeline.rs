@@ -5,6 +5,11 @@ pub use crate::windows_utils::streamer::pipeline::{
 };
 
 #[cfg(target_os = "windows")]
+pub use crate::windows_utils::streamer::pipeline::{
+    start_on_display_deferred, start_on_display_while,
+};
+
+#[cfg(target_os = "windows")]
 #[allow(unused_imports)]
 pub use crate::windows_utils::streamer::capture::{
     monitor_device_names, monitor_dimensions, monitor_dimensions_owned, monitor_rect,

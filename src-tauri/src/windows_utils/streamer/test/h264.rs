@@ -1,8 +1,8 @@
 //! Annex-B walking and just enough SPS parsing to assert what an encoder actually emitted.
 //!
-//! Asserting "SPS + PPS + IDR are present" is satisfied by a stream no browser can decode —
-//! that is how `blocker-x264-bgra-input-emits-444-stream` passed its own test for months. The
-//! decoded `profile_idc` / `chroma_format_idc` are what make the assertion mean something.
+//! Asserting "SPS + PPS + IDR are present" is satisfied by a stream no browser can decode
+//! (x264 fed BGRA emits 4:4:4). The decoded `profile_idc` / `chroma_format_idc` are what make
+//! the assertion mean something.
 
 /// `(nal_type, payload_len)` for every NAL in an Annex-B access unit.
 pub(crate) fn nal_units(au: &[u8]) -> Vec<(u8, usize)> {
@@ -55,7 +55,7 @@ pub(crate) fn is_idr_with_headers(au: &[u8]) -> bool {
 pub(crate) struct Sps {
     pub profile_idc: u8,
     pub level_idc: u8,
-    /// 1 for 4:2:0 — either decoded from the bitstream or the standard's default for a profile
+    /// 1 for 4:2:0: either decoded from the bitstream or the standard's default for a profile
     /// that does not carry the field.
     pub chroma_format_idc: u32,
     pub max_num_ref_frames: u32,
@@ -235,6 +235,36 @@ fn skip_scaling_list(r: &mut BitReader, size: usize) -> Option<()> {
     Some(())
 }
 
+/// The first `n` ue(v) fields of a NAL payload (header byte excluded): `pic_parameter_set_id`
+/// and `seq_parameter_set_id` of a PPS, or `first_mb_in_slice`, `slice_type` and
+/// `pic_parameter_set_id` of a slice.
+pub(crate) fn leading_ues(payload: &[u8], n: usize) -> Option<Vec<u32>> {
+    let rbsp = unescape(&payload[..payload.len().min(16)]);
+    let mut pos = 0usize;
+    let bit = |pos: &mut usize| -> Option<u32> {
+        let b = *rbsp.get(*pos / 8)?;
+        let v = (b >> (7 - (*pos % 8))) & 1;
+        *pos += 1;
+        Some(u32::from(v))
+    };
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let mut zeros = 0;
+        while bit(&mut pos)? == 0 {
+            zeros += 1;
+            if zeros > 31 {
+                return None;
+            }
+        }
+        let mut v = 0u32;
+        for _ in 0..zeros {
+            v = (v << 1) | bit(&mut pos)?;
+        }
+        out.push((1u32 << zeros) - 1 + v);
+    }
+    Some(out)
+}
+
 /// Strip H.264 emulation-prevention bytes (`00 00 03` -> `00 00`).
 fn unescape(nal: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(nal.len());
@@ -300,7 +330,7 @@ impl<'a> BitReader<'a> {
 
 #[test]
 fn sps_parser_decodes_a_known_baseline_sps() {
-    // 1280x720 constrained-baseline SPS+PPS emitted by libx264, captured verbatim.
+    // 1280x720 constrained-baseline SPS+PPS emitted by libx264, captured verbatim
     let au: &[u8] = &[
         0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0xc0, 0x1f, 0xd9, 0x00, 0x50, 0x05, 0xbb, 0x01, 0x6a,
         0x02, 0x02, 0x02, 0x80, 0x00, 0x00, 0x03, 0x00, 0x80, 0x00, 0x00, 0x1e, 0x07, 0x8c, 0x18,
@@ -310,6 +340,18 @@ fn sps_parser_decodes_a_known_baseline_sps() {
     assert_eq!(sps.profile_idc, 66, "constrained baseline");
     assert_eq!(sps.chroma_format_idc, 1, "4:2:0 default for baseline");
     assert!(sps.vui_present);
+}
+
+#[test]
+fn leading_ues_reads_pps_and_slice_ids() {
+    // PPS: id 2 (011), sps id 0 (1)
+    assert_eq!(leading_ues(&[0b0111_0000], 2), Some(vec![2, 0]));
+    // slice: first_mb 0 (1), slice_type 7 (0001000), pps id 4 (00101)
+    assert_eq!(
+        leading_ues(&[0b1000_1000, 0b0010_1000], 3),
+        Some(vec![0, 7, 4])
+    );
+    assert_eq!(leading_ues(&[0], 1), None);
 }
 
 #[test]

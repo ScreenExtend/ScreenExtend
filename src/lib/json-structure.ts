@@ -27,10 +27,7 @@ export interface MaskedSpan {
 
 const ARRAY_INDEX = /\[\d+\]/g;
 
-// `devices[].token` matches `devices[0].token` and `devices[7].token`. Written as a
-// separate function because it is the half of the masking that is worth testing: it
-// decides which characters get covered, and covering one column too many is how a masked
-// value turns into a line that renders as nothing at all.
+// `devices[].token` matches `devices[0].token` and `devices[7].token`
 export const isMaskedPath = (path: string, patterns: string[]): boolean =>
   patterns.includes(path) || patterns.includes(path.replace(ARRAY_INDEX, "[]"));
 
@@ -41,7 +38,7 @@ export function maskedSpans(structure: JsonStructure, patterns: string[]): Maske
     .map(value => ({
       path: value.path,
       line: value.line,
-      // scanJson reports the span including both quotes; the mask covers the contents.
+      // scanJson's span includes both quotes; the mask covers the contents
       startColumn: value.startColumn + 1,
       endColumn: value.endColumn - 1,
     }))

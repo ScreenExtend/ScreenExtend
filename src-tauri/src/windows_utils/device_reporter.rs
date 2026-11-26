@@ -3,6 +3,7 @@ use std::sync::Arc;
 use tauri::AppHandle;
 use tauri_specta::Event;
 
+use crate::streamer::lock::LockExt;
 use crate::streamer::session::{
     AudioOutputsReport, DeviceInfo, DeviceReporter, SharedDeviceOverrides,
 };
@@ -28,9 +29,19 @@ impl TauriDeviceReporter {
     ///
     /// Settings are the device's, not the join's: two tabs of one browser read the same row.
     fn row(&self, info: DeviceInfo) -> Device {
+        device_row(&self.overrides, info)
+    }
+}
+
+/// [`TauriDeviceReporter::row`], without the app handle it does not need.
+///
+/// The overrides map is shared by every adapter's server, so it is taken with `lock_recover`: a
+/// poisoned lock would fail every later join with a 500 and nothing in the log to say why.
+fn device_row(overrides: &SharedDeviceOverrides, info: DeviceInfo) -> Device {
+    {
         let token = info.token.clone();
         let mut device = Device::defaults(info);
-        if let Some(o) = self.overrides.lock().unwrap().get(&token) {
+        if let Some(o) = overrides.lock_recover().get(&token) {
             device.scale = o.scale;
             device.refresh_rate = o.refresh_rate;
             device.video_scale = o.video_scale;
@@ -50,10 +61,8 @@ impl TauriDeviceReporter {
 
 impl DeviceReporter for TauriDeviceReporter {
     fn report_join(&self, info: DeviceInfo) {
-        // What the dashboard is being told, on the record. A display change must move a row, not
-        // remove it and put a new one back, and this is the only place that question can be
-        // answered without the desktop UI in front of you — `serve` builds the same reporter, so
-        // a headless run says exactly what the app's device list would have done.
+        // logged because `serve` builds the same reporter: a headless run then shows whether a
+        // display change moved the row or removed it and put a new one back
         tprintln!(
             "[dashboard] device joined: join={} token={} ({})",
             info.join_id,
@@ -118,5 +127,37 @@ impl DeviceReporter for TauriDeviceReporter {
         if let Err(e) = ev.emit(&self.app) {
             teprintln!("[device-reporter] emit DeviceAudioOutputs failed: {e:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::streamer::session::DeviceOverride;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    #[test]
+    fn a_poisoned_overrides_map_still_reports_the_device() {
+        let overrides: SharedDeviceOverrides = Arc::new(Mutex::new(HashMap::new()));
+        let mut saved = DeviceOverride::join_defaults();
+        saved.refresh_rate = 120;
+        overrides.lock_recover().insert("tok".to_string(), saved);
+        let poisoner = overrides.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison the overrides map");
+        })
+        .join();
+        assert!(overrides.is_poisoned());
+
+        let row = device_row(
+            &overrides,
+            DeviceInfo {
+                token: "tok".to_string(),
+                ..DeviceInfo::default()
+            },
+        );
+        assert_eq!(row.refresh_rate, 120);
     }
 }

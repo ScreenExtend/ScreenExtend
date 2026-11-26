@@ -25,7 +25,6 @@ dist-ssr
 
 # Local scratch and tool state
 testwaior - Copy/
-.claude/
 
 # Code-signing private key material
 self-signed-cert.pem
@@ -33,9 +32,6 @@ self-signed-key.pem
 
 # Temporary docs
 linux-vdd/
-
-# Hardening audit log
-AUDIT.md
 
 # Personal git workflow
 SSH-GIT.md
@@ -47,11 +43,16 @@ src-tauri/tools/amf_layout_generated.txt
 src-tauri/tools/amf_layout_cpp_check.txt
 src-tauri/tools/nvenc_layout_generated.txt
 
-# Scratch files that are never part of a build
-.agents/
-skills-lock.json
-PLAN.md
-PROMPT.md
-
 # Built by src-tauri/macos/ScreenExtendAudio/scripts/release.sh
 src-tauri/resources/ScreenExtendAudio.pkg
+
+# Local working notes, kept out of the repository
+docs/
+guides/
+TEST.md
+TEST-GUIDE.md
+TEST-WORKFLOW.md
+FUTURE-TEST-WORKFLOW.md
+SQUASH.md
+src-tauri/src/windows_utils/streamer/amd.md
+src-tauri/src/windows_utils/streamer/intel.md

@@ -1,13 +1,11 @@
-// The self-test opens a TLS connection to a server presenting a runtime-generated self-signed
-// certificate, so it carries a verifier that accepts any chain. That must never be linked into
-// a shipping binary, hence the feature gate: it exists under `cargo test` and under
-// `--features probe`, and nowhere else.
+// carries a TLS verifier that accepts any chain (the server's cert is self-signed), so it
+// must never be linked into a shipping binary: `cargo test` and `--features probe` only
 #[cfg(any(test, feature = "probe"))]
 pub mod whep_selftest;
 
 #[cfg(test)]
 mod bitrate;
 
-// Counts UDP descriptors through `/dev/fd` and `getsockname`, which Windows has neither of.
-#[cfg(all(test, target_os = "macos"))]
+// counts UDP sockets via /dev/fd on macOS and the per-owner socket table on Windows
+#[cfg(all(test, any(target_os = "macos", windows)))]
 mod session_leak;

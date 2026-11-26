@@ -32,31 +32,23 @@
             typeof window.AudioDecoder === 'function' &&
             typeof window.EncodedAudioChunk === 'function' &&
             typeof window.AudioData === 'function';
-        // A property of this build, not of the browser: audio-worker.js can split a
-        // FLAG_REDUNDANT body. The host will not set the flag unless it is told this, because
-        // a client that cannot split it would decode the two payloads as one packet.
+        // `redundancy` is a property of this build: audio-worker.js can split a FLAG_REDUNDANT
+        // body. The host sets the flag only when told so, because a client that cannot split
+        // decodes the two payloads as one packet.
         return { webcodecsOpus, worklet, redundancy: true };
     }
 
-    // The constructor sniff above is not enough on its own. Safari 26 and Firefox 130 have
-    // only just shipped AudioDecoder, and the host reads this answer once: claim the fast
-    // path and it sends Opus on a DataChannel with no audio track in the SDP at all, so a
-    // decoder that then refuses `opus` is permanent silence with no way back.
-    // A CELT-only, mono, fullband 20 ms Opus frame: TOC 0xf8 is config 31, stereo bit clear,
-    // frame-count code 0. Small enough to inline and enough of a packet to make a decoder
-    // produce an AudioData that copyTo can be asked to convert.
+    // The host reads the capability answer once: on the fast path it sends Opus on a DataChannel
+    // with no audio track in the SDP, so a decoder that then refuses `opus` is permanent silence.
+    // Hence a real decode probe; AudioDecoder is new in Safari 26 and Firefox 130.
+    // Probe: a CELT-only mono fullband 20 ms frame, TOC 0xf8 (config 31, stereo clear, code 0).
     const OPUS_PROBE = new Uint8Array([0xf8, 0xff, 0xfe]);
     const DECODE_PROBE_DEADLINE_MS = 400;
 
-    // isConfigSupported answers about a configuration, not about the call that actually moves
-    // the samples. AudioData.copyTo is what deinterleaves into the ring, and an engine that
-    // says yes to `opus` and then refuses the f32-planar conversion drops every packet.
-    //
-    // Deliberately asymmetric about what counts as a refusal: only a decoder that *produced*
-    // an AudioData whose copyTo threw, or one that could not be configured at all, demotes.
-    // A decoder error or no output within the deadline is inconclusive — the probe packet
-    // itself would then be the suspect, and a wrong verdict here disables the fast audio path
-    // on every browser at once. The per-packet counter in audio-worker.js is the net for that.
+    // isConfigSupported says nothing about AudioData.copyTo, which deinterleaves into the ring: an
+    // engine that accepts `opus` and refuses the f32-planar conversion drops every packet. Only a
+    // failed copyTo or configure demotes. A decoder error or a timeout is inconclusive (the probe
+    // packet may be at fault); the per-packet counter in audio-worker.js catches that.
     function probeOpusDecode() {
         return new Promise(function (resolve) {
             let dec = null;
@@ -116,17 +108,11 @@
                 note();
             }
         }
-        // Says the answer above came from probing a decoder rather than from reading three
-        // constructor names off `window`. The host logs it per join, which is what makes a
-        // Safari with no AudioDecoder distinguishable from a device that merely failed to
-        // build a worklet.
+        // the answer came from a decoder probe, not a constructor sniff; the host logs it per join
         caps.verified = true;
-        // WHEP has no renegotiation verb, so a track absent from the first answer can never
-        // be added later — this is the only moment a spare one can exist. Ask for it exactly
-        // when it would be a safety net: on the fast path, where the decoder can still fail
-        // after saying it would work and where the host otherwise puts no audio in the SDP
-        // at all. Off the fast path the host already sends a track it feeds, and asking for a
-        // second one would be asking for the same audio twice.
+        // WHEP has no renegotiation verb, so a spare audio track must be in the first answer. Ask
+        // only on the fast path, where the host otherwise sends no audio track and the decoder can
+        // still fail later; off it the host already feeds a track.
         caps.wantsFallbackTrack = !!(caps.webcodecsOpus && caps.worklet);
         verified = caps;
         return caps;
@@ -151,10 +137,9 @@
         muted: false,
         prepared: false,
         stats: null,
-        // A/V sync running state
         videoDelayMs: null,     // from the video worker (EMA of display lag)
         hostOffsetMs: null,     // host<->local clock offset, from SEClock via PING/PONG
-        preEnqueueEmaMs: null,  // audio capture→enqueue latency, smoothed
+        preEnqueueEmaMs: null,  // audio capture-to-enqueue latency, smoothed
         lastTargetMs: null,     // last depth commanded to the worklet
         lastTargetAt: 0,
         residualOffsetMs: 0,    // unachievable sync error after clamping (diagnostics)
@@ -174,8 +159,7 @@
 
     const SE_LOUDSPEAKER = 'se:loudspeaker';
     const SE_EARPIECE = 'se:earpiece';
-    // Offered to the host in place of a list when nothing routable enumerates without a
-    // permission. Not a device: choosing it asks this page to reveal the real ones.
+    // not a device and not offered by this page; a host row saved by an older page may carry it
     const SE_CHOOSE = 'se:choose';
 
     const speakers = {
@@ -198,20 +182,15 @@
         firstDeviceChange: true,
         debounceTimer: 0,
         appliedSink: null,
-        // Whether the enumeration the host's list was built from carried real device names.
-        // `null` until something has enumerated. Posted to the host so a list of "Output 1",
-        // "Output 2" is not mistaken for what the operating system calls them.
+        // whether the posted list carries real device names; `null` until something has enumerated
         outputsLabelled: null,
         sinkWatched: false,
         msd: null,
         sinkEl: null,
         micHold: null,
         micGranted: false,
-        // A sink to route once there is a graph to route it through, as
-        // `{ id, fromPicker }`. Two things write it: `pickOutput`, whose choice the user made
-        // in the browser's own chooser, and `setSpeaker` when the host commands a sink before
-        // `attachWorklet` has finished. Only the first may claim `SINK_TIER.selectAudioOutput`,
-        // which is why the provenance is carried rather than inferred.
+        // `{ id, fromPicker }`: a sink to route once the graph exists. Only a chooser pick may
+        // claim `SINK_TIER.selectAudioOutput`, so the provenance is carried, not inferred.
         pendingSink: null,
         sessionId: '',
         deviceToken: '',
@@ -228,24 +207,17 @@
         } catch (_) { return false; }
     }
 
-    // There is no capability that says "this device has an earpiece" — `navigator.audioSession`
-    // exists on iPad too — so some device-shape inference is unavoidable here. What is avoidable
-    // is making it the weakest one available: a raw /iPhone/ test loses the Speaker/Earpiece
-    // choice on an iPhone with "Request Desktop Website" on, which sends a Macintosh UA. That is
-    // the one output control iOS has below 18.4, where HTMLMediaElement.setSinkId arrives.
-    //
-    // So: iOS by the same test the rest of the file uses (which already handles iPadOS reporting
-    // MacIntel), minus the iPads. An iPad is a large touch device — the desktop-UA iPhone still
-    // qualifies through `maxTouchPoints` and its screen's short edge, and a real Mac fails
-    // detectIOS() outright.
+    // No capability says "has an earpiece" (`navigator.audioSession` exists on iPad too), so it is
+    // inferred: iOS minus the iPads. A bare /iPhone/ test misses an iPhone with "Request Desktop
+    // Website" on, which sends a Macintosh UA. Speaker/Earpiece is the only output control iOS has
+    // below 18.4, where HTMLMediaElement.setSinkId arrives.
     function detectHasEarpiece() {
         try {
             if (!detectIOS()) return false;
             const ua = navigator.userAgent || '';
             if (/iPhone|iPod/.test(ua)) return true;
             if (/iPad/.test(ua)) return false;
-            // Desktop-mode UA. Phones are the narrow ones: every iPhone ever made is at most
-            // 440 CSS px on its short edge, every iPad at least 744.
+            // desktop-mode UA: an iPhone's short edge is at most 440 CSS px, an iPad's at least 744
             const s = window.screen || {};
             const shortEdge = Math.min(s.width || 0, s.height || 0);
             return shortEdge > 0 && shortEdge <= 500;
@@ -268,16 +240,12 @@
             speakers.hasEarpiece = detectHasEarpiece();
             speakers.canSink = speakers.hasEnumerate && (speakers.hasElemSink || speakers.hasCtxSink);
             speakers.canCategory = speakers.hasEarpiece;
-            // `setSinkId`, `selectAudioOutput` and `navigator.mediaDevices` are all
-            // secure-context only, so on plain HTTP they are simply absent: that is the
-            // connection, not the browser, and the page offers HTTPS for it at load.
+            // `setSinkId`, `selectAudioOutput` and `navigator.mediaDevices` are secure-context
+            // only: on plain HTTP their absence is the connection's doing, not the browser's
             speakers.insecure = window.isSecureContext === false;
             speakers.hasSinkApi = speakers.hasElemSink || speakers.hasCtxSink || speakers.hasSelectOut;
-            // `false` is what makes the host's sheet say "this device's browser can't switch
-            // speakers", so it is sent only when that is true: no sink API of any kind, no
-            // earpiece category, and not because the page is on HTTP. Whether a list could be
-            // read *yet* (no grant, card skipped, permission denied) is not this question; that
-            // device gets the "Choose a speaker on this device…" entry instead.
+            // `false` makes the host say this browser cannot switch speakers, so it is sent only
+            // with no sink API, no earpiece category, and not merely because the page is on HTTP
             speakers.supported = speakers.hasSinkApi || speakers.canCategory || speakers.insecure;
         } catch (_) { note(); }
         if (speakers.hasAudioSession) {
@@ -285,21 +253,10 @@
         }
     }
 
-    // ── Which speakers this device has, settled before the offer goes out ────────────────
-    //
-    // The owner's specification (findings/overhaul-new/OWNER-SPEC-audio-discovery.md): on
-    // Connect, run every output-discovery API in a fixed order, give each a definite result —
-    // `ok`, `unsupported`, `denied`, `empty`, `error`, `timeout` — under its own bounded
-    // timeout, and only when none of them produced a routable output raise the microphone card;
-    // on Continue, `getUserMedia({audio: true})` once, enumerate again, stop the stream. If that
-    // also fails the host is told about exactly one output, the default, `labelled: false`.
-    // The whole sequence finishes before the offer is sent, and every result goes to the host in
-    // `/audio-outputs` as `discovery` (docs/TELEMETRY.md).
-    //
-    // What the engines do, measured here (docs/overhaul-new/G06.md, 2026-10-05 addendum): Chrome
-    // and Edge 154 with no grant list one `audiooutput` with an empty id and label, which cannot
-    // be routed to, so their first join without a microphone grant reaches the card;
-    // `permissions.query({name: 'speaker-selection'})` throws `TypeError` there.
+    // Output discovery runs before the offer: each API in a fixed order under its own timeout,
+    // yielding `ok`, `unsupported`, `denied`, `empty`, `error` or `timeout`; the microphone card
+    // only if none gave a routable output. Ungranted, Chrome and Edge 154 list one unroutable
+    // `audiooutput` (empty id and label) and throw `TypeError` on the `speaker-selection` query.
     const DISCOVERY_MS = { picker: 30000, permission: 2000, enumerate: 3000, microphone: 30000 };
 
     function classify(e) {
@@ -309,12 +266,12 @@
         return 'error';
     }
 
-    // A call that may throw synchronously as well as reject.
+    // fn may throw synchronously as well as reject
     function attempt(fn) {
         try { return Promise.resolve(fn()); } catch (e) { return Promise.reject(e); }
     }
 
-    // Every discovery call goes through this. A timeout is a definite failure of that API.
+    // a timeout is a definite failure of that API
     function bounded(promise, ms, label) {
         let timer = 0;
         return Promise.race([
@@ -329,17 +286,16 @@
         });
     }
 
-    // Counted once the result is final, so an expected answer (an unknown permission name's
-    // `TypeError`) is not mistaken for a failure nothing else would show.
+    // called once the result is final, so an expected answer (an unknown permission name's
+    // `TypeError`) is not counted as a suppressed failure
     function counted(r) {
         if (r.result === 'error' || r.result === 'timeout') note();
         return r;
     }
 
-    // API 1, the browser's own chooser (Firefox 116+, Chromium behind a flag). It needs the
-    // Connect click's transient activation, so the submit handler calls this synchronously,
-    // before its first await, and only once: a second call after a rejection has no
-    // activation left. A dismissed chooser is `denied`.
+    // The browser's own chooser (Firefox 116+, Chromium behind a flag). It needs the Connect
+    // click's transient activation: call it synchronously before the first await, and only once (a
+    // second call has no activation left). A dismissed chooser is `denied`.
     let pickerRun = null;
     function startPicker() {
         initSpeakers();
@@ -351,7 +307,7 @@
                 .then(function (r) {
                     if (r.result === 'ok' && !(r.value && r.value.deviceId)) r.result = 'empty';
                     if (r.result === 'ok') {
-                        // The preferred sink, applied the moment the graph exists.
+                        // applied once the graph exists
                         speakers.pendingSink = { id: r.value.deviceId, fromPicker: true };
                     }
                     return counted(r);
@@ -360,7 +316,7 @@
         return pickerRun;
     }
 
-    // APIs 2 and 3. An engine that does not know the name throws `TypeError`: `unsupported`.
+    // an engine that does not know the permission name throws `TypeError`: `unsupported`
     function queryPermission(name) {
         const label = 'permissions.' + name;
         if (!navigator.permissions || typeof navigator.permissions.query !== 'function') {
@@ -376,8 +332,8 @@
     function querySpeakerPermission() { return queryPermission('speaker-selection'); }
     function queryMicrophonePermission() { return queryPermission('microphone'); }
 
-    // API 4. Entries with an empty `deviceId` are Chromium's pre-grant placeholders and cannot
-    // be routed to; `default` and `communications` are real ids and are kept.
+    // An empty `deviceId` is Chromium's pre-grant placeholder and cannot be routed to; `default`
+    // and `communications` are real ids and are kept.
     function enumerateOutputs(label) {
         const md = navigator.mediaDevices;
         const l = label || 'enumerateDevices';
@@ -398,8 +354,8 @@
         });
     }
 
-    // The last resort, only from the page's own card: one microphone request, one more
-    // enumeration while it is held, then every track stopped.
+    // Last resort, only from the page's own card: one microphone request, one enumeration while it
+    // is held, then every track stopped.
     function primeWithMicrophone() {
         const md = navigator.mediaDevices;
         if (!md || typeof md.getUserMedia !== 'function') {
@@ -408,7 +364,7 @@
         const asked = attempt(function () { return md.getUserMedia({ audio: true }); });
         return bounded(asked, DISCOVERY_MS.microphone, 'getUserMedia').then(function (r) {
             if (r.result !== 'ok') {
-                // A prompt answered after its deadline must not leave the microphone open.
+                // a prompt answered after its deadline must not leave the microphone open
                 if (r.result === 'timeout') {
                     asked.then(function (s) { try { s.getTracks().forEach(function (t) { t.stop(); }); } catch (_) { note(); } }, function () {});
                 }
@@ -424,8 +380,7 @@
         });
     }
 
-    // Routable device entries from the chooser and an enumeration. A labelled list already
-    // seen on this page is not replaced by a later unlabelled (or empty) one.
+    // a labelled list already seen on this page is not replaced by a later unlabelled or empty one
     function listFrom(picker, enumerated) {
         const out = [];
         const seen = {};
@@ -456,9 +411,8 @@
 
     let lastPlan = null;
     let lastDiscovery = null;
-    // Run by the Join handler before the offer, with the chooser it started inside the click.
-    // `showCard(onContinue, onSkip)` raises the microphone card; it always has Skip, so this
-    // never waits on anything the user cannot end, and every call above is bounded.
+    // Run by the Join handler before the offer. `showCard(onContinue, onSkip)` raises the
+    // microphone card, which always has Skip, so this never waits on what the user cannot end.
     async function prepareOutputsForJoin(showCard, pick) {
         initSpeakers();
         const r = {};
@@ -475,7 +429,7 @@
         let devices = listFrom(r.picker, r.enumerate);
         const plan = { action: 'report', reason: devices.length ? 'discovered' : (speakers.canCategory ? 'audio-session' : '') };
         if (!devices.length && !speakers.canCategory) {
-            // Nothing routable from any API. The card only where a grant could change that.
+            // nothing routable: raise the card only where a grant could change that
             const md = navigator.mediaDevices;
             if (!md || typeof md.getUserMedia !== 'function') {
                 r.getUserMedia = { label: 'getUserMedia', result: 'unsupported' };
@@ -484,7 +438,7 @@
                 r.getUserMedia = { label: 'getUserMedia', result: 'denied' };
                 plan.reason = 'mic-denied';
             } else if (!speakers.hasSinkApi) {
-                // No engine API could route a list even if a grant revealed one.
+                // no API could route a list even if a grant revealed one
                 r.getUserMedia = { label: 'getUserMedia', result: 'unsupported' };
                 plan.reason = 'no-sink-api';
             } else if (typeof showCard === 'function') {
@@ -518,8 +472,7 @@
         return plan;
     }
 
-    // Kept for a caller that only wants the cached report (a second join on the same page, or
-    // a harness).
+    // for a caller that only wants the cached report (a second join on the same page, a harness)
     let enumStarted = false;
     async function enumerateBeforeJoin() {
         if (enumStarted) return speakers._cache || { supported: speakers.supported, outputs: buildOutputs([]) };
@@ -533,32 +486,28 @@
         return speakers._cache;
     }
 
-    // "Choose a speaker on this device…" is no longer offered: discovery now runs in full at
-    // every Connect. A host row saved with it before is ignored here and in `setSpeaker`.
+    // a saved host row may still carry SE_CHOOSE: ignored here and in `setSpeaker`
     function noteOutputChoiceRequest(sink) {
         return sink === SE_CHOOSE ? 'ignored' : 'cleared';
     }
 
     function getOutputPlan() { return lastPlan; }
 
-    // The device watch's enumeration (API 8): the same call, bounded the same way.
     async function listOutputs() {
         const r = await enumerateOutputs();
         return r.result === 'ok' ? r.value : [];
     }
 
-    // Unlabelled ids are routable but unreadable, and the host's picker is a list a person
-    // chooses from: name them here — the default device by what it is, the rest by position —
-    // and tell the host they are generic (`labelled: false`) so it never presents them as what
-    // the operating system calls the hardware.
+    // Unlabelled ids are routable but unreadable: `buildOutputs` names them by position and the
+    // host is told `labelled: false`, so it never presents them as the OS's own names.
     function noteOutputLabels(devices) {
         const labelled = devices.length ? devices.some(function (d) { return d.label; }) : speakers.canCategory;
         speakers.outputsLabelled = !!labelled;
         speakers.labelsUnavailable = !labelled;
     }
 
-    // What the host is told: the earpiece categories where they apply, every routable device,
-    // and, when there is nothing else, exactly one option — the default output.
+    // What the host is told: the earpiece categories where they apply, every routable device, and,
+    // with nothing else, exactly one option, the default output.
     function buildOutputs(devices) {
         const out = [];
         if (speakers.canCategory) {
@@ -583,11 +532,9 @@
 
     async function acquireMicHold() {
         if (speakers.micHold) return true;
-        // Reached only when the host operator chose the earpiece on an engine with no
-        // audioSession category (iOS before 16.4), where holding the microphone *is* the routing
-        // mechanism. It is the one permission the page can still raise during a session: the
-        // operator's choice is the request, the microphone must be held for as long as the
-        // earpiece is in use, and an iPhone has no fullscreen or pointer lock for it to drop.
+        // Only for the earpiece on an engine with no audioSession category (iOS before 16.4), where
+        // holding the microphone is the routing mechanism. The one permission the page may raise
+        // mid-session: an iPhone has no fullscreen or pointer lock for the prompt to drop.
         try {
             speakers.micHold = await navigator.mediaDevices.getUserMedia({ audio: true });
             speakers.micGranted = true;
@@ -644,7 +591,7 @@
         const md = navigator.mediaDevices;
         const onChange = () => {
             if (speakers.firstDeviceChange) { speakers.firstDeviceChange = false; return; }
-            // A refused id may be one that has just been plugged in.
+            // a refused id may be one that was just plugged in
             speakers.refusedSink = null;
             if (speakers.debounceTimer) clearTimeout(speakers.debounceTimer);
             speakers.debounceTimer = setTimeout(reEnumerateAndPost, 500);
@@ -655,10 +602,9 @@
                 speakers.onDeviceChange = onChange;
             }
         } catch (_) { note(); }
-        // The poll is the backstop for a browser with no `devicechange` event. Where the event
-        // exists it is the mechanism, and a 4 s enumerate-and-POST on the same thread that
-        // forwards every 5 ms audio packet on the postMessage ring is a cost paid for nothing.
-        // 30 s there is a liveness check, not a device watch.
+        // The poll is the backstop for a browser with no `devicechange` event. With the event, 30 s
+        // is only a liveness check: enumerating every 4 s on the thread that forwards each 5 ms
+        // audio packet buys nothing.
         const period = speakers.hasDeviceChange ? 30000 : 4000;
         try {
             speakers.poll = setInterval(() => {
@@ -668,8 +614,7 @@
         } catch (_) { note(); }
     }
 
-    // The watch belongs to a session: with no join there is nobody to tell about a new
-    // speaker, and the next Connect's discovery starts it again.
+    // the watch belongs to a session; the next Connect's discovery starts it again
     function stopDeviceWatch() {
         speakers.watching = false;
         speakers.firstDeviceChange = true;
@@ -682,10 +627,8 @@
         }
     }
 
-    // Where the audio is *actually* playing, which is not always where the host last asked for
-    // it: the user can change it in the browser's own UI (Firefox's per-tab output control, or
-    // `selectAudioOutput()` again), and the engine then moves the sink underneath us. Read back
-    // rather than assumed, so the host's per-device picker can show what is true.
+    // Where the audio is actually playing, read back rather than assumed: the user can move the
+    // sink in the browser's own UI (Firefox's per-tab output control, `selectAudioOutput()`).
     function readCurrentSink() {
         try {
             if (state.path === 'netEQ' && state.audioEl && typeof state.audioEl.sinkId === 'string') {
@@ -709,8 +652,7 @@
         return true;
     }
 
-    // `sinkchange` fires on the context whose sink the engine moved; where it does not exist the
-    // device poll below is the floor and picks the same change up within its period.
+    // where `sinkchange` does not exist the device poll picks the same change up within its period
     function watchSinkChanges() {
         if (speakers.sinkWatched) return;
         speakers.sinkWatched = true;
@@ -741,12 +683,10 @@
 
     let lastPostedOutputs = null;
     function postOutputs(force) {
-        // Enumeration now happens before the join, so there is a window in which there is no
-        // session for the host to attach a list to. The identity is set the moment the answer
-        // lands and `setSpeakerIdentity` clears the change detection, so the first real post
-        // is the one that goes out.
+        // enumeration runs before the join, when the host has no session to attach a list to;
+        // `setSpeakerIdentity` clears the change detection so the first real post goes out
         if (!speakers.sessionId) return;
-        // `speakers.supported` is `false` until the probe runs; a post must never carry that.
+        // `speakers.supported` is `false` until the probe runs; a post must never carry that
         initSpeakers();
         try {
             const cache = speakers._cache || { supported: speakers.supported, outputs: buildOutputs([]) };
@@ -756,31 +696,21 @@
                 supported: cache.supported,
                 outputs: cache.outputs,
                 selected: speakers.appliedSink || '',
-                // What this device is playing on. The client posts the same value in both
-                // fields — it only ever knows one — and the separation is the *host's*:
-                // `selected` there is what `set_device_audio_output` asked for and the posted
-                // `selected` is ignored, so this is the only channel by which a change the user
-                // made in the browser's own output control reaches the host at all.
-                //
-                // Omitted entirely until something has actually applied a sink, because
-                // `JSON.stringify` drops an `undefined` value: the host keeps `None`, and the
-                // UI can tell "this client never said" from `''`, the device's default output.
+                // What this device is playing on. The host ignores the posted `selected`, so this
+                // is the only way a change made in the browser's own output control reaches it.
+                // `undefined` (dropped by `JSON.stringify`) until a sink has been applied, so the
+                // host can tell "never said" from `''`, the default output.
                 current: speakers.appliedSink === null ? undefined : speakers.appliedSink,
-                // False means the names above are this page's own — "Output 1", "Output 2" —
-                // because the browser withheld the real ones. Omitted until something has
-                // enumerated, so the host can tell "not said" from "generic".
+                // `false`: the names are this page's own ("Output 1") because the browser withheld
+                // the real ones. Omitted until something has enumerated ("not said").
                 labelled: speakers.outputsLabelled === null ? undefined : speakers.outputsLabelled,
-                // What each discovery API answered at the join (`ok`, `unsupported`, `denied`,
-                // `empty`, `error`, `timeout`), keyed by API. docs/TELEMETRY.md.
+                // what each discovery API answered at the join, keyed by API
                 discovery: lastDiscovery || undefined,
             });
-            // The list is identical on all but a handful of ticks in a session, and the host
-            // does the same work whether or not it changed. Re-POSTing it was a request per
-            // period per device buying nothing.
+            // the list rarely changes and the host does the same work either way: skip a repeat
             if (!force && body === lastPostedOutputs) return;
             lastPostedOutputs = body;
-            // Without a join the host has no session to attach the list to, and it will not
-            // guess one from the address.
+            // the host attaches the list by join id and will not guess a session from the address
             if (!speakers.joinId) return;
             fetch('/audio-outputs?join=' + encodeURIComponent(speakers.joinId), {
                 method: 'POST',
@@ -795,22 +725,17 @@
     const SINK_TIER = { none: 0, ctxSetSinkId: 1, elementSetSinkId: 2, audioSession: 3, selectAudioOutput: 4 };
     let sinkTier = SINK_TIER.none;
 
-    // Resolves `true` when the audio actually moved, `false` when a mechanism was tried and
-    // refused (which is what makes the picker re-offer in index.html correct rather than a
-    // guess), and `null` when there is nothing to route yet — the graph is built lazily, so a
-    // sink commanded before it exists is remembered and applied by `applyPendingSink`.
+    // Resolves `true` when the audio moved, `false` when a mechanism was tried and refused, and
+    // `null` when there is no graph yet: the sink is remembered for `applyPendingSink`.
     async function setSpeaker(deviceId) {
         initSpeakers();
         const raw = deviceId || '';
         const id = (raw === 'default') ? '' : raw;
         if (speakers.appliedSink === id) return true;
-        // The old "Choose a speaker on this device…" entry, still saved on some host rows: a
-        // request, not an output, so routing stays where it is.
+        // a request id, not an output: routing stays where it is
         if (id === SE_CHOOSE) return true;
-        // An id this engine has already refused, still saved on the host (the hardware it named
-        // is gone, or it belonged to another browser). Every /reconfig poll carries it, so it
-        // is refused once rather than retried — and re-routed — once a second. A device change
-        // clears the latch.
+        // An id this engine already refused is still saved on the host and rides every /reconfig
+        // poll: refuse it once, not once a second. A device change clears the latch.
         if (speakers.refusedSink === id) return false;
 
         if (id === SE_EARPIECE || id === SE_LOUDSPEAKER) {
@@ -818,9 +743,8 @@
             else { try { await ensureCategoryBridge(); } catch (_) { note(); } }
             if (id === SE_EARPIECE) {
                 if (applySession('play-and-record')) sinkTier = SINK_TIER.audioSession;
-                // Only where the platform has no audioSession category is the microphone
-                // hold the mechanism that routes to the earpiece; it is not a permission
-                // prime and it is released the moment the loudspeaker is chosen again.
+                // with no audioSession category the microphone hold is what routes to the earpiece;
+                // it is released as soon as the loudspeaker is chosen again
                 if (!speakers.hasAudioSession && speakers.hasEarpiece) {
                     try { if (await acquireMicHold()) sinkTier = SINK_TIER.audioSession; } catch (_) { note(); }
                 }
@@ -844,8 +768,7 @@
                 postOutputs();
                 return true;
             }
-            // Nothing is playing yet, so nothing has refused: remember it instead of
-            // reporting a failure the caller would answer with a picker.
+            // no graph yet, so nothing has refused: remember it rather than report a failure
             if (!state.ctx || !state.gain) {
                 speakers.pendingSink = { id: raw, fromPicker: false };
                 return null;
@@ -858,9 +781,8 @@
                 return true;
             }
 
-            // Its own try, so a NotFoundError on a device that has gone away — or a
-            // NotAllowedError — falls through to the element rung below instead of aborting
-            // into the shared catch with sinkTier still reporting the sink it did not set.
+            // own try: a NotFoundError (device gone) or NotAllowedError falls through to the
+            // element rung below instead of the shared catch
             if (speakers.hasCtxSink) {
                 let ctxSinkOk = false;
                 try {
@@ -870,8 +792,7 @@
                 if (ctxSinkOk) {
                     speakers.appliedSink = id;
                     sinkTier = SINK_TIER.ctxSetSinkId;
-                    // A different device has a different buffer depth, so the A/V target that
-                    // was right for the old one is not right for this one.
+                    // a different device has a different buffer depth: re-derive the A/V target
                     state.outputLatencyEmaMs = null;
                     maybeUpdateTarget();
                     postOutputs();
@@ -890,10 +811,8 @@
                     document.body.appendChild(a);
                     speakers.sinkEl = a;
                 }
-                // The sink first, the graph second. Re-routing the graph into the element before
-                // the engine had accepted the id left a refused id playing through an element
-                // on the default device — and re-assigning `srcObject` restarts the element, so
-                // a refused id retried once a second was a restart once a second.
+                // sink first, graph second: rerouted early, a refused id plays on the default
+                // device, and assigning `srcObject` restarts the element
                 await speakers.sinkEl.setSinkId(id);
                 if (!speakers.msd) {
                     speakers.msd = state.ctx.createMediaStreamDestination();
@@ -915,18 +834,9 @@
         return false;
     }
 
-    // `selectAudioOutput()` (Firefox 116+, Chromium behind a flag) is the only permission-free
-    // output picker in any engine, and the only one that gives a label without a microphone
-    // grant. It needs transient activation, so it can only ever come from a gesture the user
-    // makes: the Join button's own click, or — after a host-initiated change the engine
-    // refused — the next tap on the stage. The page has no control of its own for it, and the
-    // stage cannot be one: a live session takes pointer lock on the first gesture and a click
-    // there belongs to the host.
-    //
-    // The Join click lands before there is an AudioContext, so the choice is remembered and
-    // `applyPendingSink` routes it the moment the graph exists. The tier is claimed only once
-    // the sink actually moved, because a picker that returns a device the engine then refuses
-    // to route to is exactly the silent failure `sinkTier` exists to expose.
+    // Routes a sink chosen before the graph existed. The Join click runs `selectAudioOutput()`, the
+    // only permission-free picker and the only one that gives a label without a microphone grant,
+    // before there is an AudioContext. The tier is claimed only if the sink actually moved.
     function applyPendingSink() {
         const pending = speakers.pendingSink;
         if (!pending) return Promise.resolve(false);
@@ -935,9 +845,7 @@
         const want = (raw === 'default') ? '' : raw;
         return Promise.resolve(setSpeaker(raw)).then(function () {
             if (speakers.appliedSink !== want) return false;
-            // Only a sink the user picked in the chooser is tier 4. A host-commanded one that
-            // merely arrived before the graph existed took whatever rung `setSpeaker` reached,
-            // and `setSpeaker` has already recorded it.
+            // only a chooser pick is tier 4; `setSpeaker` already recorded a host-commanded one
             if (pending.fromPicker) sinkTier = SINK_TIER.selectAudioOutput;
             return true;
         }, function () { note(); return false; });
@@ -946,25 +854,16 @@
     function setSpeakerIdentity(sessionId, deviceToken, joinId) {
         speakers.sessionId = sessionId || '';
         speakers.deviceToken = deviceToken || '';
-        // The join this list belongs to. Two tabs of one browser enumerate the same speakers
-        // and share the sink the host chooses, but each posts under its own session so a list
-        // that arrives late cannot land on the other tab's row.
+        // each tab posts under its own join, so a late list cannot land on another tab's row
         speakers.joinId = joinId || '';
-        // A new session — or a reconfigure that rebuilt one with the same identity — needs the
-        // list once regardless of whether it changed, so the change detection in postOutputs
-        // cannot swallow the first post of a connection.
+        // a new or rebuilt session needs the list once even if unchanged: reset change detection
         lastPostedOutputs = null;
     }
 
-    // How long a sample takes to get from the graph to the speaker. `outputLatency` is the
-    // right answer and arrived in Chrome 102, Firefox 70 and Safari 18.4; treating its
-    // absence as zero made the commanded jitter depth too large by exactly that amount, so
-    // audio played early — by 3-10 ms on a wired desktop output and 100-200 ms on Bluetooth,
-    // which is the difference between lip-sync and obviously wrong.
-    //
-    // getOutputTimestamp() (Safari 14.1, Firefox 70, Chrome 57) answers the same question
-    // indirectly: it reports which sample the device is playing and when, so the distance
-    // between that and the graph's clock is the output latency.
+    // Graph-to-speaker delay. `outputLatency` (Chrome 102, Firefox 70, Safari 18.4) is the direct
+    // answer; reading its absence as zero makes the jitter depth too large by that much, 3-10 ms on
+    // a wired output and 100-200 ms on Bluetooth. getOutputTimestamp() (Safari 14.1, Firefox 70,
+    // Chrome 57) gives it indirectly: which sample the device is playing, and when.
     const OUTPUT_LATENCY_FLOOR_MS = 0;
     const OUTPUT_LATENCY_CEILING_MS = 500;
     function estimateOutputLatencyMs(c) {
@@ -991,8 +890,7 @@
         }
         const est = estimateOutputLatencyMs(c);
         if (est !== null) {
-            // Low-pass it: getOutputTimestamp jitters by a quantum or two and the target it
-            // feeds is not worth chasing that.
+            // low-pass: getOutputTimestamp jitters by a quantum or two
             state.outputLatencyEmaMs = state.outputLatencyEmaMs === null
                 ? est : state.outputLatencyEmaMs * 0.85 + est * 0.15;
             state.outputLatencySource = 'estimated';
@@ -1004,10 +902,8 @@
         return state.outputLatencyMs;
     }
 
-    // The commanded depth is the A/V answer; this is the margin on top of it that keeps the
-    // ring from starving on a link that jitters. It grows when the worklet actually runs dry
-    // and decays back on a clean one, so a good network converges to no margin at all
-    // instead of paying a fixed worst-case buffer forever.
+    // Margin on top of the A/V depth that keeps the ring from starving on a jittery link: it grows
+    // when the worklet runs dry and decays on a clean one, so a good network pays none.
     const SAFETY_STEP_MS = 4;
     const SAFETY_MAX_MS = 60;
     const SAFETY_DECAY_MS = 1;
@@ -1022,7 +918,7 @@
             maybeUpdateTarget();
             return;
         }
-        // maybePostStats fires roughly every 256 ms, so eight clean reports is ~2 s.
+        // maybePostStats fires roughly every 256 ms, so eight clean reports is ~2 s
         state.cleanBlocks++;
         if (state.cleanBlocks >= 8 && state.safetyMs > 0) {
             state.cleanBlocks = 0;
@@ -1059,8 +955,7 @@
         state.node.port.postMessage({ type: 'target', targetMs: target });
     }
 
-    // Both the audio and the video worker must apply the same clock offset, or their
-    // difference — which is what the sync target is built from — moves for no reason.
+    // audio and video workers must share one clock offset: the sync target is their difference
     function setHostClockOffset(offsetMs) {
         if (typeof offsetMs !== 'number' || !isFinite(offsetMs)) return;
         state.hostOffsetMs = offsetMs;
@@ -1073,10 +968,8 @@
         maybeUpdateTarget();
     }
 
-    // A page open on the host machine itself plays into the very mix the host is capturing:
-    // the host's loopback takes it back, sends it again, and the result is an echo that repeats
-    // every round trip and never decays. The host's own speakers are already playing the audio,
-    // so this page's copy adds nothing but that loop — it starts muted.
+    // A page open on the host machine plays into the mix the host is capturing: an echo that
+    // repeats every round trip and never decays. So it starts muted.
     let sameDeviceLogged = false;
     function playbackMutedHere() {
         const same = window.__SAME_DEVICE__ === true;
@@ -1093,16 +986,13 @@
         if (state.audioEl) state.audioEl.muted = m;
     }
 
-    // Two halves on purpose. WebKit only honours resume() from inside the user gesture that
-    // is running when it is called, and `await ctx.audioWorklet.addModule()` ends that
-    // window — so the context is constructed and resumed synchronously here, and the
-    // worklet is attached afterwards. The old order left iOS suspended for the whole
-    // session with the failure swallowed.
+    // WebKit only honours resume() inside the running user gesture, and awaiting
+    // `ctx.audioWorklet.addModule()` ends that window: construct and resume the context
+    // synchronously here and attach the worklet afterwards, or iOS stays suspended all session.
     let preparePromise = null;
     function beginFromGesture() {
         if (state.prepared) {
-            // `endSession` suspends the context when a join fails or ends; this click is the
-            // gesture iOS needs to start it again.
+            // `endSession` suspended the context; this click is the gesture iOS needs to resume it
             if (state.ctx && state.ctx.state === 'suspended') {
                 try { const p = state.ctx.resume(); if (p && p.catch) p.catch(note); } catch (_) { note(); }
             }
@@ -1141,26 +1031,21 @@
                     state.stats = e.data;
                     adaptSafetyMargin(e.data);
                 } else if (e.data.type === 'ringport-ok') {
-                    // The worklet took the far end, so the near end is worth handing to the
-                    // worker. Until this arrives — and it never does on an engine that cannot
-                    // transfer a port into an AudioWorkletGlobalScope — the samples keep
-                    // taking the page relay, which is unchanged.
+                    // the worklet took the far end; an engine that cannot transfer a port into an
+                    // AudioWorkletGlobalScope never sends this and keeps the page relay
                     noteRingPortAck();
                 } else if (e.data.type === 'mode-mismatch') {
-                    // The worklet could not map the shared ring but the worker did, so the
-                    // worker must stop writing into it. Re-init it without the buffer and both
-                    // sides land on the postMessage ring.
+                    // the worklet could not map the shared ring but the worker did: re-init the
+                    // worker without the buffer so both sides land on the postMessage ring
                     note();
                     console.warn('[audio] ring mode mismatch; falling back to the postMessage ring');
                     state.sab = null;
                     if (state.worker) state.worker.postMessage({ type: 'init', sab: null, capFrames: CAP_FRAMES });
                 }
             };
-            // A processor constructor that throws on the render thread does *not* reject
+            // A processor constructor that throws on the render thread does not reject
             // `new AudioWorkletNode`: the node is built and outputs silence. The ring ABI
-            // assertions are exactly that kind of throw, so without this the page reported
-            // worklet:true, the host answered with no audio track, and the failure was both
-            // inaudible and invisible.
+            // assertions throw that way, so this handler is the only signal.
             state.node.onprocessorerror = () => {
                 note();
                 state.prepared = false;
@@ -1174,32 +1059,29 @@
             state.prepared = true;
             offerRingPort();
             watchSinkChanges();
-            // A device chosen from the picker on the Join gesture, or a sink the host commanded
-            // before there was a graph to route it through.
+            // a chooser pick from the Join gesture, or a sink commanded before the graph existed
             try { const p = applyPendingSink(); if (p && p.catch) p.catch(note); } catch (_) { note(); }
             return true;
         } catch (e) {
             console.warn('[audio] prepare failed:', e);
             state.prepareFailed = true;
-            // Nothing here can play. Closing it releases the output device rather than
-            // holding an empty running graph open for the whole session — a real battery and
-            // audio-session cost on iOS, paid only by the browsers that could not use it.
+            // nothing here can play: close it, or an empty running graph holds the output device
+            // (battery and audio-session cost on iOS) for the whole session
             try {
                 if (state.ctx) { const p = state.ctx.close(); if (p && p.catch) p.catch(note); }
             } catch (_) { note(); }
             state.ctx = null;
             state.node = null;
             state.gain = null;
-            // Not a permanent verdict: a module fetch can lose a race with a reconnect, and
-            // memoising the failure left the fast path dead for the life of the page — with
-            // the host already told worklet:true, so there was nothing to fall back to.
+            // not a permanent verdict: a module fetch can lose a race with a reconnect, and the
+            // host was already told worklet:true, so a memoised failure has nothing to fall back to
             preparePromise = null;
             return false;
         }
     }
 
-    // Kept for callers that are not inside a gesture (a reconfigure, say): it never
-    // constructs a second context, because two would fight over the same output.
+    // For callers outside a gesture (a reconfigure). Never constructs a second context: two would
+    // fight over the same output.
     function prepare() {
         if (state.prepared) return Promise.resolve(true);
         if (preparePromise) return preparePromise;
@@ -1213,16 +1095,10 @@
         return !!(state.ctx && state.ctx.state === 'running');
     }
 
-    // Without a SharedArrayBuffer the decoded samples used to go worker → page → worklet: two
-    // postMessage hops and two fresh Float32Arrays per packet, 200 times a second at the host's
-    // 5 ms framing, half of them through the main thread that also runs the reconfig fetch, the
-    // getStats poll and every pointer event. One long task there is an underrun, and an
-    // underrun is up to MAX_TARGET_MS of silence while the buffer re-primes.
-    //
-    // A MessagePort is transferable, so the two ends can go straight to the worker and the
-    // worklet and the page drops out of the path. It is offered rather than assumed: not every
-    // engine will transfer a port into an AudioWorkletGlobalScope, so the worklet acknowledges
-    // and only then does the worker get the other end. No acknowledgement, no change.
+    // Without a SharedArrayBuffer the page relays every packet (200 a second at 5 ms framing), and
+    // one long main-thread task is an underrun: up to MAX_TARGET_MS of silence while the buffer
+    // re-primes. A MessageChannel takes the page out of the path, but not every engine transfers a
+    // port into an AudioWorkletGlobalScope: the worker gets its end only after the worklet acks.
     let ringPortForWorker = null;
     let ringPortAcked = false;
     let ringPortDirect = false;
@@ -1240,8 +1116,7 @@
         ringPortAcked = true;
         handOffRingPort();
     }
-    // Runs from the worklet's acknowledgement and again when the worker is built, because
-    // either can be the later of the two.
+    // runs on the worklet's acknowledgement and again when the worker is built: either can be last
     function handOffRingPort() {
         if (!ringPortAcked || !ringPortForWorker || !state.worker) return;
         const port = ringPortForWorker;
@@ -1271,7 +1146,7 @@
         }
     }
 
-    // Proof that the worker script actually ran, not merely that `new Worker` returned.
+    // proof the worker script ran, not merely that `new Worker` returned
     const WORKER_READY_DEADLINE_MS = 3000;
     let workerReady = false;
     let workerReadyTimer = null;
@@ -1307,18 +1182,15 @@
                 abandonWebCodecsAudio();
             }
         };
-        // A Worker whose script 404s, is blocked by CSP, or throws while parsing is
-        // *constructed successfully* and then never posts anything. Logging that and
-        // carrying on left dc.onmessage feeding a worker that would never answer, with
-        // the client still reporting audioPath 1 while playing silence for the session.
+        // a Worker whose script 404s, is blocked by CSP, or throws while parsing still constructs
+        // and then never posts: an error means the fast path is dead
         w.onerror = (e) => {
             note();
             console.warn('[audio] decoder worker error:', e);
             abandonWebCodecsAudio();
         };
-        // Nothing above proves the script ran. The worker answers `init` with `mode`,
-        // so a deadline on that first reply is the only thing that distinguishes a
-        // worker that started from one that was built and is dead.
+        // the worker answers `init` with `mode`; a deadline on that first reply is the only way to
+        // tell a worker that started from one that was built and is dead
         if (workerReadyTimer) clearTimeout(workerReadyTimer);
         workerReady = false;
         workerReadyTimer = setTimeout(function () {
@@ -1329,11 +1201,8 @@
         }, WORKER_READY_DEADLINE_MS);
         w.postMessage({ type: 'init', sab: state.sab, capFrames: CAP_FRAMES });
         state.worker = w;
-        // attachWorklet runs once per page but the worker is rebuilt on every
-        // reconfigure, and stopWorker throws the port away with it — so without this
-        // the direct transport existed for the first session only and every later one
-        // silently went back to relaying through the page. A no-op on the shared ring
-        // and while an offer is already outstanding.
+        // the worker is rebuilt on every reconfigure and stopWorker drops the port, so offer it
+        // again here; a no-op on the shared ring and while an offer is outstanding
         offerRingPort();
         handOffRingPort();
         if (state.hostOffsetMs !== null) w.postMessage({ type: 'clockoffset', offsetMs: state.hostOffsetMs });
@@ -1349,12 +1218,9 @@
         state.worker = null;
     }
 
-    // The decoder said yes to isConfigSupported and then failed anyway. Silence is the worst
-    // possible answer, so take every rung there is: the DataChannel handler is detached first
-    // (it posted into a worker this is about to null, ~200 uncaught throws a second at the
-    // host's 5 ms framing), then the browser's own Opus track if the host put one in the SDP.
-    // When it did not — which is precisely the case where the client claimed the fast path —
-    // the only route back is a renegotiation that asks for one, which the page owns.
+    // The fast path failed after claiming it would work. Detach the DataChannel handler first (it
+    // would post into a null worker ~200 times a second), then take the browser's own Opus track if
+    // the host sent one; otherwise only a renegotiation, which the page owns, can ask for one.
     function abandonWebCodecsAudio() {
         if (state.decoderFailed) return;
         state.decoderFailed = true;
@@ -1371,9 +1237,8 @@
     }
 
     async function attachDataChannel(dc) {
-        // Both of these used to be a bare `return`: no handler installed, no bit set, and the
-        // host already told `webcodecsOpus: true`, so the session played nothing and reported
-        // itself on the fast path. Every exit from here now takes the ladder instead.
+        // the host was already told `webcodecsOpus: true`: a failed exit must take the fallback
+        // ladder, never a bare return, or the session is silent while reporting the fast path
         if (!(await prepare())) {
             console.warn('[audio] cannot prepare WebCodecs path');
             abandonWebCodecsAudio();
@@ -1394,11 +1259,9 @@
             (state.sab ? 'shared-memory ring' : 'postMessage ring'));
     }
 
-    // What `ontrack` calls. A host that honours `wantsFallbackTrack` puts a recvonly Opus
-    // track in the answer as a spare; attaching it while the WebCodecs path is live would
-    // report `netEQ` in the stats frame and play a second, silent element beside the worklet.
-    // So remember it and attach only when there is nothing else. This is what makes the spare
-    // track a safety net rather than a regression.
+    // Called from `ontrack`. A host that honours `wantsFallbackTrack` adds a spare recvonly Opus
+    // track; attaching it while the WebCodecs path is live would report `netEQ` and play a second,
+    // silent element. So remember it and attach only when there is nothing else.
     function noteFallbackStream(stream) {
         state.fallbackStream = stream;
         const claimingFastPath = !!(verified && verified.webcodecsOpus && verified.worklet);
@@ -1442,18 +1305,14 @@
         state.stats = null;
     }
 
-    // `teardown` is per peer connection: a renegotiation calls it and keeps everything else for
-    // the next one. This is the end of the session itself — the join failed, the link was lost,
-    // the host ended it, or the page is going away — so a page back on its join form holds no
-    // microphone, runs no device watch, posts nothing to the host and keeps no audio device
-    // busy. The context is suspended rather than closed: iOS builds one only inside a gesture
-    // and two would fight over the output, so `beginFromGesture` resumes this one from the next
-    // Connect click.
+    // Ends the session itself (`teardown` is per peer connection): a page back on its join form
+    // holds no microphone, device watch or busy audio device. The context is suspended, not closed:
+    // iOS builds one only inside a gesture, and `beginFromGesture` resumes it on the next Connect.
     function endSession() {
         teardown();
         if (speakers.micHold && speakers.appliedSink === SE_EARPIECE) {
-            // Releasing the hold is what moves the audio off the earpiece, so the next session
-            // must not believe it is still there and skip re-acquiring it.
+            // releasing the hold moves audio off the earpiece: clear the sink so the
+            // next session re-acquires it
             speakers.appliedSink = null;
         }
         releaseMicHold();
@@ -1461,8 +1320,7 @@
         speakers.sessionId = '';
         speakers.deviceToken = '';
         speakers.joinId = '';
-        // A sink chosen in the browser's chooser at this Connect, or commanded before the graph
-        // existed, belongs to the join that failed; the next Connect asks again.
+        // a pending sink belongs to the join that ended; the next Connect asks again
         speakers.pendingSink = null;
         state.fallbackStream = null;
         if (state.audioEl) { try { state.audioEl.pause(); } catch (_) { note(); } }
@@ -1499,14 +1357,12 @@
             labelsUnavailable: !!speakers.labelsUnavailable,
             sinkTier: sinkTier,
             currentSink: speakers.appliedSink,
-            // How the outputs were found at the join: action, reason, the card's answer and the
-            // per-API `discovery` results that also go to the host.
+            // how the outputs were found at the join: action, reason, card answer, per-API results
             outputPlan: lastPlan,
         };
     }
 
-    // The page owns the degradation bitfield; this reports the audio bits into it so the
-    // host sees one number rather than two half-pictures.
+    // the page owns the degradation bitfield; this contributes the audio bits
     function degradeFlags(DEG) {
         let f = 0;
         if (!DEG) return f;
@@ -1514,8 +1370,7 @@
         if (state.ctx && state.ctx.state === 'suspended') f |= DEG.AUDIO_CONTEXT_SUSPENDED;
         if (state.outputLatencySource !== 'measured') f |= DEG.AUDIO_OUTPUT_LATENCY_ESTIMATED;
         if (speakers.labelsUnavailable) f |= DEG.AUDIO_OUTPUT_LABELS_UNAVAILABLE;
-        // Latched rather than read off preparePromise, which is cleared on failure so a
-        // later attempt is not poisoned by it.
+        // latched: preparePromise is cleared on failure so a later attempt can retry
         if (state.prepareFailed && !state.prepared) f |= DEG.AUDIO_PREPARE_FAILED;
         return f;
     }

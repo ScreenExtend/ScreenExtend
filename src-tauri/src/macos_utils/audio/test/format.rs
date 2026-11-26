@@ -103,7 +103,7 @@ fn i16_scales_by_32768_not_32767() {
     };
     let mut src = Vec::new();
     src.extend_from_slice(&i16::MIN.to_le_bytes()); // L = -1.0
-    src.extend_from_slice(&i16::MAX.to_le_bytes()); // R ≈ 0.99997
+    src.extend_from_slice(&i16::MAX.to_le_bytes()); // R ~ 0.99997
     let mut out = [0.0f32; 2];
     let n = convert_interleaved(&src, 1, &d, &mut out);
     assert_eq!(n, 2);
@@ -113,7 +113,7 @@ fn i16_scales_by_32768_not_32767() {
 
 #[test]
 fn downmix_5_1_uses_bs775_coefficients() {
-    // 5.1 order: FL, FR, FC, LFE, BL, BR. LFE dropped; FC/BL/BR at -3 dB.
+    // 5.1 order: FL, FR, FC, LFE, BL, BR; LFE dropped, FC/BL/BR at -3 dB
     let d = AudioFormatDesc {
         sample_rate: 48000,
         channels: 6,
@@ -132,7 +132,7 @@ fn downmix_5_1_uses_bs775_coefficients() {
 
 #[test]
 fn clamps_out_of_range_sums() {
-    // Quad where the back channels push the sum past 1.0 → must clamp, not wrap.
+    // quad where the back channels push the sum past 1.0: must clamp, not wrap
     let d = AudioFormatDesc {
         sample_rate: 48000,
         channels: 4,
@@ -148,7 +148,7 @@ fn clamps_out_of_range_sums() {
 
 #[test]
 fn planar_stereo_f32_interleaves() {
-    // Two separate channel planes (the SCK layout).
+    // two separate channel planes (the SCK layout)
     let d = AudioFormatDesc {
         sample_rate: 48000,
         channels: 2,
@@ -166,13 +166,13 @@ fn planar_stereo_f32_interleaves() {
 
 #[test]
 fn parse_rejects_unknown_format() {
-    // No float, no signed-int flag → unsupported.
+    // no float flag, no signed-int flag: unsupported
     let a = asbd(48000.0, 2, 0, 24, 6);
     assert!(parse_asbd(&a).is_err());
 }
 
-/// The fast path is a `copy_nonoverlapping` plus a clamp pass instead of a per-sample rebuild, so
-/// it has to agree with the general path everywhere the general path used to run.
+/// The fast path is a `copy_nonoverlapping` plus a clamp pass, so it has to agree with the
+/// per-sample general path.
 #[test]
 fn the_fast_path_agrees_with_the_general_one() {
     let fast = AudioFormatDesc {

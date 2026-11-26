@@ -1,22 +1,13 @@
 //! Driving the AirPlay picker without the user.
 //!
-//! Selecting an AirPlay display is a sender-side, WindowServer-local decision:
-//! nothing a receiver advertises can pre-select it, so the connect step has to
-//! be performed on the sender. The public route (`AVOutputContext`) is gated
-//! behind `com.apple.avfoundation.allow-system-wide-context`, an entitlement
-//! AMFI will not honour for a third-party binary — so this drives the menu
-//! extra instead, through the Accessibility API that ScreenExtend already asks
-//! the user to grant for remote input.
-//!
-//! The one thing that makes this robust rather than a screen-scrape: AppKit
-//! publishes each menu item's action selector as its `AXIdentifier`. The row for
-//! an AirPlay device is `connectToAirPlayDevice:` in every locale, so we never
-//! match on a translated title. The device's own name — which we chose when we
-//! published the Bonjour service — disambiguates between rows.
-//!
-//! Pressing the extra does not steal focus and the menu populates in tens of
-//! milliseconds; we close it again with `AXCancel` so nothing is left open on
-//! the user's screen.
+//! Nothing a receiver advertises can pre-select an AirPlay display, and the
+//! public sender route (`AVOutputContext`) is gated behind
+//! `com.apple.avfoundation.allow-system-wide-context`, an entitlement AMFI will
+//! not honour for a third-party binary. So this drives the Displays menu extra
+//! through the Accessibility API. Rows are matched by `AXIdentifier` (the action
+//! selector, the same in every locale) or by a title read from the menu's own
+//! bundle, never by a hardcoded translation; the Bonjour name we published
+//! picks the device row. Pressing the extra does not steal focus.
 
 use std::ffi::c_void;
 use std::process::Command;
@@ -67,15 +58,11 @@ unsafe extern "C" {
 /// checkbox, in `com.apple.airplay`.
 ///
 /// macOS only keeps the Displays menu extra resident while this is on, and the
-/// extra is the only way to start an AirPlay session from a third-party process
-/// — the programmatic route needs an entitlement AMFI will not honour. Leaving
-/// it to the user would make this backend depend on a manual step, so we set it
-/// ourselves. It is a per-user preference: no privileges, no restart.
+/// extra is the only way to start an AirPlay session from a third-party process,
+/// so we set it ourselves. It is a per-user preference: no privileges, no restart.
 ///
-/// It is also the user's setting, not ours, so what it was before is
-/// remembered and [`restore_menu_bar_option`] puts it back at shutdown. The
-/// sibling module states the principle and declines to write its preference at
-/// all ([`super::sender_prefs`]); this one has to write, so it has to undo.
+/// It is the user's setting, not ours, so what it was before is remembered and
+/// [`restore_menu_bar_option`] puts it back at shutdown.
 const AIRPLAY_DOMAIN: &str = "com.apple.airplay";
 const SHOW_IN_MENU_BAR_KEY: &str = "showInMenuBarIfPresent";
 
@@ -118,8 +105,7 @@ fn write_menu_bar_option(value: Option<bool>) -> bool {
         let cf = match value {
             Some(true) => K_CF_BOOLEAN_TRUE,
             Some(false) => K_CF_BOOLEAN_FALSE,
-            // A null value removes the key, which is how "it was never set"
-            // is restored.
+            // a null value removes the key, which restores "never set"
             None => ptr::null(),
         };
         CFPreferencesSetAppValue(k.0, cf, d.0);
@@ -127,7 +113,7 @@ fn write_menu_bar_option(value: Option<bool>) -> bool {
     }
 }
 
-/// Turns the menu-bar option on if it is off. Returns true when it changed.
+/// Returns true when it changed the setting.
 fn enable_menu_bar_option() -> bool {
     let previous = match menu_bar_option() {
         Some(true) => return false,
@@ -147,11 +133,10 @@ fn enable_menu_bar_option() -> bool {
     true
 }
 
-/// Puts the menu-bar option back the way we found it.
+/// Puts the menu-bar option back the way it was found.
 ///
-/// The item does not vanish from the menu bar until the next login — adding the
-/// extra takes effect live, removing it needs a SystemUIServer restart — so this
-/// restores the *setting*, not the appearance.
+/// Restores the *setting*, not the appearance: removing the extra needs a
+/// SystemUIServer restart, so the item stays in the menu bar until the next login.
 pub fn restore_menu_bar_option() {
     let previous = match saved_menu_bar_option().lock() {
         Ok(mut slot) => slot.take(),
@@ -174,18 +159,17 @@ pub fn restore_menu_bar_option() {
     }
 }
 
-/// The menu extra we drive, and the source of every title we compare against.
+/// The menu extra this backend drives, and the source of every title it matches.
 const DISPLAYS_MENU_BUNDLE: &str = "/System/Library/CoreServices/Menu Extras/Displays.menu";
 
 /// Reads a localized string out of the Displays menu extra's own bundle.
 ///
-/// This is what makes title matching safe. `AXIdentifier` on menu items is a
-/// **10.15-only** affordance: `-[NSMenuItem userInterfaceItemIdentifier]` on
-/// 10.13.6 and 10.14.6 returns only the `_uiid` ivar, and `DisplaysExtra` never
-/// calls `setIdentifier:` — so on the OS versions this backend actually exists
-/// for, the rows have no identifier at all. Asking CFBundle for the same key the
-/// menu itself uses gets the right string in whatever language the menu is
-/// drawn in, without hardcoding English.
+/// This is what makes title matching safe. `AXIdentifier` on menu items is
+/// **10.15-only**: `-[NSMenuItem userInterfaceItemIdentifier]` on 10.13.6 and
+/// 10.14.6 returns only the `_uiid` ivar, and `DisplaysExtra` never calls
+/// `setIdentifier:`, so on the OS versions this backend exists for the rows
+/// have no identifier at all. Asking CFBundle for the key the menu itself uses
+/// gets the string in whatever language the menu is drawn in.
 fn menu_string(key: &str) -> Option<String> {
     let path = cf_string(DISPLAYS_MENU_BUNDLE)?;
     let k = cf_string(key)?;
@@ -206,7 +190,7 @@ fn menu_string(key: &str) -> Option<String> {
         }
         let out = cf_string_to_string(value);
         CFRelease(value);
-        // CFBundle returns the key itself when the lookup misses.
+        // CFBundle returns the key itself when the lookup misses
         out.filter(|v| v != key)
     }
 }
@@ -245,14 +229,13 @@ fn attr_string(element: AXUIElementRef, name: &str) -> Option<String> {
     cf_string_to_string(v.0)
 }
 
-/// Whether a menu row can actually be chosen.
+/// Whether a menu row can be chosen.
 ///
-/// The menu carries disabled headers — `"AirPlay: <name>"`, `"AirPlay To:"` —
-/// whose titles can look enough like a device row to be matched by accident on
-/// the OS versions that publish no `AXIdentifier`. Only enabled rows are real.
+/// Disabled headers (`"AirPlay: <name>"`, `"AirPlay To:"`) can match a device
+/// row by title on the OS versions that publish no `AXIdentifier`.
 fn is_enabled(element: AXUIElementRef) -> bool {
     let Some(v) = copy_attr(element, "AXEnabled") else {
-        // Absent means "not applicable", which for a menu item means selectable.
+        // absent means "not applicable", which for a menu item means selectable
         return true;
     };
     unsafe { CFGetTypeID(v.0) != CFBooleanGetTypeID() || CFBooleanGetValue(v.0) != 0 }
@@ -261,11 +244,10 @@ fn is_enabled(element: AXUIElementRef) -> bool {
 /// An element's children, together with the array that owns them.
 ///
 /// `CFArrayGetValueAtIndex` hands back a *borrowed* reference, so the array has
-/// to outlive every pointer taken out of it. That used to be arranged by leaking
-/// the array — and with it a Mach port send right into SystemUIServer per child
-/// — on every call, from inside poll loops that run every 25 ms for seconds at a
-/// time. Owning it gives the same lifetime with a `Drop`; anything that has to
-/// outlive the array is retained explicitly instead ([`retained`]).
+/// to outlive every pointer taken out of it. Owned, not leaked: a leaked array
+/// also leaks a Mach port send right into SystemUIServer per child, and this is
+/// called from 25 ms poll loops. Anything that has to outlive the array is
+/// retained explicitly ([`retained`]).
 struct Children {
     _array: CfOwned,
     items: Vec<AXUIElementRef>,
@@ -316,10 +298,10 @@ fn perform(element: AXUIElementRef, action: &str) -> Result<(), String> {
             "{action} is not supported by that element (AXError {err})"
         )),
         AX_ERROR_CANNOT_COMPLETE => Err(format!(
-            "{action} could not be completed — the target app may be busy or gone (AXError {err})"
+            "{action} could not be completed: the target app may be busy or gone (AXError {err})"
         )),
         AX_ERROR_INVALID_ELEMENT => Err(format!(
-            "{action} hit a stale element — the menu was rebuilt or dismissed (AXError {err})"
+            "{action} hit a stale element: the menu was rebuilt or dismissed (AXError {err})"
         )),
         _ => Err(format!("{action} failed (AXError {err})")),
     }
@@ -332,8 +314,7 @@ pub const NO_GUI_SESSION: &str =
 /// Whether there is a desktop session at all.
 ///
 /// SystemUIServer owns the menu bar and only exists inside a logged-in console
-/// session, so its absence is exactly the condition that makes this backend
-/// unusable — over ssh, at the login window, or in a headless session.
+/// session: it is absent over ssh, at the login window and in a headless session.
 pub fn gui_session_present() -> bool {
     system_ui_server_pid().is_some()
 }
@@ -346,8 +327,8 @@ pub const ACCESSIBILITY_DENIED: &str =
 /// across locales because it is the action selector, not a title.
 const CONNECT_IDENTIFIER: &str = "connectToAirPlayDevice:";
 /// AX identifier of the row that turns an existing mirror into an extended
-/// desktop. We normally do this with CoreGraphics instead — see
-/// [`super::topology::stop_mirroring`] — but the row is useful as a probe.
+/// desktop. Mostly a probe: the switch itself normally goes through CoreGraphics
+/// ([`super::topology::stop_mirroring`]).
 const USE_AS_DISPLAY_IDENTIFIER: &str = "stopMirroring:";
 
 /// How long to wait for a pressed menu to populate. Measured at ~30 ms on
@@ -364,9 +345,8 @@ const SYSTEM_UI_SERVER: &[u8] = b"SystemUIServer";
 /// `<sys/proc_info.h>`: `PROC_ALL_PIDS`.
 const PROC_ALL_PIDS: u32 = 1;
 
-/// True when `pid` is still the process we think it is.
 fn process_is_named(pid: i32, name: &[u8]) -> bool {
-    // `proc_name` truncates at MAXCOMLEN; every name we ask about is shorter.
+    // `proc_name` truncates at MAXCOMLEN: every name asked about here is shorter
     let mut buf = [0u8; 64];
     let len = unsafe { libc::proc_name(pid, buf.as_mut_ptr() as *mut c_void, buf.len() as u32) };
     len > 0 && &buf[..len as usize] == name
@@ -400,20 +380,17 @@ fn find_process_named(name: &[u8]) -> Option<i32> {
 
 /// SystemUIServer's pid, cached, without forking.
 ///
-/// This used to be `/usr/bin/pgrep -x SystemUIServer`, called at the top of
-/// every `find_displays_extra_once` — i.e. inside a 25 ms retry loop, up to 200
-/// times per attempt and 3 attempts per connect, so up to 600 fork+exec+waits
-/// for a single failed join, on exactly the old hardware this tier exists for.
-/// `proc_listpids`/`proc_name` are libproc, in libSystem since 10.5, and answer
-/// the same question without a process spawn.
+/// Called at the top of every `find_displays_extra_once`, i.e. inside a 25 ms
+/// retry loop (up to 600 times for one failed join), so it must not spawn
+/// `pgrep`. `proc_listpids`/`proc_name` are libproc, in libSystem since 10.5.
 ///
 /// The pid is then held: SystemUIServer starts at login and lives as long as the
-/// session. The cheap name check is what makes a restart self-healing — a
-/// recycled pid belonging to something else fails it and forces a rescan.
+/// session. The name check makes a restart self-healing: a recycled pid
+/// belonging to something else fails it and forces a rescan.
 fn system_ui_server_pid() -> Option<i32> {
     static CACHED: std::sync::OnceLock<std::sync::Mutex<Option<i32>>> = std::sync::OnceLock::new();
     let cell = CACHED.get_or_init(|| std::sync::Mutex::new(None));
-    // Poisoning here would only mean a stale pid, which the name check catches.
+    // poisoning would only mean a stale pid, which the name check catches
     let mut slot = match cell.lock() {
         Ok(s) => s,
         Err(e) => e.into_inner(),
@@ -463,13 +440,11 @@ struct Extra {
 /// Finds the Displays menu extra, adding it to the menu bar if it is missing.
 ///
 /// macOS only keeps the extra resident "when available", i.e. while it has seen
-/// an AirPlay destination — so on a machine that has not, there is nothing to
-/// drive. `open`ing the bundle asks SystemUIServer to load it live: the path is
-/// appended to `com.apple.systemuiserver`'s `menuExtras` and the extra appears
-/// within a couple of seconds, **with SystemUIServer's pid unchanged**. That
-/// matters: `killall SystemUIServer` would also work but visibly flashes the
-/// user's whole menu bar, and removal — unlike addition — is the operation that
-/// actually requires it. So we only ever add.
+/// an AirPlay destination. `open`ing the bundle asks SystemUIServer to load it
+/// live: the path is appended to `com.apple.systemuiserver`'s `menuExtras` and
+/// the extra appears within a couple of seconds, **with SystemUIServer's pid
+/// unchanged**. `killall SystemUIServer` would also work but flashes the user's
+/// whole menu bar, and only removal requires it. So we only ever add.
 fn find_displays_extra(budget: Instant) -> Result<Extra, String> {
     match find_displays_extra_once() {
         Ok(extra) => return Ok(extra),
@@ -477,8 +452,8 @@ fn find_displays_extra(budget: Instant) -> Result<Extra, String> {
         Err(_) => {}
     }
 
-    // Two levers, cheapest first: turn on the preference that keeps the extra
-    // resident, then ask LaunchServices to load the bundle now.
+    // two levers, cheapest first: the preference that keeps the extra resident,
+    // then ask LaunchServices to load the bundle now
     enable_menu_bar_option();
     if let Err(e) = Command::new("/usr/bin/open")
         .arg(DISPLAYS_MENU_BUNDLE)
@@ -496,9 +471,8 @@ fn find_displays_extra(budget: Instant) -> Result<Extra, String> {
                 return Ok(extra);
             }
             Err(e) if Instant::now() >= deadline => return Err(e),
-            // Hammering SystemUIServer with AX queries every 25 ms is not what
-            // makes it finish loading a menu extra; back off once the fast case
-            // has clearly not happened.
+            // AX queries every 25 ms do not make SystemUIServer load the extra
+            // any sooner: back off once the fast case has not happened
             Err(_) => std::thread::sleep(poll_interval(started)),
         }
     }
@@ -507,9 +481,9 @@ fn find_displays_extra(budget: Instant) -> Result<Extra, String> {
 /// Poll interval that widens once it is clear the cheap case did not happen.
 ///
 /// The fast paths here land in tens of milliseconds, so the first second is
-/// polled tightly. Past that we are waiting on something slow — a menu extra
-/// loading, network discovery answering — and sub-100 ms polling buys nothing
-/// while costing an AX round trip and two allocations per row per iteration.
+/// polled tightly. Past that we are waiting on something slow (a menu extra
+/// loading, network discovery answering), and each poll costs an AX round trip
+/// and two allocations per row.
 fn poll_interval(started: Instant) -> Duration {
     if started.elapsed() < Duration::from_secs(1) {
         POPULATE_POLL
@@ -541,14 +515,14 @@ fn find_displays_extra_once() -> Result<Extra, String> {
     let app = CfOwned(app);
 
     let extras = copy_attr(app.0, "AXExtrasMenuBar").ok_or_else(|| {
-        "SystemUIServer exposes no menu-bar extras — is Accessibility granted to ScreenExtend?"
+        "SystemUIServer exposes no menu-bar extras. Is Accessibility granted to ScreenExtend?"
             .to_string()
     })?;
 
     let mut found: Option<CfOwned> = None;
     for extra in children(extras.0).iter() {
-        // The Displays extra is the one whose description names it. It has no
-        // AXTitle, so the description is what identifies it before it is opened.
+        // the Displays extra has no AXTitle: its description is what identifies
+        // it before it is opened
         let desc = attr_string(extra, "AXDescription").unwrap_or_default();
         let ident = attr_string(extra, "AXIdentifier").unwrap_or_default();
         let known = menu_strings().descriptions.contains(&desc);
@@ -557,8 +531,8 @@ fn find_displays_extra_once() -> Result<Extra, String> {
             || desc.contains("AirPlay")
             || ident.contains("Displays")
         {
-            // Retained rather than borrowed: `extras` and its child array both
-            // go out of scope here, and the extra has to survive them.
+            // retained, not borrowed: `extras` and its child array both go out
+            // of scope here, and the extra has to survive them
             found = Some(retained(extra));
             break;
         }
@@ -577,7 +551,7 @@ fn find_displays_extra_once() -> Result<Extra, String> {
 
 fn read_menu(extra: &Extra) -> MenuSnapshot {
     let mut snapshot = MenuSnapshot::default();
-    // The open menu is the extra's first child; its rows are flat.
+    // the open menu is the extra's first child; its rows are flat
     let menus = children(extra.element.0);
     for child in menus.iter() {
         let rows = children(child);
@@ -612,15 +586,14 @@ fn find_row(extra: &Extra, want_identifier: &str, want_title: Option<&str>) -> O
             let title = attr_string(item, "AXTitle").unwrap_or_default();
 
             let matches = match want_title {
-                // A title we can name exactly: match on it, and accept a
-                // mismatched identifier only if the platform supplied one.
+                // match on the title; an identifier has to agree only when the
+                // platform supplied one
                 Some(t) => title == t && (identifier.is_empty() || identifier == want_identifier),
-                // No title to go on: the identifier is all we have, which means
-                // this path only works on 10.15+.
+                // identifier only, so this path works on 10.15+ alone
                 None => !identifier.is_empty() && identifier == want_identifier,
             };
-            // A menu listing several AirPlay devices is the normal case, so the
-            // match has to be exact *and* selectable — never the nearest header.
+            // several AirPlay devices in one menu is the normal case: the match
+            // has to be exact *and* selectable, never the nearest header
             if matches && is_enabled(item) {
                 return Some(retained(item));
             }
@@ -630,13 +603,11 @@ fn find_row(extra: &Extra, want_identifier: &str, want_title: Option<&str>) -> O
 }
 
 fn open_menu(extra: &Extra, budget: Instant) -> Result<(), String> {
-    // `AXPress` on a menu-bar extra is a *toggle*, and there is no AX-visible
-    // open/closed state to read — `AXChildren` on the extra is 0 before the very
-    // first press and 1 forever after, open or closed. So the only reliable
-    // signal is whether the menu has items, and the only safe loop is: if it
-    // already has them we are open; otherwise press once and wait. A press that
-    // happened to close an already-open menu simply reopens it next time round,
-    // which is why this must not also try to "reset" by pressing again itself.
+    // `AXPress` on a menu-bar extra is a *toggle* with no AX-visible open/closed
+    // state: `AXChildren` on the extra is 0 before the first press and 1 forever
+    // after. The only reliable signal is whether the menu has items, so: open if
+    // it has them, otherwise press once and wait. A press that closed an open
+    // menu reopens it next time round; never "reset" by pressing again here.
     for _ in 0..3 {
         if !read_menu(extra).items.is_empty() {
             return Ok(());
@@ -661,32 +632,21 @@ fn open_menu(extra: &Extra, budget: Instant) -> Result<(), String> {
     )
 }
 
-/// Dismisses the menu, by a route that can never *open* one.
+/// How the menu is dismissed, by routes that can never *open* one.
 ///
-/// Pressing the menu-bar extra is a toggle, so using it to "close" is a trap:
-/// activating a menu item already dismisses the menu, and a toggle afterwards
-/// re-opens it — which is exactly how the picker ends up sitting on screen after
-/// a device connects. So this never presses the extra.
+/// There is deliberately no variant for pressing the menu-bar extra: that is a
+/// toggle, and since activating a menu item already dismisses the menu, a press
+/// afterwards re-opens it and leaves the picker on screen after a device connects.
 ///
 /// `AXCancel` is unsupported on the extra itself (`-25206`) but works on the
-/// menu below it, and a synthetic Escape closes whatever is open without being
-/// able to open anything.
-///
-/// The Escape is the last resort and is gated, because it is not delivered to
-/// the menu — it goes to `kCGHIDEventTap`, i.e. to whatever the user has
-/// focused. Escape there dismisses their sheet, cancels their text input, or
-/// drops them out of full screen, which is a real side effect of an operation
-/// they did not start. So it is only sent when a menu is demonstrably open, by
-/// the same signal `open_menu` uses, and it says so in the log.
-/// How the menu is dismissed.
-///
-/// An enum rather than a comment, because the mistake this guards against is a specific one:
-/// pressing the menu-bar extra is a *toggle*, so using it to "close" leaves the picker on screen
-/// after a device connects. There is deliberately no variant for it, which makes the rule a
-/// compile-time fact rather than something a test has to read the source to check.
+/// menu below it. The synthetic Escape is the last resort and is gated: it goes
+/// to `kCGHIDEventTap`, i.e. to whatever the user has focused (it dismisses
+/// their sheet, cancels their text input, or drops them out of full screen), so
+/// it is only sent when a menu is demonstrably open, by the same signal
+/// `open_menu` uses, and it says so in the log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DismissPlan {
-    /// `AXCancel` on the open menu — the only dismissal that is not also a toggle.
+    /// `AXCancel` on the open menu, the only dismissal that is not also a toggle.
     Cancel,
     /// Nothing to do: the menu is not open.
     AlreadyClosed,
@@ -745,25 +705,23 @@ fn press_escape() {
 /// How many times to reopen the menu and look again before giving up.
 ///
 /// The menu is a live `NSMenu` that SystemUIServer rebuilds as devices come and
-/// go, so element references go stale on their own; and the person at the
-/// keyboard can dismiss it at any moment by clicking elsewhere. Both look
-/// identical from here — the row is gone or the press fails — and both are
-/// fixed by opening it again.
+/// go, so element references go stale on their own, and the person at the
+/// keyboard can dismiss it at any moment. Both look identical from here (the
+/// row is gone or the press fails) and both are fixed by opening it again.
 const ROW_PRESS_ATTEMPTS: usize = 3;
 
 /// How long to keep the menu open waiting for the row we want to appear.
 ///
-/// The picker paints as soon as it opens, but it opens on `AirPlay: Looking for
-/// TV…` and fills the device rows in as discovery answers. So "the menu has
-/// items" does **not** mean "the menu has ours", and looking exactly once —
-/// then closing — is how a selection silently fails to happen.
+/// The picker opens on `AirPlay: Looking for TV...` and fills the device rows in
+/// as discovery answers, so "the menu has items" does **not** mean "the menu has
+/// ours": looking exactly once and closing silently selects nothing.
 const DEVICE_ROW_TIMEOUT: Duration = Duration::from_millis(6000);
 
 /// How long to wait for a row whose presence does not depend on discovery.
 ///
 /// "Stop AirPlay" and "Use As Separate Display" are drawn from state the menu
-/// already has, so if they are not there shortly after it opens they are not
-/// coming — and waiting the full discovery budget would just make teardown slow.
+/// already has: if they are not there shortly after it opens they are not
+/// coming, and waiting the full discovery budget would only slow teardown.
 const STATE_ROW_TIMEOUT: Duration = Duration::from_millis(1000);
 
 /// After activating a row, how long to let AppKit dispatch the action.
@@ -775,10 +733,8 @@ const ACTION_SETTLE: Duration = Duration::from_millis(250);
 
 /// Poll `find` until it answers or `deadline` passes.
 ///
-/// The picker opens on "AirPlay: Looking for TV…" and fills its rows in as discovery answers, so
-/// looking once and closing is how a selection silently fails to happen. Separated from the AX
-/// calls around it so the *waiting* can be tested with a closure that answers late — which is
-/// the only part a machine with no Displays menu extra can execute.
+/// Separated from the AX calls around it so the *waiting* can be tested with a closure that
+/// answers late, the only part a machine with no Displays menu extra can execute.
 fn wait_for_row<T>(started: Instant, deadline: Instant, find: impl Fn() -> Option<T>) -> Option<T> {
     loop {
         if let Some(found) = find() {
@@ -791,15 +747,13 @@ fn wait_for_row<T>(started: Instant, deadline: Instant, find: impl Fn() -> Optio
     }
 }
 
-/// Give a dispatched menu action a moment before the caller moves on.
-///
-/// `AXPress` returns once the action is *dispatched*, not once macOS has acted on it, so a
-/// caller that immediately re-read the display list would read the state before the change.
+/// Sleeps [`ACTION_SETTLE`]: `AXPress` returns once the action is *dispatched*, not once macOS
+/// has acted on it, so a caller that re-read the display list at once would see the old state.
 fn settle_after_action() {
     std::thread::sleep(ACTION_SETTLE);
 }
 
-/// Opens the menu, waits for a row, and presses it — retrying the sequence.
+/// Opens the menu, waits for a row, and presses it, retrying the sequence.
 ///
 /// Finding and pressing are deliberately adjacent: a reference fetched and then
 /// held across other work is exactly what goes stale.
@@ -823,18 +777,16 @@ fn press_row_in_menu(
             continue;
         }
 
-        // Hold the menu open until our row shows up, re-reading it each time —
-        // the rows are rebuilt as devices arrive, so a reference from the
-        // previous pass is no good.
+        // re-read on every pass: the rows are rebuilt as devices arrive, so a
+        // reference from the previous pass is stale
         let started = Instant::now();
         let deadline = (started + appear_timeout).min(budget);
         let pressed = wait_for_row(started, deadline, || find(&extra)).map(|row| press(row.0));
 
         match pressed {
             Some(Ok(())) => {
-                // Deliberately no dismissal: activating a menu item is what
-                // closes an NSMenu, and anything we did afterwards could only
-                // re-open it. Just let the action get going.
+                // no dismissal: activating a menu item is what closes an NSMenu,
+                // and anything done afterwards could only re-open it
                 settle_after_action();
                 return Ok(());
             }
@@ -859,8 +811,8 @@ fn press_row_in_menu(
 pub fn snapshot(budget: Instant) -> Result<MenuSnapshot, String> {
     let extra = find_displays_extra(budget)?;
     open_menu(&extra, budget)?;
-    // Same reason the press path waits: the menu opens before the device rows
-    // exist, so reading it immediately would report an empty picker.
+    // the menu opens before the device rows exist: reading it at once would
+    // report an empty picker
     let started = Instant::now();
     let deadline = (started + DEVICE_ROW_TIMEOUT).min(budget);
     let mut snap = read_menu(&extra);
@@ -919,7 +871,7 @@ pub fn use_as_separate_display(budget: Instant) -> Result<(), String> {
                 .or_else(|| find_row(extra, USE_AS_DISPLAY_IDENTIFIER, None))
         },
         |_| {
-            "the Displays menu is not offering an extend option — either nothing is mirroring or \
+            "the Displays menu is not offering an extend option: either nothing is mirroring or \
              the display is already extended"
                 .to_string()
         },
@@ -934,10 +886,10 @@ const START_MIRRORING_IDENTIFIER: &str = "startMirroring:";
 ///
 /// Two ways to find the row, because the reliable one differs by OS version:
 ///
-/// * **By title** — `AIRPLAY_TURN_OFF` read from the menu's own bundle, so it is
+/// * **By title**: `AIRPLAY_TURN_OFF` read from the menu's own bundle, so it is
 ///   whatever "Stop AirPlay" is called in the user's language. This is the only
 ///   route that works on 10.13/10.14, where menu items have no `AXIdentifier`.
-/// * **By position** — on 10.15+, where identifiers exist, the Stop row is the
+/// * **By position**: on 10.15+, where identifiers exist, the Stop row is the
 ///   *first* `connectToAirPlayDevice:` item (it is that action invoked with no
 ///   device), sitting above the `startMirroring:` / `stopMirroring:` block,
 ///   while the real devices are listed after the "AirPlay To:" header.
@@ -978,8 +930,8 @@ fn find_stop_row_by_position(extra: &Extra) -> Option<CfOwned> {
                     first_connect = Some(retained(item))
                 }
                 START_MIRRORING_IDENTIFIER | USE_AS_DISPLAY_IDENTIFIER => {
-                    // The mirror-mode block only exists during a live session,
-                    // and it sits below the Stop row.
+                    // the mirror-mode block only exists during a live session,
+                    // and it sits below the Stop row
                     return first_connect;
                 }
                 _ => {}
@@ -996,10 +948,10 @@ mod tests {
     #[test]
     fn system_ui_server_is_running_on_a_desktop_session() {
         // SystemUIServer only exists in a logged-in GUI session; over ssh it is
-        // absent, so this asserts the probe does not panic either way.
+        // absent, so this asserts the probe does not panic either way
         let first = system_ui_server_pid();
         println!("SystemUIServer pid: {first:?}");
-        // The second call comes off the cache and must agree with the first.
+        // the second call comes off the cache and must agree with the first
         assert_eq!(first, system_ui_server_pid());
         if let Some(pid) = first {
             assert!(process_is_named(pid, SYSTEM_UI_SERVER));
@@ -1008,8 +960,8 @@ mod tests {
 
     #[test]
     fn the_process_scan_finds_this_process() {
-        // The test binary is the one process the scan is guaranteed to be able
-        // to see, whatever the session and whatever the privileges.
+        // the test binary is the one process the scan is guaranteed to be able
+        // to see, whatever the session and whatever the privileges
         let me = std::process::id() as i32;
         let mut name = [0u8; 64];
         let len =
@@ -1019,8 +971,8 @@ mod tests {
         println!("own process name: {:?}", String::from_utf8_lossy(name));
         assert!(process_is_named(me, name));
         assert!(!process_is_named(me, b"definitely-not-this-process"));
-        // The scan returns the lowest matching pid, which need not be us if a
-        // second copy of the harness is running — but it must be *a* match.
+        // the scan returns the lowest matching pid, which need not be us if a
+        // second copy of the harness is running, but it must be *a* match
         let found = find_process_named(name).expect("the scan must find a process by that name");
         assert!(process_is_named(found, name));
         assert_eq!(find_process_named(b"definitely-not-this-process"), None);
@@ -1039,9 +991,9 @@ mod tests {
 
     #[test]
     fn the_menu_bundle_yields_localized_titles() {
-        // The keys come from Displays.menu's own Localizable.strings. If Apple
-        // ever renames one, this is where it surfaces — and the code degrades to
-        // the positional fallback rather than misfiring.
+        // keys from Displays.menu's own Localizable.strings: if Apple renames
+        // one this is where it surfaces, and the code degrades to the positional
+        // fallback rather than misfiring
         let m = menu_strings();
         assert!(
             m.stop_airplay.is_some(),
@@ -1061,14 +1013,7 @@ mod tests {
 
     #[test]
     fn a_row_is_waited_for_rather_than_looked_for_once() {
-        // The picker opens on "AirPlay: Looking for TV…" and fills in devices as
-        // discovery answers, so a single look followed by a close is how a
-        // selection silently fails to happen.
-        //
-        // This used to assert on the *text* of `press_row_in_menu`, because the
-        // wait was tangled up in AX calls no test machine can make. It is now a
-        // seam that takes the lookup as a closure, so the waiting itself runs
-        // here: the row below appears only on the fourth look.
+        // the row appears only on the fourth look
         let looks = std::cell::Cell::new(0);
         let started = Instant::now();
         let found = wait_for_row(started, started + Duration::from_secs(2), || {
@@ -1093,8 +1038,8 @@ mod tests {
 
     #[test]
     fn a_row_that_never_appears_gives_up_at_the_deadline() {
-        // The other half: waiting must be bounded, or a Mac with no receiver on
-        // the network hangs the join instead of reporting that it found nothing.
+        // waiting must be bounded, or a Mac with no receiver on the network
+        // hangs the join instead of reporting that it found nothing
         let looks = std::cell::Cell::new(0);
         let started = Instant::now();
         let deadline = started + Duration::from_millis(300);
@@ -1123,8 +1068,6 @@ mod tests {
 
     #[test]
     fn a_dispatched_action_is_given_time_to_take_effect() {
-        // `AXPress` returns when the action is dispatched, not when macOS has
-        // acted on it, so the caller has to pause before reading the result.
         let started = Instant::now();
         settle_after_action();
         assert!(started.elapsed() >= ACTION_SETTLE);
@@ -1132,20 +1075,13 @@ mod tests {
 
     #[test]
     fn a_device_row_gets_longer_than_a_state_row() {
-        // One depends on network discovery; the other is already in the menu's
-        // own state, and waiting the full budget for it would slow teardown.
         assert!(DEVICE_ROW_TIMEOUT > STATE_ROW_TIMEOUT);
     }
 
     #[test]
     fn dismissing_the_menu_never_presses_the_extra() {
-        // Pressing the extra is a toggle: using it to "close" is what leaves the
-        // picker on screen after a device connects. `DismissPlan` has no variant
-        // for it, so that rule is now a compile-time fact; what is left to check
-        // is that the three real outcomes are chosen correctly.
-        //
-        // This used to read the text of `close_menu` and look for the absence of
-        // a substring, which a comment mentioning it would have broken.
+        // `DismissPlan` has no variant for pressing the extra (a toggle), so
+        // only the three real outcomes are left to check
         assert_eq!(
             dismiss_plan(true, false),
             DismissPlan::Cancel,
@@ -1190,8 +1126,8 @@ mod tests {
                 },
             ],
         };
-        // Every device is listed, and the one we published is exactly one of
-        // them — the picker being busy is the normal case, not an error.
+        // every device is listed and ours is exactly one of them: a busy picker
+        // is the normal case, not an error
         assert_eq!(
             snap.device_names(),
             vec!["Living Room TV", "ScreenExtend - iPad", "Kitchen"]
@@ -1207,8 +1143,8 @@ mod tests {
 
     #[test]
     fn a_device_row_is_not_confused_with_the_connected_header() {
-        // While connected the menu grows an "AirPlay: <name>" header whose
-        // title contains ours. Matching is exact, so it cannot collide.
+        // while connected the menu grows an "AirPlay: <name>" header whose
+        // title contains ours; matching is exact, so it cannot collide
         let header = "AirPlay: ScreenExtend - iPad";
         let row = "ScreenExtend - iPad";
         assert_ne!(header, row);

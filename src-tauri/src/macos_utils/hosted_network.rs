@@ -15,11 +15,9 @@ use crate::macos_utils::AppState;
 
 /// `securityType:` values for the private HostAP SPI.
 ///
-/// 2 (open) and 16 (WEP) are the only two values ever confirmed, and they come from a 2012 sweep
-/// that only covered [-127, 127] — so nothing at or above 128 has ever been tried on any macOS.
-/// The candidates below are guesses ordered most-preferred first; the first one that both returns
-/// YES and brings the radio up is remembered for the rest of the process. Override the whole
-/// ladder with `SCREENEXTEND_HOSTAP_SECURITY=<n>` to sweep by hand on a machine we do not have.
+/// Only 2 (open) and 16 (WEP) are confirmed, from a sweep of [-127, 127]. The other candidates
+/// are guesses, most preferred first: the first that returns YES and brings the radio up is
+/// remembered for the process. `SCREENEXTEND_HOSTAP_SECURITY=<n>` overrides the whole ladder.
 const SECURITY_OPEN: u64 = 2;
 const SECURITY_WEP: u64 = 16;
 const SECURED_CANDIDATES: &[u64] = &[1024, 512, 256, 128, 64, 32, SECURITY_WEP];
@@ -36,7 +34,7 @@ const PREFERRED_5GHZ_CHANNELS: [isize; 6] = [36, 40, 48, 153, 157, 161];
 /// 2.4 GHz fallback. 11 rather than 6 for the same reason.
 const PREFERRED_CHANNEL: isize = 11;
 
-/// WPA-class passphrases are 8-63 characters; WEP-104 wants 13 ASCII. We accept the WPA floor and
+/// WPA-class passphrases are 8-63 characters; WEP-104 wants 13 ASCII. Accept the WPA floor and
 /// let the SPI reject what it cannot use.
 const MIN_PASSWORD_LEN: usize = 8;
 
@@ -77,16 +75,14 @@ pub struct HostedNetworkStatus {
     pub band: Option<&'static str>,
     pub security: Option<String>,
     /// Whether the AP that came up carries encryption at all. The HostAP SPI can refuse
-    /// every secured `securityType` this Mac was asked for, and the fallback then brings up
-    /// an open network that stays up for the session — so this is not a detail, it is the
-    /// difference between a passphrase and none.
+    /// every secured `securityType`, and the fallback then brings up an open network.
     pub secured: bool,
     /// The platform accepted the start request.
     pub advertised: bool,
     /// The host holds a routable IPv4 on the AP interface, i.e. `bootpd` is serving.
     pub host_ipv4: Option<Ipv4Addr>,
-    /// A client that actually associated, took a DHCP lease from us and reached the streamer.
-    /// This is the only field that distinguishes an AP that works from one that merely exists.
+    /// A client that associated, took a DHCP lease and reached the streamer: the only field
+    /// that tells an AP that works from one that merely exists.
     pub associated_peer: Option<Ipv4Addr>,
 }
 
@@ -152,16 +148,15 @@ pub fn turn_on_wifi() -> bool {
     unsafe { interface.setPower_error(true) }.is_ok()
 }
 
-/// Which mechanism this Mac can actually use to create a network, decided by asking the live
-/// `CWInterface` whether it implements the selector — never by an OS version. A bare `msg_send!`
-/// to a selector the class does not implement raises an Obj-C exception through a non-unwinding
-/// Rust frame, which aborts the process, so this probe is load-bearing rather than cosmetic.
+/// Which mechanism this Mac can use to create a network, decided by asking the live `CWInterface`
+/// whether it implements the selector, never by an OS version. A `msg_send!` to an unimplemented
+/// selector raises an Obj-C exception through a non-unwinding Rust frame and aborts the process.
 pub fn probe_hosted_network_backend() -> HostedNetworkBackend {
     static CACHED: OnceLock<HostedNetworkBackend> = OnceLock::new();
     if let Some(cached) = CACHED.get() {
         return *cached;
     }
-    // No interface yet (radio hard-off, no Wi-Fi hardware) is not a verdict — do not cache it.
+    // no interface yet (radio hard-off, no Wi-Fi hardware) is not a verdict: do not cache it
     let Some(interface) = wifi_interface() else {
         return HostedNetworkBackend::Unsupported;
     };
@@ -193,7 +188,7 @@ fn channel_band(channel: &CWChannel) -> &'static str {
 }
 
 fn channel_override() -> Option<isize> {
-    std::env::var("SCREENEXTEND_HOSTAP_CHANNEL")
+    crate::envcfg::var("SCREENEXTEND_HOSTAP_CHANNEL")
         .ok()?
         .trim()
         .parse::<isize>()
@@ -246,7 +241,7 @@ fn pick_channel(interface: &CWInterface) -> Option<Retained<CWChannel>> {
 }
 
 fn security_override() -> Option<u64> {
-    std::env::var("SCREENEXTEND_HOSTAP_SECURITY")
+    crate::envcfg::var("SCREENEXTEND_HOSTAP_SECURITY")
         .ok()?
         .trim()
         .parse::<u64>()
@@ -255,7 +250,7 @@ fn security_override() -> Option<u64> {
 
 fn open_fallback_allowed() -> bool {
     !matches!(
-        std::env::var("SCREENEXTEND_HOSTAP_ALLOW_OPEN").as_deref(),
+        crate::envcfg::var("SCREENEXTEND_HOSTAP_ALLOW_OPEN").as_deref(),
         Ok("0") | Ok("false") | Ok("no")
     )
 }
@@ -361,9 +356,8 @@ fn interface_mode_is_host_ap(interface: &CWInterface) -> bool {
     mode == CWInterfaceMode::HostAP || mode == CWInterfaceMode::IBSS
 }
 
-/// A start that returned YES has told us nothing about the radio: wait for the interface to
-/// actually enter AP mode. `start_hosted_network` is a synchronous Tauri command, so this is the
-/// only wait it is allowed to make the user sit through.
+/// A start that returned YES says nothing about the radio: wait for the interface to enter AP
+/// mode. `start_hosted_network` is a synchronous Tauri command, so this is its only wait.
 fn wait_for_ap_mode(interface: &CWInterface) -> bool {
     let deadline = Instant::now() + MODE_SETTLE_TIMEOUT;
     loop {
@@ -377,16 +371,13 @@ fn wait_for_ap_mode(interface: &CWInterface) -> bool {
     }
 }
 
-/// AP mode with no address on the interface means nothing is serving DHCP: clients will see the
-/// network and fail to join. This is the difference between advertised and working, and it settles
-/// a second or two after the start, so it is watched rather than waited on.
+/// AP mode with no address on the interface means nothing is serving DHCP: clients see the
+/// network and fail to join. It settles a second or two after the start, so it is watched
+/// rather than waited on.
 ///
-/// `previous` is the address the interface held *before* the start, and rejecting it is not a
-/// refinement. Measured on 10.15.8: two seconds after `startHostAPModeWithSSID:` returned YES and
-/// `interfaceMode()` read HostAP, `getifaddrs` still reported the station address from the network
-/// the Mac had just left — so a naive read reports the AP as verified, on the LAN address, before
-/// the interface has been reconfigured at all. Forty-five seconds later the real answer was that
-/// the AP holds no address whatsoever.
+/// `previous` is the address the interface held *before* the start and must be rejected: on
+/// 10.15.8 `getifaddrs` still reported the station address two seconds after
+/// `startHostAPModeWithSSID:` returned YES and `interfaceMode()` read HostAP.
 fn wait_for_ipv4(name: &str, previous: Option<Ipv4Addr>, timeout: Duration) -> Option<Ipv4Addr> {
     let deadline = Instant::now() + timeout;
     loop {
@@ -403,10 +394,9 @@ fn wait_for_ipv4(name: &str, previous: Option<Ipv4Addr>, timeout: Duration) -> O
 
 /// Finish the verification the command thread could not afford to wait for, then keep watching.
 ///
-/// Phase one asks whether the host got a routable IPv4 on the AP interface and says plainly which
-/// of the two outcomes happened. Phase two notices an AP that goes away on its own — a radio reset,
-/// a Wi-Fi mode change from the menu bar, or the OS reclaiming the interface — which is what
-/// otherwise leaves the dashboard with a green light on a dead AP.
+/// First reports whether the host got a routable IPv4 on the AP interface, then notices an AP
+/// that goes away on its own (a radio reset, a Wi-Fi mode change from the menu bar, the OS
+/// reclaiming the interface), which would otherwise leave the dashboard green on a dead AP.
 fn watch_liveness(
     app: AppHandle,
     generation: u64,
@@ -428,7 +418,7 @@ fn watch_liveness(
             guard.host_ipv4 = host_ipv4;
             match (host_ipv4, guard.channel, guard.band, guard.security.clone()) {
                 (Some(ip), Some(channel), Some(band), Some(security)) => tprintln!(
-                    "[hosted-network] '{ssid}' verified — channel {channel} ({band}), {security}, \
+                    "[hosted-network] '{ssid}' verified: channel {channel} ({band}), {security}, \
                      host address {ip}"
                 ),
                 (None, ..) => teprintln!(
@@ -450,7 +440,7 @@ fn watch_liveness(
                 return;
             }
 
-            // "Started" has never meant "a client can join". Look for one.
+            // "started" does not mean "a client can join": look for one
             if let (Some(host), false) = (host_ipv4, announced_association) {
                 if let Some(peer) = associated_peer(&app, host) {
                     status().lock().unwrap().associated_peer = Some(peer);
@@ -487,7 +477,7 @@ fn watch_liveness(
                 return;
             }
             teprintln!(
-                "[hosted-network] '{ssid}' is no longer in AP mode — the OS or the radio dropped it"
+                "[hosted-network] '{ssid}' is no longer in AP mode: the OS or the radio dropped it"
             );
             *status().lock().unwrap() = HostedNetworkStatus::default();
             if let Some(state) = app.try_state::<AppState>() {
@@ -499,11 +489,10 @@ fn watch_liveness(
     });
 }
 
-/// A client of *our* AP, as opposed to one that reached us over the wired LAN.
+/// A client of this host's AP, as opposed to one that came in over the wired LAN.
 ///
-/// The hosted network hands out a /24 around the host's own address, so a session whose client IP
-/// shares that /24 came in over the AP. This is the promotion from "advertised" to "verified":
-/// nothing before it observes a client at all.
+/// The hosted network hands out a /24 around the host's own address, so a session whose client
+/// IP shares that /24 came in over the AP.
 fn associated_peer(app: &AppHandle, host: Ipv4Addr) -> Option<Ipv4Addr> {
     use tauri::Manager;
     let state = app.try_state::<AppState>()?;
@@ -540,7 +529,7 @@ fn secured_attempts(password: &str) -> Vec<Attempt> {
         .map(|&security| Attempt {
             security,
             label: if security == SECURITY_WEP {
-                "securityType 16 (WEP — crackable, and modern phones warn about it)".to_string()
+                "securityType 16 (WEP: crackable, and modern phones warn about it)".to_string()
             } else {
                 format!("securityType {security} (unconfirmed)")
             },
@@ -597,7 +586,7 @@ fn try_ibss(interface: &CWInterface, ssid: &str, password: Option<&str>) -> Opti
     };
     tprintln!(
         "[hosted-network] falling back to IBSS on 2.4 GHz channel {PREFERRED_CHANNEL}. IBSS is \
-         802.11g-rate and open/WEP only, so the link tops out near 20 Mbit/s of TCP goodput — \
+         802.11g-rate and open/WEP only, so the link tops out near 20 Mbit/s of TCP goodput: \
          enough for a scaled-down stream, not for 1080p60"
     );
     if !send_start_ibss(interface, PREFERRED_CHANNEL as u64, ssid, security, pw) {
@@ -657,7 +646,7 @@ fn start_via_host_ap(
 
     let open = Attempt {
         security: SECURITY_OPEN,
-        label: "securityType 2 (open — no encryption)".to_string(),
+        label: "securityType 2 (open, no encryption)".to_string(),
         password: None,
     };
     for (index, channel) in channels.iter().enumerate() {
@@ -688,14 +677,13 @@ pub fn start_hosted_network(
     password: &str,
 ) -> bool {
     let Some(interface) = wifi_interface() else {
-        teprintln!("[hosted-network] no Wi-Fi interface — this Mac cannot host a network");
+        teprintln!("[hosted-network] no Wi-Fi interface: this Mac cannot host a network");
         *state.hosted_network_running.lock().unwrap() = false;
         return false;
     };
 
-    // Read before anything touches the radio. macOS leaves the station address on the interface
-    // for seconds after the AP is up, and a verification that accepts it reports the AP as
-    // working, on the address of the network the Mac just left.
+    // read before anything touches the radio: macOS leaves the station address on the
+    // interface for seconds after the AP is up, and the verification must not accept it
     let station_ipv4 = interface_bsd_name(&interface)
         .as_deref()
         .and_then(crate::macos_utils::networking::interface_ipv4);
@@ -722,9 +710,8 @@ pub fn start_hosted_network(
         return false;
     }
 
-    // Start from a known state, but only if there is something to stop: sending stopHostAPMode to
-    // an interface that is associated as a station is unverified territory, and this Mac's Wi-Fi is
-    // very likely the link the user is about to stream over.
+    // only stop when there is an AP to stop: stopHostAPMode on an interface associated as a
+    // station is untested, and that link is likely the one the user streams over
     if interface_mode_is_host_ap(&interface) {
         tprintln!("[hosted-network] the interface is already in AP mode; stopping it first");
         stop_host_ap_mode();
@@ -760,7 +747,7 @@ pub fn start_hosted_network(
     };
 
     tprintln!(
-        "[hosted-network] '{name}' is up on {} — channel {} ({}), {}; checking for a DHCP address",
+        "[hosted-network] '{name}' is up on {}: channel {} ({}), {}; checking for a DHCP address",
         backend.as_str(),
         outcome.channel,
         outcome.band,
@@ -796,10 +783,10 @@ pub fn start_hosted_network(
 #[specta::specta]
 pub fn stop_hosted_network(_app: AppHandle, state: State<'_, AppState>) -> bool {
     match state.stop_hosted_network.lock().unwrap().take() {
-        // We started it, so stop it unconditionally — the radio may not have followed.
+        // started here, so stop unconditionally: the radio may not have followed
         Some(stop) => stop(),
-        // We did not. Only send the SPI if there is actually an AP to stop; otherwise this is a
-        // private selector aimed at the interface the user is currently associated through.
+        // not started here: only send the SPI when there is an AP to stop, or it is a private
+        // selector aimed at the interface the user is associated through
         None => {
             let in_ap_mode = wifi_interface()
                 .map(|i| interface_mode_is_host_ap(&i))
@@ -831,7 +818,7 @@ pub fn is_hosted_network(_app: AppHandle, state: State<'_, AppState>) -> bool {
 
 /// Everything the network card can show without opening the log terminal: the tri-state,
 /// the backend, the channel and band the ladder settled on, the `securityType` that was
-/// accepted, and — the one that matters for consent — whether the AP carries encryption at
+/// accepted, and (the one that matters for consent) whether the AP carries encryption at
 /// all. All of it was already logged on every start and reachable through
 /// `hosted_network_status()`; none of it had a way to reach the UI.
 #[tauri::command]
@@ -851,9 +838,8 @@ pub fn get_hosted_network_status(
         };
     }
     crate::HostedNetworkReport {
-        // `associated_peer` is the stronger signal and it is reported separately; the
-        // tri-state means the same thing on both platforms, which is "is anything serving
-        // DHCP behind this SSID".
+        // the tri-state means the same on both platforms: is anything serving DHCP behind
+        // this SSID (`associated_peer`, the stronger signal, is reported separately)
         state: if status.host_ipv4.is_some() {
             crate::HostedNetworkReport::VERIFIED.to_string()
         } else {
@@ -891,8 +877,8 @@ mod tests {
         assert!(!SECURED_CANDIDATES.contains(&SECURITY_OPEN));
     }
 
-    /// Read-only inventory of what this Mac's Wi-Fi interface offers. Safe to run anywhere — it
-    /// starts nothing and changes nothing:
+    /// Read-only inventory of what this Mac's Wi-Fi interface offers. It starts nothing and
+    /// changes nothing, so it is safe to run anywhere:
     ///
     /// ```text
     /// cargo test --lib macos_utils::hosted_network::tests::report_hostap_surface -- --ignored --nocapture
@@ -956,20 +942,18 @@ mod tests {
         );
     }
 
-    /// One bounded run of exactly what shipping code does, with every number the ledger wants:
-    /// which securityType the SPI accepts, on which channel and band, how long the radio takes to
-    /// reach AP mode, and whether anything then serves DHCP.
+    /// One bounded run of what shipping code does: which securityType the SPI accepts, on which
+    /// channel and band, how long the radio takes to reach AP mode, and whether anything then
+    /// serves DHCP.
     ///
-    /// **This takes the Wi-Fi interface.** On a Mac whose only network is that interface — which
-    /// is this project's dev box — it drops every remote session, so it has to be run detached
-    /// with a watchdog that restores the radio. `docs/manual-tests/macos-hosted-network.md` has
-    /// the script.
+    /// **This takes the Wi-Fi interface.** On a Mac whose only network is that interface it drops
+    /// every remote session, so run it detached with a watchdog that restores the radio.
     ///
     /// ```text
     /// cargo test --lib macos_utils::hosted_network::tests::measure_hostap_start -- --ignored --nocapture
     /// ```
     #[test]
-    #[ignore = "takes the Wi-Fi interface; see docs/manual-tests/macos-hosted-network.md"]
+    #[ignore = "takes the Wi-Fi interface; run it manually"]
     fn measure_hostap_start() {
         let Some(interface) = wifi_interface() else {
             println!("no Wi-Fi interface");
@@ -1016,14 +1000,14 @@ mod tests {
                 attempt.label
             );
             if mode_ok {
-                // Hold the AP up long enough for a second device to scan it, which is the only
-                // way to learn what security an accepted `securityType:` actually advertises.
-                let hold = std::env::var("SCREENEXTEND_HOSTAP_HOLD_SECS")
+                // hold the AP up so a second device can scan it: the only way to learn what
+                // security an accepted `securityType:` advertises
+                let hold = crate::envcfg::var("SCREENEXTEND_HOSTAP_HOLD_SECS")
                     .ok()
                     .and_then(|v| v.trim().parse::<u64>().ok())
                     .unwrap_or(0);
                 if hold > 0 {
-                    println!("holding '{ssid}' up for {hold}s — scan it from another device now");
+                    println!("holding '{ssid}' up for {hold}s: scan it from another device now");
                     let held = Instant::now();
                     while held.elapsed() < Duration::from_secs(hold) {
                         std::thread::sleep(Duration::from_secs(5));
@@ -1046,18 +1030,16 @@ mod tests {
         println!("stopped; the radio should rejoin its known network on its own");
     }
 
-    /// The security-type sweep the tree has been carrying as a 2012 comment. Run it on a real Mac
-    /// with a phone nearby:
+    /// The `securityType:` sweep. Run it on a real Mac with a phone nearby:
     ///
     /// ```text
     /// cargo test --lib macos_utils::hosted_network::tests::sweep_security_types -- --ignored --nocapture
     /// ```
     ///
     /// It records, for every candidate, whether the SPI returned YES and whether the radio then
-    /// actually entered AP mode. Scan from a second device to see what each accepted value
-    /// advertises.
+    /// entered AP mode. Scan from a second device to see what each accepted value advertises.
     #[test]
-    #[ignore = "takes the Wi-Fi interface; see docs/manual-tests/macos-hosted-network.md"]
+    #[ignore = "takes the Wi-Fi interface; run it manually"]
     fn sweep_security_types() {
         let Some(interface) = wifi_interface() else {
             println!("no Wi-Fi interface");

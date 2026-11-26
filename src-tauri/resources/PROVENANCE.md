@@ -1,4 +1,4 @@
-# Vendored resources — provenance
+# Vendored resources: provenance
 
 Third-party binaries bundled as Tauri `resources`. Checksums are pinned in
 `SHA256SUMS` and verified by the `blob-checksums` job in
@@ -8,9 +8,8 @@ against the upstream release the next time these are refreshed.
 
 ## Virtual Display Driver (`VirtualDisplayDriver.{dll,cat,inf}`)
 
-**This is not an upstream artifact.** It is a locally built, rebranded fork, and until this
-section was rewritten nothing in the tree said so — the only way to learn what the binary
-was, was to run `strings` on it. That is recorded here so the next person does not have to.
+**This is not an upstream artifact.** It is a locally built, rebranded fork. The facts below
+were read out of the binary with `strings` and out of the shipped `.inf`.
 
 - **Upstream base:** [MolotovCherry/virtual-display-rs](https://github.com/MolotovCherry/virtual-display-rs),
   a Windows indirect-display driver (IDD) creating virtual monitors. Credited in the project
@@ -34,19 +33,18 @@ was, was to run `strings` on it. That is recorded here so the next person does n
   - `DriverVer = 07/18/2024,1.0.0.0`
   - the IPC pipe name is **unchanged** at `\\.\pipe\virtualdisplaydriver`, which is what
     `windows_utils/driver_ipc` connects to and what `probe_display_backend()` tests for.
-- **Capability ceiling, from the same `.inf`** — this is the one fact that is otherwise only
-  discoverable by disassembly:
-  - `UmdfExtensions = IddCx0102` — IddCx **1.2**, i.e. Windows 10 1709. Anything the driver
+- **Capability ceiling, from the same `.inf`** (otherwise discoverable only by disassembly):
+  - `UmdfExtensions = IddCx0102`: IddCx **1.2**, i.e. Windows 10 1709. Anything the driver
     could gain from a later IddCx level (adapter selection among them) needs a rebuild
     against a newer WDK, not a configuration change.
   - `UmdfLibraryVersion = 2.15.0`, `UmdfKernelModeClientPolicy = AllowKernelModeClients`,
     `UmdfHostProcessSharing = ProcessSharingDisabled`
-  - `HKR, "WUDF", "DeviceGroupId", %REG_SZ%, "VirtualDisplayDriverGroup"` — Microsoft advises
+  - `HKR, "WUDF", "DeviceGroupId", %REG_SZ%, "VirtualDisplayDriverGroup"`. Microsoft advises
     dropping `DeviceGroupId` for low-lock-contention IDDs. Advisory for a console IDD like
     this one, but it belongs in the same review.
   - `Class = Display`, `ClassGUID = {4D36E968-E325-11CE-BFC1-08002BE10318}`,
-    `%DeviceName%=VirtualDisplay_Install, Root\VirtualDisplayDriver` — the hardware id the
-    `nefconc` calls in `cli.rs`/`lib.rs` pass.
+    `%DeviceName%=VirtualDisplay_Install, Root\VirtualDisplayDriver`. That is the hardware id
+    the `nefconc` calls in `cli.rs`/`lib.rs` pass.
 - **License:** upstream `virtual-display-rs` terms apply to the fork; confirm against its
   `LICENSE` at commit `eae5120`.
 - **Signing:** the `.cat` catalog is signed with the key behind `ScreenExtend.cer` (below),
@@ -54,7 +52,7 @@ was, was to run `strings` on it. That is recorded here so the next person does n
   certificate has to be installed into `root` and `TrustedPublisher` for Windows to load the
   driver, which is what `ScreenExtend drivers install` does through `certutil`.
 - **Reproducing it:** a second machine following this section will not produce a
-  byte-identical DLL — embedded paths and timestamps differ — so the check is behavioural,
+  byte-identical DLL (embedded paths and timestamps differ), so the check is behavioural,
   plus a matching `Initialized Virtual Display Driver ... @ <commit>` string.
 
 | File | SHA-256 |
@@ -67,27 +65,27 @@ was, was to run `strings` on it. That is recorded here so the next person does n
 
 - **What:** the public certificate installed into the Windows `root` and
   `TrustedPublisher` stores (via `certutil`) so the signed virtual display driver
-  loads. Public cert only — no private key.
+  loads. Public cert only, no private key.
 - **SHA-256:** `db896ceccd9cba9e5f5cbebdb1d61d27e8e984f076233f97bcc75840faf0492c`
 
 ## libopus (`libopus.dll`)
 
-- **Upstream:** [xiph/opus](https://github.com/xiph/opus) — the reference Opus audio
+- **Upstream:** [xiph/opus](https://github.com/xiph/opus), the reference Opus audio
   codec. BSD-3-Clause.
 - **Used for:** low-delay (`OPUS_APPLICATION_RESTRICTED_LOWDELAY`, CELT-only) encode of
   captured system audio before WebRTC transport. Loaded at runtime via `libloading`, the
-  same way `libx264-164.dll` is — see `windows_utils/audio/opus_sys.rs`.
+  same way `libx264-164.dll` is (see `windows_utils/audio/opus_sys.rs`).
 - **Version:** built from source at commit
   `03647f524a40b05a1898522e92033810b58103c7` (2026-08-14). `opus_get_version_string()`
-  reports the literal string `libopus unknown` — upstream's own fallback, because the DLL was
+  reports the literal string `libopus unknown`. That is upstream's own fallback, because the DLL was
   produced from a shallow git checkout that lacks the generated `package_version` file. The
   pointer is valid and the symbol is the right one; the library really is called that. The
-  commit hash above is the authoritative pin. Built x64 Release, `-DBUILD_SHARED_LIBS=ON` (DRED/OSCE off — encoder-only path).
+  commit hash above is the authoritative pin. Built x64 Release, `-DBUILD_SHARED_LIBS=ON` (DRED/OSCE off, encoder-only path).
 - **License:** BSD-3-Clause (Xiph.Org / Skype et al.). Compatible with this project's
   AGPL-3.0 (permissive → copyleft is fine).
 - **SHA-256:** `73924f6a4124a52c9a3e1b5cedb68339f4d21627826b2b5fce5c453dde2857b5`
 
-## libopus — macOS (`libopus.dylib`)
+## libopus, macOS (`libopus.dylib`)
 
 - **Upstream:** [xiph/opus](https://github.com/xiph/opus). BSD-3-Clause. Same codec as the
   Windows `libopus.dll`; feeds the shared encoder wrapper (`streamer/audio/opus_sys.rs`).
@@ -175,7 +173,7 @@ was, was to run `strings` on it. That is recorded here so the next person does n
 
 ## libx264 (`libx264-164.dll`)
 
-- **Upstream:** [videolan/x264](https://code.videolan.org/videolan/x264) — the
+- **Upstream:** [videolan/x264](https://code.videolan.org/videolan/x264), the
   x264 H.264 encoder. `164` is the libx264 ABI/build number.
 - **Used for:** the CPU (software) H.264 encode fallback when no supported GPU
   encoder is available.
@@ -187,9 +185,8 @@ was, was to run `strings` on it. That is recorded here so the next person does n
 
 ## How each FFI binding is proved, and against what
 
-Four native ABIs are reached by hand-written bindings, and they are not all checked the same
-way — deliberately. The question each answers is "what would go wrong, and would anything
-notice", and the answers differ:
+The native ABIs reached by hand-written bindings are not all checked the same way. Each
+method follows from what would go wrong and whether anything would notice:
 
 | binding | how the ABI is established | test |
 | --- | --- | --- |
@@ -203,26 +200,26 @@ Why the last two are not header-derived:
 
 - **libx264.** `x264.h` is GPL-2.0-or-later; the NVENC and AMF headers are MIT, which is what
   made vendoring them into this tree a licence question with an easy answer. A GPL header
-  vendored to run a generator over is a different question, and one the test does not need to
-  ask — libx264 is loaded at runtime and can be interrogated directly, which is strictly
-  stronger: a header describes *a* libx264, and the one that matters is whichever
-  `libx264-164.dll` the machine actually has.
+  vendored to run a generator over is a different question, and the test does not need it:
+  libx264 is loaded at runtime and can be queried directly. That is a stronger check, because a
+  header describes *a* libx264, and the one that matters is whichever `libx264-164.dll` the
+  machine actually has.
 - **libopus.** Same reasoning without the licence part: `opus_defines.h` is BSD and could be
-  vendored, but every number in `opus_sys.rs` is a CTL request or an error code, and both are
-  things the loaded library will answer for directly. A CTL number checked against a header is
+  vendored, but every number in `opus_sys.rs` is a CTL request or an error code, and the
+  loaded library returns both directly. A CTL number checked against a header is
   checked against a claim; a CTL number checked by writing a value and reading it back through
   its paired getter is checked against the behaviour the host depends on.
 
-Why oneVPL is neither: its dispatcher ships with the Intel driver and is not bundled (see the
-section below), so a vendored header set would describe a oneVPL nobody is running. What
-compensates is that the Intel path is exercised end to end on hardware in `intel_encoder.rs`.
+Why oneVPL is neither: its dispatcher is installed with the Intel driver and is not bundled (see the
+section below), so a vendored header set would describe a oneVPL nobody is running. Instead,
+`intel_encoder.rs` exercises the Intel path end to end on hardware.
 
-The rule to carry forward: **generate where the artifact cannot be questioned at runtime,
-interrogate where it can.** NVENC and AMF are drivers whose headers are the only available
-statement of their ABI. libx264 and libopus are libraries this repo ships and loads, so the
-shipped artifact is the better witness.
+The rule: **generate where the artifact cannot be queried at runtime, query it where it
+can.** NVENC and AMF are drivers whose headers are the only available statement of their ABI.
+libx264 and libopus are libraries this repo ships and loads, so the tests check the shipped
+artifact itself.
 
-## Intel oneVPL dispatcher (`libvpl.dll`) — **deliberately not bundled**
+## Intel oneVPL dispatcher (`libvpl.dll`): **deliberately not bundled**
 
 - **Upstream:** [intel/libvpl](https://github.com/intel/libvpl), MIT.
 - **Used for:** `windows_utils/streamer/intel/intel_sys.rs` loads it by name to reach the Quick
@@ -235,14 +232,14 @@ shipped artifact is the better witness.
      Publisher*, SHA-256
      `803a53d4a8062838a7fa85bc7385a036121162fb969d2f501803d1b01e863815`.
   2. Pre-Gen12 hosts, the ones Intel says must ship their own dispatcher, run **Media SDK**
-     behind it — API 1.x. This encoder requires oneVPL **2.x** for internal surface allocation
+     behind it, which is API 1.x. This encoder requires oneVPL **2.x** for internal surface allocation
      (`MFXMemory_GetSurfaceForVPP`/`Encode`, `mfxFrameSurfaceInterface::GetNativeHandle`) and
      `create_session` rejects a 1.x runtime at session creation. Shipping a dispatcher for those
      hosts would buy a cleaner error message, not a working encoder.
   3. There is no official prebuilt Windows binary to vendor: `intel/libvpl` releases are source
-     only (checked through v2.17.0 — no assets). The only `libvpl.dll` on a real machine is the
+     only (checked through v2.17.0: no assets). The only `libvpl.dll` on a real machine is the
      driver's, and copying a WHQL-signed driver component into our own signed installer is not a
-     provenance chain this file could honestly record.
+     provenance chain this file can record.
 - **Consequences for the loader.** Because the driver's copy is the one matched to the runtime
   the same package installed, `open_dispatcher` searches the **OS path first**, then the exe
   directory, then `resources/`. An app-side copy must never shadow the driver's.
@@ -251,29 +248,29 @@ shipped artifact is the better witness.
   `"resources/libvpl.dll"` to `bundle.resources` in `tauri.conf.json`, and re-verify on a Gen12
   host that the bundled copy does not displace the driver's.
 
-## NVENC header (`nvenc-headers/nvEncodeAPI.h`) — source only, **not bundled**
+## NVENC header (`nvenc-headers/nvEncodeAPI.h`): source only, **not bundled**
 
 - **Upstream:** [FFmpeg/nv-codec-headers](https://github.com/FFmpeg/nv-codec-headers),
   `include/ffnvcodec/nvEncodeAPI.h` at tag **`n12.1.14.1`** (commit
   `e1ff958747e9e08247cea31b6e629d61ece824c0`), which is NVENC API **12.1**
   (`NVENCAPI_MAJOR_VERSION 12`, `NVENCAPI_MINOR_VERSION 1`).
-- **License:** MIT, in the header's own copyright block — "permission is hereby granted, free of
+- **License:** MIT, in the header's own copyright block: "permission is hereby granted, free of
   charge... to deal in the Software without restriction, including... distribute". This is the
   header FFmpeg itself builds NVENC support against; NVIDIA's own SDK copy carries a more
   restrictive licence and is deliberately not the source used here.
 - **Used for:** `tools/nvenc_layout_gen.c` compiles against it and emits the assertions in
-  `windows_utils/streamer/test/nvenc_layout.rs`. Nothing links against it and nothing ships it —
+  `windows_utils/streamer/test/nvenc_layout.rs`. Nothing links against it and nothing ships it:
   `nvEncodeAPI64.dll` comes from the NVIDIA driver and is loaded by name at runtime.
-- **Why this version.** The bindings in `nvenc_sys/` were audited against it rather than assumed.
+- **Why this version.** The bindings in `nvenc_sys/` were checked against it.
   Every struct revision in the hand-written `version.rs` matches 12.1 exactly (CONFIG 8,
   INITIALIZE_PARAMS 6, RECONFIGURE_PARAMS 1, PRESET_CONFIG 4, PIC_PARAMS 6, LOCK_BITSTREAM 1,
   REGISTER_RESOURCE 4, EVENT_PARAMS 1); 13.0 raises every one of those by one. The members that
-  looked like SDK-13 additions — `nvEncRestoreEncoderState`, `nvEncLookaheadPicture`,
-  `numStateBuffers`, `outputStatsLevel`, `splitEncodeMode`, `NV_ENC_CAPS_EXPOSED_COUNT = 55` —
+  looked like SDK-13 additions (`nvEncRestoreEncoderState`, `nvEncLookaheadPicture`,
+  `numStateBuffers`, `outputStatsLevel`, `splitEncodeMode`, `NV_ENC_CAPS_EXPOSED_COUNT = 55`)
   are all present at 12.1, so there was no version skew to fix.
 - **SHA-256:** `dbdaa8bcbc2b9325bd24bc68b36170a8432411518040e8d4c8421608cf217425`
 
-## AMD AMF headers (`amf-headers/`) — source only, **not bundled**
+## AMD AMF headers (`amf-headers/`): source only, **not bundled**
 
 - **Upstream:** [GPUOpen-LibrariesAndSDKs/AMF](https://github.com/GPUOpen-LibrariesAndSDKs/AMF),
   `amf/public/include/{core,components}` at commit
@@ -286,7 +283,7 @@ shipped artifact is the better witness.
   hand-written bindings in `windows_utils/streamer/amd_sys/`.
 - **Not shipped, not linked, not compiled into the app.** They are a test fixture: absent from
   `bundle.resources` in `tauri.conf.json`, unread by `build.rs`, and the encoder loads
-  `amfrt64.dll` at runtime with `libloading`. The runtime itself ships with the AMD
+  `amfrt64.dll` at runtime with `libloading`. The runtime itself is installed with the AMD
   Radeon/Adrenalin driver and is never redistributed by us.
 - **License:** MIT, plus a non-license "Notice Regarding Standards" preamble disclaiming any
   patent grant for MPEG-2/MPEG-4/AVC/HEVC/AAC/VC-1/MP3. Both blocks are kept intact at the top of
@@ -294,7 +291,7 @@ shipped artifact is the better witness.
 - **Refreshing:** re-fetch the whole `{core,components}` set at one commit, re-run
   `src-tauri/tools/amf_layout_build.bat`, paste the regenerated assertions into
   `test/amd_layout.rs`, and update the commit above plus every SHA-256 in `SHA256SUMS`. A diff in
-  the generated numbers is a required review item — a changed vtable slot index is silent memory
+  the generated numbers is a required review item: a changed vtable slot index is silent memory
   corruption, not a compile error.
 
 | File | SHA-256 |

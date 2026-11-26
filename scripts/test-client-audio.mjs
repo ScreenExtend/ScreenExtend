@@ -1,8 +1,7 @@
 // Runs audio-worker.js under Node with stub WebCodecs classes and drives real DataChannel
-// frames through it. What it protects is the packet-redundancy split: the host appends the
-// previous frame's Opus payload behind a u16 length prefix when the link is losing packets
-// (streamer/audio/protocol.rs), and a copy that is played when its frame already arrived is
-// worse than no redundancy at all — it doubles the audio.
+// frames through it. It protects the packet-redundancy split: under loss the host appends the
+// previous frame's Opus payload behind a u16 length prefix (streamer/audio/protocol.rs), and
+// playing a copy whose frame already arrived doubles the audio.
 import fs from 'node:fs';
 import vm from 'node:vm';
 
@@ -38,7 +37,7 @@ class FakeAudioDecoder {
   configure() { this.state = 'configured'; }
   decode(chunk) {
     decoded.push(chunk.timestamp);
-    // Synchronous output keeps the ordering assertions exact and exercises copyTo.
+    // synchronous output keeps the ordering assertions exact and exercises copyTo
     this.init.output(new FakeAudioData(chunk.timestamp));
   }
   close() { this.state = 'closed'; }
@@ -49,8 +48,8 @@ const ctx = {
   performance: { now: () => clock, timeOrigin: 1_700_000_000_000 },
   AudioDecoder: FakeAudioDecoder,
   EncodedAudioChunk: class { constructor(o) { Object.assign(this, o); } },
-  // The worker gates on `d instanceof ArrayBuffer`, and instanceof does not cross realms —
-  // the buffers below have to be built from the same constructor the worker sees.
+  // the worker gates on `d instanceof ArrayBuffer` and instanceof does not cross realms, so
+  // the buffers below must come from the constructor the worker sees
   ArrayBuffer,
   Float32Array,
   Uint8Array,
@@ -101,7 +100,7 @@ send(packet(10, capture(10), 0, body(1)));
 eq('plain packet decodes', decoded.length, 1);
 eq('plain packet timestamp us', decoded[0], capture(10) / 1000);
 
-// 2. A redundant packet with no gap: the copy is for a frame we already have, so it is
+// 2. A redundant packet with no gap: the copy is for a frame already held, so it is
 //    discarded, not played. Playing it would emit the same 5 ms twice.
 decoded.length = 0;
 send(packet(11, capture(11), 0, body(2), body(1)));
@@ -144,12 +143,8 @@ else {
   eq('redundant copies discarded', sync.redundantDiscarded, 1);
 }
 
-// 7. The sequence gate, over the shipped implementation.
-//
-//    These five cases used to live in `src-tauri/src/streamer/audio/tests.rs` against a
-//    `SeqGate` struct defined in that test file and used nowhere else — and the copy had
-//    already drifted from the real gate at one value (`0x7FFF_FFFF`). The host is the producer
-//    and never dedups, so the only sequence gate in the product is the one below.
+// 7. The sequence gate, over the shipped implementation. The host is the producer and never
+//    dedups, so this is the only sequence gate in the product.
 // A fresh module scope per case, because `lastSeq` persists across messages by design.
 function freshWorker() {
   const local = { decoded: [], posted: [] };
@@ -199,8 +194,7 @@ function freshWorker() {
 }
 {
   // u32 wraparound. The cutoff is `>= 0x80000000` on the unsigned difference, so 0 after
-  // 0xFFFFFFFF is newer and 0xFFFFFFFF after 1 is late. This is the exact value the deleted
-  // Rust mirror disagreed on.
+  // 0xFFFFFFFF is newer and 0xFFFFFFFF after 1 is late.
   const w = freshWorker();
   w.send(0xFFFFFFFE); w.send(0xFFFFFFFF); w.send(0); w.send(1);
   const afterWrap = w.decoded.length;
@@ -210,8 +204,7 @@ function freshWorker() {
   else fail('only ' + afterWrap + ' packets survived the wrap');
 }
 {
-  // The half-range boundary itself: a difference of exactly 0x7FFFFFFF is newer (the drifted
-  // Rust mirror called it late), and 0x80000000 is late.
+  // the half-range boundary: a difference of exactly 0x7FFFFFFF is newer, 0x80000000 is late
   const w = freshWorker();
   w.send(0);
   w.send(0x7FFFFFFF);
@@ -232,19 +225,16 @@ bv.setUint16(HDR, 999, true); // claims more primary bytes than the frame holds
 send(bad);
 eq('a truncated redundant frame decodes nothing', decoded.length, 0);
 
-// ── audio.js: output discovery at Connect (owner spec, OWNER-SPEC-audio-discovery.md) ──────
-//
-// Every discovery API runs in order with its own bounded timeout and a definite result (`ok`,
-// `unsupported`, `denied`, `empty`, `error`, `timeout`). A routable output — a non-empty
-// `deviceId` from the chooser or the enumeration, or the iPhone's two audio-session sinks — is
-// a success. Only when there is none does the microphone card appear; on Continue,
-// `getUserMedia` once, enumerate again, stop the stream. If that fails too the host gets exactly
-// one option, the default output, `labelled: false`. The report is final before the offer.
-// The facts (Chrome/Edge 154, measured): with no grant one output with an empty id and label; a
-// microphone grant lists them all, labelled; `speaker-selection` throws `TypeError`.
+// audio.js: output discovery at Connect. Each discovery API runs in order under its own
+// timeout and ends in one of `ok`, `unsupported`, `denied`, `empty`, `error`, `timeout`. A
+// routable output (a non-empty `deviceId`, or the iPhone's two audio-session sinks) is a
+// success. Only with none does the microphone card appear, and if its retry finds nothing the
+// host gets the default output alone, `labelled: false`.
+// Chrome/Edge 154, measured: no grant lists one output with an empty id and label, a
+// microphone grant lists them all with labels, and `speaker-selection` throws `TypeError`.
 //
 // audio.js is an IIFE that assigns `window.SEAudio`, so it is run whole against stubbed
-// `navigator` surfaces and asked directly. Timers run at 1/1000 speed, so a 30 s bound is 30 ms.
+// `navigator` surfaces. Timers run at 1/1000 speed: a 30 s bound is 30 ms.
 {
   const audioSrc = fs.readFileSync(STATIC + '/audio.js', 'utf8');
 
@@ -273,8 +263,8 @@ eq('a truncated redundant frame decodes nothing', decoded.length, 0);
     const win = { AudioContext: function () {}, isSecureContext: o.secure !== false, localStorage: null };
     win.AudioContext.prototype = o.sinkApi === false ? { audioWorklet: {} } : { audioWorklet: {}, setSinkId() {} };
     if (o.liveCtx) {
-      // A context whose worklet loads, so `beginFromGesture` builds the whole graph and the
-      // suspend/resume pair can be watched.
+      // a context whose worklet loads, so `beginFromGesture` builds the whole graph and the
+      // suspend/resume pair can be watched
       win.AudioContext = function () {
         st.ctx = this;
         this.state = 'running';
@@ -343,7 +333,7 @@ eq('a truncated redundant frame decodes nothing', decoded.length, 0);
     const c = {
       console: { log() {}, warn() {}, error() {} },
       performance: { now: () => 0, timeOrigin: 0 },
-      // Not unref'd: a bounded call's deadline is what settles it, so it must keep node alive.
+      // not unref'd: a bounded call's deadline is what settles it, so it must keep node alive
       setTimeout: (fn, ms) => setTimeout(fn, Math.ceil((ms || 0) / 1000)),
       setInterval: (fn, ms) => { const t = setInterval(fn, ms); if (t.unref) t.unref(); st.intervals.add(t); return t; },
       clearTimeout,
@@ -365,7 +355,7 @@ eq('a truncated redundant frame decodes nothing', decoded.length, 0);
   }
 
   // A whole Connect: the chooser started synchronously (as the click does), then the awaited
-  // preparation, then — as `start()` does at the answer — the identity and the post. `card` is
+  // preparation, then the identity and the post (as `start()` does at the answer). `card` is
   // what the user does with the microphone card: 'continue' | 'skip'.
   async function connect(o, card) {
     const A = page(o);
@@ -379,7 +369,7 @@ eq('a truncated redundant frame decodes nothing', decoded.length, 0);
     return { A, plan, raised, p, ids: p ? p.outputs.map((x) => x.id).join(',') : null, d: p ? p.discovery : null };
   }
 
-  // The baseline where every source fails: Chromium with nothing granted, no chooser.
+  // baseline where every source fails: Chromium with nothing granted, no chooser
   const NOTHING = { enumerate: chromium, picker: 'missing', gum: 'grant' };
 
   // 1. Each API's definite result, as recorded and posted.
@@ -421,7 +411,7 @@ eq('a truncated redundant frame decodes nothing', decoded.length, 0);
   }
 
   // 2. The microphone step is reached only when no source yields a routable output, whichever
-  //    way each one failed — and never when any single one succeeds.
+  //    way each one failed, and never when any single one succeeds.
   for (const [what, o] of [
     ['every source failing (chooser absent, placeholders only)', {}],
     ['chooser throwing, enumeration empty', { picker: 'throw' }],
@@ -475,8 +465,8 @@ eq('a truncated redundant frame decodes nothing', decoded.length, 0);
     eq('and recorded', r.d.getUserMedia, 'denied');
   }
 
-  // 4. What the host is told per device class. `supported: false` — the sheet's "This device's
-  //    browser can't switch speakers" — only where there is no sink API of any kind.
+  // 4. What the host is told per device class. `supported: false` (the sheet's "This device's
+  //    browser can't switch speakers") only where there is no sink API of any kind.
   {
     let r = await connect({ enumerate: chromium, picker: 'missing', secure: false, sinkApi: false, mediaDevices: false });
     eq('plain HTTP (every sink API hidden): default only, supported', r.ids + '/' + r.p.supported + '/' + r.raised, '/true/0');
@@ -522,8 +512,8 @@ eq('a truncated redundant frame decodes nothing', decoded.length, 0);
     eq('a post before discovery: default only, supported', A._st.posts[0].outputs.map((x) => x.id).join(',') + '/' + A._st.posts[0].supported, '/true');
   }
 
-  // 7. endSession: a join that failed (or ended) gives back everything audio.js armed for it — the
-  // device watch and its POSTs, the speaker identity, the chooser's pending sink — and suspends
+  // 7. endSession: a join that failed (or ended) gives back everything audio.js armed for it (the
+  // device watch and its POSTs, the speaker identity, the chooser's pending sink) and suspends
   // the context, which the next Connect click resumes. `teardown` alone (a renegotiation) keeps
   // all of it.
   {
@@ -543,7 +533,6 @@ eq('a truncated redundant frame decodes nothing', decoded.length, 0);
     eq('nothing reaches the host once the session has ended', st.posts.length, posted);
     A.endSession();
     eq('endSession twice is harmless', st.intervals.size + '/' + st.dcListeners, '0/0');
-    // The next Connect: the click resumes the context and discovery starts the watch again.
     const ready = await A.beginFromGesture();
     eq('the next Connect click resumes the suspended context', ready + '/' + st.ctx.state + '/' + st.ctx.calls.join(','), 'true/running/suspend,resume');
     const pick = A.startPicker();
@@ -552,7 +541,7 @@ eq('a truncated redundant frame decodes nothing', decoded.length, 0);
     A.endSession();
   }
 
-  // 6. The old "Choose a speaker…" entry, still saved on some host rows, is ignored.
+  // 6. The "Choose a speaker..." entry, still saved on some host rows, is ignored.
   {
     const A = page(NOTHING);
     eq('the choose request is ignored', A.noteOutputChoiceRequest(A.CHOOSE_OUTPUT), 'ignored');

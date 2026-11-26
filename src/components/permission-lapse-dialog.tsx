@@ -20,20 +20,14 @@ const stopListening = (unlisten: () => void) => {
   );
 };
 
-// The other half of the macOS TCC watchdog. It re-reads `screen_recording_live()` every
-// 30 s while a session holds a live display and ends the sessions on a *definite* denial
-// (other apps' windows on screen with their titles stripped -- never the per-process cached
-// answer, never "nothing on screen to read"). Without the permission `CGDisplayStream`
-// keeps delivering frames of the wallpaper. Until now that edge was named in the log and nowhere else, so the person at
-// the host saw a device drop with no reason given. This raises the permission gate over
-// whatever route is mounted, with the copy that says a relaunch is part of the fix.
-//
-// Nothing emits the event off macOS.
+// Raised when the host's macOS screen-recording watchdog ends the sessions on a definite
+// denial (without the permission CGDisplayStream keeps delivering frames of the wallpaper).
+// Shown over whatever route is mounted. Nothing emits the event off macOS.
 export function PermissionLapseDialog() {
   const { t } = useTranslation();
   const [lapse, setLapse] = useState<{ key: string; sessionsEnded: number } | null>(null);
-  // One Retry at a time: each one is an explicit request that may raise the macOS dialog (and,
-  // on a definite denial, clear the TCC entry first), so a double click must not send two.
+  // one Retry at a time: each may raise the macOS dialog and clear the TCC entry, so a double
+  // click must not send two
   const [retrying, setRetrying] = useState(false);
   const retryInFlight = useRef(false);
 
@@ -56,10 +50,9 @@ export function PermissionLapseDialog() {
     };
   }, []);
 
-  // Poll while the dialog is up so ticking the box in System Settings closes it, the same
-  // way the bootstrap gate behaves. A grant bound to the old process still reads as denied
-  // here, which is what the relaunch button is for. The poll is `checkPermissions` only --
-  // a silent read. Nothing here re-raises the macOS prompt except the Retry button.
+  // poll so ticking the box in System Settings closes the dialog. A grant bound to the old
+  // process still reads denied (hence Relaunch). checkPermissions is a silent read: only
+  // Retry may raise the macOS prompt.
   useEffect(() => {
     if (!lapse) return;
     let cancelled = false;
@@ -104,7 +97,7 @@ export function PermissionLapseDialog() {
           <AlertDialogAction
             className="mr-auto bg-secondary hover:bg-secondary/80 text-secondary-foreground"
             onClick={event => {
-              // The dialog re-opens on the next revocation; dismissing is not a grant.
+              // dismissing is not a grant: the dialog re-opens on the next revocation
               event.preventDefault();
               setLapse(null);
             }}
@@ -116,11 +109,10 @@ export function PermissionLapseDialog() {
             title={t("bootstrap.permissions.retryHint")}
             disabled={retrying}
             onClick={event => {
-              // The one explicit re-request. "retry:" is the host's marker for a user-pressed
-              // Retry (`RETRY_PREFIX` in macos_utils/permissions.rs); without it the request
-              // would be a silent read, because this permission was requested before.
+              // "retry:" marks a user-pressed Retry (RETRY_PREFIX in macos_utils/permissions.rs);
+              // without it the request is a silent read, since this permission was asked before
               event.preventDefault();
-              // The ref closes the gap before React re-renders the button as disabled.
+              // the ref covers the gap before React re-renders the button disabled
               if (retryInFlight.current) return;
               retryInFlight.current = true;
               setRetrying(true);
@@ -140,7 +132,7 @@ export function PermissionLapseDialog() {
           <AlertDialogAction
             className="bg-secondary hover:bg-secondary/80 text-secondary-foreground"
             onClick={event => {
-              // Opens the pane only; it never requests.
+              // opens the pane only, never requests
               event.preventDefault();
               commands.openPermissionSettings(lapse.key).catch((e: unknown) => {
                 console.error("openPermissionSettings failed", e);
@@ -152,8 +144,8 @@ export function PermissionLapseDialog() {
           <AlertDialogAction
             className="bg-blue-600 hover:bg-blue-700 text-white"
             onClick={() => {
-              // Through LaunchServices, so the new process is its own TCC subject rather
-              // than an heir of this one -- the same reason bootstrap uses it.
+              // through LaunchServices, so the new process is its own TCC subject, not an heir
+              // of this one
               commands.relaunchApp().catch(() => {
                 toast({
                   variant: "destructive",

@@ -4,6 +4,7 @@
 // kill the once-a-second timer: a TypeError inside sendStats().
 import fs from 'node:fs';
 import vm from 'node:vm';
+import path from 'node:path';
 
 const STATIC = process.argv[2] || 'src-tauri/src/streamer/static';
 const src = fs.readFileSync(STATIC + '/input.js', 'utf8');
@@ -17,9 +18,8 @@ const chan = (label) => ({
   onmessage: null,
   onopen: null,
   onclose: null,
-  // Copied, not viewed: input.js reuses one ArrayBuffer per frame type, so two views over it
-  // would both read whatever the newer send wrote — which is exactly what a test comparing two
-  // frames of the same kind needs not to happen.
+  // copied, not viewed: input.js reuses one ArrayBuffer per frame type, so two views over it
+  // would both read whatever the newer send wrote
   send(buf) { sent.push({ label, bytes: new Uint8Array(buf.buffer || buf, buf.byteOffset || 0, buf.byteLength || buf.length).slice() }); },
   close() {},
 });
@@ -85,7 +85,7 @@ if (ctx.SEClock.offsetMs !== null) fail('SEClock starts with an offset it never 
 if (ctx.SEClock.hostNsToAbsMs(1e9) !== null) fail('hostNsToAbsMs must refuse to guess without an offset');
 ok('SEClock reports no offset before the first PONG');
 
-// Wire up the channels the way index.html does.
+// wire up the channels the way index.html does
 const pc = {
   createDataChannel(label) { channels[label] = chan(label); return channels[label]; },
 };
@@ -104,6 +104,7 @@ ctx.SEVideo = {
     suppressed: 9, degraded: (1 << 3) | (1 << 13),
     audioTargetMs: 18.5, audioConcealed: 4, audioOutputLatencyMs: 12.25,
     audioRedundantUsed: 17, audioRedundantDiscarded: 265,
+    videoCatchUps: 6, videoFramesStale: 431, videoLateMs: 212.5, videoLateState: 2,
   }),
 };
 
@@ -123,17 +124,19 @@ const stats = sent.find((s) => s.bytes[0] === OP.STATS);
 if (!stats) { fail('no STATS frame was sent'); process.exit(); }
 const b = stats.bytes;
 const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
-if (b.length !== 104) fail('STATS is ' + b.length + ' bytes, expected the 104 of v3');
-else ok('STATS is exactly the 104 bytes docs/TELEMETRY.md documents for v3');
+if (b.length !== 120) fail('STATS is ' + b.length + ' bytes, expected the 120 of v4');
+else ok('STATS is exactly the 120 bytes of v4');
 if (b.length < 72) fail('STATS is shorter than the 72-byte floor the Rust parser requires');
 else ok('STATS clears the 72-byte floor an older host reads');
 if (b.length < 96) fail('STATS is shorter than the 96 bytes a v2 host reads the tail from');
 else ok('STATS clears the 96-byte v2 tail a v2 host reads');
+if (b.length < 104) fail('STATS is shorter than the 104 bytes a v3 host reads the tail from');
+else ok('STATS clears the 104-byte v3 tail a v3 host reads');
 if (stats.label !== 'reliable') fail('STATS went out on ' + stats.label + ', not reliable');
 else ok('STATS goes on the reliable channel');
 
 const eq = (name, got, want) => (got === want ? ok(name + ' = ' + got) : fail(name + ' = ' + got + ', expected ' + want));
-eq('version', dv.getUint8(1), 3);
+eq('version', dv.getUint8(1), 4);
 eq('video path', dv.getUint8(2), 1);
 eq('audio path', dv.getUint8(3), 2);
 // SAB | ISOLATED | KEYBOARD_LOCK | FULLSCREEN | DECODER_HW | CLOCK_VALID
@@ -163,6 +166,13 @@ eq('audio output latency us', dv.getUint32(92, true), 12250);
 // ignores the rest.
 eq('audio redundant used', dv.getUint32(96, true), 17);
 eq('audio redundant discarded', dv.getUint32(100, true), 265);
+// v4 tail. Bytes 0..104 are byte-identical to v3. A catch-up is reported here and only here:
+// the keyframe-request count above is what the host reads as a sign of loss.
+eq('video catch-ups', dv.getUint32(104, true), 6);
+eq('video frames not painted (stale)', dv.getUint32(108, true), 431);
+eq('video peak local lateness us', dv.getUint32(112, true), 212500);
+eq('video late state', dv.getUint8(116), 2);
+eq('v4 reserved bytes', dv.getUint8(117) | dv.getUint16(118, true), 0);
 
 // A host PONG carrying its clock: t0 = 1000 ms in ns, host at 5000 ms, reply read at 1010 ms.
 now = 1010;
@@ -221,6 +231,46 @@ else ok('bit 1 decodes as STATS_V2');
 if (ctx.RemoteInput.hostCapability('UNRELIABLE_MOVE_CHANNEL')) fail('an unset bit read as set');
 else ok('an unset capability bit reads as unset');
 
+// The state byte after the capabilities: "picture pending" while a host that answered before its
+// capture opened has sent no frame. A 19-byte PONG is a host that never says, and means no state.
+if (typeof ctx.RemoteInput.picturePending !== 'function' || typeof ctx.RemoteInput.onHostState !== 'function') {
+  fail('input.js does not expose the host state (picturePending / onHostState)');
+} else {
+if (ctx.RemoteInput.picturePending()) fail('a 19-byte PONG reported a pending picture');
+else ok('an older host (19-byte PONG) reports no pending picture');
+let stateSeen = null;
+ctx.RemoteInput.onHostState((s) => { stateSeen = s; });
+const pongState = (state) => {
+  const buf = new ArrayBuffer(20);
+  const v = new DataView(buf);
+  v.setUint8(0, OP.PONG);
+  v.setBigUint64(1, BigInt(Math.round(1195 * 1e6)), true);
+  v.setBigUint64(9, BigInt(Math.round(5200 * 1e6)), true);
+  v.setUint16(17, KEYFRAME_REQUEST_BIT | (1 << 1), true);
+  v.setUint8(19, state);
+  channels.reliable.onmessage({ data: buf });
+};
+pongState(1);
+if (!ctx.RemoteInput.picturePending() || stateSeen !== 1) fail('the pending bit did not reach the page');
+else ok('a 20-byte PONG with bit 0 reports the picture pending, to subscribers too');
+if (!ctx.RemoteInput.hostCapability('KEYFRAME_REQUEST')) fail('the state byte disturbed the capabilities');
+else ok('the capabilities read the same with the state byte after them');
+pongState(0);
+if (ctx.RemoteInput.picturePending() || stateSeen !== 0) fail('the pending bit did not clear');
+else ok('a PONG with the bit clear clears it');
+
+// The host's own bytes, from the fixture its encoder test checks.
+const hostFrames = JSON.parse(fs.readFileSync(path.join(STATIC, '..', 'input', 'host-frames.json'), 'utf8')).vectors;
+for (const v of hostFrames) {
+  const bytes = new Uint8Array(v.hex.match(/../g).map((b) => parseInt(b, 16)));
+  channels.reliable.onmessage({ data: bytes.buffer });
+  if (ctx.RemoteInput.picturePending() !== !!(v.state & 1)) fail(v.name + ': the page read the host state wrong');
+  else ok(v.name + ': the page reads the bytes of the host encoder as ' + (v.state & 1 ? 'pending' : 'not pending'));
+}
+// back to the capabilities the rest of this harness expects
+pongState(0);
+}
+
 sent.length = 0;
 now = 1500;
 if (ctx.RemoteInput.requestKeyframe() !== true) fail('the keyframe request was refused against a capable host');
@@ -247,10 +297,9 @@ if (ctx.RemoteInput.requestKeyframe() !== true) fail('the attempt on a closed ch
 else ok('an attempt that could not send does not burn the rate-limit window');
 
 
-// ── The optional input tails (docs/INPUT-PROTOCOL.md) ────────────────────────────────────
-// Both are gated on the host having advertised that it parses them. Until then every frame
-// must be byte-identical to v1, because the tail bytes would otherwise be read as nothing at
-// best and as the MOUSE_DELTA pad at worst.
+// The optional input tails. Both are gated on the host having advertised that it parses them.
+// Until then every frame must be byte-identical to v1, because the tail bytes would otherwise
+// be read as nothing at best and as the MOUSE_DELTA pad at worst.
 const INPUT_TIMESTAMP_BIT = 1 << 3;
 const INPUT_EVENT_FLAGS_BIT = 1 << 4;
 const fire = (type, ev) => {
@@ -285,7 +334,7 @@ if (!v1Wheel || v1Wheel.bytes.length !== 15) fail('WHEEL is ' + (v1Wheel && v1Wh
 else ok('WHEEL stays 15 bytes until the host asks for a stamp');
 const v1KeyLen = v1Key && v1Key.bytes.length;
 
-// Now the host says it reads both tails.
+// the host advertises both tails
 now = 6000;
 const pongCaps = new ArrayBuffer(19);
 const pc19 = new DataView(pongCaps);
@@ -316,7 +365,7 @@ else ok('a stamped WHEEL is 23 bytes with the stamp at offset 15');
 if (!k2 || k2.bytes.length !== v1KeyLen + 8) fail('stamped KEY is ' + (k2 && k2.bytes.length) + ' bytes, expected ' + (v1KeyLen + 8));
 else ok('a stamped KEY appends 8 bytes past the key string');
 
-// MOUSE_DELTA: byte 8 was the pad and is now the flags byte; bit 0 says the deltas are raw.
+// MOUSE_DELTA: byte 8 (the v1 pad) is the flags byte; bit 0 says the deltas are raw
 ctx.document.pointerLockElement = {};
 ctx.RemoteInput.setPointerLockUnadjusted(true);
 sent.length = 0;
@@ -360,10 +409,10 @@ else {
 }
 
 
-// ── The fast-channel sequence (docs/INPUT-PROTOCOL.md, "The optional fast-channel sequence") ──
-// It rides past the stamp, so it can only appear when the stamp does, and only on `fast`. The
-// host finds it by offset, which is why a client that sent it without the stamp — or on the
-// reliable channel, where the host never looks — would be writing bytes into the wrong place.
+// The fast-channel sequence. It rides past the stamp, so it can only appear when the stamp
+// does, and only on `fast`. The host finds it by offset, so a client that sent it without the
+// stamp, or on the reliable channel where the host never looks, would be writing bytes into
+// the wrong place.
 const INPUT_SEQUENCE_BIT = 1 << 5;
 const seqAt = (s, off) => {
   const d = new DataView(s.bytes.buffer, s.bytes.byteOffset, s.bytes.byteLength);
@@ -410,7 +459,7 @@ else {
   ok('a sequenced WHEEL is 25 bytes with the sequence at offset 23');
   const s0 = seqAt(wheels[0], 23), s1 = seqAt(wheels[1], 23), s2 = seqAt(wheels[2], 23);
   if (!(s1 === ((s0 + 1) & 0xffff) && s2 === ((s1 + 1) & 0xffff))) {
-    fail('the counter went ' + s0 + ', ' + s1 + ', ' + s2 + ' — it must advance once per fast frame');
+    fail('the counter went ' + s0 + ', ' + s1 + ', ' + s2 + ': it must advance once per fast frame');
   } else ok('the counter advances by one per fast frame');
 }
 

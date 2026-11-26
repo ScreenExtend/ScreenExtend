@@ -1,27 +1,17 @@
-//! The mirroring data connection — accepted, framed, and thrown away.
+//! The mirroring data connection: accepted, framed, and thrown away.
 //!
 //! The sender opens one TCP connection to the `dataPort` we hand back in the
 //! type-110 SETUP response and pushes H.264 down it, framed as a 128-byte header
-//! plus a payload whose length is a little-endian `u32` at offset 0. The channel
-//! is strictly one-way: there is no ACK, no window update, nothing the receiver
-//! ever writes back.
+//! plus a payload whose length is a little-endian `u32` at offset 0. Nothing is
+//! ever written back. It still has to be read (a full receive buffer
+//! back-pressures the sender's encoder into a reset) and read *framed* (a blind
+//! drain cannot notice a desync), but no payload is decrypted and no NAL unit is
+//! looked at. Packet type `0x01` (unencrypted SPS/PPS) is re-sent whenever the
+//! sender changes video geometry.
 //!
-//! We still have to *read* it. Not reading leaves the socket's receive buffer
-//! full, which back-pressures the sender's encoder and eventually produces a
-//! reset rather than a stable session. And we have to read it *framed* — a blind
-//! drain would have no way to resynchronise or to notice a desync. That framing
-//! loop is the only place in this module that goes past "handshake only". We
-//! never decrypt a payload, never look at a NAL unit, never touch VideoToolbox.
-//!
-//! The one header byte we do read is the packet type, because type `0x01`
-//! (unencrypted SPS/PPS) is re-sent whenever the sender changes video geometry —
-//! a free signal that macOS moved the display out from under us.
-//!
-//! The listener outlives a connection. The receiver is deliberately kept warm
-//! across sessions ([`super::AirPlayVirtualDisplay::remove_display`]), and the
-//! port we advertise in SETUP is cached for its whole life, so a sink that
-//! served one connection and closed would leave every session after the first
-//! pointing at a dead port.
+//! The listener outlives a connection: the receiver is kept warm across sessions
+//! ([`super::AirPlayVirtualDisplay::remove_display`]) and the port advertised in
+//! SETUP is cached for its whole life, so every later session connects here too.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -46,10 +36,9 @@ const TYPE_STREAM_REPORT: u8 = 0x05;
 
 /// How often the drain loop reports its throughput.
 ///
-/// This is the one number that says whether macOS honours the `maxFPS` we
-/// advertise ([`super::info`]). At the advertised 1 fps a live session should
-/// show single-digit packets per interval; a full-rate desktop encode the host
-/// is doing purely for us to discard would show hundreds.
+/// The rate says whether macOS honours the `maxFPS` we advertise
+/// ([`super::info`]): at 1 fps a live session shows single-digit packets per
+/// interval, a full-rate desktop encode shows hundreds.
 const RATE_REPORT_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Default, Debug)]
@@ -174,7 +163,7 @@ async fn drain(mut stream: TcpStream, stats: &MirrorStats) -> Result<(), String>
         let kind = header[4];
         match kind {
             TYPE_CODEC_DATA => {
-                // SPS/PPS. Re-sent when the sender's video geometry changes.
+                // SPS/PPS, re-sent when the sender's video geometry changes
                 stats.geometry_changed.store(true, Ordering::Relaxed);
             }
             TYPE_VIDEO | TYPE_HEARTBEAT | TYPE_STREAM_REPORT => {}
@@ -217,16 +206,14 @@ async fn drain(mut stream: TcpStream, stats: &MirrorStats) -> Result<(), String>
     }
 }
 
-/// The sender's own statistics, which arrive in the clear and used to be counted and dropped.
+/// The sender's own statistics, which arrive in the clear.
 ///
 /// Type-`0x05` packets are not video: their payload is a `bplist00` binary property list carrying
-/// the AirPlay sender's view of the link — round-trip time, bandwidth, queue depth — measured by
-/// macOS itself, about macOS itself, once a second. No FairPlay, no AES, nothing to decrypt; only
-/// the type-`0x00` payloads are ciphertext.
+/// the AirPlay sender's view of the link (round-trip time, bandwidth, queue depth), once a
+/// second. Nothing to decrypt; only the type-`0x00` payloads are ciphertext.
 ///
-/// The first report is logged with every scalar it carries, because the key set is undocumented
-/// and a field report is the only way to learn it. After that only the numeric keys are logged,
-/// throttled, so a long session does not fill the backlog with one line a second.
+/// The first report is logged with every scalar it carries, because the key set is undocumented.
+/// After that only the numeric keys are logged, throttled to [`STREAM_REPORT_INTERVAL`].
 struct StreamReports {
     since: Instant,
     seen: u64,
@@ -251,9 +238,8 @@ impl StreamReports {
         }
         self.since = Instant::now();
 
-        // A stream report is a small property list followed by a ~25 KiB trailer of something
-        // else, so the whole payload does not parse. `binary_plist_len` finds where the plist
-        // ends.
+        // a small property list followed by a ~25 KiB trailer of something else, so the whole
+        // payload does not parse
         let Some(len) = binary_plist_len(payload) else {
             if first {
                 tprintln!(
@@ -300,7 +286,7 @@ impl StreamReports {
 /// A stream report is a small `bplist00` followed by a much larger trailer, so handing the whole
 /// payload to the parser fails. A binary plist ends with a 32-byte trailer whose last three fields
 /// are `numObjects`, `topObject` and `offsetTableOffset`, and the offset table sits immediately
-/// before that trailer — which makes the end position self-describing: the only `end` whose
+/// before that trailer, which makes the end position self-describing: the only `end` whose
 /// trailer is internally consistent is the real one.
 fn binary_plist_len(buf: &[u8]) -> Option<usize> {
     const HEADER: &[u8] = b"bplist00";
@@ -333,8 +319,8 @@ fn binary_plist_len(buf: &[u8]) -> Option<usize> {
 
 /// Flatten a property list into `key=value` pairs.
 ///
-/// `numbers_only` drops strings and booleans, which is what the throttled summaries want; the
-/// first report keeps everything so the schema is recorded once.
+/// Without `everything`, strings and booleans are dropped, which is what the throttled summaries
+/// want; the first report keeps everything so the schema is recorded once.
 fn collect_scalars(value: &plist::Value, prefix: &str, out: &mut Vec<String>, everything: bool) {
     const MAX_FIELDS: usize = 64;
     if out.len() >= MAX_FIELDS {
@@ -410,7 +396,7 @@ fn ntp_fixed_to_ns(v: u64) -> i128 {
 /// Whether an NTP fixed-point reading is a plausible *sender-epoch* stamp.
 ///
 /// Measured on 10.15.8: the mirror header's timestamp is not a wall clock. Read little-endian its
-/// seconds field was 41457 and then 41459 two seconds later — a monotonic clock whose epoch is
+/// seconds field was 41457 and then 41459 two seconds later: a monotonic clock whose epoch is
 /// somewhere inside this boot, not 1900 and not 1970. Read big-endian the same bytes are 11.5
 /// years, which is what makes the byte order decidable at all.
 fn plausible_sender_seconds(v: u64) -> bool {
@@ -421,28 +407,20 @@ fn plausible_sender_seconds(v: u64) -> bool {
 
 /// Reads the plaintext part of the mirror header.
 ///
-/// Every published AirPlay receiver frames a mirror packet as a 128-byte header whose first five
-/// bytes are the payload length and the packet type, with a flag field at offset 6 and the
-/// sender's capture time — NTP fixed point — at offset 8. This module read five of those bytes and
-/// discarded the rest, which threw away the one thing on this connection nothing else in the tree
-/// can see: the sender is *this same Mac*, so the distance between that timestamp and the instant
-/// the bytes reach our socket is macOS's own compose-to-consumer path.
+/// A mirror packet's 128-byte header carries the payload length and the packet type in its first
+/// five bytes, a flag field at offset 6 and the sender's capture time (NTP fixed point) at
+/// offset 8. The sender is *this same Mac*, so the distance between that timestamp and the
+/// instant the bytes reach our socket is macOS's own compose-to-consumer path.
 ///
-/// **What the stamp turned out to be, measured on 10.15.8:** not a wall clock. Read
-/// little-endian, its seconds field read 41457 while the machine had been up fourteen hours — a
-/// monotonic clock whose epoch is somewhere inside this boot and is published nowhere. So the
-/// *absolute* figure is unobtainable without implementing AirPlay's own NTP time sync, which this
-/// receiver deliberately does not.
-///
-/// What survives is the half that does not need the epoch. Both clocks are the same machine's
-/// monotonic time, so the offset between them is a constant: subtracting the smallest difference
-/// seen in a session leaves how much later than its own best case each frame arrived. That is the
-/// variability of macOS's compose-to-consumer path, which is the half that matters to a stream.
+/// The stamp is a monotonic clock with an unpublished epoch (see [`plausible_sender_seconds`]),
+/// so the *absolute* figure is unobtainable without AirPlay's own NTP time sync, which this
+/// receiver deliberately does not implement. Both clocks are the same machine's monotonic time,
+/// so their offset is constant: subtracting the smallest difference seen in a session leaves
+/// how much later than its own best case each frame arrived.
 ///
 /// Off unless `SE_AIRPLAY_TIMING=1`, because the measurement is only interesting with
 /// `SE_AIRPLAY_MAX_FPS` raised, and that makes the host encode its whole desktop for us to throw
-/// away. Purely a read of bytes that already arrive — no decryption, and none is possible: only
-/// the payload is FairPlay ciphertext.
+/// away. Only header bytes are read; the payload is FairPlay ciphertext.
 struct HeaderProbe {
     enabled: bool,
     /// Header hexdumps still owed, per packet type.
@@ -465,7 +443,7 @@ const SAMPLE_BATCH: usize = 2048;
 
 impl HeaderProbe {
     fn new() -> Self {
-        let enabled = std::env::var("SE_AIRPLAY_TIMING").is_ok_and(|v| v != "0");
+        let enabled = crate::envcfg::var("SE_AIRPLAY_TIMING").is_ok_and(|v| v != "0");
         if enabled {
             tprintln!(
                 "[airplay] mirror header timing probe on (SE_AIRPLAY_TIMING); raise \
@@ -507,13 +485,13 @@ impl HeaderProbe {
             raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
         ]);
 
-        // Stream reports carry zeros here; only video and codec data are stamped.
+        // stream reports carry zeros here; only video and codec data are stamped
         if le == 0 {
             return;
         }
 
-        // The byte order is not something to look up with confidence, so it is decided once, on
-        // the evidence: one reading is a sane number of seconds of uptime, the other is a decade.
+        // byte order is decided once, on the evidence: one reading is a sane number of seconds
+        // of uptime, the other is a decade
         let big_endian = match self.big_endian {
             Some(v) => v,
             None => {
@@ -567,10 +545,9 @@ impl HeaderProbe {
     fn report(&mut self) {
         self.deltas.sort_unstable();
         let n = self.deltas.len();
-        // The epoch offset between the sender's clock and ours is constant and unknown, so the
-        // fastest frame in the batch is the zero. Everything reported is *excess over best case*,
-        // not an absolute latency, and saying so in the line matters: an absolute number here
-        // would be a fabrication.
+        // the epoch offset between the sender's clock and ours is constant and unknown, so the
+        // fastest frame in the batch is the zero: everything reported is excess over best case,
+        // never an absolute latency
         let floor = self.deltas[0];
         let at = |q: f64| self.deltas[((n as f64 * q) as usize).min(n - 1)] - floor;
         tprintln!(
@@ -611,8 +588,6 @@ fn configure_keepalive(stream: &TcpStream) {
             )
         };
         if rc != 0 {
-            // Without it a sender that vanishes without a FIN leaves the drain
-            // loop blocked in `read` for as long as the process lives.
             teprintln!(
                 "[airplay] could not set {what} on the mirror socket: {}",
                 std::io::Error::last_os_error()
@@ -625,7 +600,7 @@ fn configure_keepalive(stream: &TcpStream) {
 
 /// Our end of the timing exchange: bound, named in the SETUP reply, never read.
 ///
-/// The SETUP response has to name a real port — an unbound one earns ICMP
+/// The SETUP response has to name a real port: an unbound one earns ICMP
 /// unreachables and the sender treats that as a broken receiver. The sender does
 /// send replies here, and a real receiver would run an NTP-style exchange over
 /// it to align clocks. We do not need to: the sender is this same Mac, so its
@@ -693,8 +668,8 @@ mod tests {
         client.shutdown().await.unwrap();
         drop(client);
 
-        // The sink now outlives the connection, so it has to be stopped rather
-        // than waited on.
+        // the sink outlives the connection, so it has to be stopped rather than
+        // waited on
         tokio::time::timeout(Duration::from_secs(2), async {
             while stats.packets.load(Ordering::Relaxed) < 3 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -714,9 +689,8 @@ mod tests {
         assert!(stats.connected.load(Ordering::Relaxed));
     }
 
-    /// The regression that made every session after the first fail: the sink
-    /// used to serve one connection and then drop its listener, while the
-    /// advertised `dataPort` stayed the same for the receiver's whole life.
+    /// The advertised `dataPort` stays the same for the receiver's whole life,
+    /// so the sink must keep its listener across connections.
     #[tokio::test]
     async fn a_second_session_lands_on_the_same_port() {
         let sink = MirrorSink::bind().await.unwrap();
@@ -809,7 +783,7 @@ mod tests {
         s.begin_session();
         assert!(!s.connected.load(Ordering::Relaxed));
         assert!(!s.geometry_changed.load(Ordering::Relaxed));
-        // Cumulative counters survive; only the per-session latches reset.
+        // cumulative counters survive; only the per-session latches reset
         assert_eq!(s.packets.load(Ordering::Relaxed), 9);
     }
 
@@ -830,16 +804,16 @@ mod tests {
 
     #[test]
     fn a_sub_second_ntp_value_converts_through_its_fraction() {
-        // The whole-second case above leaves the low 32 bits zero, so it cannot catch a fault
-        // in the fractional half of the fixed-point conversion. 20 ms is entirely fraction.
+        // a whole-second value leaves the low 32 bits zero, so it cannot catch a fault in the
+        // fractional half of the conversion: 20 ms is entirely fraction
         let twenty_ms = (20u64 << 32) / 1000;
         let ns = ntp_fixed_to_ns(twenty_ms);
         assert!(
             (19_000_000..=21_000_000).contains(&ns),
             "20 ms of NTP fixed point converted to {ns} ns"
         );
-        // A difference taken between two stamps is the same conversion applied to the
-        // difference, so the round trip has to hold there too.
+        // a difference between two stamps is the same conversion applied to the difference,
+        // so the round trip has to hold there too
         let now = 41457u64 << 32;
         assert_eq!(ntp_fixed_to_ns(now + twenty_ms) - ntp_fixed_to_ns(now), ns);
     }
@@ -853,7 +827,7 @@ mod tests {
         plist::to_writer_binary(&mut encoded, &plist::Value::Dictionary(dict)).unwrap();
         let exact = encoded.len();
 
-        // The real payload is the plist plus a trailer several hundred times its size.
+        // the real payload is the plist plus a trailer several hundred times its size
         let mut payload = encoded.clone();
         payload.extend(std::iter::repeat_n(0xABu8, 25_000));
 

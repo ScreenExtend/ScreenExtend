@@ -1,7 +1,7 @@
 use crate::PermissionStatus;
 
-/// Nothing on Windows is gated behind a user-granted permission, so the list is empty and the
-/// probe costs nothing. It exists so the command surface matches macOS.
+/// Empty: nothing on Windows is gated behind a user-granted permission. It exists so the command
+/// surface matches macOS.
 pub fn probe_permissions() -> Vec<PermissionStatus> {
     Vec::new()
 }

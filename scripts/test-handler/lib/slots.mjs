@@ -34,7 +34,7 @@ function tryTake(file, info) {
     } catch (e) {
       if (e.code !== 'EEXIST') throw e;
       const o = readOwner(file);
-      // A file caught mid-write reads as null; give its writer a moment before calling it stale.
+      // a file caught mid-write reads as null; give its writer a moment before calling it stale
       if (o && pidAlive(o.pid)) return false;
       if (!o) { try { if (Date.now() - fs.statSync(file).mtimeMs < 3000) return false; } catch { continue; } }
       try { fs.rmSync(file, { force: true }); } catch { return false; }

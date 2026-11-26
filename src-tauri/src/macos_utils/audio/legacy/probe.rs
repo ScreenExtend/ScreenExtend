@@ -7,12 +7,10 @@ use super::branding;
 
 /// How long a probe result is reused before the HAL is asked again.
 ///
-/// One probe costs a `stat`, an enumeration of every CoreAudio device, and one UID property read
-/// per device — each a round trip to `coreaudiod`. The compatibility report polls this from the
-/// frontend and `start_capture` calls it on the join path, so uncached it is tens of milliseconds
-/// in front of the first audio packet. Install state does change at runtime, but only through
-/// `installer::install_pkg`/`uninstall`, which invalidate explicitly, or a user running the
-/// package by hand, which the TTL catches.
+/// One probe is a `stat`, a device enumeration and a UID read per device, each a round trip to
+/// `coreaudiod`: tens of milliseconds on the join path if uncached. Install state changes only
+/// through `installer::install_pkg`/`uninstall`, which invalidate explicitly, or a hand-run
+/// package, which the TTL catches.
 const CACHE_TTL: Duration = Duration::from_secs(2);
 
 static CACHE: Mutex<Option<(Instant, LegacyState)>> = Mutex::new(None);

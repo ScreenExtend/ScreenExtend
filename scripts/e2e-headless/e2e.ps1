@@ -1,8 +1,8 @@
 # End-to-end audio+video test: headless host from the CLI, a fresh headless Chrome, one join,
 # 20 s of measured video and a 440 Hz tone through the audio path, then everything shut down.
-# No input is injected and the cursor is never touched. See TEST-GUIDE.md.
+# No input is injected and the cursor is never touched.
 param(
-  [string]$Exe = "$env:USERPROFILE\.cargo\shared_target\ScreenExtend\release\ScreenExtend.exe",
+  [string]$Exe = (Join-Path $(if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $PSScriptRoot '..\..\src-tauri\target' }) 'release\ScreenExtend.exe'),
   [switch]$Headed,     # a visible Chrome window instead of headless
   [switch]$NoAudio     # video only: no tone is played and config.json is never written
 )
@@ -21,9 +21,9 @@ if ($cfgHash) { Copy-Item $cfg (Join-Path $work 'config.json.before') -Force }
 $log = Join-Path $work 'serve.log'; $outFile = Join-Path $work 'run.out'
 $code = 1
 try {
-  # Credentials go by environment, never on the command line.
-  $env:SCREENEXTEND_SESSION_ID = $sid; $env:SCREENEXTEND_OTP = $otp
-  $hostProc = Start-Process $Exe -ArgumentList 'serve', '--no-cloud', '--no-qr', '-v' -RedirectStandardOutput $log -RedirectStandardError (Join-Path $work 'serve.err') -WindowStyle Hidden -PassThru
+  # the OTP goes in a file: a command line is readable by every process on the machine
+  $otpFile = Join-Path $work 'otp.txt'; Set-Content -Path $otpFile -Value $otp -NoNewline -Encoding ascii
+  $hostProc = Start-Process $Exe -ArgumentList 'serve', '--no-cloud', '--no-qr', '-v', '--session-id', $sid, '--otp-file', $otpFile -RedirectStandardOutput $log -RedirectStandardError (Join-Path $work 'serve.err') -WindowStyle Hidden -PassThru
   $ip = $null
   foreach ($i in 1..60) {
     Start-Sleep -Milliseconds 500
@@ -44,6 +44,7 @@ try {
 }
 finally {
   & $Exe stop | Out-Null
+  Remove-Item (Join-Path $work 'otp.txt') -Force -ErrorAction SilentlyContinue
   foreach ($i in 1..40) { if (-not (Get-Process ScreenExtend -ErrorAction SilentlyContinue)) { break }; Start-Sleep -Milliseconds 250 }
   if ($cfgHash -and (Get-FileHash $cfg -Algorithm SHA256).Hash -ne $cfgHash) { Copy-Item (Join-Path $work 'config.json.before') $cfg -Force; 'config.json restored to its pre-test contents' }
   Add-Type -AssemblyName System.Windows.Forms

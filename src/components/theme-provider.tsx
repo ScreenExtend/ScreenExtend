@@ -12,15 +12,13 @@ const stopListening = (unlisten: () => void) => {
 
 export type Theme = "dark" | "light" | "system";
 
-// A synchronous paint hint for the inline script in index.html, which runs long before
-// the store can be read over IPC. `config.json` stays the source of truth: bootstrap
-// overwrites whatever is seeded from here as soon as it has read it.
+// synchronous paint hint for the inline script in index.html, which runs before the store
+// can be read over IPC. config.json stays the source of truth.
 const THEME_HINT_KEY = "se-theme";
 
-// Kept in step with the two literals in index.html and with `--background` in index.css.
-// It is set as a property rather than as a CSS rule because an inline <style> anywhere in
-// index.html makes Tauri nonce `style-src`, which voids the `'unsafe-inline'` monaco's
-// runtime-injected theme sheet depends on. See the comment at the top of index.html.
+// Keep in step with the two literals in index.html and `--background` in index.css.
+// Set as a property, not a CSS rule: an inline <style> in index.html makes Tauri nonce
+// `style-src`, which voids the 'unsafe-inline' monaco's injected theme sheet depends on.
 const HTML_BACKGROUND = { light: "hsl(0 0% 100%)", dark: "hsl(222.2 84% 4.9%)" } as const;
 
 const readThemeHint = (): Theme | null => {

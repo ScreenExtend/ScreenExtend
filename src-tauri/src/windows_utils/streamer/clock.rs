@@ -1,19 +1,12 @@
-//! QPC → host-clock conversion for the timestamps the capture APIs hand us.
+//! QPC to host-clock conversion for the timestamps the capture APIs hand us.
 //!
-//! DXGI duplication's `DXGI_OUTDUPL_FRAME_INFO::LastPresentTime` (raw QPC ticks) says when the
-//! pixels were presented, so the difference between it and callback entry is the delivery latency
-//! the host adds before doing any work at all.
+//! DXGI's `DXGI_OUTDUPL_FRAME_INFO::LastPresentTime` (raw QPC ticks) is when the pixels were
+//! presented. WGC's `Direct3D11CaptureFrame::SystemRelativeTime` is deliberately not converted:
+//! it is the composition's target present time, measured 3-14 ms after callback entry, so as a
+//! capture origin it makes nearly every latency sample negative.
 //!
-//! WGC's `Direct3D11CaptureFrame::SystemRelativeTime` is deliberately **not** converted. It is on
-//! the same QPC timebase, but measured on the Windows dev box (2026-10-05, 120-frame blocks over a
-//! 1080p session) it sat 3-14 ms (mean 8-11 ms) *after* our own callback entry on 2,879 of 2,880
-//! frames: it is the composition's target present time, not the moment the frame existed. Used as
-//! the origin it made `capture_delivery` drop every sample but the stale ones (3 of ~9,900) and
-//! `capture_to_encode` / `capture_to_socket` drop ~89 % of frames and keep a biased remainder.
-//!
-//! The rest of the streamer measures against `streamer::audio::host_now_ns()`, whose epoch is an
-//! `Instant` taken at process start. On Windows `Instant` is itself QPC-backed, so the two clocks
-//! differ by a constant, sampled once and cached.
+//! `streamer::audio::host_now_ns()` counts from an `Instant` taken at process start, which on
+//! Windows is QPC-backed, so the two clocks differ by a constant, sampled once and cached.
 
 use std::sync::OnceLock;
 
@@ -46,7 +39,7 @@ pub fn qpc_ticks_to_boot_ns(ticks: i64) -> u64 {
     ((ticks as i128 * 1_000_000_000i128) / qpc_frequency() as i128) as u64
 }
 
-/// `boot_ns - host_ns`, sampled once from a single pair of reads of the two clocks.
+/// `boot_ns - host_ns`, sampled once.
 fn boot_to_host_delta_ns() -> i128 {
     static DELTA: OnceLock<i128> = OnceLock::new();
     *DELTA.get_or_init(|| {
@@ -58,9 +51,8 @@ fn boot_to_host_delta_ns() -> i128 {
 
 /// Convert a since-boot nanosecond stamp to the shared host clock.
 ///
-/// Returns 0 for a stamp that predates the host epoch — a frame captured before the process
-/// started cannot be timed against it, and 0 is how [`crate::streamer::telemetry::FrameTiming`]
-/// spells "no OS timestamp", so such a sample is dropped rather than folded in as a negative.
+/// Returns 0 for a stamp that predates the host epoch: 0 is how
+/// [`crate::streamer::telemetry::FrameTiming`] spells "no OS timestamp", so the sample is dropped.
 pub fn boot_ns_to_host_ns(boot_ns: u64) -> u64 {
     if boot_ns == 0 {
         return 0;
@@ -98,7 +90,7 @@ mod tests {
     fn a_missing_or_pre_epoch_stamp_reads_as_absent() {
         assert_eq!(boot_ns_to_host_ns(0), 0);
         assert_eq!(dxgi_present_time_to_host_ns(0), 0);
-        // A stamp from long before this process started must not wrap into a huge positive.
+        // a pre-epoch stamp must not wrap into a huge positive
         assert_eq!(boot_ns_to_host_ns(1), 0);
     }
 

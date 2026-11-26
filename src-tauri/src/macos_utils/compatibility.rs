@@ -11,8 +11,7 @@ const MIN_MAJOR: isize = 10;
 const MIN_MINOR: isize = 15;
 
 /// `NSProcessInfo.operatingSystemVersion` is 10.10+ and link-time safe, so nothing here forks a
-/// process. The previous implementation ran `sw_vers` three times per report, on the main thread,
-/// from a command the bootstrap screen calls twice.
+/// process.
 fn os_version() -> (isize, isize, isize) {
     static CACHED: OnceLock<(isize, isize, isize)> = OnceLock::new();
     *CACHED.get_or_init(|| {
@@ -35,9 +34,7 @@ fn meets_minimum() -> bool {
     (major, minor) >= (MIN_MAJOR, MIN_MINOR)
 }
 
-/// Which capture path `start_capture` will actually take, decided by class lookup rather than by
-/// an OS version. The tier with the largest latency and quality consequence of the three was the
-/// one the report never named.
+/// Which capture path `start_capture` will take, decided by class lookup, not by an OS version.
 pub fn capture_backend() -> &'static str {
     static CACHED: OnceLock<&'static str> = OnceLock::new();
     CACHED.get_or_init(|| {
@@ -66,16 +63,13 @@ struct Probes {
 
 /// Turn what was probed into the capability notes the report carries.
 ///
-/// The severities encode one rule: `blocking` is only for a host that cannot create a display,
-/// cannot capture, or cannot encode. On this platform that leaves exactly one blocking row — an
-/// OS below the app's own floor, where `CGVirtualDisplay` is not reachable at all. Everything
-/// else here is a degraded feature: the audio tier, the hosted network, Accessibility (which
-/// only gates remote input), the AirPlay display cap, and ScreenCaptureKit-versus-CGDisplayStream
-/// where both capture.
+/// `blocking` is only for a host that cannot create a display, cannot capture or cannot encode.
+/// On macOS that is one row: an OS below the app's own floor, where `CGVirtualDisplay` is not
+/// reachable. Everything else here is a degraded feature.
 ///
-/// Screen Recording is deliberately absent. It is a *permission*, it is reported through
-/// `check_permissions` as `required`, and the permission gate runs before this report is ever
-/// asked for — reporting it twice would let one surface contradict the other.
+/// Screen Recording is deliberately absent: it is a permission, reported through
+/// `check_permissions` as `required`, and reporting it twice would let one surface contradict
+/// the other.
 fn capability_notes(probes: &Probes) -> Vec<UnsupportedApi> {
     let mut unsupported: Vec<UnsupportedApi> = Vec::new();
 
@@ -101,11 +95,9 @@ fn capability_notes(probes: &Probes) -> Vec<UnsupportedApi> {
         ));
     }
 
-    // No display backend at all. `probe_display_backend` does not return this today — it falls
-    // back to AirPlay — but `new_shared_controller` answers `None` for it, which is a host that
-    // cannot give a joining device anything to look at. That is bare minimum, and the arm exists
-    // so a future tier that probes its way to `Unsupported` is classified rather than silently
-    // reported as a working host.
+    // `probe_display_backend` falls back to AirPlay and never returns this today, but
+    // `new_shared_controller` answers `None` for it: a host with nothing to show a joining
+    // device must be classified as blocking, not reported as working
     if probes.at_least_min && probes.display_backend == DisplayBackend::Unsupported {
         unsupported.push(UnsupportedApi::blocking(
             BareMinimum::Display,
@@ -115,8 +107,7 @@ fn capability_notes(probes: &Probes) -> Vec<UnsupportedApi> {
         ));
     }
 
-    // The AirPlay tier is capped at one display by macOS itself. Reported as a backend name only,
-    // that limit surfaced when the user connected a second device and it failed.
+    // macOS caps the AirPlay tier at one display: say so up front, not when a second device fails
     if probes.display_backend == DisplayBackend::AirPlayFallback {
         unsupported.push(UnsupportedApi::optional(
             api_key::DISPLAY_CAPPED,
@@ -137,11 +128,8 @@ fn capability_notes(probes: &Probes) -> Vec<UnsupportedApi> {
         ));
     }
 
-    // Not granted means every `CGEventPost` is dropped by the OS with no error the process can
-    // observe, so a client with remote control enabled sees a host that simply never moves.
-    // Reported through the list that already exists rather than a new UI surface; the
-    // `request_permission` / `open_permission_settings` commands are what act on it. Optional,
-    // and it must stay optional: this Mac still extends a display without it.
+    // without Accessibility the OS drops every `CGEventPost` with no error the process can
+    // observe. Must stay optional: this Mac still extends a display without it
     if probes.at_least_min && !probes.injects_input {
         unsupported.push(UnsupportedApi::optional(
             api_key::INPUT_ACCESSIBILITY,
@@ -184,7 +172,7 @@ pub fn check_system_requirements() -> CompatibilityReport {
     });
 
     tprintln!(
-        "[compat] {} — capture {}, display {}, audio {}, hosted network {}, input {}",
+        "[compat] {}: capture {}, display {}, audio {}, hosted network {}, input {}",
         os_version_string(),
         capture_backend(),
         display_backend.as_str(),
@@ -202,11 +190,8 @@ pub fn check_system_requirements() -> CompatibilityReport {
         audio_backend: audio_backend.as_str().to_string(),
         display_backend: display_backend.as_str().to_string(),
         capture_backend: capture_backend().to_string(),
-        // Which VideoToolbox encoder, not just "VideoToolbox": `VTCopyVideoEncoderList` says
-        // whether this Mac has a hardware H.264 encoder at all, and the report is the one place
-        // a user can see that answer without reading the log. It stays the bare backend name
-        // (CLAUDE.md, `doctor --json`); the rate-control detail goes to the log and, per session,
-        // to the telemetry (`encoder_id`, `rate_tier`).
+        // hardware or software VideoToolbox, per `VTCopyVideoEncoderList`. Stays a bare backend
+        // name (`doctor --json` reads it): rate-control detail goes to the log and the telemetry
         encoder_backend: {
             tprintln!(
                 "[vt] encoder backend: {}",
@@ -216,8 +201,7 @@ pub fn check_system_requirements() -> CompatibilityReport {
         },
         hosted_network_backend: hostap_backend.as_str().to_string(),
         input_backend: input_backend.as_str().to_string(),
-        // Both are Windows' display-driver story: macOS has no driver to install, and so no
-        // repair budget to scope to a boot.
+        // both belong to Windows' display driver: macOS has none to install or repair
         display_driver_holder_pid: None,
         boot_id: crate::boot_id(),
     }
@@ -267,9 +251,8 @@ mod tests {
         assert!(capability_notes(&healthy()).is_empty());
     }
 
-    /// The rule the owner set: a Mac that can create a display and capture it starts, whatever
-    /// else is missing. Accessibility in particular gates only remote input, and no combination
-    /// of these faults may take "Continue anyway" away.
+    /// A Mac that can create a display and capture it starts, whatever else is missing: no
+    /// combination of these faults may take "Continue anyway" away.
     #[test]
     fn no_optional_fault_can_stop_startup() {
         let cases: Vec<(&str, Probes)> = vec![

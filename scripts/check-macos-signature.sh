@@ -4,13 +4,11 @@
 #
 #   bash scripts/check-macos-signature.sh <App.app>
 #
-# Why this exists: 0.7.0 shipped with no bundle signature at all. Only the arm64 slice of
-# the main executable carried the linker's ad-hoc signature (identifier
-# `ScreenExtend-<hash>`, Info.plist not bound, no sealed resources), the x86_64 slice was
-# unsigned, and SecCodeCopyDesignatedRequirement on the bundle returned -67062. TCC stored
-# the user's Screen Recording and Accessibility grants against a csreq that the running
-# process could never satisfy, so every check stayed false and the bootstrap gate could not
-# be passed. `codesign -dv` alone did not catch it: it happily prints the linker signature.
+# A bundle with only the linker's ad-hoc signature (one slice, identifier `<exe>-<hash>`,
+# Info.plist not bound, nothing sealed) has no designated requirement
+# (SecCodeCopyDesignatedRequirement returns -67062), so TCC stores grants against a csreq the
+# running process can never satisfy. `codesign -dv` alone does not catch it: it happily prints
+# the linker signature.
 #
 # Checks, all of which must pass:
 #   1. codesign --verify --deep --strict
