@@ -68,6 +68,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # a runner that briefly cannot resolve the crates host should not cost the whole build
+          CARGO_NET_RETRY: '10'
           # also in src-tauri/.cargo/config.toml; repeated so C/ObjC built by build scripts inherit it.
           # rustc's default for x86_64-apple-darwin is 10.12, below minimumSystemVersion 10.15
           MACOSX_DEPLOYMENT_TARGET: '10.15'
