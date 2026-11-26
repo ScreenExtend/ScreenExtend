@@ -5,6 +5,11 @@ on:
     tags:
       - 'app-v*'
   workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Create and publish the GitHub release. Off: build only, the app and installers are attached to the run.'
+        type: boolean
+        default: true
 
 jobs:
   build-tauri:
@@ -67,12 +72,27 @@ jobs:
           # rustc's default for x86_64-apple-darwin is 10.12, below minimumSystemVersion 10.15
           MACOSX_DEPLOYMENT_TARGET: '10.15'
         with:
-          tagName: app-v__VERSION__
+          # no tag on a build-only run: the action then builds and uploads nothing to a release,
+          # so a branch can be built without touching the published version
+          tagName: ${{ (github.event_name == 'push' || inputs.publish) && 'app-v__VERSION__' || '' }}
           releaseName: 'ScreenExtend v__VERSION__'
           releaseBody: 'See the assets to download this version and install.'
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
+
+      # the release-profile binary and its installers, on every run: a build-only run has no
+      # release to carry them
+      - name: attach the built app to the run
+        uses: actions/upload-artifact@v4
+        with:
+          name: ScreenExtend-${{ matrix.platform }}
+          if-no-files-found: error
+          path: |
+            src-tauri/target/*/release/ScreenExtend.exe
+            src-tauri/target/*/release/bundle/nsis/*.exe
+            src-tauri/target/*/release/bundle/msi/*.msi
+            src-tauri/target/*/release/bundle/dmg/*.dmg
 
       # the checks below gate finalize-release: a failure leaves the draft unpublished
 
@@ -190,6 +210,7 @@ jobs:
 
   finalize-release:
     needs: build-tauri
+    if: github.event_name == 'push' || inputs.publish
     runs-on: ubuntu-latest
     permissions:
       contents: write
