@@ -1482,12 +1482,12 @@ fn run_inner(app: &tauri::AppHandle, spec: &RunSpec, ctx: &mut Ctx) -> Result<Js
     teardown_host(Some(&join_id));
     let mut session_gone_ms = None;
     while t_leave.elapsed() < Duration::from_secs(4) {
-        let gone = !state
+        let gone = state
             .sessions
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&join_id)
-            .is_some_and(|s| s.live_display.is_some());
+            .is_none_or(|s| s.live_display.is_none());
         if gone {
             session_gone_ms = Some(t_leave.elapsed().as_secs_f64() * 1e3);
             break;

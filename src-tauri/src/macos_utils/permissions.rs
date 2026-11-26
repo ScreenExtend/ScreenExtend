@@ -485,7 +485,7 @@ pub fn screen_recording_silent() -> SilentRead {
         (None, false)
     } else {
         let on_screen = window_scan(true);
-        let anywhere = !on_screen.is_some_and(|s| s.named > 0) && titled_window_anywhere();
+        let anywhere = on_screen.is_none_or(|s| s.named == 0) && titled_window_anywhere();
         (on_screen, anywhere)
     };
     let read = classify_screen_recording(
