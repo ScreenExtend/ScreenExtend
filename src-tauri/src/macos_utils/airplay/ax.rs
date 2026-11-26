@@ -991,6 +991,16 @@ mod tests {
 
     #[test]
     fn the_menu_bundle_yields_localized_titles() {
+        // the menu is driven only on the AirPlay tier, chosen where CGVirtualDisplay is missing
+        // (before 10.14.4); systems that have it no longer carry these strings
+        use crate::macos_utils::virtual_display::{probe_display_backend, DisplayBackend};
+        if matches!(probe_display_backend(), DisplayBackend::CgVirtualDisplay) {
+            crate::test_support::skip_because(
+                "Displays menu strings",
+                "the AirPlay display tier cannot be selected here (CGVirtualDisplay is present)",
+            );
+            return;
+        }
         // keys from Displays.menu's own Localizable.strings: if Apple renames
         // one this is where it surfaces, and the code degrades to the positional
         // fallback rather than misfiring
