@@ -1319,12 +1319,22 @@ const IMPAIRMENTS = {
   stall200: { label: 'periodic 200 ms stall every 3 s (host -> browser held, released in order)', down: { stall: { ms: 200, every_s: 3 } } },
   loss1: { label: '1 % random loss, host -> browser', down: { loss: 0.01 } },
   loss5: { label: '5 % random loss, host -> browser', down: { loss: 0.05 } },
+  loss20: { label: '20 % random loss, host -> browser, no cap', down: { loss: 0.2 } },
   burst: { label: 'burst loss (Gilbert-Elliott: enter 0.5 %, leave 30 %, all lost in a burst), host -> browser', down: { burst: { p_enter: 0.005, p_exit: 0.3, loss: 1 } } },
   loss5_up: { label: '5 % random loss, browser -> host (feedback, NACK, PLI, input)', up: { loss: 0.05 } },
   delay_jitter: { label: '30 ms delay with +-10 ms uniform jitter, order kept, both directions', down: { delay_ms: 30, jitter_ms: 10 }, up: { delay_ms: 30, jitter_ms: 10 } },
+  delay_jitter30: { label: '40 ms delay with +-30 ms uniform jitter, order kept, both directions', down: { delay_ms: 40, jitter_ms: 30 }, up: { delay_ms: 40, jitter_ms: 30 } },
   cap5: { label: '5 Mbit/s cap, host -> browser (token bucket, 100 ms drop-tail queue)', down: { rate_kbps: 5000 } },
   cap1_5: { label: '1.5 Mbit/s cap, host -> browser (token bucket, 100 ms drop-tail queue)', down: { rate_kbps: 1500 } },
   cap_change: { label: 'cap that changes mid-run: 8 -> 1.5 -> 8 Mbit/s, host -> browser', down: { rate_kbps: 8000 }, schedule: [{ at_s: 7, down: { rate_kbps: 1500 } }, { at_s: 14, down: { rate_kbps: 8000 } }] },
+  // a base delay that moves is not congestion: nothing should be cut for it
+  delay_step: { label: 'base delay step 5 -> 60 -> 5 ms (at 7 s and 14 s), both directions, order kept, no loss', down: { delay_ms: 5 }, up: { delay_ms: 5 }, schedule: [{ at_s: 7, down: { delay_ms: 60 }, up: { delay_ms: 60 } }, { at_s: 14, down: { delay_ms: 5 }, up: { delay_ms: 5 } }] },
+  delay_step_loss1: { label: 'base delay step 5 -> 60 -> 5 ms (at 7 s and 14 s) with 1 % random loss throughout, order kept', down: { delay_ms: 5, loss: 0.01 }, up: { delay_ms: 5 }, schedule: [{ at_s: 7, down: { delay_ms: 60, loss: 0.01 }, up: { delay_ms: 60 } }, { at_s: 14, down: { delay_ms: 5, loss: 0.01 }, up: { delay_ms: 5 } }] },
+  loss_step3: { label: 'loss step: none, 3 % random loss from 5 s to 12 s, none, host -> browser', down: {}, schedule: [{ at_s: 5, down: { loss: 0.03 } }, { at_s: 12, down: {} }] },
+  cap3: { label: '3 Mbit/s cap, host -> browser (token bucket, 100 ms drop-tail queue)', down: { rate_kbps: 3000 } },
+  cap2: { label: '2 Mbit/s cap, host -> browser (token bucket, 100 ms drop-tail queue)', down: { rate_kbps: 2000 } },
+  cap_slowfill: { label: 'cap at 98 % of the input rate measured in this baseline, host -> browser (token bucket, 500 ms drop-tail queue)', down: { rate_of_baseline: 0.98, queue_ms: 500 } },
+  cap5_long: { label: '5 Mbit/s cap held for 60 s, host -> browser (token bucket, 100 ms drop-tail queue)', down: { rate_kbps: 5000 }, impaired_s: 60 },
 };
 const DEFAULT_IMPAIRMENTS = ['stall200', 'loss1', 'loss5', 'cap5', 'cap1_5', 'cap_change'];
 
@@ -1342,16 +1352,120 @@ function hostSampler(periodMs = 1000) {
       const s = pickSession(j && j.telemetry);
       if (s) {
         const d = s.degradation || {};
-        samples.push({ t: t0, ms: r.ms, frames: s.frames_encoded, bytes: s.bytes_sent, encoder: s.encoder, qp: s.qp_governor ? s.qp_governor.qp_effective : null, ceilingMbps: s.qp_governor ? s.qp_governor.ceiling_mbps : null,
+        const lg = s.link_governor || null;
+        samples.push({ t: t0, ms: r.ms, frames: s.frames_encoded, bytes: s.bytes_sent, encoder: s.encoder, qp: s.qp_governor ? s.qp_governor.qp_effective : (lg && lg.qp_effective != null ? lg.qp_effective : null), ceilingMbps: s.qp_governor ? s.qp_governor.ceiling_mbps : null,
           kfReq: d.keyframe_requests, kfSuppressed: d.keyframe_requests_suppressed, clientKfReq: d.client_keyframe_requests, idrs: d.idrs_sent, nacks: d.nacks_received, bitrateCuts: d.bitrate_cuts, overuse: d.delay_overuse_events, pacerMiss: d.pacer_deadline_misses,
           clientPainted: s.client ? s.client.frames_painted : null, clientDropped: s.client ? s.client.frames_dropped : null,
-          packets: s.packets_sent ?? null, fps: s.fps ?? null, client: s.client || null });
+          packets: s.packets_sent ?? null, fps: s.fps ?? null, client: s.client || null,
+          captureBackend: s.capture_backend || null, link: lg, rtx: rtxCounters(s) });
       } else samples.push({ t: t0, ms: r.ms, error: 'no session in status --json' });
       const wait = periodMs - (Date.now() - t0); if (wait > 0) await sleep(wait);
     }
   })();
   return { async stop() { on = false; await loop; return samples; } };
 }
+// numeric leaves of any retransmission object the host reports, flattened by path, so new
+// counters reach the timeline without a change here
+const RTX_KEY = /retrans|rtx|resen[dt]/i;
+function rtxCounters(s) {
+  const out = {};
+  const walk = (v, p) => {
+    if (typeof v === 'number' && Number.isFinite(v)) out[p] = v;
+    else if (v && typeof v === 'object' && !Array.isArray(v)) for (const k of Object.keys(v)) walk(v[k], p + '.' + k);
+  };
+  for (const [where, o] of [['', s], ['degradation', s.degradation], ['link_governor', s.link_governor]]) {
+    if (!o || typeof o !== 'object') continue;
+    for (const k of Object.keys(o)) if (RTX_KEY.test(k)) walk(o[k], where ? where + '.' + k : k);
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+/**
+ * One row per host sample interval: the host's encoder output and counters, the relay's down
+ * direction over the same interval, what the client painted and the governor's state. Relay rows
+ * and host samples share the system clock; stamps are moved onto it with `offsetMs`.
+ */
+function impairTimeline(hostSamples, relaySeconds, stampSamples, { t0, tB, tC, offsetMs }) {
+  const hs = hostSamples.filter((x) => !x.error);
+  const first = new Map();
+  for (const x of stampSamples || []) {
+    if (x.stamp === undefined) continue;
+    const t = x.ts - offsetMs;
+    // the same plausibility window stampMetrics applies
+    if (!(t - x.stamp > -5 && t - x.stamp < 5000)) continue;
+    if (!first.has(x.stamp) || first.get(x.stamp) > t) first.set(x.stamp, t);
+  }
+  const seen = [...first.entries()].map(([st, t]) => ({ t, lat: t - st })).sort((x, y) => x.t - y.t);
+  const r2 = (v) => (v == null || !Number.isFinite(v) ? null : Math.round(v * 100) / 100);
+  const rows = [];
+  for (let i = 1; i < hs.length; i++) {
+    const a = hs[i - 1], b = hs[i]; const dt = (b.t - a.t) / 1000;
+    if (!(dt > 0)) continue;
+    const reset = a.frames != null && b.frames != null && b.frames < a.frames;
+    const d = (k) => (reset || a[k] == null || b[k] == null ? null : b[k] - a[k]);
+    const rate = (k, f = 1) => { const v = d(k); return v == null ? null : r2(v * f / dt); };
+    const row = { s: Math.round((b.t - t0) / 100) / 10, phase: b.t <= tB ? 'baseline' : b.t <= tC ? 'impaired' : 'recovery', dt: r2(dt),
+      hostMbps: rate('bytes', 8 / 1e6), fps: rate('frames'), idrs: d('idrs'), nacks: d('nacks'), kfReq: d('kfReq'), bitrateCuts: d('bitrateCuts'), overuse: d('overuse') };
+    if (reset) row.sessionChanged = true;
+    const rr = (relaySeconds || []).filter((r) => r.t > a.t && r.t <= b.t);
+    const sum = (dir, k) => rr.reduce((x, r) => x + ((r[dir] && r[dir][k]) || 0), 0);
+    row.relayInMbps = rr.length ? r2(sum('down', 'inBytes') * 8 / 1e6 / dt) : null;
+    row.relayOutMbps = rr.length ? r2(sum('down', 'sentBytes') * 8 / 1e6 / dt) : null;
+    row.queueDrops = rr.length ? sum('down', 'queueDrops') : null;
+    row.lossDrops = rr.length ? sum('down', 'lossDrops') : null;
+    row.queueMs = rr.some((r) => r.down.queueMs != null) ? Math.max(...rr.map((r) => r.down.queueMs || 0)) : null;
+    row.queueBytes = rr.length ? Math.max(...rr.map((r) => r.down.queueBytes || 0)) : null;
+    row.upLossDrops = rr.length ? sum('up', 'lossDrops') : null;
+    row.clientPainted = rate('clientPainted');
+    const st = seen.filter((x) => x.t > a.t && x.t <= b.t).map((x) => x.lat).sort((x, y) => x - y);
+    row.stampsPainted = r2(st.length / dt);
+    row.latencyP50 = st.length ? r2(st[st.length >> 1]) : null;
+    const g = b.link, ga = a.link;
+    if (g) {
+      const dg = (k) => (ga && typeof g[k] === 'number' && typeof ga[k] === 'number' ? g[k] - ga[k] : null);
+      const ev = g.evidence || {};
+      row.gov = { state: g.state ?? null, verdict: g.verdict ?? null, qp: g.qp_effective ?? null, qpLink: g.qp_link ?? null, frameDivisor: g.frame_divisor ?? null, clientFrameDivisor: g.client_frame_divisor ?? null,
+        steps: dg('steps'), raises: dg('raises'), clientCuts: dg('client_cuts'), queueMs: ev.queue_ms ?? null, deliveredMbps: ev.delivered_mbps ?? null, sentMbps: ev.sent_mbps ?? null, loss: ev.loss ?? null };
+      if (g.last_move && (!ga || ga.last_move !== g.last_move)) row.gov.lastMove = g.last_move;
+    } else row.gov = null;
+    if (b.rtx) {
+      const o = {};
+      for (const k of Object.keys(b.rtx)) o[k] = !reset && a.rtx && a.rtx[k] != null ? b.rtx[k] - a.rtx[k] : null;
+      row.rtx = o;
+    }
+    rows.push(row);
+  }
+  return rows;
+}
+
+/** The timeline as fixed-width text, one line per row; '*' marks the impaired phase. */
+function timelineTable(rows) {
+  const f = (v, w, p = 2) => (v == null ? '-' : typeof v === 'number' ? v.toFixed(p) : String(v)).padStart(w);
+  const out = ['     s | host Mbit   fps  idr  nack cuts | relay in   out  qdrop  q ms | painted stamps   p50 | gov qp div state'];
+  for (const r of rows) {
+    const g = r.gov;
+    const gov = g ? `${f(g.qp, 6, 0)} ${f(g.frameDivisor, 3, 0)} ${g.state || '-'}` : '-';
+    out.push(`${r.phase === 'impaired' ? '*' : ' '}${f(r.s, 5, 1)} |${f(r.hostMbps, 9)} ${f(r.fps, 5, 1)} ${f(r.idrs, 4, 0)} ${f(r.nacks, 5, 0)} ${f(r.bitrateCuts, 4, 0)} |${f(r.relayInMbps, 9)} ${f(r.relayOutMbps, 5)} ${f(r.queueDrops, 6, 0)} ${f(r.queueMs, 5, 0)} |${f(r.clientPainted, 8, 1)} ${f(r.stampsPainted, 6, 1)} ${f(r.latencyP50, 5, 0)} | ${gov}${r.sessionChanged ? ' (new session)' : ''}`);
+  }
+  return out;
+}
+
+/** Per phase: how much of what reached the relay was not encoder output (retransmissions, packet overhead, RTCP). */
+function retransmitLoad(rows) {
+  const out = {};
+  for (const ph of ['baseline', 'impaired', 'recovery']) {
+    const rs = rows.filter((r) => r.phase === ph && r.hostMbps != null && r.relayInMbps != null);
+    const enc = rs.reduce((x, r) => x + r.hostMbps * r.dt, 0), rin = rs.reduce((x, r) => x + r.relayInMbps * r.dt, 0);
+    const rtx = {};
+    for (const r of rows.filter((x) => x.phase === ph && x.rtx)) for (const k of Object.keys(r.rtx)) if (r.rtx[k] != null) rtx[k] = (rtx[k] || 0) + r.rtx[k];
+    out[ph] = { rows: rs.length, encoderMbit: Math.round(enc * 100) / 100, relayInMbit: Math.round(rin * 100) / 100, nonEncoderShare: rin > 0 ? Math.round((rin - enc) / rin * 1000) / 1000 : null, ...(Object.keys(rtx).length ? { rtx } : {}) };
+  }
+  const b = out.baseline.nonEncoderShare, i = out.impaired.nonEncoderShare;
+  out.impairedExcessShare = b != null && i != null ? Math.round((i - b) * 1000) / 1000 : null;
+  out.note = 'nonEncoderShare = (relay input - encoder output) / relay input; the baseline share is packet overhead, the impaired share above it is mostly retransmission';
+  return out;
+}
+
 /** Host counters across [from, to] (ms, node clock): deltas and the bitrate series. */
 function hostPhase(samples, from, to) {
   const inn = samples.filter((s) => s.t >= from - 600 && s.t <= to + 600 && !s.error);
@@ -1362,7 +1476,7 @@ function hostPhase(samples, from, to) {
   const dl = (k) => (a[k] != null && b[k] != null ? b[k] - a[k] : null);
   const mbps = []; for (let i = 1; i < inn.length; i++) { const dt = (inn[i].t - inn[i - 1].t) / 1000; if (dt > 0 && inn[i].bytes != null) mbps.push(+((inn[i].bytes - inn[i - 1].bytes) * 8 / dt / 1e6).toFixed(2)); }
   return { samples: inn.length, seconds: +secs.toFixed(1), meanMbps: secs > 0 && dl('bytes') != null ? +(dl('bytes') * 8 / secs / 1e6).toFixed(2) : null, mbpsSeries: mbps, encodedFps: secs > 0 && dl('frames') != null ? +(dl('frames') / secs).toFixed(1) : null,
-    qpSeries: inn.map((s) => s.qp), ceilingMbps: inn.map((s) => s.ceilingMbps), keyframeRequests: dl('kfReq'), keyframeRequestsSuppressed: dl('kfSuppressed'), clientKeyframeRequests: dl('clientKfReq'), idrsSent: dl('idrs'), nacksReceived: dl('nacks'), bitrateCuts: dl('bitrateCuts'), delayOveruse: dl('overuse'), pacerDeadlineMisses: dl('pacerMiss') };
+    qpSeries: inn.map((s) => s.qp), ceilingMbps: inn.map((s) => s.ceilingMbps), frameDivisorSeries: inn.map((s) => (s.link && s.link.frame_divisor != null ? s.link.frame_divisor : null)), keyframeRequests: dl('kfReq'), keyframeRequestsSuppressed: dl('kfSuppressed'), clientKeyframeRequests: dl('clientKfReq'), idrsSent: dl('idrs'), nacksReceived: dl('nacks'), bitrateCuts: dl('bitrateCuts'), delayOveruse: dl('overuse'), pacerDeadlineMisses: dl('pacerMiss') };
 }
 /** From the impairment's end: when were 4 consecutive 250 ms bins healthy again? */
 function recovery(samples, { endAt, until, baseFps, baseP50, offsetMs }) {
@@ -1377,11 +1491,11 @@ function recovery(samples, { endAt, until, baseFps, baseP50, offsetMs }) {
 
 // baseline, condition, recovery in one stamp window; apply() and restore() switch the condition
 async function impairedWindow(cl, name, relay, sc, o, { apply = null, restore = null, prefix = 'impair' } = {}) {
-  const A = o.baseline_s || 10, B = o.impaired_s || 20, C = o.recover_s || 15;
+  const A = sc.baseline_s || o.baseline_s || 10, B = sc.impaired_s || o.impaired_s || 20, C = sc.recover_s || o.recover_s || 15;
   const total = A + B + C;
   const lbl = prefix + ':' + sc.key;
-  if (!apply) apply = async () => { await relay.set({ down: sc.down || {}, up: sc.up || {} }); await relay.arm(sc.schedule || []); };
-  if (!restore) restore = async () => { await relay.set({ down: {}, up: {} }); };
+  if (!apply) apply = async () => { const v = await relay.set({ down: sc.down || {}, up: sc.up || {} }); await relay.arm(sc.schedule || []); return v; };
+  if (!restore) restore = async () => { await relay.disarm(); await relay.set({ down: {}, up: {} }); };
   const gate = await loadGate(lbl);
   const st = await stageFor(name, { seconds: total + REQ.warmup + 8, stamp: true });
   const ready = await st.ready;
@@ -1394,6 +1508,7 @@ async function impairedWindow(cl, name, relay, sc, o, { apply = null, restore = 
       await sleep(REQ.warmup * 1000);
       const load = startLoadSampler(); const hs = hostSampler(1000);
       const tot0 = relay ? (await relay.stats(0, true)).totals : null;
+      if (relay) await relay.markBaseline();
       const off = R.clock.browserMinusSystemMs;
       const sec = [];
       const t0 = Date.now(); sec.push(await cl.secondary());
@@ -1420,6 +1535,9 @@ async function impairedWindow(cl, name, relay, sc, o, { apply = null, restore = 
       if (rs && rs.lateness_ms.wake.p99 != null && rs.lateness_ms.wake.p99 > 2) invalid.push(`relay scheduler late: wake p99 ${rs.lateness_ms.wake.p99} ms (> 2 ms)`);
       const verdict = loadedVerdict(gate, loadSum);
       if (verdict.loaded) invalid.push('machine CPU above the load gate during the window');
+      for (const dir of ['down', 'up']) if (applied && applied[dir] && applied[dir].rate_error) invalid.push(`${dir} cap relative to the baseline not applied: ${applied[dir].rate_error}`);
+      const tl = impairTimeline(hostSamples, rs && rs.seconds, got.samples, { t0, tB, tC, offsetMs: off });
+      const lastHost = hostSamples.filter((x) => !x.error).pop() || {};
       return {
         scenario: sc.key, label: sc.label, impairment: relay ? { down: sc.down || null, up: sc.up || null, schedule: sc.schedule || null } : undefined, applied, restored, seconds: { baseline: A, impaired: B, recovery: C },
         valid: invalid.length === 0, invalid, ...verdict, load: loadSum,
@@ -1431,6 +1549,8 @@ async function impairedWindow(cl, name, relay, sc, o, { apply = null, restore = 
         recovery: { ...rec, lastFiveSecondsP50: lastFive.latencyMs ? lastFive.latencyMs.p50 : null, baselineP50: baseP50, backToFloor: lastFive.latencyMs && baseP50 != null ? lastFive.latencyMs.p50 <= baseP50 + Math.max(5, 0.15 * baseP50) : null },
         relay: rs ? { totals: tot, lateness_ms: rs.lateness_ms, schedule: rs.schedule, perSecond: rs.seconds.map((r) => ({ s: Math.round((r.t - tB) / 100) / 10, down: { in: r.down.in, sent: r.down.sent, kbps: Math.round(r.down.sentBytes * 8 / 1000), lossDrops: r.down.lossDrops, queueDrops: r.down.queueDrops, held: r.down.held, queueBytes: r.down.queueBytes }, up: { in: r.up.in, sent: r.up.sent, lossDrops: r.up.lossDrops } })) } : null,
         hostSamples: hostSamples.length, hostRaw: dumpRows(`impair-${sc.key}-${Date.now()}.json`, { hostSamples, relaySeconds: rs && rs.seconds }),
+        stream: { encoder: lastHost.encoder || null, captureBackend: lastHost.captureBackend || null, governor: tl.some((r) => r.gov) },
+        timeline: tl, timelineTable: timelineTable(tl), retransmitLoad: retransmitLoad(tl),
       };
     });
   } finally { await st.exited.catch(() => {}); stopStage(st); if (lg) { await lg.exited.catch(() => {}); stopStage(lg); } }
@@ -1438,7 +1558,9 @@ async function impairedWindow(cl, name, relay, sc, o, { apply = null, restore = 
 
 async function impairTest() {
   const o = REQ.impair === true ? {} : { ...REQ.impair };
-  const list = (o.scenarios || DEFAULT_IMPAIRMENTS).map((s) => (typeof s === 'string' ? { key: s, ...(IMPAIRMENTS[s] || { error: 'unknown impairment; known: ' + Object.keys(IMPAIRMENTS).join(', ') }) } : { key: s.name || 'custom', label: s.label || 'custom', ...s }));
+  // a known name given as an object with no impairment of its own keeps the table's, with overrides (durations, label)
+  const known = (s) => IMPAIRMENTS[s.name] && s.down === undefined && s.up === undefined && s.schedule === undefined;
+  const list = (o.scenarios || DEFAULT_IMPAIRMENTS).map((s) => (typeof s === 'string' ? { key: s, ...(IMPAIRMENTS[s] || { error: 'unknown impairment; known: ' + Object.keys(IMPAIRMENTS).join(', ') }) } : known(s) ? { key: s.name, ...IMPAIRMENTS[s.name], ...s } : { key: s.name || 'custom', label: s.label || 'custom', ...s }));
   const spec = { ...REQ.client, ...(o.client || {}) };
   const out = { client: spec, queueDiscipline: QUEUE_DISCIPLINE, scenarios: [] };
   const cl = await openClient(spec, { offset: 4, browser: o.browser || 'chrome', workerExtra: o.timeline ? RX_HOOK_SOURCE : '' });

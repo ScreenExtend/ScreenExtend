@@ -294,7 +294,7 @@ The table is in execution order. Modifier keys are listed beside the request the
 | `arms` | null | A/B arms inside one join. See "A/B arms" |
 | `auto_rejoin` | false | stops and restarts the host under a live page. Reports a timeline of host joins and page state for up to 30 s |
 | `receive_hold` | null | `{rates: [30, 60, 120], browsers: ["chrome", "edge"], modes: ["headless"], seconds: 30, settle_s: 5, large: true, relay: false, client}`: when does the page's transform worker get each encoded frame? See "Receive timeline" |
-| `impair` | false | `true` or `{scenarios, baseline_s: 10, impaired_s: 20, recover_s: 15, settle_s: 3, large: true, browser, client}`: network impairment through the loopback relay, on one join. See "Relay and impairment" |
+| `impair` | false | `true` or `{scenarios, baseline_s: 10, impaired_s: 20, recover_s: 15, settle_s: 3, large: true, browser, client}`: network impairment through the loopback relay, on one join. A scenario's own durations win over these. See "Relay and impairment" |
 | `slow_client` | false | `true` or `{cases, spin_ms: 25, cpu_rate: 6, baseline_s: 10, slow_s: 15, recover_s: 15, large: true, browser, client}`: a client that cannot keep up. Cases: `worker_spin`, `cpu_throttle`, `hidden`, `software_decode`. The first three are phased windows on one join. `software_decode` is its own browser and join |
 | `remote_client` | false | `true` or `{ssh: "user@host", rates: [60, 120], seconds: 20, settle_s: 5, large: true, chrome_path, flags, client}`: the page in a headless Chrome on another machine. See "A client on another machine" |
 | `multi_session` | false | `true` or `{max: 4, seconds: 15, client}`: browsers join one at a time, one display creation each. After each join every session gets a simultaneous stamp window, with each display's mode and DWM's composition rate (`displayRates`) |
@@ -656,18 +656,32 @@ Per direction, in this order:
 1. Stall: hold everything, then release in arrival order.
 2. Loss: Bernoulli, or Gilbert-Elliott bursts.
 3. Delay with uniform jitter. Order is kept unless `reorder` is set.
-4. Rate cap: a token bucket serving a FIFO drop-tail queue limited in bytes (default 100 ms at the rate).
+4. Rate cap: a token bucket serving a FIFO drop-tail queue limited in bytes.
 
-A `schedule` changes a direction's settings mid-window. The relay keeps:
+Settings per direction:
 
-- a row per second: packets in and out, drops by cause, held packets, queue depth;
+| key | meaning |
+|---|---|
+| `loss`, `burst` | Bernoulli loss, or Gilbert-Elliott `{p_enter, p_exit, loss}` |
+| `delay_ms`, `jitter_ms`, `reorder` | fixed delay, uniform jitter, and whether jitter may reorder |
+| `stall` | `{ms, every_s}` |
+| `rate_kbps`, `bucket_bytes` | the token bucket (bucket 16000 bytes by default) |
+| `queue_bytes` | the queue limit in bytes. Wins over `queue_ms` |
+| `queue_ms` | the queue limit as time at the rate, 100 ms by default |
+| `rate_of_baseline` | a cap of this fraction of the direction's input rate since the window's baseline mark. The rate is measured once, when the first setting asks for it, and every later schedule phase reuses it. The settings in effect record `baseline_kbps` and the resolved `rate_kbps`. Without a mark, or with nothing received, no cap is applied and `rate_error` says why |
+
+Each window marks the baseline at the start of its baseline phase, so `rate_of_baseline` applied at the impairment measures that phase. The input rate is everything the host sent towards the browser: video, RTCP and any retransmissions.
+
+A `schedule` changes a direction's settings mid-window. Phases that have not fired when the impairment ends are dropped. The relay keeps:
+
+- a row per second: packets in and out, drops by cause, held packets, queue depth in bytes and in ms at the rate;
 - totals;
 - the RTP sequence gaps it saw arriving (`streams[].seqGaps`), which is loss before the relay;
 - its own lateness (`lateness_ms.wake`): when its scheduler meant to run against when it ran.
 
 ### Scenarios
 
-`impair.scenarios` takes names, or `{name, label, down, up, schedule}` objects.
+`impair.scenarios` takes names, or `{name, label, down, up, schedule, baseline_s, impaired_s, recover_s}` objects. An object whose `name` is in the table and that has no `down`, `up` or `schedule` of its own keeps the table's impairment and overrides the rest, for example `{"name": "cap5_long", "impaired_s": 90}`.
 
 | name | impairment |
 |---|---|
@@ -680,8 +694,35 @@ A `schedule` changes a direction's settings mid-window. The relay keeps:
 | `cap5` | 5 Mbit/s cap, host to browser |
 | `cap1_5` | 1.5 Mbit/s cap, host to browser |
 | `cap_change` | a cap of 8, then 1.5, then 8 Mbit/s, host to browser |
+| `delay_step` | base delay of 5 ms, 60 ms from 7 s, 5 ms again from 14 s, both ways, order kept, no loss. A governor should not react |
+| `loss_step3` | no loss, 3 % random loss from 5 s to 12 s, then none, host to browser |
+| `cap3` | 3 Mbit/s cap, host to browser |
+| `cap2` | 2 Mbit/s cap, host to browser |
+| `cap_slowfill` | a cap of 98 % of the input rate measured in the scenario's own baseline, with a 500 ms queue, host to browser: a standing queue that fills slowly |
+| `cap5_long` | 5 Mbit/s cap held for 60 s, host to browser |
 
-The default list is `stall200`, `loss1`, `loss5`, `cap5`, `cap1_5`, `cap_change`.
+The caps use a 100 ms queue unless stated. The default list is `stall200`, `loss1`, `loss5`, `cap5`, `cap1_5`, `cap_change`.
+
+The full link matrix:
+
+```json
+{"label": "link matrix, NVENC", "scenarios": [], "calibrate": false, "display_check": true,
+ "impair": {"scenarios": ["stall200", "loss1", "loss5", "burst", "loss5_up", "delay_jitter", "delay_step", "loss_step3",
+   "cap5", "cap3", "cap2", "cap1_5", "cap_change", "cap_slowfill", "cap5_long"]},
+ "host_args": ["--encoder", "nvidia"]}
+```
+
+`--encoder intel` or `--encoder software` in `host_args` runs the same matrix on Quick Sync or x264.
+
+DXGI duplication is reached by a real join only when the first capture API fails. The host has a developer hook that forces it: `SE_FORCE_DXGI=1` together with `SE_TEST_HOOKS=1`. Hooks are read only by a debug build or one built with the `probe` or `bench` feature, so the run needs such an `--exe`:
+
+```json
+{"label": "link matrix, DXGI", "scenarios": [], "calibrate": false, "display_check": true,
+ "impair": {"scenarios": ["delay_step", "loss_step3", "cap5", "cap3", "cap2", "cap1_5", "cap_slowfill"]},
+ "host_args": ["--encoder", "nvidia"], "host_env": {"SE_TEST_HOOKS": "1", "SE_FORCE_DXGI": "1"}}
+```
+
+Check `stream.captureBackend` in each scenario: it reads `dxgi` when the hook took effect. A shipped build ignores the hook without a word (the handler warns that `host_env` has no effect there), and a hook build without `SE_TEST_HOOKS=1` logs that it ignored it.
 
 ### What a scenario reports
 
@@ -689,19 +730,52 @@ Each scenario is one continuous stamp window in three phases: baseline, impaired
 
 - the stamp metric;
 - the page and WebRTC counter deltas: keyframes requested, PLI, NACK, packets lost;
-- the host's counters, from `status --json` once a second: bitrate series, encoded fps, QP, keyframe requests and suppressed ones, IDRs sent, NACKs, bitrate cuts.
+- the host's counters, from `status --json` once a second: bitrate series, encoded fps, QP, keyframe requests and suppressed ones, IDRs sent, NACKs, bitrate cuts. The QP comes from `qp_governor`, or from `link_governor` when that is on; `frameDivisorSeries` is the governor's frame-rate divisor.
+
+Across the whole window:
+
+| field | meaning |
+|---|---|
+| `applied` | the relay settings the impairment started with, a baseline-relative cap resolved |
+| `stream` | the encoder and capture backend the host reported, and whether a link governor was seen |
+| `timeline` | one row per host sample (about a second), below |
+| `timelineTable` | the same rows as fixed-width text; `*` marks the impaired phase |
+| `retransmitLoad` | per phase: encoder output, relay input, and `nonEncoderShare`, the share of relay input that was not encoder output. The baseline share is packet overhead; `impairedExcessShare` is the impaired share above it, which is mostly retransmission |
+
+A `timeline` row:
+
+| field | meaning |
+|---|---|
+| `s`, `phase`, `dt` | seconds since the window started, the phase, the interval length |
+| `hostMbps`, `fps` | the host's encoder output and frames encoded |
+| `idrs`, `nacks`, `kfReq`, `bitrateCuts`, `overuse` | new IDRs, NACKs received, keyframe requests, bitrate cuts, delay overuse events |
+| `relayInMbps`, `relayOutMbps` | what the host sent towards the browser, and what the relay passed on |
+| `queueDrops`, `lossDrops`, `queueMs`, `queueBytes` | the relay's drops towards the browser, and its queue at the end of the second |
+| `upLossDrops` | relay loss on the browser to host direction |
+| `clientPainted` | frames the client reported painted (its `STATS`) |
+| `stampsPainted`, `latencyP50` | new stamps the harness read, and their p50 latency |
+| `gov` | null without a link governor. Otherwise `state`, `verdict` (when the host reports one), `qp`, `qpLink`, `frameDivisor`, `clientFrameDivisor`, the new `steps`, `raises` and `clientCuts`, the evidence (`queueMs`, `deliveredMbps`, `sentMbps`, `loss`), and `lastMove` when it changed |
+| `rtx` | every numeric counter under a host telemetry key matching `retrans`, `rtx` or `resend` (at the session's top level, in `degradation` or in `link_governor`), by path, as a per-row difference. Absent while the host reports none |
+| `sessionChanged` | the host's counters went backwards: a new session, so this row has no deltas |
+
+The raw samples behind it are in the file `hostRaw` names.
 
 | field | rule |
 |---|---|
 | `recovery.recoveredMs` | from the end of the impairment to the first of four consecutive healthy 250 ms bins. A healthy bin paints at least 80 % of the baseline frame rate, with a p50 within max(10 ms, 30 %) of the baseline's |
 | `recovery.backToFloor` | the p50 of the last 5 s is within max(5 ms, 15 %) of the baseline's |
 
-A scenario is invalid (`valid: false`, reasons in `invalid`) in four cases:
+A scenario is invalid (`valid: false`, reasons in `invalid`) in five cases:
 
 - the baseline painted under 20 fps;
 - the relay did nothing to the traffic;
 - the relay's scheduler was more than 2 ms late at p99;
-- the machine was above the load gate.
+- the machine was above the load gate;
+- a baseline-relative cap could not be worked out.
+
+### Relay self-test
+
+`node scripts/test-handler/relay-selftest.mjs` checks the relay on loopback, with no host, browser or display: the delay step, the loss step, the queue depth at 100 and 500 ms, and the baseline-relative cap. It takes about 25 s and exits 1 on a failed check.
 
 ## A client on another machine (`remote_client`)
 
@@ -923,6 +997,7 @@ These concern the app, not the handler.
 | `lib/png.mjs`, `lib/stamp.mjs` | PNG decoding and stamp decoding for the screencast reader (not the default) |
 | `lib/rx-hook.mjs` | the worker hook and the analysis behind `receive_hold` |
 | `lib/relay.mjs` | the UDP relay with impairment behind `impair` |
+| `relay-selftest.mjs` | the relay's offline self-test |
 | `lib/remote.mjs` | a headless Chrome on another machine over SSH |
 | `lib/joinlog.mjs` | the host log parsed into join stages |
 | `lib/tslog.mjs` | runs the host with its output read by a process of its own (`host_log: 'relay'`) |

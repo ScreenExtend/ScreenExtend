@@ -8,7 +8,9 @@
 //   loss     Bernoulli (`loss`) or Gilbert-Elliott (`burst: {p_enter, p_exit, loss}`)
 //   delay    `delay_ms` plus uniform jitter of +-`jitter_ms`; order kept unless `reorder`
 //   rate     token bucket (`rate_kbps`, `bucket_bytes`) serving a FIFO drop-tail queue of
-//            `queue_bytes` (default 100 ms at the rate)
+//            `queue_bytes` (default `queue_ms` at the rate, and `queue_ms` defaults to 100)
+// `rate_of_baseline: f` caps at f times the direction's input rate since `markBaseline()`;
+// the first setting that asks measures it, every later one reuses that number.
 // `schedule: [{ at_s, down, up }]` replaces settings that long after `arm()`.
 // Times are on the precise system clock (lib/clock.mjs); node's hrtime is QPC on Windows.
 import { Worker } from 'node:worker_threads';
@@ -21,13 +23,26 @@ const K = workerData.K;
 const now = () => Number(process.hrtime.bigint()) / 1e6 + K;
 const HOST = workerData.hostIp, BIND = workerData.bindIp;
 const BUF = 4 * 1024 * 1024;
-const DEF = { loss: 0, burst: null, delay_ms: 0, jitter_ms: 0, reorder: false, rate_kbps: 0, bucket_bytes: 16000, queue_bytes: 0, stall: null };
+const DEF = { loss: 0, burst: null, delay_ms: 0, jitter_ms: 0, reorder: false, rate_kbps: 0, bucket_bytes: 16000, queue_bytes: 0, queue_ms: 0, rate_of_baseline: 0, stall: null };
 const mkTot = () => ({ in: 0, inBytes: 0, sent: 0, sentBytes: 0, lossDrops: 0, queueDrops: 0, held: 0, heldBytes: 0, stalls: 0, sendErrors: 0, maxQueueBytes: 0, maxDelayLineBytes: 0 });
 const dirs = {};
 for (const d of ['down', 'up']) dirs[d] = { cfg: Object.assign({}, DEF), tot: mkTot(), sec: mkTot(), ge: false, holding: false, held: [], line: [], lastDue: 0, q: [], qBytes: 0, lineBytes: 0, tokens: 16000, tokAt: now(), late: [], stallTimer: null };
+// input rate per direction since markBaseline(), measured once on first use
+let base = null;
+function baselineKbps(d) {
+  if (!base) return null;
+  if (base.kbps[d] == null) { const ms = now() - base.at; base.kbps[d] = ms > 0 ? (dirs[d].tot.inBytes - base.inBytes[d]) * 8 / ms : 0; base.until[d] = Math.round(now()); }
+  return base.kbps[d];
+}
 function setCfg(d, c) {
   const D = dirs[d]; const old = D.cfg; D.cfg = Object.assign({}, DEF, c || {});
-  if (D.cfg.rate_kbps && !D.cfg.queue_bytes) D.cfg.queue_bytes = Math.max(3000, Math.round(D.cfg.rate_kbps * 1000 / 8 * 0.1));
+  if (D.cfg.rate_of_baseline) {
+    const b = baselineKbps(d);
+    D.cfg.baseline_kbps = b == null ? null : Math.round(b);
+    if (b) D.cfg.rate_kbps = Math.max(50, Math.round(b * D.cfg.rate_of_baseline));
+    else D.cfg.rate_error = b == null ? 'no baseline marked' : 'nothing arrived during the baseline';
+  }
+  if (D.cfg.rate_kbps && !D.cfg.queue_bytes) D.cfg.queue_bytes = Math.max(3000, Math.round(D.cfg.rate_kbps * 1000 / 8 * (D.cfg.queue_ms || 100) / 1000));
   D.tokens = Math.min(D.tokens, D.cfg.bucket_bytes);
   if (D.stallTimer) { clearInterval(D.stallTimer); D.stallTimer = null; }
   if (D.cfg.stall) D.stallTimer = setInterval(() => { D.tot.stalls++; D.sec.stalls++; D.holding = true; setTimeout(() => releaseHeld(d), D.cfg.stall.ms); }, D.cfg.stall.every_s * 1000);
@@ -150,7 +165,7 @@ async function relayFor(hostPort, hostIp) {
 const seconds = []; let t0 = now(); let armedAt = null; const sched = []; let schedTimers = [];
 setInterval(() => {
   const row = { t: Math.round(now()), s: armedAt ? Math.round((now() - armedAt) / 100) / 10 : null };
-  for (const d of ['down', 'up']) { const D = dirs[d]; row[d] = Object.assign({}, D.sec, { queueBytes: D.qBytes, delayLineBytes: D.lineBytes, holding: D.holding }); D.sec = mkTot(); }
+  for (const d of ['down', 'up']) { const D = dirs[d]; row[d] = Object.assign({}, D.sec, { queueBytes: D.qBytes, queueMs: D.cfg.rate_kbps ? Math.round(D.qBytes * 8 / D.cfg.rate_kbps) : 0, delayLineBytes: D.lineBytes, holding: D.holding }); D.sec = mkTot(); }
   if (seconds.length < 20000) seconds.push(row);
 }, 1000);
 function pct(a) { const s = a.slice().sort((x, y) => x - y); const q = (p) => (s.length ? Math.round(s[Math.min(s.length - 1, Math.floor(p * s.length))] * 100) / 100 : null); return { n: s.length, p50: q(0.5), p90: q(0.9), p99: q(0.99), max: s.length ? Math.round(s[s.length - 1] * 100) / 100 : null }; }
@@ -158,12 +173,14 @@ parentPort.on('message', async (m) => {
   let v = null;
   if (m.type === 'port') v = await relayFor(m.hostPort, m.hostIp);
   else if (m.type === 'arm') { armedAt = now(); for (const t of schedTimers) clearTimeout(t); schedTimers = (m.schedule || []).map((ph) => setTimeout(() => { if (ph.down) setCfg('down', ph.down); if (ph.up) setCfg('up', ph.up); sched.push({ at: Math.round(now()), s: ph.at_s, down: dirs.down.cfg, up: dirs.up.cfg }); }, ph.at_s * 1000)); v = armedAt; }
-  else if (m.type === 'set') { if (m.down !== undefined) setCfg('down', m.down); if (m.up !== undefined) setCfg('up', m.up); sched.push({ at: Math.round(now()), set: true, down: dirs.down.cfg, up: dirs.up.cfg }); v = true; }
+  else if (m.type === 'set') { if (m.down !== undefined) setCfg('down', m.down); if (m.up !== undefined) setCfg('up', m.up); sched.push({ at: Math.round(now()), set: true, down: dirs.down.cfg, up: dirs.up.cfg }); v = { down: dirs.down.cfg, up: dirs.up.cfg }; }
+  else if (m.type === 'disarm') { for (const t of schedTimers) clearTimeout(t); schedTimers = []; v = true; }
+  else if (m.type === 'mark') { base = { at: now(), inBytes: { down: dirs.down.tot.inBytes, up: dirs.up.tot.inBytes }, kbps: { down: null, up: null }, until: { down: null, up: null } }; v = Math.round(base.at); }
   else if (m.type === 'tapOn') { tap.on = true; tap.frames = []; tap.cur.clear(); v = true; }
   else if (m.type === 'tapOff') { tap.on = false; let best = null; for (const s of tap.streams.values()) if (!best || s.bytes > best.bytes) best = s; v = { videoSsrc: best ? best.ssrc : null, streams: [...tap.streams.values()], frames: tap.frames.filter((f) => best && f.ssrc === best.ssrc).map((f) => ({ rtp: f.rtp, firstAt: f.firstAt, lastAt: f.lastAt, n: f.n, bytes: f.bytes })) }; tap.frames = []; }
   else if (m.type === 'stats') {
     const since = m.since || 0;
-    v = { totals: { down: dirs.down.tot, up: dirs.up.tot }, config: { down: dirs.down.cfg, up: dirs.up.cfg }, seconds: seconds.filter((r) => r.t >= since), schedule: sched, ports, buffers,
+    v = { totals: { down: dirs.down.tot, up: dirs.up.tot }, config: { down: dirs.down.cfg, up: dirs.up.cfg }, baseline: base ? { at: Math.round(base.at), until: base.until, kbps: base.kbps } : null, seconds: seconds.filter((r) => r.t >= since), schedule: sched, ports, buffers,
       lateness_ms: { down: pct(dirs.down.late), up: pct(dirs.up.late), wake: pct(wake), note: 'down/up: actual send - due time of each delayed packet; wake: actual - intended run of the scheduler (delay and token bucket)' }, streams: [...tap.streams.values()] };
     if (m.resetLate) { dirs.down.late = []; dirs.up.late = []; wake.length = 0; }
   } else if (m.type === 'close') { for (const d of ['down', 'up']) if (dirs[d].stallTimer) clearInterval(dirs[d].stallTimer); for (const s of socks) { try { s.close(); } catch (_) {} } v = true; }
@@ -171,7 +188,7 @@ parentPort.on('message', async (m) => {
 });
 `;
 
-export const QUEUE_DISCIPLINE = 'per direction: stall gate (hold everything, release in arrival order) -> Bernoulli or Gilbert-Elliott loss -> fixed delay + uniform jitter (arrival order kept unless reorder) -> FIFO drop-tail queue limited in bytes, served by a token bucket (rate, bucket size)';
+export const QUEUE_DISCIPLINE = 'per direction: stall gate (hold everything, release in arrival order) -> Bernoulli or Gilbert-Elliott loss -> fixed delay + uniform jitter (arrival order kept unless reorder) -> FIFO drop-tail queue limited in bytes (default queue_ms, 100 ms, at the rate), served by a token bucket (rate, bucket size; rate_of_baseline scales the input rate measured since the baseline mark)';
 
 export class Relay {
   constructor({ hostIp, bindIp = null, cfg = {} }) {
@@ -189,7 +206,12 @@ export class Relay {
   }
   portFor(hostPort, hostIp) { return this.call({ type: 'port', hostPort, hostIp }); }
   arm(schedule) { return this.call({ type: 'arm', schedule: schedule || this.cfg.schedule || [] }); }
+  /** Resolves to the settings now in effect ({down, up}), with any baseline-relative cap worked out. */
   set(c) { return this.call({ type: 'set', ...c }); }
+  /** Start the window a later `rate_of_baseline` measures the input rate over. */
+  markBaseline() { return this.call({ type: 'mark' }); }
+  /** Drop schedule phases that have not fired yet. */
+  disarm() { return this.call({ type: 'disarm' }); }
   stats(since, resetLate = false) { return this.call({ type: 'stats', since, resetLate }); }
   armFrames() { return this.call({ type: 'tapOn' }); }
   async readFrames() { const v = await this.call({ type: 'tapOff' }); return v ? v.frames : null; }
