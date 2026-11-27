@@ -149,14 +149,9 @@ export function recordAttempt(repair: DriverRepair, what: RepairAttempt): Driver
   return { ...repair, [what]: repair[what] + 1 };
 }
 
-/// What the first run creates and the store still lacks.
-///
-/// A store that holds any key is not a first run to its reader, and the repair record above is
-/// written before startup reaches the settings. On a machine whose first launch installed the
-/// driver, the account name and the hosted network were therefore never created.
-/// `storedKeys` are the keys the file holds, not the defaults a reader fills in. Hosted network
-/// credentials that are both empty cannot have been saved from Settings, which refuses a short
-/// password, so they count as never created.
+/// First-run values the store still lacks. The repair record above can be written first, and a
+/// store with any key no longer reads as a first run. `storedKeys` are the file's own keys;
+/// hosted network credentials that are both empty count as never created.
 export function firstRunGaps(
   storedKeys: readonly string[],
   hostedNetwork: { name: string; password: string } | null | undefined,
