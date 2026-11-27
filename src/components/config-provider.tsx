@@ -8,6 +8,7 @@ import {
   type KnownDevice,
 } from "@/lib/config-defaults";
 import { normalizeConfig } from "@/lib/config-normalize";
+import { firstRunGaps } from "@/lib/startup-gate";
 
 // the shape and its defaults live in a module with no imports so the Settings editor's
 // schema and the node test that cross-checks them can both load it; re-exported because
@@ -143,8 +144,30 @@ export const flushConfig = async () => {
   await db.save();
 };
 
+const firstRunHostedNetwork = (name: string) => ({
+  name: "ScreenExtend" + ((name.length > 0) ? ("-" + name) : ""),
+  password: generatePassword(12),
+});
+
 export const createConfig = async (information: Partial<Config> & { name: string }) => {
-  await updateConfig({ ...defaultConfig, hostedNetworkCredentials: { name: "ScreenExtend" + ((information.name.length > 0) ? ("-" + information.name) : ""), password: generatePassword(12) }, ...information });
+  await updateConfig({ ...defaultConfig, hostedNetworkCredentials: firstRunHostedNetwork(information.name), ...information });
+};
+
+// Creates what the first run would have, for a store that was written to before it ran
+// (`firstRunGaps`). Keys the store already holds are left alone. True when it wrote something.
+export const completeFirstRun = async (username: () => Promise<string>): Promise<boolean> => {
+  const existing = await getConfig();
+  if (!existing) return false;
+  const db = await ConfigDB;
+  const gaps = firstRunGaps(await db.keys(), existing.hostedNetworkCredentials);
+  if (!gaps.name && !gaps.hostedNetwork) return false;
+  // the network is named after the account, whichever of the two is being created
+  const name = gaps.name ? await username() : existing.name;
+  await updateConfig({
+    ...(gaps.name ? { name } : {}),
+    ...(gaps.hostedNetwork ? { hostedNetworkCredentials: firstRunHostedNetwork(name) } : {}),
+  });
+  return true;
 };
 
 export const getSavedDevices = async (): Promise<Device[]> => {

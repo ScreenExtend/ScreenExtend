@@ -14,6 +14,7 @@ import {
   classifyCompat,
   classifyDriverHealth,
   classifySetupFailure,
+  firstRunGaps,
   RESTART_FAILURE_REASONS,
   restartFailureKey,
   driverRemediation,
@@ -336,6 +337,27 @@ test('every restart failure has its own sentence, and an unknown one falls back'
   for (const key of ['title', 'body', 'usage', 'restarting', 'restart', 'exit']) {
     assert.equal(typeof at(`bootstrap.driverRestart.${key}`), 'string', key);
   }
+});
+
+test('a store the repair record reached first still gets its first-run values', () => {
+  // what a first launch that installed the driver leaves behind: keys, but no account name
+  const early = ['driverRepair', 'theme', 'knownDevices'];
+  assert.deepEqual(firstRunGaps(early, { name: '', password: '' }), { name: true, hostedNetwork: true });
+  assert.deepEqual(firstRunGaps(early, undefined), { name: true, hostedNetwork: true });
+  // empty credentials written back by a reader are still never-created ones
+  assert.deepEqual(
+    firstRunGaps([...early, 'hostedNetworkCredentials'], { name: '', password: '' }),
+    { name: true, hostedNetwork: true },
+  );
+});
+
+test('a store that was set up is left alone', () => {
+  const keys = ['name', 'hostedNetworkCredentials', 'driverRepair'];
+  assert.deepEqual(firstRunGaps(keys, { name: 'ScreenExtend-a', password: 'abcdefgh1234' }), { name: false, hostedNetwork: false });
+  // an account name the user cleared is a stored key, not a gap
+  assert.equal(firstRunGaps(keys, { name: 'n', password: 'p' }).name, false);
+  // a name typed by hand does not stop the network from being created
+  assert.deepEqual(firstRunGaps(['name', 'hostedNetworkCredentials'], { name: '', password: '' }), { name: false, hostedNetwork: true });
 });
 
 console.log(failed === 0 ? '\nall startup-gate assertions passed' : `\n${failed} failed`);

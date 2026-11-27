@@ -15,6 +15,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { toast } from "@/components/ui/use-toast";
 
 import {
+  completeFirstRun,
   createConfig,
   defaultConfig,
   getConfig,
@@ -200,6 +201,10 @@ export default function Bootstrap() {
       let existing = await getConfig();
       if (!existing) {
         await createConfig({ name: await commands.getUsername(), theme });
+        existing = await getConfig();
+      } else if (await completeFirstRun(() => commands.getUsername())) {
+        // a store the driver repair record reached first: it had keys, so it was never set up
+        console.log("[bootstrap] the saved configuration lacked its first-run values; created them");
         existing = await getConfig();
       }
       if (existing) return existing;
