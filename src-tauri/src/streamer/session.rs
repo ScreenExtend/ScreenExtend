@@ -225,6 +225,10 @@ pub trait DeviceReporter: Send + Sync + std::fmt::Debug {
     fn report_remove(&self, join_id: String, token: String);
     fn report_join_attempts_paused(&self, _retry_after_secs: u64) {}
     fn report_audio_outputs(&self, _join_id: String, _token: String, _report: AudioOutputsReport) {}
+    /// The link governor has held this join's stream down for `engaged_secs` of the last
+    /// `window_secs`: its network cannot carry the stream.
+    #[cfg(windows)]
+    fn report_slow_connection(&self, _device: DeviceInfo, _engaged_secs: u32, _window_secs: u32) {}
 }
 
 pub type SharedDeviceReporter = Arc<dyn DeviceReporter>;

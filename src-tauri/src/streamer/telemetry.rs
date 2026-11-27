@@ -698,6 +698,9 @@ pub struct SessionTelemetry {
     /// divisor out to the capture gate, and its state for `status --json` (`link_governor`).
     #[cfg(windows)]
     pub link: crate::windows_utils::streamer::governor::LinkShared,
+    /// Video retransmission under its byte budget (`rtx_budget`), for `status --json`.
+    #[cfg(windows)]
+    pub rtx: crate::windows_utils::streamer::rtx::RtxCounters,
 }
 
 /// One value behind a lock.
@@ -1046,6 +1049,10 @@ impl SessionTelemetry {
         #[cfg(windows)]
         if let Some(v) = self.link.to_json() {
             out["link_governor"] = v;
+        }
+        #[cfg(windows)]
+        if let Some(v) = self.rtx.to_json() {
+            out["retransmission"] = v;
         }
         let (host_now_ns, unix_ns) = clock_pair();
         out["clock"] = serde_json::json!({ "host_now_ns": host_now_ns, "unix_ns": unix_ns });

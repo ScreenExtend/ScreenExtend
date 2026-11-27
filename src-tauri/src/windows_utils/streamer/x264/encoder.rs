@@ -48,8 +48,7 @@ impl X264Options {
             slices_by_height: tune::candidate("x264_slices_by_height"),
             rate_by_delivered_fps: tune::candidate("x264_rate_by_delivered_fps"),
             negotiated_profile: tune::on("x264_negotiated_profile"),
-            wide_qp_clamp: tune::candidate("link_governor")
-                || tune::candidate("qp_ceiling_governor"),
+            wide_qp_clamp: tune::on("link_governor") || tune::candidate("qp_ceiling_governor"),
         }
     }
 }

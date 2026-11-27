@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback, lazy, Suspense } from "react";
 import QRCode from "react-qr-code";
-import { useBlocker } from "react-router-dom";
+import { useBlocker, useLocation } from "react-router-dom";
 
 import Layout from "@/layout/layout";
 import { Switch } from "@/components/ui/switch";
@@ -267,6 +267,9 @@ export default function Settings() {
   const { setOtp, setHostedNetworkOn, setQrValues, setPublicSessionsEnabled, setAvatar, setZoom } = useGlobalSetters();
   const { t } = useTranslation();
   const { setTheme } = useTheme();
+
+  const location = useLocation();
+  const hostedNetworkCard = useRef<HTMLDivElement>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [cropSrc, setCropSrc] = useState<string | null>(null);
@@ -752,6 +755,13 @@ export default function Settings() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hostedNetworkName, hostedNetworkPassword, configLoaded]);
 
+  // a slow connection notice sends the user here to start the hosted network
+  useEffect(() => {
+    if (!configLoaded) return;
+    const focus = (location.state as { focus?: string } | null)?.focus;
+    if (focus === "hostedNetwork") hostedNetworkCard.current?.scrollIntoView({ block: "start" });
+  }, [configLoaded, location.key, location.state]);
+
   useEffect(() => {
     if (!hostedNetworkOn) setWifiQrModalOpen(false);
   }, [hostedNetworkOn]);
@@ -944,7 +954,7 @@ export default function Settings() {
             </CardContent>
           </Card>
         </div>
-        <div className="mb-4">
+        <div className="mb-4" ref={hostedNetworkCard}>
           <Card>
             <CardHeader>
               <div>

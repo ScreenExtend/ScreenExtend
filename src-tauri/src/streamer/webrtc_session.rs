@@ -239,6 +239,9 @@ impl KeyframeRequester {
             tprintln!("picture recovery: {reason} (repairing from a long-term reference, no IDR)");
             return true;
         }
+        // tagged only when a keyframe is coming: a repair leaves no request behind
+        #[cfg(windows)]
+        self.tag(key_origin::LAG);
         tprintln!("keyframe requested: {reason}");
         self.pipeline.request_idr();
         true
@@ -251,6 +254,8 @@ impl KeyframeRequester {
             return false;
         }
         if !self.pipeline.request_repair() {
+            #[cfg(windows)]
+            self.tag(key_origin::START);
             self.pipeline.request_idr();
         }
         true
@@ -268,6 +273,8 @@ impl KeyframeRequester {
         if !self.gate.allow(audio::host_now_ns()) {
             return false;
         }
+        #[cfg(windows)]
+        self.tag(key_origin::START);
         tprintln!("keyframe requested: {reason}");
         self.pipeline.request_idr();
         true
@@ -294,6 +301,8 @@ impl KeyframeRequester {
             _ => {}
         }
         if matches!(asked, DistanceAsk::Admitted | DistanceAsk::Forced) {
+            #[cfg(windows)]
+            self.tag(key_origin::DISTANCE);
             self.pipeline.request_idr();
         }
         asked
@@ -304,10 +313,32 @@ impl KeyframeRequester {
         if !self.gate.allow(audio::host_now_ns()) {
             return false;
         }
+        #[cfg(windows)]
+        self.tag(key_origin::PLI);
+        self.pipeline.request_idr();
+        true
+    }
+
+    /// Where the request came from, for the encode thread's keyframe policy.
+    #[cfg(windows)]
+    fn tag(&self, origin: u32) {
+        self.pipeline.telemetry.link.note_key_origin(origin);
+    }
+
+    /// A keyframe for `origin`, through the gate, without a log line.
+    #[cfg(windows)]
+    pub(crate) fn request_keyframe_from(&self, origin: u32) -> bool {
+        if !self.gate.allow(audio::host_now_ns()) {
+            return false;
+        }
+        self.tag(origin);
         self.pipeline.request_idr();
         true
     }
 }
+
+#[cfg(windows)]
+use crate::windows_utils::streamer::governor::key_origin;
 
 /// The `transport_tier` a client reports when it reads frames through `RTCRtpScriptTransform`
 /// (`telemetry::transport_tier_name`).
@@ -589,10 +620,165 @@ fn lan_media_socket(bind: std::net::IpAddr) -> Option<MediaSocket> {
     })
 }
 
+/// Windows `rtx_budget`: the RTP writer answers video NACKs itself, under a byte budget, instead
+/// of the stock responder resending everything asked for. Read once per session.
+#[cfg(windows)]
+fn rtx_budget_enabled() -> bool {
+    // without the link governor nothing ever engages, and the stock responder is what runs
+    crate::windows_utils::streamer::tune::on("rtx_budget")
+        && crate::windows_utils::streamer::tune::on("link_governor")
+}
+
+#[cfg(not(windows))]
+fn rtx_budget_enabled() -> bool {
+    false
+}
+
+/// What the writer keeps of a sent packet to send it again: the header and payload as written,
+/// and the transport-wide sequence it carried, which a resend repeats as the stock responder did.
+#[cfg(windows)]
+struct RtxItem {
+    pkt: webrtc::rtp::packet::Packet,
+    twcc: Option<u16>,
+}
+
+#[cfg(windows)]
+type NackRx = tokio::sync::mpsc::Receiver<
+    Vec<webrtc::rtcp::transport_feedbacks::transport_layer_nack::NackPair>,
+>;
+
+#[cfg(windows)]
+async fn next_nack(
+    rx: &mut Option<NackRx>,
+) -> Option<Vec<webrtc::rtcp::transport_feedbacks::transport_layer_nack::NackPair>> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Answer one NACK from the writer's own history: each packet the budget admits goes out
+/// through the same pacer as media. False when the track refused a write.
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+async fn answer_nack(
+    pairs: &[webrtc::rtcp::transport_feedbacks::transport_layer_nack::NackPair],
+    rtx: &mut crate::windows_utils::streamer::rtx::Retransmitter<RtxItem>,
+    extensions: &mut [webrtc::rtp::extension::HeaderExtension],
+    track: &TrackLocalStaticRTP,
+    pacer: &mut Pacer,
+    precise_wait: bool,
+    telemetry: &super::telemetry::SessionTelemetry,
+    target_bps: u32,
+    link: &mut LinkPace,
+    keyframes: &KeyframeRequester,
+) -> bool {
+    use crate::windows_utils::streamer::rtx;
+    let rtt = rtx::client_rtt(telemetry.client.get().as_ref(), audio::host_now_ns());
+    pacer.begin_frame();
+    let pace = telemetry.link.pace_bps();
+    let engaged = telemetry.link.engaged();
+    // paced to the link, resends share what the link delivers
+    let target_bps = match telemetry.link.delivered_bps() {
+        d if pace > 0 && d > 0 => target_bps.min(d.min(u32::MAX as u64) as u32),
+        _ => target_bps,
+    };
+    for seq in rtx::nacked(pairs) {
+        if pace > 0 && link.key_needed {
+            // a keyframe is on its way for a loss that could not be repaired: nothing before it
+            // is worth the link's time
+            break;
+        }
+        // the limits bind only while the link side is engaged; until then every packet still in
+        // the history goes again, as the stock responder sends it
+        let verdict = if engaged {
+            rtx.request(seq, Instant::now(), rtt, target_bps)
+        } else {
+            rtx.request_unlimited(seq)
+        };
+        telemetry
+            .rtx
+            .count(verdict.as_ref().map(|v| v.1).map_err(|e| *e));
+        let (item, bytes) = match verdict {
+            Ok(v) => v,
+            // that frame can never be completed, and every later one depends on it: one keyframe,
+            // sent once the backlog has left, instead of waiting for the page or a PLI
+            Err(rtx::Refusal::Stale | rtx::Refusal::Budget) if pace > 0 && !link.key_needed => {
+                link.key_needed = keyframes.request_keyframe_from(key_origin::UNREPAIRABLE);
+                continue;
+            }
+            Err(_) => continue,
+        };
+        let pkt = item.pkt.clone();
+        let twcc = item.twcc;
+        if pace > 0 {
+            link.pacer.set_rate(pace);
+            let wait = link.pacer.schedule(bytes as usize, Instant::now());
+            if !wait.is_zero() {
+                if precise_wait {
+                    pace_sleep_precise(wait).await;
+                } else {
+                    tokio::time::sleep(wait).await;
+                }
+            }
+        } else if engaged && pacer.mode() != PacingMode::Off {
+            let wait = pacer.schedule(bytes as usize, Instant::now());
+            if !wait.is_zero() {
+                if precise_wait {
+                    pace_sleep_precise(wait).await;
+                } else {
+                    tokio::time::sleep(wait).await;
+                }
+            }
+        }
+        if let (Some(seq), Some(slot)) = (twcc, extensions.get_mut(1)) {
+            *slot = webrtc::rtp::extension::HeaderExtension::TransportCc(
+                webrtc::rtp::extension::transport_cc_extension::TransportCcExtension {
+                    transport_sequence: seq,
+                },
+            );
+        }
+        if track
+            .write_rtp_with_extensions(&pkt, extensions)
+            .await
+            .is_err()
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// The writer's pacing to the link while the link side paces (`link_pace`), and whether it has
+/// already asked for a keyframe for a loss it could not repair.
+#[cfg(windows)]
+#[derive(Default)]
+struct LinkPace {
+    pacer: crate::windows_utils::streamer::governor::LinkPacer,
+    key_needed: bool,
+}
+
+/// The interceptors every session registers: the stock set, or with `budgeted_rtx` the same set
+/// without video retransmission, which the writer then answers.
+fn interceptors(media_engine: &mut MediaEngine, budgeted_rtx: bool) -> Result<Registry> {
+    #[cfg(windows)]
+    if budgeted_rtx {
+        return crate::windows_utils::streamer::rtx::register_interceptors(
+            Registry::new(),
+            media_engine,
+        );
+    }
+    #[cfg(not(windows))]
+    let _ = budgeted_rtx;
+    register_default_interceptors(Registry::new(), media_engine)
+        .context("register default interceptors")
+}
+
 fn build_api(
     profile: H264Profile,
     mux: Option<Arc<webrtc::ice::udp_mux::UDPMuxDefault>>,
     bind_ip: std::net::IpAddr,
+    budgeted_rtx: bool,
 ) -> Result<webrtc::api::API> {
     let mut media_engine = MediaEngine::default();
 
@@ -685,9 +871,7 @@ fn build_api(
         )
         .context("register playout-delay hdrext")?;
 
-    let mut registry = Registry::new();
-    registry = register_default_interceptors(registry, &mut media_engine)
-        .context("register default interceptors")?;
+    let registry = interceptors(&mut media_engine, budgeted_rtx)?;
 
     Ok(APIBuilder::new()
         .with_media_engine(media_engine)
@@ -1118,6 +1302,10 @@ pub struct PendingWhep {
     playout_delay_max: u16,
     twcc_offered: bool,
     locality: SessionLocality,
+    /// The writer answers video NACKs itself (`rtx_budget`): the interceptors were built without
+    /// the stock video responder.
+    #[cfg(windows)]
+    rtx_budget: bool,
     /// The transport this one replaces when it is a renegotiation in place: the client has
     /// already abandoned it, and it is closed the moment this one connects.
     superseded: Option<std::sync::Weak<webrtc::peer_connection::RTCPeerConnection>>,
@@ -1178,7 +1366,8 @@ pub async fn prepare_whep(
     // the mux's read worker runs from here: until the transport owns the mux, the guard closes
     // it on any way out (an error below, or the caller ceasing to poll)
     let mut mux = MuxGuard(media_socket.map(|m| m.mux));
-    let api = build_api(profile, mux.0.clone(), bind_ip)?;
+    let rtx_budget = rtx_budget_enabled();
+    let api = build_api(profile, mux.0.clone(), bind_ip, rtx_budget)?;
 
     let rtc_config = RTCConfiguration {
         ice_servers,
@@ -1325,6 +1514,8 @@ pub async fn prepare_whep(
         playout_delay_max,
         twcc_offered,
         locality,
+        #[cfg(windows)]
+        rtx_budget,
         superseded,
     })
 }
@@ -1378,6 +1569,8 @@ pub(crate) async fn activate_session(
         playout_delay_max,
         twcc_offered,
         locality,
+        #[cfg(windows)]
+        rtx_budget,
         superseded,
     } = pending;
     let pc = Arc::clone(&transport.pc);
@@ -1534,6 +1727,9 @@ pub(crate) async fn activate_session(
                                 last_idr_request = Some(now);
                                 // via the requester: this floor stops a looping client, the gate
                                 // stops a decoder's backlog from being answered with IDRs
+                                #[cfg(windows)]
+                                idr_keyframes.request_keyframe_from(key_origin::PAGE);
+                                #[cfg(not(windows))]
                                 idr_keyframes.request_keyframe_for_client_quietly();
                             }
                         }
@@ -1556,6 +1752,16 @@ pub(crate) async fn activate_session(
         }));
     }
 
+    // video NACKs go to the writer, which holds what was sent and the pacer
+    #[cfg(windows)]
+    let (nack_tx, mut nack_rx) = if rtx_budget {
+        let (tx, rx) = tokio::sync::mpsc::channel(crate::windows_utils::streamer::rtx::NACK_QUEUE);
+        pipeline.telemetry.rtx.active.store(true, Ordering::Relaxed);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+
     {
         let pipeline = pipeline.clone();
         let keyframes = keyframes.clone();
@@ -1576,7 +1782,45 @@ pub(crate) async fn activate_session(
             let mut client_painting = false;
             let mut rtcp_buf = vec![0u8; 1500];
             let mut deltas: Vec<f64> = Vec::with_capacity(256);
-            while let Ok((packets, _attrs)) = rtp_sender.read(&mut rtcp_buf).await {
+            // the video stream's SSRC, read once it is bound: a NACK for anything else is not ours
+            #[cfg(windows)]
+            let mut video_ssrc = 0u32;
+            loop {
+                let packets = match rtp_sender.read(&mut rtcp_buf).await {
+                    Ok((packets, _attrs)) => packets,
+                    // the resends ride this reader: one packet that does not parse must not end it
+                    #[cfg(windows)]
+                    Err(e) => {
+                        use crate::windows_utils::streamer::rtx::{rtcp_read_error, RtcpReadError};
+                        match rtcp_read_error(&e) {
+                            RtcpReadError::Skip => {
+                                if telemetry.rtx.rtcp_unparsed.fetch_add(1, Ordering::Relaxed) == 0
+                                {
+                                    teprintln!(
+                                        "rtcp: skipped a feedback packet that does not parse \
+                                         ({e}); later ones are counted in \
+                                         retransmission.rtcp_packets_unparsed"
+                                    );
+                                }
+                                continue;
+                            }
+                            RtcpReadError::Closed => break,
+                            RtcpReadError::Fatal => {
+                                telemetry
+                                    .rtx
+                                    .rtcp_reader_failed
+                                    .store(true, Ordering::Relaxed);
+                                teprintln!(
+                                    "rtcp: the feedback reader ended on an error ({e}): no more \
+                                     PLIs, NACKs or transport feedback from this viewer"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    #[cfg(not(windows))]
+                    Err(_) => break,
+                };
                 for p in &packets {
                     let any = p.as_any();
                     if any.downcast_ref::<PictureLossIndication>().is_some()
@@ -1629,6 +1873,34 @@ pub(crate) async fn activate_session(
                             .nacks_received
                             .fetch_add(lost.max(1), Ordering::Relaxed);
                         pli_backoff.note_evidence();
+                        #[cfg(windows)]
+                        if telemetry.link.engaged() {
+                            pli_backoff.withdraw_evidence();
+                        }
+                        // as the stock responder: only requests for the stream this writer owns.
+                        // What still differs while nothing is engaged: a resend goes out between
+                        // frames rather than from its own task, through the whole interceptor
+                        // chain (so sender reports count it), and a full queue drops a batch
+                        #[cfg(windows)]
+                        if video_ssrc == 0 && nack_tx.is_some() {
+                            video_ssrc = rtp_sender
+                                .get_parameters()
+                                .await
+                                .encodings
+                                .first()
+                                .map_or(0, |e| e.ssrc);
+                        }
+                        #[cfg(windows)]
+                        if let Some(tx) = nack_tx.as_ref().filter(|_| nack.media_ssrc == video_ssrc)
+                        {
+                            use tokio::sync::mpsc::error::TrySendError;
+                            if let Err(TrySendError::Full(_)) = tx.try_send(nack.nacks.clone()) {
+                                telemetry
+                                    .rtx
+                                    .nack_batches_dropped
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
                     } else if let Some(fb) = any.downcast_ref::<TransportLayerCc>() {
                         let summary = {
                             let mut guard = feedback.history.lock_recover();
@@ -1646,6 +1918,10 @@ pub(crate) async fn activate_session(
                         }
                         if summary.lost > 0 {
                             pli_backoff.note_evidence();
+                            #[cfg(windows)]
+                            if telemetry.link.engaged() {
+                                pli_backoff.withdraw_evidence();
+                            }
                         }
                         // per-frame receipts for the encode thread: what the client holds and
                         // what it lost, which a long-term-reference repair needs
@@ -1725,6 +2001,8 @@ pub(crate) async fn activate_session(
             #[cfg(windows)]
             let precise_wait =
                 crate::windows_utils::streamer::tune::candidate("pacer_precise_wait");
+            #[cfg(windows)]
+            let mut link_pace = LinkPace::default();
             let mut warned_unbound = false;
             let mut last_rtp_ts: Option<u32> = None;
             let mut first_frame_written = false;
@@ -1745,7 +2023,60 @@ pub(crate) async fn activate_session(
             } else {
                 *feedback.history.lock_recover() = None;
             }
+            #[cfg(windows)]
+            let mut rtx = nack_rx.is_some().then(|| {
+                // the same extensions the frame path writes; a resend fills in its own sequence
+                let mut ext = vec![webrtc::rtp::extension::HeaderExtension::PlayoutDelay(
+                    webrtc::rtp::extension::playout_delay_extension::PlayoutDelayExtension::new(
+                        0,
+                        playout_delay_max,
+                    ),
+                )];
+                if twcc_offered {
+                    ext.push(webrtc::rtp::extension::HeaderExtension::TransportCc(
+                        webrtc::rtp::extension::transport_cc_extension::TransportCcExtension::default(),
+                    ));
+                }
+                (
+                    crate::windows_utils::streamer::rtx::Retransmitter::<RtxItem>::new(),
+                    ext,
+                )
+            });
             loop {
+                // a repair goes ahead of the next frame: the decoder is waiting on it
+                #[cfg(windows)]
+                let received = tokio::select! {
+                    biased;
+                    _ = &mut writer_stopped => break,
+                    Some(pairs) = next_nack(&mut nack_rx) => {
+                        if let Some((history, ext)) = rtx.as_mut() {
+                            answer_nack(
+                                &pairs,
+                                history,
+                                ext,
+                                &track,
+                                &mut pacer,
+                                precise_wait,
+                                &telemetry,
+                                pacing_target.load(Ordering::Relaxed),
+                                &mut link_pace,
+                                &keyframes,
+                            )
+                            .await;
+                        }
+                        let pace = telemetry.link.pace_bps();
+                        if pace > 0 {
+                            link_pace.pacer.set_rate(pace);
+                            let left = link_pace.pacer.backlog(0, Instant::now());
+                            telemetry
+                                .link
+                                .set_writer_until(audio::host_now_ns() + left.as_nanos() as u64);
+                        }
+                        continue;
+                    }
+                    received = rx.recv() => received,
+                };
+                #[cfg(not(windows))]
                 let received = tokio::select! {
                     biased;
                     _ = &mut writer_stopped => break,
@@ -1790,6 +2121,24 @@ pub(crate) async fn activate_session(
                         pacer.set_target_bps(pacing_target.load(Ordering::Relaxed));
                         pacer.begin_frame();
                         let frame_bytes = frame.data.len() as u64;
+                        // paced to the link: the session's own pacer stands aside for this frame
+                        // and says when the frame will have left. Not paced, the mode it always
+                        // had, which changes nothing
+                        #[cfg(windows)]
+                        let link_bps = telemetry.link.pace_bps();
+                        #[cfg(windows)]
+                        if link_bps > 0 {
+                            pacer.set_mode(PacingMode::Off);
+                            link_pace.pacer.set_rate(link_bps);
+                            let left = link_pace
+                                .pacer
+                                .backlog(frame_bytes as usize, Instant::now());
+                            telemetry
+                                .link
+                                .set_writer_until(audio::host_now_ns() + left.as_nanos() as u64);
+                        } else {
+                            pacer.set_mode(pacing_mode);
+                        }
                         if super::telemetry::frame_trace_enabled() {
                             timing.trace_bytes = frame_bytes as u32;
                             timing.trace_idr = frame
@@ -1810,6 +2159,19 @@ pub(crate) async fn activate_session(
                         let mut slept_ns = 0u64;
                         for (i, payload) in payloads.drain(..).enumerate() {
                             let wire_len = payload.len() + 12;
+                            #[cfg(windows)]
+                            if link_bps > 0 {
+                                let wait = link_pace.pacer.schedule(wire_len, Instant::now());
+                                if !wait.is_zero() {
+                                    let started = Instant::now();
+                                    if precise_wait {
+                                        pace_sleep_precise(wait).await;
+                                    } else {
+                                        tokio::time::sleep(wait).await;
+                                    }
+                                    slept_ns += started.elapsed().as_nanos() as u64;
+                                }
+                            }
                             // `PacingMode::Off`: no clock read, no bucket, no sleep
                             if pacer.mode() != PacingMode::Off {
                                 let wait = pacer.schedule(wire_len, Instant::now());
@@ -1826,6 +2188,8 @@ pub(crate) async fn activate_session(
                                     tokio::time::sleep(wait).await;
                                 }
                             }
+                            #[cfg(windows)]
+                            let mut sent_twcc: Option<u16> = None;
                             if twcc_offered {
                                 // stamped here: the stock `twcc::sender::Sender` interceptor keeps
                                 // its counter private, and the feedback is useless without the
@@ -1838,6 +2202,10 @@ pub(crate) async fn activate_session(
                                     })
                                 };
                                 if let Some(seq) = transport_seq {
+                                    #[cfg(windows)]
+                                    {
+                                        sent_twcc = Some(seq);
+                                    }
                                     extensions[1] =
                                         webrtc::rtp::extension::HeaderExtension::TransportCc(
                                             webrtc::rtp::extension::transport_cc_extension::TransportCcExtension {
@@ -1856,8 +2224,25 @@ pub(crate) async fn activate_session(
                                 },
                                 payload,
                             };
+                            // a header with no extensions and a refcounted payload: no allocation
+                            #[cfg(windows)]
+                            let kept = rtx.as_ref().map(|_| pkt.clone());
                             match track.write_rtp_with_extensions(&pkt, &extensions).await {
-                                Ok(n) => written += n,
+                                Ok(n) => {
+                                    written += n;
+                                    #[cfg(windows)]
+                                    if let (Some((history, _)), Some(pkt)) = (rtx.as_mut(), kept) {
+                                        history.sent(
+                                            pkt.header.sequence_number,
+                                            wire_len,
+                                            Instant::now(),
+                                            RtxItem {
+                                                pkt,
+                                                twcc: sent_twcc,
+                                            },
+                                        );
+                                    }
+                                }
                                 Err(e) => {
                                     tprintln!(
                                         "track write_rtp failed ({e}); viewer writer stopping"
@@ -1869,6 +2254,10 @@ pub(crate) async fn activate_session(
                         }
                         if stop {
                             break;
+                        }
+                        #[cfg(windows)]
+                        if frame_idr {
+                            link_pace.key_needed = false;
                         }
                         let asked = distance.on_frame(
                             frame_packets,
@@ -1915,7 +2304,11 @@ pub(crate) async fn activate_session(
                         // has to be separable from the cost of sending
                         let pace_wait = pacer.total_wait_ns().saturating_sub(waited_before);
                         #[cfg(windows)]
-                        let pace_wait = if precise_wait { slept_ns } else { pace_wait };
+                        let pace_wait = if precise_wait || link_bps > 0 {
+                            slept_ns
+                        } else {
+                            pace_wait
+                        };
                         telemetry.stages.pace_wait.record(pace_wait);
                         let missed = pacer.deadline_misses().saturating_sub(missed_before);
                         if missed > 0 {
@@ -2004,6 +2397,11 @@ pub(crate) async fn activate_session(
             let _ = grace_cancel_tx.send(true);
             // the first moment the track can carry an IDR: before the binding `write_rtp` returns
             // `Ok(0)`, and with an infinite GOP nothing else would produce a keyframe
+            #[cfg(windows)]
+            if keyframes_state.request_keyframe_from(key_origin::START) {
+                tprintln!("keyframe requested: connection is up and the track is bound");
+            }
+            #[cfg(not(windows))]
             keyframes_state.request("connection is up and the track is bound");
             if !locality_logged.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 let pc = pc_state.clone();
@@ -2744,6 +3142,48 @@ impl AuDump {
 
 #[cfg(test)]
 mod tests {
+    /// A loss answered by a long-term-reference repair leaves no keyframe request behind; one
+    /// answered by an IDR is tagged as the lagging viewer's.
+    #[cfg(windows)]
+    #[test]
+    fn a_repair_from_a_long_term_reference_leaves_no_keyframe_origin_behind() {
+        use crate::windows_utils::streamer::governor::key_origin;
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        use std::sync::Arc;
+        struct Control {
+            repair: AtomicBool,
+            idrs: AtomicU32,
+        }
+        impl super::EncoderControl for Control {
+            fn request_idr(&self) {
+                self.idrs.fetch_add(1, Ordering::Relaxed);
+            }
+            fn request_repair(&self) -> bool {
+                self.repair.load(Ordering::Relaxed)
+            }
+            fn set_target_bitrate(&self, _bps: u32) {}
+        }
+        for repair in [true, false] {
+            let control = Arc::new(Control {
+                repair: AtomicBool::new(repair),
+                idrs: AtomicU32::new(0),
+            });
+            let pipeline = super::SessionPipeline::without_encoder(control.clone());
+            let k = super::KeyframeRequester {
+                pipeline: pipeline.clone(),
+                gate: Arc::new(crate::streamer::keyframe::KeyframeGate::new()),
+            };
+            assert!(k.request("a lagging viewer"));
+            let origins = pipeline.telemetry().link.key_origins_pending();
+            if repair {
+                assert_eq!((origins, control.idrs.load(Ordering::Relaxed)), (0, 0));
+            } else {
+                assert_eq!(origins, key_origin::LAG);
+                assert_eq!(control.idrs.load(Ordering::Relaxed), 1);
+            }
+        }
+    }
+
     #[test]
     fn the_tuned_media_socket_stays_opt_in() {
         if crate::envcfg::var_os("SCREENEXTEND_MEDIA_SOCKET").is_some()
@@ -3104,8 +3544,13 @@ mod tests {
         use webrtc::rtp_transceiver::rtp_transceiver_direction::RTCRtpTransceiverDirection;
         use webrtc::rtp_transceiver::RTCRtpTransceiverInit;
 
-        let api =
-            build_api(profile, None, std::net::Ipv4Addr::UNSPECIFIED.into()).expect("build_api");
+        let api = build_api(
+            profile,
+            None,
+            std::net::Ipv4Addr::UNSPECIFIED.into(),
+            rtx_budget_enabled(),
+        )
+        .expect("build_api");
         // a peer connection binds UDP sockets for its ICE agent, which a locked-down box may
         // refuse: a skip, not a failure of the SDP under test
         let client = match api.new_peer_connection(RTCConfiguration::default()).await {

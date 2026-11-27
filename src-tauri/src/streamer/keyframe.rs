@@ -255,6 +255,14 @@ impl PliBackoff {
         self.evidence = true;
     }
 
+    /// Loss on a link the governor has already cut for is not news: the page's own request and
+    /// the keyframe for an unrepairable loss cover a stuck decoder, and the periodic PLI must not
+    /// become a periodic keyframe.
+    #[cfg(windows)]
+    pub fn withdraw_evidence(&mut self) {
+        self.evidence = false;
+    }
+
     /// Whether this PLI/FIR may go on to the session's [`KeyframeGate`].
     pub fn allow(&mut self, now_ns: u64) -> bool {
         self.allow_with_cap(now_ns, PLI_BACKOFF_CAP_MS)

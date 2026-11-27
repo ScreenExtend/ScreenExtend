@@ -168,6 +168,24 @@ pub struct JoinAttemptsPaused {
     pub retry_after_secs: u32,
 }
 
+/// The link governor kept lowering a device's picture to keep its stream moving, so its network
+/// is what holds it back. Never sent for a device already on the hosted network. Only Windows
+/// emits it; it is registered everywhere so the bindings match.
+#[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
+pub struct SlowConnection {
+    #[serde(rename = "joinId")]
+    pub join_id: String,
+    pub token: String,
+    pub name: String,
+    /// A label, as on every device row.
+    pub ip: String,
+    /// How long the governor was engaged within the last `window_secs`.
+    #[serde(rename = "engagedSecs")]
+    pub engaged_secs: u32,
+    #[serde(rename = "windowSecs")]
+    pub window_secs: u32,
+}
+
 /// The severities a capability note can carry.
 ///
 /// `blocking` is the only one that takes "Continue anyway" off the startup gate, so it is
@@ -1135,6 +1153,7 @@ pub fn run() {
             CloudStatusChange,
             SessionIdChange,
             JoinAttemptsPaused,
+            SlowConnection,
             logbus::LogLine
         ]);
 

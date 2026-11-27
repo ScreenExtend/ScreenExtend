@@ -301,7 +301,8 @@ joinAttemptsPaused: JoinAttemptsPaused,
 logLine: LogLine,
 networkChange: NetworkChange,
 screenRecordingRevoked: ScreenRecordingRevoked,
-sessionIdChange: SessionIdChange
+sessionIdChange: SessionIdChange,
+slowConnection: SlowConnection
 }>({
 cloudStatusChange: "cloud-status-change",
 deviceAudioOutputs: "device-audio-outputs",
@@ -313,7 +314,8 @@ joinAttemptsPaused: "join-attempts-paused",
 logLine: "log-line",
 networkChange: "network-change",
 screenRecordingRevoked: "screen-recording-revoked",
-sessionIdChange: "session-id-change"
+sessionIdChange: "session-id-change",
+slowConnection: "slow-connection"
 })
 
 /** user-defined constants **/
@@ -555,6 +557,20 @@ export type ServerPorts = { http: number; https: number }
  * change it could not see.
  */
 export type SessionIdChange = { sessionId: string; otp: string }
+/**
+ * The link governor kept lowering a device's picture to keep its stream moving, so its network
+ * is what holds it back. Never sent for a device already on the hosted network. Only Windows
+ * emits it; it is registered everywhere so the bindings match.
+ */
+export type SlowConnection = { joinId: string; token: string; name: string; 
+/**
+ * A label, as on every device row.
+ */
+ip: string; 
+/**
+ * How long the governor was engaged within the last `window_secs`.
+ */
+engagedSecs: number; windowSecs: number }
 export type TurnConfig = { urls: string; username: string; credential: string }
 export type UnsupportedApi = { 
 /**

@@ -411,6 +411,7 @@ fn build(
                 scaler,
                 reader,
                 staging: None,
+                held: None,
                 target_bitrate: Arc::clone(&target_bitrate),
                 idr_request: Arc::clone(&idr),
                 current_bitrate: bitrate,

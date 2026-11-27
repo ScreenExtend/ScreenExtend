@@ -23,6 +23,11 @@
       "title": "Join Attempts Paused",
       "description": "Too many incorrect codes were entered from different devices. Someone may be guessing your code. New joins are paused for {seconds} seconds."
     },
+    "slowConnection": {
+      "title": "Slow Connection to {name}",
+      "description": "Picture quality was lowered to keep the stream moving. The hosted network gives {name} a direct connection to this computer.",
+      "action": "Hosted Network"
+    },
     "displaySettingsUnavailable": {
       "title": "Unable to Open Display Settings",
       "description": "Please adjust your display settings manually."
@@ -360,6 +365,10 @@
     "deviceRemove": {
       "title": "Device Disconnected",
       "body": "{name} left."
+    },
+    "slowConnection": {
+      "title": "Slow Connection to {name}",
+      "body": "Picture quality was lowered to keep the stream moving. The hosted network gives {name} a direct connection to this computer."
     }
   },
   "dialogs": {

@@ -580,6 +580,13 @@ impl FrameGate {
     }
 }
 
+/// Whether the gate holds a frame it gates instead of dropping it: always on the ring's trailing
+/// edge, and on the classic path only while the governor divides the frame rate, so at the full
+/// rate the classic gate is exactly the one it always was.
+pub(crate) fn gate_holds(trailing_edge: bool, classic_hold: bool, divisor: u32) -> bool {
+    trailing_edge || (classic_hold && divisor > 1)
+}
+
 /// A frame the cadence gate held back, on the ring path with `wgc_trailing_frame`: staged into a
 /// free slot now, delivered by [`TrailingEdge`]'s timer if nothing newer arrives first.
 #[allow(clippy::too_many_arguments)]
@@ -2977,6 +2984,7 @@ fn dxgi_capture_thread(args: DxgiThreadArgs, ready_tx: std::sync::mpsc::Sender<R
                 scaler,
                 reader,
                 staging: None,
+                held: None,
                 target_bitrate: Arc::clone(&target_bitrate),
                 idr_request: Arc::clone(&idr_request),
                 current_bitrate: config.bitrate_bps,
@@ -3486,6 +3494,13 @@ impl super::governor::QpEncoder for Backend {
             _ => Ok(false),
         }
     }
+
+    fn qp_top(&self) -> u8 {
+        match self {
+            Backend::X264 { encoder } => encoder.qp_range().map_or(51, |(_, top)| top),
+            _ => 51,
+        }
+    }
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -3690,6 +3705,9 @@ pub(crate) struct EncodeCore {
     /// Reused readback texture for the WGC classic CPU-bridge path. Rebuilt only when the
     /// captured content size or format changes, which is a virtual-display mode change.
     pub(crate) staging: Option<StagingTexture>,
+    /// WGC classic path with a governor: the frame its gate held back while the frame rate is
+    /// divided, encoded by the repeater at its deadline unless a newer frame comes first.
+    pub(crate) held: Option<HeldCopy>,
     pub(crate) target_bitrate: Arc<AtomicU32>,
     pub(crate) idr_request: Arc<AtomicBool>,
     pub(crate) current_bitrate: u32,
@@ -3699,9 +3717,118 @@ pub(crate) struct EncodeCore {
     pub(crate) health: CoreHealth,
 }
 
+/// A copy of a frame the classic gate held back. It lives in the encode core because the copy
+/// and the encode both use the capture device's immediate context, which the core's lock
+/// already serializes between the capture callback and the repeater.
+pub(crate) struct HeldCopy {
+    device: ID3D11Device,
+    context: ID3D11DeviceContext,
+    tex: ID3D11Texture2D,
+    desc: D3D11_TEXTURE2D_DESC,
+    /// The size the core's `TextureReader` was built for, when the held copy built it.
+    reader_for: Option<(u32, u32)>,
+    pending: bool,
+    capture: Instant,
+}
+
+/// What the WGC classic callback and its repeater share about the held copy.
+#[derive(Default)]
+pub(crate) struct ClassicHold {
+    /// When the held copy is due, in nanoseconds after the session epoch; 0 when none is.
+    due_ns: AtomicU64,
+    /// Callback entry of the newest held copy the repeater delivered; 0 when none.
+    delivered_ns: AtomicU64,
+}
+
 impl EncodeCore {
+    /// Copy `src` to be encoded later, replacing any copy still waiting. `true` when one was.
+    pub(crate) fn hold_copy(
+        &mut self,
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        src: &ID3D11Texture2D,
+        capture: Instant,
+    ) -> Result<bool> {
+        let mut want = D3D11_TEXTURE2D_DESC::default();
+        unsafe { src.GetDesc(&mut want) };
+        let fits = self.held.as_ref().is_some_and(|h| {
+            h.desc.Width == want.Width
+                && h.desc.Height == want.Height
+                && h.desc.Format == want.Format
+        });
+        if !fits {
+            let desc = D3D11_TEXTURE2D_DESC {
+                MipLevels: 1,
+                ArraySize: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: want.BindFlags
+                    | (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: 0,
+                ..want
+            };
+            let mut tex: Option<ID3D11Texture2D> = None;
+            unsafe { device.CreateTexture2D(&desc, None, Some(&mut tex)) }
+                .context("creating the held-frame copy")?;
+            self.held = Some(HeldCopy {
+                device: device.clone(),
+                context: context.clone(),
+                tex: tex.context("the held-frame copy was null")?,
+                desc,
+                reader_for: None,
+                pending: false,
+                capture,
+            });
+        }
+        let h = self
+            .held
+            .as_mut()
+            .ok_or_else(|| anyhow!("held-frame copy missing"))?;
+        unsafe { h.context.CopyResource(&h.tex, src) };
+        let replaced = std::mem::replace(&mut h.pending, true);
+        h.capture = capture;
+        Ok(replaced)
+    }
+
+    /// A newer frame supersedes the held copy. `true` when one was waiting.
+    pub(crate) fn drop_held(&mut self) -> bool {
+        self.held
+            .as_mut()
+            .is_some_and(|h| std::mem::replace(&mut h.pending, false))
+    }
+
+    /// Encode the held copy, if one is waiting: its access unit and capture time.
+    pub(crate) fn encode_held(&mut self) -> Option<Result<(Vec<u8>, Instant)>> {
+        let h = self.held.as_mut().filter(|h| h.pending)?;
+        h.pending = false;
+        let (tex, capture, size) = (h.tex.clone(), h.capture, (h.desc.Width, h.desc.Height));
+        // a CPU bridge with no scaler reads a texture through the core's reader; the classic
+        // path never built one, its own frames read through `staging`
+        if self.backend.is_cpu_bridge() && self.scaler.is_none() && h.reader_for != Some(size) {
+            match TextureReader::new(&h.device, &h.context, size.0, size.1) {
+                Ok(r) => {
+                    self.reader = Some(r);
+                    h.reader_for = Some(size);
+                }
+                Err(e) => return Some(Err(e)),
+            }
+        }
+        Some(self.encode_texture(&tex).map(|au| (au, capture)))
+    }
+
     fn take_force_idr(&mut self) -> bool {
-        self.frame_index == 0 || self.idr_request.swap(false, Ordering::Relaxed)
+        if self.frame_index == 0 {
+            return true;
+        }
+        let asked = self.idr_request.swap(false, Ordering::Relaxed);
+        match self.health.qp.as_mut() {
+            Some(g) => g.admit_keyframe(asked),
+            None => asked,
+        }
     }
 
     fn apply_pending_bitrate(&mut self) {
@@ -3990,6 +4117,10 @@ struct LiveCapture {
     /// Ring path only, `wgc_trailing_frame`: delivers the newest frame the cadence gate held back
     /// once the burst it belonged to has ended. See [`TrailingEdge`].
     trailing: Option<TrailingEdge>,
+    /// Classic path with a governor: the held copy's deadline, shared with the repeater that
+    /// encodes it. The gate holds a frame only while the frame rate is divided.
+    classic_hold: Option<Arc<ClassicHold>>,
+    hold_failed: bool,
     /// The display's size when the pipeline was built, and the first frame's size. A later frame
     /// of another size means the display changed mode: `CopyResource` into a slot of the old size
     /// is a call the runtime silently drops, so the client would keep getting stale pixels.
@@ -4941,6 +5072,9 @@ struct RingWorker<E> {
     /// Reused, because the encode thread does not allocate per frame.
     lost_frames: Vec<u64>,
     held_slot: Option<usize>,
+    /// Paced to the link with more than a frame period waiting at the sender: the newest frame,
+    /// staged and not encoded, sent once the backlog has left.
+    deferred: Option<ReadyMsg>,
     last_emit: Instant,
     /// Repair work taken from `RepairState` and not yet put on a picture. An idle tick reads the
     /// state too, and a mark it takes there must not be lost because the tick did not emit.
@@ -5022,6 +5156,7 @@ impl<E: RingEngine> RingWorker<E> {
             tick,
             lost_frames: Vec::with_capacity(8),
             held_slot: None,
+            deferred: None,
             last_emit: Instant::now(),
             pending: Default::default(),
             ltr_active,
@@ -5031,6 +5166,14 @@ impl<E: RingEngine> RingWorker<E> {
 
     fn live_slots(&self) -> u32 {
         (self.slots as u32).saturating_sub(self.poisoned.count())
+    }
+
+    /// A frame that waited at the sender was superseded before it was sent: skipped there, its
+    /// slot back to the stage unencoded. `true` when the stage has gone.
+    fn skip_deferred(&mut self, slot: usize) -> bool {
+        self.telemetry.link.note_skip();
+        self.unencoded.mark(slot);
+        self.free_tx.send(slot).is_err()
     }
 
     /// Hold `slot` for the keepalive and hand the previously held one back to the stage.
@@ -5186,6 +5329,26 @@ impl<E: RingEngine> RingWorker<E> {
                 }
             }
         }
+        // one load while not paced
+        if self.qp.is_some() {
+            if self.telemetry.link.sender_busy() {
+                if let Some(older) = self.deferred.replace(msg) {
+                    if let Some(newest) = self.deferred.as_mut() {
+                        newest.force_idr |= older.force_idr;
+                    }
+                    if self.skip_deferred(older.slot) {
+                        return RingStep::Stop;
+                    }
+                }
+                return RingStep::Continue;
+            }
+            if let Some(older) = self.deferred.take() {
+                msg.force_idr |= older.force_idr;
+                if self.skip_deferred(older.slot) {
+                    return RingStep::Stop;
+                }
+            }
+        }
         let mut timing = msg.timing;
         timing.mark_encode_submit();
 
@@ -5194,6 +5357,9 @@ impl<E: RingEngine> RingWorker<E> {
         self.apply_pending_repair();
         // the QP for this picture, once repair has had its say on what kind of picture it is
         if let Some(g) = self.qp.as_mut() {
+            if self.encoder.next_frame_index() != 0 {
+                msg.force_idr = g.admit_keyframe(msg.force_idr);
+            }
             g.keyframe_next(msg.force_idr || self.idr_request.load(Ordering::Relaxed));
             g.before_submit(&mut self.encoder);
         }
@@ -5271,6 +5437,16 @@ impl<E: RingEngine> RingWorker<E> {
             // a fresher captured frame is waiting; it takes any IDR and repair itself
             return RingStep::Continue;
         }
+        if self.qp.is_some() {
+            // a frame waiting at the sender goes first, once the backlog has left; until then
+            // nothing else does either
+            if self.telemetry.link.sender_busy() {
+                return RingStep::Continue;
+            }
+            if let Some(msg) = self.deferred.take() {
+                return self.on_frame(msg);
+            }
+        }
         let Some(slot) = self.held_slot else {
             return RingStep::Continue;
         };
@@ -5293,17 +5469,20 @@ impl<E: RingEngine> RingWorker<E> {
         // read, then claim only if this tick will emit: a `swap` before the early return below
         // loses the keyframe request, and a client that never gets its keyframe gives up on
         // WebCodecs and demotes itself to a `<video>` element
+        // a keyframe request the governor held is carried by the first tick it may go on
         if !self.idr_request.load(Ordering::Relaxed)
             && !cursor_moved
             && !repair_due
             && now.saturating_duration_since(self.last_emit) < self.keepalive
+            && !self.qp.as_ref().is_some_and(|g| g.keyframe_due())
         {
             return RingStep::Continue;
         }
-        let idr_pending = self.idr_request.swap(false, Ordering::Relaxed);
+        let mut idr_pending = self.idr_request.swap(false, Ordering::Relaxed);
         self.apply_bitrate();
         self.apply_pending_repair();
         if let Some(g) = self.qp.as_mut() {
+            idr_pending = g.admit_keyframe(idr_pending);
             g.keyframe_next(idr_pending);
             g.before_submit(&mut self.encoder);
         }
@@ -5957,11 +6136,92 @@ pub(crate) fn spawn_repeater(
         telemetry,
         "classic",
         None,
+        None,
     );
 }
 
+/// How long until what waits at the sender has left at the pace.
+fn backlog_left(telemetry: &SessionTelemetry) -> Duration {
+    let now = crate::streamer::audio::host_now_ns();
+    Duration::from_nanos(telemetry.link.busy_until_ns().saturating_sub(now))
+}
+
+/// The classic path's held copy, once its deadline has passed and no newer frame is on its way to
+/// the encoder: encoded and sent as a captured frame. `true` when one was sent.
+#[allow(clippy::too_many_arguments)]
+fn deliver_held(
+    core: &Mutex<EncodeCore>,
+    held: &ClassicHold,
+    tx: &broadcast::Sender<EncodedFrame>,
+    telemetry: &SessionTelemetry,
+    last_frame_at: &AtomicU64,
+    epoch: Instant,
+    arriving: &dyn Fn() -> bool,
+    failures: &mut u32,
+) -> bool {
+    let due = held.due_ns.load(Ordering::Relaxed);
+    let now = epoch.elapsed().as_nanos() as u64;
+    if due == 0 || now < due || arriving() {
+        return false;
+    }
+    if telemetry.link.sender_busy() {
+        let later = now + backlog_left(telemetry).as_nanos() as u64;
+        let _ =
+            held.due_ns
+                .compare_exchange(due, later.max(1), Ordering::Relaxed, Ordering::Relaxed);
+        return false;
+    }
+    let (au, capture, mut timing) = {
+        let Ok(mut core) = core.lock() else {
+            return false;
+        };
+        if arriving() {
+            return false;
+        }
+        // zeroed under the lock the callback sets it under, so a newer deadline is never lost
+        held.due_ns.store(0, Ordering::Relaxed);
+        let mut timing = FrameTiming::entering_capture();
+        timing.mark_encode_submit();
+        match core.encode_held() {
+            Some(Ok((au, capture))) if !au.is_empty() => {
+                timing.capture_cb_entry_ns = crate::streamer::audio::host_instant_to_ns(capture);
+                (au, capture, timing)
+            }
+            Some(Err(e)) => {
+                *failures = failures.saturating_add(1);
+                telemetry
+                    .degradation
+                    .encoder_transient_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                if failures.is_power_of_two() {
+                    teprintln!("held frame encode failed ({failures} so far): {e:#}");
+                }
+                return false;
+            }
+            _ => return false,
+        }
+    };
+    *failures = 0;
+    timing.mark_encode_done();
+    last_frame_at.store(epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
+    held.delivered_ns.store(
+        (capture.saturating_duration_since(epoch).as_nanos() as u64).max(1),
+        Ordering::Relaxed,
+    );
+    telemetry.frames_encoded.fetch_add(1, Ordering::Relaxed);
+    let data = Bytes::from(au);
+    let record = data.clone();
+    let _ = tx.send(EncodedFrame {
+        data,
+        capture,
+        timing,
+    });
+    record_sent(core, Some(record), false);
+    true
+}
+
 /// [`spawn_repeater`] with the backend's name for the thread and, on the WGC classic path, the
-/// flag a captured frame raises on its way to the encoder.
+/// flag a captured frame raises on its way to the encoder and the held copy's deadline.
 #[allow(clippy::too_many_arguments)]
 fn spawn_named_repeater(
     core: Arc<Mutex<EncodeCore>>,
@@ -5975,6 +6235,7 @@ fn spawn_named_repeater(
     telemetry: SharedTelemetry,
     path_name: &'static str,
     arriving: Option<Arc<AtomicBool>>,
+    held: Option<Arc<ClassicHold>>,
 ) {
     let tick = frame_duration.max(Duration::from_millis(8));
     let idle_after_ms = (frame_duration.as_millis() as u64 * 2).max(34);
@@ -5998,15 +6259,39 @@ fn spawn_named_repeater(
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
-                match wake_rx.recv_timeout(tick) {
+                // a held copy due before the next tick is woken for
+                let wait = held
+                    .as_ref()
+                    .map(|h| h.due_ns.load(Ordering::Relaxed))
+                    .filter(|due| *due != 0)
+                    .map_or(tick, |due| {
+                        let now = epoch.elapsed().as_nanos() as u64;
+                        Duration::from_nanos(due.saturating_sub(now)).min(tick)
+                    });
+                match wake_rx.recv_timeout(wait) {
                     Ok(()) | Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                     Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                        std::thread::sleep(tick);
+                        std::thread::sleep(wait);
                     }
                 }
                 while wake_rx.try_recv().is_ok() {}
                 if stop.load(Ordering::Relaxed) {
                     break;
+                }
+                if let Some(h) = held.as_ref() {
+                    if deliver_held(
+                        &core,
+                        h,
+                        &tx,
+                        &telemetry,
+                        &last_frame_at,
+                        epoch,
+                        &frame_arriving,
+                        &mut failures,
+                    ) {
+                        last_emit = Instant::now();
+                        continue;
+                    }
                 }
                 let now_ms = epoch.elapsed().as_millis() as u64;
                 let last = last_frame_at.load(Ordering::Relaxed);
@@ -6016,6 +6301,10 @@ fn spawn_named_repeater(
                 let idr_pending = idr_request.load(Ordering::Relaxed);
                 let keepalive_due = last_emit.elapsed().as_millis() as u64 >= keepalive_ms;
                 if !idr_pending && !keepalive_due {
+                    continue;
+                }
+                // nothing goes behind a backlog that is waiting at the sender
+                if held.is_some() && telemetry.link.sender_busy() {
                     continue;
                 }
                 if frame_arriving() {
@@ -6316,6 +6605,8 @@ impl GraphicsCaptureApiHandler for LiveCapture {
                 cursor: CursorProbe::new(monitor_handle),
                 cursor_composited,
                 trailing,
+                classic_hold: None,
+                hold_failed: false,
                 native_w,
                 native_h,
                 frame_size: None,
@@ -6380,6 +6671,7 @@ impl GraphicsCaptureApiHandler for LiveCapture {
             scaler,
             reader: None,
             staging: None,
+            held: None,
             target_bitrate: Arc::clone(&target_bitrate),
             idr_request: Arc::clone(&idr_request),
             current_bitrate: config.bitrate_bps,
@@ -6391,6 +6683,8 @@ impl GraphicsCaptureApiHandler for LiveCapture {
 
         let arriving =
             super::tune::on("classic_repeater_yields").then(|| Arc::new(AtomicBool::new(false)));
+        let governed = core.lock_recover().governed();
+        let classic_hold = governed.then(|| Arc::new(ClassicHold::default()));
         spawn_named_repeater(
             Arc::clone(&core),
             tx.clone(),
@@ -6403,9 +6697,9 @@ impl GraphicsCaptureApiHandler for LiveCapture {
             Arc::clone(&telemetry),
             path_name,
             arriving.clone(),
+            classic_hold.clone(),
         );
 
-        let governed = core.lock_recover().governed();
         Ok(Self {
             governed,
             core: Some(core),
@@ -6431,6 +6725,8 @@ impl GraphicsCaptureApiHandler for LiveCapture {
             // texture in place), so WGC keeps compositing it
             cursor_composited: false,
             trailing: None,
+            classic_hold,
+            hold_failed: false,
             native_w,
             native_h,
             frame_size: None,
@@ -6615,6 +6911,12 @@ impl LiveCapture {
     /// When the trailing-edge timer last delivered a held frame; the gate measures from the
     /// newer of that and its own last delivery.
     fn timer_delivered_at(&self) -> Option<Instant> {
+        if let Some(h) = self.classic_hold.as_ref() {
+            return match h.delivered_ns.load(Ordering::Relaxed) {
+                0 => None,
+                ns => Some(self.epoch + Duration::from_nanos(ns)),
+            };
+        }
         self.trailing
             .as_ref()
             .and_then(|t| t.delivered_at(self.epoch))
@@ -6657,6 +6959,68 @@ impl LiveCapture {
             &self.telemetry,
         )?;
         self.check_ring_alive()
+    }
+
+    /// A frame the classic gate held back while the frame rate is divided: copied, and encoded by
+    /// the repeater at the divided cadence's deadline unless a newer frame arrives first. Without
+    /// it the last picture of a burst would never reach the client.
+    fn hold_classic(
+        &mut self,
+        frame: &mut Frame,
+        capture: Instant,
+        deadline: Instant,
+        backlog: bool,
+    ) -> Result<()> {
+        let skipped = |t: &SessionTelemetry| {
+            t.degradation
+                .frames_skipped_cadence
+                .fetch_add(1, Ordering::Relaxed);
+        };
+        if self.gate.auto_frame_rate
+            && self.gate.dirty_region_reporting
+            && frame.has_dirty_regions().ok() == Some(false)
+        {
+            skipped(&self.telemetry);
+            return Ok(());
+        }
+        let (Some(core), Some(h)) = (self.core.as_ref(), self.classic_hold.as_ref()) else {
+            skipped(&self.telemetry);
+            return Ok(());
+        };
+        let held = {
+            let mut core = core
+                .lock()
+                .map_err(|_| anyhow!("encode core mutex poisoned; stopping capture"))?;
+            let held = core.hold_copy(
+                frame.device(),
+                frame.device_context(),
+                frame.as_raw_texture(),
+                capture,
+            );
+            if held.is_ok() {
+                let due = deadline.saturating_duration_since(self.epoch).as_nanos() as u64;
+                h.due_ns.store(due.max(1), Ordering::Relaxed);
+            }
+            held
+        };
+        match held {
+            Ok(false) => {}
+            Ok(true) => {
+                skipped(&self.telemetry);
+                if backlog {
+                    self.telemetry.link.note_skip();
+                }
+            }
+            Err(e) => {
+                // dropped as before the copy existed; a device that cannot make one says so once
+                skipped(&self.telemetry);
+                if !self.hold_failed {
+                    self.hold_failed = true;
+                    teprintln!("wgc: the held-frame copy failed ({e:#}); gated frames are dropped");
+                }
+            }
+        }
+        Ok(())
     }
 
     fn deliver(&mut self, frame: &mut Frame) -> Result<()> {
@@ -6722,8 +7086,8 @@ impl LiveCapture {
         let cursor_moved = !self.cursor_composited && self.cursor.changed();
 
         // frames past this device's cadence are coalesced, never queued. WGC delivers on change
-        // only, so the last frame of a burst is held for `TrailingEdge` (ring path only: the
-        // classic path has no slot to hold it in and drops it)
+        // only, so the last frame of a burst is held for `TrailingEdge` (ring path only: at the
+        // full rate the classic path has no slot to hold it in and drops it)
         //
         // a cursor-moved frame is exempt, bounded only by the rate the display composes at
         // (`DISPLAY_COMPOSE_HZ`): a pointer sweep paints 113 fps exempt, 74 with a
@@ -6731,21 +7095,33 @@ impl LiveCapture {
         // than DWM's compose interval drops every frame that arrives a jitter early
         //
         // `can_hold`: only where a gated frame can be delivered later does the gate widen its
-        // window for the QP governor's divisor, and the governor cut the frame rate
-        let can_hold = self.trailing.is_some();
-        super::governor::set_frame_hold(&self.telemetry, can_hold);
+        // window for the QP governor's divisor, and the governor cut the frame rate. The classic
+        // path holds a copy for its repeater, and only while the rate is divided: at the full
+        // rate its gate is the one it always had
+        let can_hold = self.trailing.is_some() || self.classic_hold.is_some();
+        super::governor::set_frame_hold(&self.telemetry, can_hold, self.trailing.is_some());
         self.gate.divisor = super::governor::frame_divisor(&self.telemetry);
+        let gate_holds = gate_holds(
+            self.trailing.is_some(),
+            self.classic_hold.is_some(),
+            self.gate.divisor,
+        );
         let admit = self.gate.admit(
             capture,
             cursor_moved,
             self.timer_delivered_at(),
-            can_hold,
+            gate_holds,
             self.ring.is_some(),
             || frame.has_dirty_regions().ok(),
             &self.telemetry,
         );
         match admit {
             Admit::Stage => {}
+            Admit::Hold { last } if self.classic_hold.is_some() => {
+                let deadline = trailing_deadline(last, self.gate.frame_period)
+                    + self.gate.frame_period * (self.gate.divisor.max(1) - 1);
+                return self.hold_classic(frame, capture, deadline, false);
+            }
             Admit::Hold { last } => return self.hold_trailing(frame, timing, capture, last),
             Admit::SkipCadence | Admit::SkipUnchanged => return Ok(()),
         }
@@ -6777,6 +7153,12 @@ impl LiveCapture {
 
         // no panics past this point: this is inside a WinRT `TypedEventHandler`, so an unwind
         // would cross `extern "system"` frames. Returning `Err` halts the capture cleanly
+        // paced to the link with more than a frame period waiting at the sender: this frame waits
+        // too, as a copy the repeater sends once the backlog has left (one load while not paced)
+        if self.classic_hold.is_some() && self.telemetry.link.sender_busy() {
+            let deadline = Instant::now() + backlog_left(&self.telemetry);
+            return self.hold_classic(frame, capture, deadline, true);
+        }
         let core = self
             .core
             .as_ref()
@@ -6785,6 +7167,21 @@ impl LiveCapture {
             let mut core = core
                 .lock()
                 .map_err(|_| anyhow!("encode core mutex poisoned; stopping capture"))?;
+            // this frame supersedes the held copy
+            // (a copy is only ever waiting with a deadline set, so the full rate pays one load)
+            if let Some(h) = self
+                .classic_hold
+                .as_ref()
+                .filter(|h| h.due_ns.load(Ordering::Relaxed) != 0)
+            {
+                h.due_ns.store(0, Ordering::Relaxed);
+                if core.drop_held() {
+                    self.telemetry
+                        .degradation
+                        .frames_skipped_cadence
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
             timing.mark_encode_submit();
             core.encode_captured(frame)
         };
@@ -7383,8 +7780,8 @@ mod wgc_handler_tests {
     use super::*;
     use crate::streamer::config::EncoderVendor;
 
-    /// With no governor switch on, a classic core (armed like a live one) has no governor, and
-    /// nothing after a send touches its lock.
+    /// With the governor switched off, a classic core (armed like a live one) has none, and nothing
+    /// after a send touches its lock.
     #[test]
     fn a_core_without_a_governor_is_not_locked_again_after_a_send() {
         let config = EncoderConfig {
@@ -7404,18 +7801,22 @@ mod wgc_handler_tests {
         };
         let telemetry = SessionTelemetry::new_shared();
         super::super::governor::arm(&telemetry, &config);
+        let mut health = CoreHealth::new(Arc::clone(&telemetry));
+        // the link governor ships on: this is the core a session gets with it switched off
+        health.qp = None;
         let core = Mutex::new(EncodeCore {
             backend: Backend::X264 { encoder },
             scaler: None,
             reader: None,
             staging: None,
+            held: None,
             target_bitrate: Arc::new(AtomicU32::new(0)),
             idr_request: Arc::new(AtomicBool::new(false)),
             current_bitrate: config.bitrate_bps,
             bitrate_warned: false,
             have_frame: false,
             frame_index: 0,
-            health: CoreHealth::new(Arc::clone(&telemetry)),
+            health,
         });
         let governed = core.lock_recover().governed();
         assert!(!governed, "a governor was built with every switch off");
@@ -7860,5 +8261,189 @@ mod wgc_handler_tests {
             scaled.is_err(),
             "a downscale with no video processor cannot be done"
         );
+    }
+
+    fn x264_core(qp: u8, governed: bool) -> Result<(Mutex<EncodeCore>, SharedTelemetry)> {
+        let config = EncoderConfig {
+            width: 640,
+            height: 360,
+            fps: 60,
+            bitrate_bps: 6_000_000,
+            max_bitrate_bps: 6_000_000,
+            profile: H264Profile::High,
+            qp: Some(qp),
+            min_qp: None,
+            intra_refresh: false,
+        };
+        let encoder = X264Encoder::new(config)?;
+        let telemetry = SessionTelemetry::new_shared();
+        super::super::governor::arm(&telemetry, &config);
+        let mut health = CoreHealth::new(Arc::clone(&telemetry));
+        health.qp = if governed {
+            super::super::governor::QpControl::build(&telemetry, true, true, true)
+                .map(|c| c.with_link_pace(true))
+        } else {
+            None
+        };
+        let core = Mutex::new(EncodeCore {
+            backend: Backend::X264 { encoder },
+            scaler: None,
+            reader: None,
+            staging: None,
+            held: None,
+            target_bitrate: Arc::new(AtomicU32::new(0)),
+            idr_request: Arc::new(AtomicBool::new(false)),
+            current_bitrate: config.bitrate_bps,
+            bitrate_warned: false,
+            have_frame: false,
+            frame_index: 0,
+            health,
+        });
+        Ok((core, telemetry))
+    }
+
+    /// A governor that has seen no congestion takes every keyframe request the way a core without
+    /// one does: the same submits become keyframes, including the session's first.
+    #[test]
+    fn a_governor_with_no_congestion_takes_every_keyframe_request_as_it_came() {
+        let (bare, gov) = match (x264_core(18, false), x264_core(18, true)) {
+            (Ok((a, _)), Ok((b, t))) => (a, (b, t)),
+            (Err(e), _) | (_, Err(e)) => {
+                return crate::test_support::skip("keyframe requests under an idle governor", e)
+            }
+        };
+        let (gov, telemetry) = gov;
+        let (mut bare, mut gov) = (bare.lock_recover(), gov.lock_recover());
+        assert!(gov.governed() && !bare.governed());
+        let mut x = 0x9E37_79B9u32;
+        for k in 0..400u64 {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            let asked = x.is_multiple_of(5);
+            if x.is_multiple_of(17) {
+                telemetry
+                    .degradation
+                    .client_keyframe_requests
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            bare.idr_request.store(asked, Ordering::Relaxed);
+            gov.idr_request.store(asked, Ordering::Relaxed);
+            let (a, b) = (bare.take_force_idr(), gov.take_force_idr());
+            assert_eq!(a, b, "submit {k}");
+            assert_eq!(a, k == 0 || asked, "submit {k}");
+            bare.frame_index += 1;
+            gov.frame_index += 1;
+        }
+        assert_eq!(telemetry.link.frame_divisor(), 1);
+    }
+
+    #[test]
+    fn the_classic_gate_holds_only_while_the_rate_is_divided() {
+        assert!(!gate_holds(false, false, 1));
+        assert!(!gate_holds(false, false, 4), "no copy to hold it in");
+        assert!(
+            !gate_holds(false, true, 1),
+            "the full rate keeps the gate it had"
+        );
+        assert!(gate_holds(false, true, 2));
+        assert!(
+            gate_holds(true, false, 1),
+            "the ring's trailing edge always holds"
+        );
+        // and at the full rate a classic gate with a governor decides exactly as one without
+        let t = SessionTelemetry::default();
+        let period = Duration::from_micros(16_667);
+        let t0 = Instant::now();
+        for divisor in [1u32, 2, 4] {
+            let mut g = FrameGate::new(period, false, false, false);
+            g.divisor = divisor;
+            let holds = gate_holds(false, true, divisor);
+            let at = |ms: u64| t0 + Duration::from_millis(ms);
+            assert_eq!(
+                g.admit(at(0), false, None, holds, false, || None, &t),
+                Admit::Stage
+            );
+            let next = g.admit(at(5), false, None, holds, false, || None, &t);
+            if divisor == 1 {
+                assert_eq!(next, Admit::SkipCadence);
+            } else {
+                assert!(matches!(next, Admit::Hold { .. }), "{next:?}");
+            }
+        }
+    }
+
+    /// The classic path's held copy: copied from a texture on the capture device, encoded once by
+    /// the repeater, and superseded by a newer frame.
+    #[test]
+    fn a_held_classic_frame_is_encoded_once_and_a_newer_one_supersedes_it() {
+        use windows::Win32::Foundation::HMODULE;
+        use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL_11_0};
+        use windows::Win32::Graphics::Direct3D11::{
+            D3D11CreateDevice, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
+        };
+        let core = match x264_core(18, true) {
+            Ok((c, _)) => c,
+            Err(e) => return crate::test_support::skip("held classic frame", e),
+        };
+        let mut device = None;
+        let mut context = None;
+        let created = unsafe {
+            D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_WARP,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                Some(&[D3D_FEATURE_LEVEL_11_0]),
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                Some(&mut context),
+            )
+        };
+        let (Ok(()), Some(device), Some(context)) = (created, device, context) else {
+            return crate::test_support::skip_because(
+                "held classic frame",
+                "no WARP device could be created",
+            );
+        };
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: 640,
+            Height: 360,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut src: Option<ID3D11Texture2D> = None;
+        unsafe { device.CreateTexture2D(&desc, None, Some(&mut src)) }.unwrap();
+        let src = src.unwrap();
+        let mut core = core.lock_recover();
+        let now = Instant::now();
+        assert!(core.encode_held().is_none(), "nothing held yet");
+        assert!(!core.hold_copy(&device, &context, &src, now).unwrap());
+        assert!(
+            core.hold_copy(&device, &context, &src, now).unwrap(),
+            "replaced"
+        );
+        let (au, at) = core.encode_held().expect("held").unwrap();
+        assert!(
+            au.starts_with(&[0, 0, 0, 1]) && au.len() > 16,
+            "{} bytes",
+            au.len()
+        );
+        assert_eq!(at, now);
+        assert!(core.encode_held().is_none(), "encoded once");
+        assert!(!core.hold_copy(&device, &context, &src, now).unwrap());
+        assert!(core.drop_held(), "a newer frame supersedes it");
+        assert!(core.encode_held().is_none());
+        assert!(!core.drop_held());
     }
 }

@@ -2448,6 +2448,28 @@ async fn start_session(
                 ),
             ));
         }
+        // the governor is the only thing that moves what this watch reads
+        if let (true, Some(s), Some(reporter)) = (
+            tune::on("link_governor"),
+            state.config.sessions.as_ref(),
+            state.config.device_reporter.as_ref(),
+        ) {
+            tokio::spawn(crate::windows_utils::streamer::slow_link::watch_slow_link(
+                Arc::clone(s),
+                session_seq,
+                Arc::clone(&session.pipeline.telemetry),
+                Arc::clone(reporter),
+                DeviceInfo {
+                    join_id: join_id.clone(),
+                    ip: client_ip.to_string(),
+                    token: device_token.to_string(),
+                    name: req.device_name.trim().to_string(),
+                    ..DeviceInfo::default()
+                },
+                state.config.lan_ip.clone(),
+                locality,
+            ));
+        }
     }
     let own_telemetry = Arc::clone(&session.pipeline.telemetry);
     let session_holder = match state.config.sessions.as_ref() {

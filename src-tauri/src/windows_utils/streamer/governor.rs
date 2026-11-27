@@ -5,11 +5,18 @@
 //! fixed ceiling, the macOS `QpGovernor`'s formula and constants) and [`LinkGovernor`] (a standing
 //! queue or a delivered rate far under the sent one, read from transport-wide feedback) raise the
 //! QP instead. A bitrate estimate is never evidence, and loss with no queue behind it is Wi-Fi,
-//! not congestion. At [`QP_LINK_MAX`] frames are gated to a divisor of the rate, and recovery
-//! undoes the divisor first.
+//! not congestion. At [`QP_LINK_MAX`] frames are gated to a divisor of the rate, a halving at a
+//! time, and recovery undoes the divisor first. With `link_pace` (on under the link governor)
+//! the divisor gives way to pacing: once the link is judged too slow, everything sent to the
+//! viewer goes out at a share of what the link delivered, frames are skipped at the sender
+//! against what waits there instead of being dropped in the network, keyframes are paced and
+//! coarse, and recovery ramps the pace up and the QP down. While the link side is engaged,
+//! keyframes are sized to the link and spaced out ([`KeyPolicy`]), except the ones a stuck
+//! decoder needs.
 //!
-//! All three switches (`link_governor`, `qp_ceiling_governor`, `client_pace_governor`) are off
-//! unless `SE_TUNE_ON` names them.
+//! The link side ships on (`link_governor`) and does nothing until the link is shown to be the
+//! limit: a shortfall that lasts, with a queue or stretched arrivals behind it, never loss or
+//! jitter alone. `qp_ceiling_governor` and `client_pace_governor` ship off.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
@@ -235,20 +242,143 @@ impl CeilingGovernor {
     }
 }
 
-/// The highest QP the link side asks for before it gates the frame rate. At 34 the 4x4 quantiser
-/// step is about an eighth of a black-on-white glyph edge: text goes soft but small UI text still
-/// reads; by 38 to 40 one-pixel stems break up.
-pub(crate) const QP_LINK_MAX: u8 = 34;
+/// The highest QP the link side asks for before it gates the frame rate. Quality goes before
+/// frames: by 38 to 40 one-pixel stems break up and small text goes soft, but large text and the
+/// layout still read, and the six steps from 34 halve the bits again, which is as much as
+/// quartering the frame rate buys (a picture that stands for four periods carries twice the
+/// change). Past 40 text stops reading at all, so the frame rate goes next.
+pub(crate) const QP_LINK_MAX: u8 = 40;
 /// 60 -> 30 -> 20 -> 15 at the most.
 pub(crate) const MAX_DIVISOR: u32 = 4;
 /// With the frame rate at a quarter and the link still not carrying the stream, the QP may go
-/// past `QP_LINK_MAX` up to here, six steps a move. Recovery takes it back first. A capture that
-/// cannot hold a gated frame never gets here: it stops at `QP_LINK_MAX`.
+/// past `QP_LINK_MAX` up to here, six steps a move. Recovery takes it back first. Only a capture
+/// that holds gated frames on its trailing edge gets here; any other stops at `QP_LINK_MAX`.
 const QP_LAST_RESORT: u8 = 51;
 const LAST_RESORT_STEP: f64 = 6.0;
-/// A keyframe asked for while the governor is engaged is encoded this much coarser: it is the
-/// largest thing the stream sends.
+/// A keyframe asked for while the governor is engaged is encoded at least this much coarser: it
+/// is the largest thing the stream sends.
 pub(crate) const KEYFRAME_BOOST: u8 = 6;
+/// A keyframe on a governed link is never coded past this: the frame bound plus one boost. Past
+/// it the picture the following frames predict from is too coarse to be worth the bytes saved.
+pub(crate) const KEY_QP_MAX: u8 = QP_LINK_MAX + KEYFRAME_BOOST;
+/// What a keyframe may take of the link at once: 80 ms of the rate it delivered, under the
+/// shallowest buffer the stream was measured against (a 100 ms drop-tail queue), so a burst
+/// queues instead of overflowing.
+const KEY_BURST_S: f64 = 0.08;
+/// While paced, what a keyframe may take of the link: a quarter second of the pace. Nothing is
+/// lost to its size any more, but every frame behind it waits it out.
+const KEY_PACED_S: f64 = 0.25;
+/// While the link side is engaged, a keyframe nobody on the page asked for waits this long after
+/// the last one at least: the widest window the PLI back-off opens without evidence. Loss opens
+/// that window, so on a congested link every periodic PLI would otherwise be answered.
+const KEY_GAP_MIN_NS: u64 = 2_000 * MS;
+/// ... and no longer than this, whatever the last keyframe cost to drain.
+const KEY_GAP_MAX_NS: u64 = 4_000 * MS;
+/// The share of the link the governed stream leaves free (`1 - TARGET_MAX`): what drains a
+/// keyframe's burst. The gap is twice that drain.
+const KEY_DRAIN_SHARE: f64 = 1.0 - TARGET_MAX;
+/// The frames after a coarse keyframe come back to the governed QP this many steps a frame: a
+/// still region a finer P frame refines costs almost a keyframe of its own, spread this way over
+/// a few frames instead of landing in the next one.
+const KEY_RETURN_STEP: u8 = 3;
+/// How a keyframe's size answers its QP, until two keyframes have shown it: weaker than a P
+/// frame's (all intra, no skipped blocks).
+const KEY_HALVING: f64 = 8.0;
+const KEY_HALVING_MAX: f64 = 16.0;
+
+/// Pacing to the link (`link_pace`): once the link is judged too slow, everything this viewer is
+/// sent goes out at this share of what the link delivered, so the bottleneck queue never fills
+/// and drops nothing; what the pacer cannot pass waits at the sender, and frames are skipped
+/// there instead of being lost in the network.
+pub(crate) const PACE_SHARE: f64 = 0.9;
+/// The pacing rate never goes under this, so a collapsed reading cannot starve the session.
+const PACE_MIN_BPS: f64 = 300_000.0;
+/// Paced, the QP rises once this share of frames waits at the sender, by two to four steps
+/// against how many wait, and the next raise waits this long: the skip share is read over half
+/// a second, so a shorter hold raises again on frames that waited before the last raise.
+const SKIP_RAISE_SHARE: f64 = 0.05;
+const SKIP_RAISE_HOLD_NS: u64 = 600 * MS;
+/// After a raise that frames waiting forced, the QP is not lowered for this long; after that, a
+/// step down needs this long with nothing waiting and at the same QP, its heaviest half second
+/// under the pace with room, and goes at most `LOWER_STEP_MAX` steps on the strongest response.
+const LOWER_AFTER_RAISE_NS: u64 = 6_000 * MS;
+const LOWER_EVIDENCE_NS: u64 = 2_000 * MS;
+const LOWER_STEP_MAX: u8 = 2;
+/// Paced at the bound, half the frames waiting lets the QP past it, toward `QP_LAST_RESORT`
+/// (the frame rate is already halved by then); under a fifth waiting takes it back.
+const LAST_RESORT_SKIP: f64 = 0.5;
+const LAST_RESORT_LOWER_SKIP: f64 = 0.2;
+/// ... held this long, and not in the first of it after pacing began, when what waits is the
+/// engagement's own backlog; back a step every `LAST_RESORT_LOWER_NS`.
+const LAST_RESORT_AFTER_NS: u64 = 1_500 * MS;
+const LAST_RESORT_LOWER_NS: u64 = 1_000 * MS;
+/// QP steps per halving the encoded rate is carried across QPs with while paced: between the
+/// textbook's 6 and the 12 a raise assumes (the live content halved its bits every 10), so a
+/// rate carried to a lower QP comes out a little high.
+const FIT_HALVING: f64 = 9.0;
+/// Recovery while paced is a ramp: every `RAMP_STEP_NS` the QP comes down `RAMP_QP_STEP` (one
+/// more under `RAMP_ROOMY` of the pace) while the stream leaves room under the pace, and the pace
+/// goes up while the stream fills `RAMP_FILLED` of it, by `RAMP_GAIN_NEAR` until it is
+/// `RAMP_NEAR` over where it began and by `RAMP_GAIN` past that. Nothing depends on the content
+/// filling a probe: a light stream walks the QP down, a heavy one walks the pace up, and with a
+/// fifth of the frames waiting (`RAMP_SKIP`) the QP goes back up a step while the pace still
+/// climbs.
+const RAMP_STEP_NS: u64 = 120 * MS;
+const RAMP_GAIN_NEAR: f64 = 1.05;
+const RAMP_NEAR: f64 = 1.3;
+const RAMP_GAIN: f64 = 1.25;
+const RAMP_QP_STEP: u8 = 3;
+const RAMP_FILLED: f64 = 0.85;
+const RAMP_ROOMY: f64 = 0.5;
+const RAMP_SKIP: f64 = 0.2;
+/// The ramp walks the QP down no further than this many steps under the QP the last seconds fit
+/// the pace at: twice the bits of the heaviest of them on the live content's response.
+const RAMP_SPAN: u8 = 10;
+/// The sender's skip share covers this long: one back-up per window.
+const SKIP_WINDOW_NS: u64 = 500 * MS;
+/// The ramp ends at the first queue rise of this much over where it started, or any loss: 5 %
+/// a step past a link still at its old pace is a 10 ms rise within two steps, and the queue it
+/// leaves is a few tens of ms, under the shallowest buffer, so a failed ramp costs a little
+/// queue and no packet.
+const RAMP_QUEUE_US: i64 = 10_000;
+/// The stream at the user's QP passes this long under the ramp with no queue and nothing waiting,
+/// and the link has been shown to take the heaviest half second of the last `DEMAND_SPAN_NS`
+/// carried to that QP: pacing lets go entirely.
+const RELEASE_PASS_NS: u64 = 600 * MS;
+const DEMAND_SPAN_NS: u64 = 8_000 * MS;
+/// ... to within this share: carried down twenty steps at `FIT_HALVING`, a rate comes out a
+/// fifth over what the live content's response gives.
+const RELEASE_DEMAND: f64 = 0.9;
+/// A ramp starts once the queue has been clear this long, and no sooner than the hold after the
+/// last one: `RAMP_HOLD_MIN_NS`, doubling after each that found no more room, to the max.
+const RAMP_QUIET_NS: u64 = 500 * MS;
+const RAMP_HOLD_MIN_NS: u64 = 1_000 * MS;
+const RAMP_HOLD_MAX_NS: u64 = 2_000 * MS;
+/// A ramp that left the pace this much higher found room.
+const RAMP_PROGRESS: f64 = 1.05;
+/// A lossless queue within this long of a ramp is the ramp's own.
+const RAMP_SETTLE_NS: u64 = 1_000 * MS;
+/// The encoded bytes, in buckets this long, kept over the demand span.
+const ENC_BUCKET_NS: u64 = 250 * MS;
+const ENC_BUCKETS: usize = 36;
+/// The encoder is aimed at this share of the pace: frame sizes vary by a third either side, and
+/// the sender's backlog is allowed `BACKLOG_PERIODS` frame periods before a frame waits.
+pub(crate) const SENDER_SHARE: f64 = 0.8;
+pub(crate) const BACKLOG_PERIODS: u64 = 2;
+
+/// Engagement (see `LinkGovernor::may_engage`): a second of send time taken whole, delivered
+/// under 85 % of sent with a standing queue or arrivals stretched to under 85 % of the send
+/// time, for a second without a break. Loss alone is never the evidence: at 15 % random loss
+/// the shortfall is the loss itself. A cap at half the stream crosses the shortfall within half
+/// a second of arriving, so engagement comes about 1.5 s after a cap where a single window's
+/// verdict took 0.6 s: the price of never reacting to anything shorter.
+const ENGAGE_SPAN_US: i64 = 1_000_000;
+const ENGAGE_SHORTFALL: f64 = 0.85;
+const ENGAGE_STRETCH: f64 = 0.85;
+const ENGAGE_HOLD_NS: u64 = 1_000 * MS;
+/// ... or a queue under every packet of the span for this long, unless it came up as a step in
+/// the path's delay (see `LinkGovernor::route_step`).
+const ENGAGE_STANDING_NS: u64 = 2_000 * MS;
 
 /// Each judged window covers at least this much send time and this many packets.
 const EVAL_SPAN_US: i64 = 100_000;
@@ -269,11 +399,13 @@ const SHARE_OVERFLOW: f64 = 0.97;
 /// Under this in both windows, the path is dropping too much to be anything but too slow (a
 /// shallow buffer drops instead of queueing). No working Wi-Fi link loses 40 % at random.
 const SHARE_SEVERE: f64 = 0.6;
-/// A queue that has stood flat (within `FLAT_US`) for `REBASE_AFTER_NS` with nothing lost in any
-/// window is the path's new base delay (a route or relay change, a cellular hop), not a queue: a
-/// full drop-tail queue always loses something.
+/// A queue that came up within `STEP_WITHIN_NS` and has stood flat (within `FLAT_US`) ever since,
+/// for at least `REBASE_AFTER_NS`, losing no more than `SHARE_STEP` lets through on average, is
+/// the path's new base delay (a route or relay change, a cellular hop), not a queue: a drop-tail
+/// queue that fills that fast is overfilled by far more than that, and loses it.
 const FLAT_US: i64 = 10_000;
 const REBASE_AFTER_NS: u64 = 1_500 * MS;
+const SHARE_STEP: f64 = 0.95;
 const SHARE_CLEAN: f64 = 0.995;
 /// A raise after which the queue stood flat for `REBASE_AFTER_NS` although the encoded rate fell
 /// to `UNDO_RATE` of what it was did not meet a queue: it is undone and the delay taken as the
@@ -310,6 +442,21 @@ const ACTIVE_SHARE: f64 = 0.5;
 /// governor lets go entirely, so a still screen is refined at the user's QP by the next repeat.
 const IDLE_BPS: f64 = 300_000.0;
 const IDLE_RELEASE_NS: u64 = 2_000 * MS;
+/// A lossless queue rising within this long of a keyframe is the keyframe's own burst.
+const KEY_SETTLE_NS: u64 = 1_500 * MS;
+/// The link's rate is read from the windows it limited over this long: during a loss burst
+/// resends and the stream share the link and feedback shows only the stream, so a single window
+/// reads as little as half of what the link carries.
+const LINK_EST_NS: u64 = 1_000 * MS;
+/// Link-limited readings kept: four seconds of reports, enough to reach back to a cap's onset
+/// from the moment the engagement evidence is complete.
+const LINK_HIST_KEEP: usize = 80;
+/// Paced, a window that arrived at this share of its send rate was carried: it says nothing
+/// against the pace, whatever the verdict made of a queue still draining from before.
+const PACE_CARRIED: f64 = 0.95;
+/// For this long after pacing begins, what is reported was sent before it, into the queue and
+/// the resends the engagement found: it does not lower the pace.
+const PACE_SETTLE_NS: u64 = 1_000 * MS;
 /// The encoded rate a raise is sized from.
 const ENC_WINDOW_NS: u64 = 500 * MS;
 /// The response to a raise is read once its frames fill the rate window, and not after this: a
@@ -350,11 +497,28 @@ pub(crate) struct Window {
     pub loss: f64,
 }
 
+/// An attempt on the link while paced (see `LinkGovernor::ramp_step`).
+#[derive(Clone, Copy, Debug)]
+struct Ramp {
+    from_pace: f64,
+    from_q: u8,
+    /// The queue when it began, and when the last step went.
+    base_us: i64,
+    stage_ns: u64,
+    /// The most the link delivered under it with no queue rise, and whether one rose.
+    carried: f64,
+    rose: bool,
+    since_ns: u64,
+    /// When the QP last changed before it, and when it last backed the QP up.
+    q_changed_ns: u64,
+    backed_ns: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Verdict {
     NoData,
     Congested,
-    /// A standing queue, not proven congestion: holds a probe back.
+    /// A standing queue, not proven congestion: holds a ramp back.
     Queued,
     /// The queue did not drain when the rate fell: the path's delay moved.
     NotAQueue,
@@ -378,11 +542,53 @@ pub(crate) struct LinkGovernor {
     div: u32,
     /// Whether this capture path can gate frames without losing the last one of a burst.
     hold_frames: bool,
+    /// Whether the QP may go past the bound once the frame rate is at a quarter.
+    last_resort: bool,
+    /// Pace the sender to the link instead of cutting the frame rate (`link_pace`).
+    pacing: bool,
+    /// The rate the sender is paced at; 0 while nothing is paced.
+    pace_bps: f64,
+    /// Share of frames the sender skipped over the last half second.
+    skip_share: f64,
+    /// Since when the engagement evidence has held without a break.
+    short_since_ns: Option<u64>,
+    standing_since_ns: Option<u64>,
+    /// The best reading of the link among the windows that made the engagement evidence: the
+    /// earliest of them, before the resends the loss calls for fill the link, read it best.
+    engage_link_bps: f64,
+    paced_since_ns: u64,
+    pub(crate) engagements: u64,
+    pub(crate) engaged_ns: u64,
+    pub(crate) last_engagement: String,
+    sender_waiting: bool,
+    ramp: Option<Ramp>,
+    ramp_hold_ns: u64,
+    ramp_not_before_ns: u64,
+    ramp_ended_ns: u64,
+    lower_not_before_ns: u64,
+    /// The last tick any frame, or a fifth of them, waited at the sender.
+    last_skip_ns: u64,
+    last_heavy_skip_ns: u64,
+    half_waiting_since_ns: Option<u64>,
+    /// Since when the stream at the user's QP has passed with nothing waiting.
+    pass_since_ns: Option<u64>,
+    q_changed_ns: u64,
+    /// Encoded bytes per `ENC_BUCKETS_NS`: bucket + 1, the bytes carried to the user's QP frame by
+    /// frame, the highest QP in it, and whether frames waited at the sender then (what was
+    /// encoded is what the pace let through).
+    enc_buckets: [(u64, f64, u8, bool); ENC_BUCKETS],
+    /// Ramps begun.
+    pub(crate) probes: u64,
     samples: VecDeque<(u64, PathSample)>,
     /// Per-second minimum one-way delay, `(second + 1, min)`; 0 is empty.
     base: [(u64, i64); BASE_BUCKETS],
     /// `(when, queue, byte share)` of every valid newest window.
     queue_hist: VecDeque<(u64, i64, f64)>,
+    /// `(when, delivered)` of the windows the link limited (a queue stood or something was lost):
+    /// only those say what the link carries.
+    link_hist: VecDeque<(u64, f64)>,
+    /// A keyframe went out until here: a lossless queue it builds is its own, not congestion.
+    key_settle_ns: u64,
     /// The first raise of an episode: when, the level before it, the encoded and delivered rates
     /// then.
     undo: Option<(u64, (u8, u32), f64, f64)>,
@@ -426,9 +632,35 @@ impl LinkGovernor {
             q_max: QP_LINK_MAX.max(q_user),
             div: 1,
             hold_frames: true,
+            last_resort: true,
+            pacing: false,
+            pace_bps: 0.0,
+            skip_share: 0.0,
+            short_since_ns: None,
+            standing_since_ns: None,
+            engage_link_bps: 0.0,
+            paced_since_ns: 0,
+            engagements: 0,
+            engaged_ns: 0,
+            last_engagement: String::new(),
+            sender_waiting: false,
+            ramp: None,
+            ramp_hold_ns: RAMP_HOLD_MIN_NS,
+            ramp_not_before_ns: 0,
+            ramp_ended_ns: 0,
+            lower_not_before_ns: 0,
+            last_skip_ns: 0,
+            last_heavy_skip_ns: 0,
+            half_waiting_since_ns: None,
+            pass_since_ns: None,
+            q_changed_ns: 0,
+            enc_buckets: [(0, 0.0, 0, false); ENC_BUCKETS],
+            probes: 0,
             samples: VecDeque::with_capacity(SAMPLE_KEEP),
             base: [(0, 0); BASE_BUCKETS],
             queue_hist: VecDeque::with_capacity(64),
+            link_hist: VecDeque::with_capacity(LINK_HIST_KEEP),
+            key_settle_ns: 0,
             undo: None,
             fresh: false,
             hold_until_ns: 0,
@@ -479,6 +711,61 @@ impl LinkGovernor {
         }
     }
 
+    /// Whether the QP may go past the bound at a quarter of the frames (see `QP_LAST_RESORT`).
+    pub(crate) fn last_resort(&mut self, yes: bool) {
+        self.last_resort = yes;
+    }
+
+    /// What the link delivered when it was last judged congested, or the newest window's rate
+    /// when it never was; 0 when nothing is known.
+    pub(crate) fn link_bps(&self) -> f64 {
+        if self.pace_bps > 0.0 {
+            self.pace_bps / PACE_SHARE
+        } else if self.cap_bps > 0.0 {
+            self.cap_bps
+        } else if self.last.valid {
+            self.last.delivered_bps
+        } else {
+            0.0
+        }
+    }
+
+    /// The encoder reaches no higher than `top`: the bound follows it.
+    pub(crate) fn limit_qp(&mut self, top: u8) {
+        self.q_max = self.q_max.min(top).max(self.q_user);
+    }
+
+    /// The link side itself has cut something (the ceiling's raises do not count).
+    pub(crate) fn engaged(&self) -> bool {
+        self.q > self.q_user || self.div > 1 || self.pace_bps > 0.0
+    }
+
+    /// Pace the sender to the link once it is judged too slow, instead of the frame divisor and
+    /// the QP past the bound.
+    pub(crate) fn set_pacing(&mut self, yes: bool) {
+        self.pacing = yes;
+        if !yes {
+            self.pace_bps = 0.0;
+        }
+    }
+
+    /// The rate the sender is paced at; 0 when it is not.
+    pub(crate) fn pace_bps(&self) -> f64 {
+        self.pace_bps
+    }
+
+    /// An attempt on the link is in progress.
+    pub(crate) fn attempting(&self) -> bool {
+        self.ramp.is_some()
+    }
+
+    /// The share of frames the sender skipped over the last half second (keyframe drains left
+    /// out), and whether a keyframe is draining at the pace right now.
+    pub(crate) fn sender(&mut self, skip_share: f64, draining: bool) {
+        self.skip_share = skip_share.clamp(0.0, 1.0);
+        self.sender_waiting = draining;
+    }
+
     /// The path changed under the session (a new ICE candidate pair): what was learnt about its
     /// delay belongs to the old one.
     pub(crate) fn path_changed(&mut self) {
@@ -518,6 +805,9 @@ impl LinkGovernor {
     /// One emitted access unit. A keyframe is left out of the rate a raise is sized from.
     pub(crate) fn encoded(&mut self, now_ns: u64, bytes: u64, keyframe: bool) {
         self.enc_since_ns.get_or_insert(now_ns);
+        if keyframe {
+            self.key_settle_ns = now_ns + KEY_SETTLE_NS;
+        }
         if !keyframe {
             if self.enc.len() == self.enc.capacity() {
                 if let Some((_, b)) = self.enc.pop_front() {
@@ -526,6 +816,14 @@ impl LinkGovernor {
             }
             self.enc.push_back((now_ns, bytes));
             self.enc_bytes += bytes;
+            let id = now_ns / ENC_BUCKET_NS + 1;
+            let slot = &mut self.enc_buckets[(id as usize) % ENC_BUCKETS];
+            if slot.0 != id {
+                *slot = (id, 0.0, 0, false);
+            }
+            slot.1 +=
+                bytes as f64 * 2f64.powf(self.q.saturating_sub(self.q_user) as f64 / FIT_HALVING);
+            slot.2 = slot.2.max(self.q);
         }
     }
 
@@ -563,6 +861,14 @@ impl LinkGovernor {
     }
 
     fn window<'a>(it: &mut impl Iterator<Item = &'a PathSample>, base: Option<i64>) -> Window {
+        Self::window_over(it, base, EVAL_SPAN_US)
+    }
+
+    fn window_over<'a>(
+        it: &mut impl Iterator<Item = &'a PathSample>,
+        base: Option<i64>,
+        span_us: i64,
+    ) -> Window {
         let mut reported = 0u32;
         let mut lost = 0u32;
         let mut matched = 0u32;
@@ -584,7 +890,7 @@ impl LinkGovernor {
                 arr = (arr.0.min(s.first_arrival_us), arr.1.max(s.last_arrival_us));
                 owd_min = owd_min.min(s.owd_min_us);
             }
-            if send.0 != i64::MAX && send.1 - send.0 >= EVAL_SPAN_US {
+            if send.0 != i64::MAX && send.1 - send.0 >= span_us {
                 break;
             }
         }
@@ -593,7 +899,7 @@ impl LinkGovernor {
         if reported < MIN_PACKETS
             || matched < 2
             || sent == 0
-            || send_span < EVAL_SPAN_US
+            || send_span < span_us
             || arr_span <= 0
         {
             return Window::default();
@@ -663,25 +969,50 @@ impl LinkGovernor {
             })
     }
 
-    /// The queue came up as a step: it was low just before the flat stretch began.
-    fn stepped(&self, now_ns: u64) -> bool {
-        let flat_from = now_ns.saturating_sub(REBASE_AFTER_NS);
-        self.queue_hist
+    /// The queue at `q` came up as a step and has stood flat since: it was under `QUEUE_LOW_US`,
+    /// reached `q` within `STEP_WITHIN_NS`, and every window since is within `FLAT_US` of it and
+    /// lost little on average. However old the step is, a queue that crept up is not one.
+    fn route_step(&self, q: i64) -> bool {
+        let Some(low) = self
+            .queue_hist
             .iter()
-            .rev()
-            .find(|(t, x, _)| *t < flat_from && *x < QUEUE_LOW_US)
-            .is_some_and(|(t, _, _)| flat_from - t <= STEP_WITHIN_NS)
+            .rposition(|(_, x, _)| *x < QUEUE_LOW_US)
+        else {
+            return false;
+        };
+        let t_low = self.queue_hist[low].0;
+        let Some(up) = self
+            .queue_hist
+            .iter()
+            .skip(low + 1)
+            .position(|(_, x, _)| (x - q).abs() < FLAT_US)
+            .map(|i| low + 1 + i)
+        else {
+            return false;
+        };
+        if self.queue_hist[up].0.saturating_sub(t_low) > STEP_WITHIN_NS {
+            return false;
+        }
+        let (mut n, mut share) = (0u32, 0.0);
+        for (_, x, s) in self.queue_hist.iter().skip(up) {
+            if (x - q).abs() >= FLAT_US {
+                return false;
+            }
+            n += 1;
+            share += s;
+        }
+        n > 0 && share / n as f64 >= SHARE_STEP
     }
 
-    /// Flat for `REBASE_AFTER_NS`; and with `clean`, nothing lost in any window of it.
-    fn flat(&self, now_ns: u64, q: i64, clean: bool) -> bool {
+    /// Flat for `REBASE_AFTER_NS`.
+    fn flat(&self, now_ns: u64, q: i64) -> bool {
         let since = now_ns.saturating_sub(REBASE_AFTER_NS);
         self.queue_hist.front().is_some_and(|(t, _, _)| *t <= since)
             && self
                 .queue_hist
                 .iter()
                 .filter(|(t, _, _)| *t >= since)
-                .all(|(_, x, share)| (x - q).abs() < FLAT_US && (!clean || *share >= SHARE_CLEAN))
+                .all(|(_, x, _)| (x - q).abs() < FLAT_US)
     }
 
     fn judge(&mut self, now_ns: u64, a: &Window, b: &Window) -> Verdict {
@@ -696,6 +1027,14 @@ impl LinkGovernor {
         {
             self.queue_hist.pop_front();
         }
+        // a queue, not loss alone: a window across the moment a cap arrives loses packets and
+        // carries ones that arrived at the old rate
+        if self.pacing && a.queue_us >= QUEUE_LOW_US {
+            if self.link_hist.len() >= LINK_HIST_KEEP {
+                self.link_hist.pop_front();
+            }
+            self.link_hist.push_back((now_ns, a.delivered_bps));
+        }
         if let Some((at, _, enc_then, delivered_then)) = self.undo {
             let age = now_ns.saturating_sub(at);
             let enc = self.enc_rate(now_ns);
@@ -703,7 +1042,7 @@ impl LinkGovernor {
                 self.undo = None;
             } else if age >= REBASE_AFTER_NS
                 && a.queue_us >= QUEUE_LOW_US
-                && self.flat(now_ns, a.queue_us, false)
+                && self.flat(now_ns, a.queue_us)
                 && enc <= UNDO_RATE * enc_then
                 && enc <= UNDO_UNDER * delivered_then
             {
@@ -713,16 +1052,27 @@ impl LinkGovernor {
         let both = |f: &dyn Fn(&Window) -> bool| f(a) && b.valid && f(b);
         let overflow = both(&|w| w.queue_us > QUEUE_HIGH_US && w.share < SHARE_OVERFLOW);
         let severe = both(&|w| w.share < SHARE_SEVERE);
-        if self.growing(now_ns, a.queue_us)
-            || self.creeping(now_ns, a.queue_us)
+        // a keyframe's own burst queues on any path and drains by itself; with nothing lost it
+        // is not the link (a relay's per-packet delay put 67 ms behind one on a jittery link)
+        let own_burst = now_ns < self.key_settle_ns && both(&|w| w.share >= SHARE_CLEAN);
+        if (!own_burst && (self.growing(now_ns, a.queue_us) || self.creeping(now_ns, a.queue_us)))
             || overflow
             || severe
         {
             return Verdict::Congested;
         }
-        if a.queue_us >= QUEUE_LOW_US && self.flat(now_ns, a.queue_us, true) && self.stepped(now_ns)
+        // (a step right behind our own move, or behind our own keyframe while a coarse one may
+        // drain at a slow link's pace, is ours, not a new path; unengaged, the periodic PLI's
+        // keyframes would otherwise hold the rebase off until the step is too old to tell)
+        if a.queue_us >= QUEUE_LOW_US
+            && (!self.engaged() || now_ns >= self.key_settle_ns)
+            && now_ns.saturating_sub(self.last_move_ns) >= REBASE_AFTER_NS + STEP_WITHIN_NS
+            && (self.last_evidence_ns == 0
+                || now_ns.saturating_sub(self.last_evidence_ns) >= CAP_MEMORY_NS)
+            && self.flat(now_ns, a.queue_us)
+            && self.route_step(a.queue_us)
         {
-            // a standing, flat, lossless queue is the path's new base delay
+            // a queue that stepped up and stands flat with little lost is the path's new base
             self.path_changed();
             return Verdict::Neither;
         }
@@ -741,6 +1091,9 @@ impl LinkGovernor {
             if self.q > self.q_user || self.div > 1 {
                 self.above_ns += now_ns.saturating_sub(last);
             }
+            if self.engaged() {
+                self.engaged_ns += now_ns.saturating_sub(last);
+            }
         }
         if let Some((t, q, d)) = self.last_down {
             if now_ns.saturating_sub(t) >= PROBE_FAIL_NS {
@@ -758,16 +1111,55 @@ impl LinkGovernor {
             let (a, b) = self.windows(now_ns);
             if a.valid {
                 self.last = a;
+                if let Some(r) = self.ramp.as_mut() {
+                    if a.queue_us >= r.base_us + RAMP_QUEUE_US || a.share < SHARE_CLEAN {
+                        r.rose = true;
+                    } else {
+                        r.carried = r.carried.max(a.delivered_bps);
+                    }
+                }
             }
-            match self.judge(now_ns, &a, &b) {
+            let verdict = self.judge(now_ns, &a, &b);
+            let was_engaged = self.engaged();
+            let verdict = if was_engaged {
+                verdict
+            } else if self.may_engage(now_ns, verdict) {
+                Verdict::Congested
+            } else if verdict == Verdict::Congested {
+                // a window's verdict alone never engages: that takes the sustained evidence
+                Verdict::Queued
+            } else {
+                verdict
+            };
+            // a lossless queue under or right after our own ramp is the ramp's: it ends the ramp
+            // and nothing else
+            let own = verdict == Verdict::Congested
+                && self.pace_bps > 0.0
+                && a.share >= SHARE_CLEAN
+                && (self.ramp.is_some()
+                    || now_ns.saturating_sub(self.ramp_ended_ns) < RAMP_SETTLE_NS);
+            if own {
+                self.clear_since_ns = None;
+                return self.end_ramp(now_ns, "a queue");
+            }
+            match verdict {
                 Verdict::Congested => {
                     self.last_evidence_ns = now_ns;
                     self.clear_since_ns = None;
                     self.idle_since_ns = None;
-                    if now_ns >= self.hold_until_ns {
-                        return self.raise(now_ns, q_eff, a);
+                    if self.pacing {
+                        self.pace_to(now_ns, &a);
                     }
-                    return None;
+                    let m = if now_ns >= self.hold_until_ns {
+                        self.raise(now_ns, q_eff, a)
+                    } else {
+                        None
+                    };
+                    // an engagement counts once something was cut: a pace set or a QP raised
+                    if !was_engaged && self.engaged() {
+                        self.engagements += 1;
+                    }
+                    return m;
                 }
                 Verdict::Queued => self.clear_since_ns = None,
                 Verdict::NotAQueue => return self.undo_raise(now_ns, a),
@@ -780,7 +1172,543 @@ impl LinkGovernor {
         if let Some(m) = self.release_if_idle(now_ns) {
             return Some(m);
         }
+        if self.pacing && self.pace_bps > 0.0 {
+            return self.paced(now_ns);
+        }
         self.step_down(now_ns)
+    }
+
+    /// Whether the link side may engage, asked on every judged report while it is not engaged.
+    ///
+    /// The link is the limit when, over the last `ENGAGE_SPAN_US` of send time taken whole, the
+    /// rate that arrived is under `ENGAGE_SHORTFALL` of the rate sent, and that shortfall comes
+    /// with what only a bottleneck produces: a queue standing under every packet of the span (its
+    /// lowest one-way delay `QUEUE_HIGH_US` over the base), or under every packet of the newest
+    /// judged window when that queue did not come up as a step in the path's delay, or arrivals
+    /// stretched to under `ENGAGE_STRETCH` of the send time, and all of that has held without a
+    /// break for
+    /// `ENGAGE_HOLD_NS`. Loss, however heavy, shortens what arrives and stretches nothing. A queue
+    /// standing for `ENGAGE_STANDING_NS` engages too, unless it is a step in the path's delay
+    /// (`route_step`), and so does a slowly filling one (the creep rule, itself three seconds of
+    /// steady rise). Over a whole second, jitter, a stall or a keyframe's burst neither stretch
+    /// arrivals by 15 % nor leave a queue under every packet, and none lasts a second more.
+    fn may_engage(&mut self, now_ns: u64, verdict: Verdict) -> bool {
+        let base = self.base_owd(now_ns);
+        let mut it = self.samples.iter().rev().map(|(_, s)| s);
+        let span = Self::window_over(&mut it, base, ENGAGE_SPAN_US);
+        let short = span.valid
+            && span.delivered_bps < ENGAGE_SHORTFALL * span.sent_bps
+            && (span.queue_us >= QUEUE_HIGH_US
+                || span.sigma < ENGAGE_STRETCH
+                || (self.last.valid
+                    && self.last.queue_us >= QUEUE_HIGH_US
+                    && !self.route_step(self.last.queue_us)));
+        if short {
+            self.short_since_ns.get_or_insert(now_ns);
+        } else {
+            self.short_since_ns = None;
+        }
+        // a link just under the stream: no shortfall to speak of, but a queue under every packet
+        // that has stood for seconds and did not come up as a step in the path's delay
+        let newest = self.queue_hist.back().map_or(0, |(_, q, _)| *q);
+        if span.valid && span.queue_us >= QUEUE_HIGH_US && !self.route_step(newest) {
+            self.standing_since_ns.get_or_insert(now_ns);
+        } else {
+            self.standing_since_ns = None;
+        }
+        let standing = self
+            .standing_since_ns
+            .is_some_and(|t| now_ns.saturating_sub(t) >= ENGAGE_STANDING_NS);
+        let creep = verdict == Verdict::Congested
+            && self
+                .queue_hist
+                .back()
+                .is_some_and(|(_, q, _)| self.creeping(now_ns, *q));
+        let held = self
+            .short_since_ns
+            .is_some_and(|t| now_ns.saturating_sub(t) >= ENGAGE_HOLD_NS);
+        if !held && !creep && !standing {
+            return false;
+        }
+        let from = self
+            .short_since_ns
+            .into_iter()
+            .chain(self.standing_since_ns)
+            .min()
+            .unwrap_or(now_ns)
+            .saturating_sub(ENGAGE_SPAN_US as u64 * 1_000);
+        self.engage_link_bps = self
+            .link_hist
+            .iter()
+            .filter(|(t, _)| *t >= from)
+            .map(|(_, d)| *d)
+            .fold(0.0, f64::max);
+        self.short_since_ns = None;
+        self.standing_since_ns = None;
+        self.last_engagement = if held {
+            format!(
+                "over {:.1} s the link delivered {:.2} of {:.2} Mbps sent, {:.1} % lost, a {:.0} ms \
+                 queue under every packet, arrivals stretched to {:.2} of the send time, for \
+                 {:.1} s without a break",
+                ENGAGE_SPAN_US as f64 / 1e6,
+                span.delivered_bps / 1e6,
+                span.sent_bps / 1e6,
+                span.loss * 100.0,
+                span.queue_us as f64 / 1e3,
+                span.sigma,
+                ENGAGE_HOLD_NS as f64 / 1e9
+            )
+        } else if standing {
+            format!(
+                "a {:.0} ms queue stood under every packet for {:.0} s: a link just under the stream",
+                span.queue_us as f64 / 1e3,
+                ENGAGE_STANDING_NS as f64 / 1e9
+            )
+        } else {
+            format!(
+                "a queue rose steadily for {:.0} s to {:.0} ms: a link just under the stream",
+                CREEP_NS as f64 / 1e9,
+                self.queue_hist.back().map_or(0, |(_, q, _)| *q) as f64 / 1e3
+            )
+        };
+        true
+    }
+
+    /// The link is too slow: pace to what it delivered. A ramp in progress ends where it is.
+    fn pace_to(&mut self, now_ns: u64, a: &Window) {
+        if self.ramp.is_some() {
+            let _ = self.end_ramp(now_ns, "congestion");
+        }
+        self.ramp_not_before_ns = self.ramp_not_before_ns.max(now_ns + self.ramp_hold_ns);
+        if self.pace_bps > 0.0
+            && (a.delivered_bps >= PACE_CARRIED * a.sent_bps
+                || now_ns.saturating_sub(self.paced_since_ns) < PACE_SETTLE_NS)
+        {
+            // the sender is what limits this window: the link carried it; or what is reported
+            // was sent before the pace began, into the queue the engagement found
+            return;
+        }
+        let since = now_ns.saturating_sub(LINK_EST_NS);
+        let link = self
+            .link_hist
+            .iter()
+            .filter(|(t, _)| *t >= since)
+            .map(|(_, d)| *d)
+            .fold(a.delivered_bps, f64::max)
+            .max(std::mem::take(&mut self.engage_link_bps));
+        if link > 0.0 {
+            if self.pace_bps == 0.0 {
+                self.paced_since_ns = now_ns;
+                self.q_changed_ns = now_ns;
+            }
+            let pace = (PACE_SHARE * link).max(PACE_MIN_BPS);
+            // the response to a link too slow for the pace only ever lowers it
+            self.pace_bps = if self.pace_bps > 0.0 {
+                self.pace_bps.min(pace)
+            } else {
+                pace
+            };
+        }
+    }
+
+    /// Encoded bits a second over the last `span_ns`, keyframes left out.
+    fn enc_recent(&self, now_ns: u64, span_ns: u64) -> f64 {
+        let from = now_ns.saturating_sub(span_ns);
+        let bytes: u64 = self
+            .enc
+            .iter()
+            .rev()
+            .take_while(|(t, _)| *t >= from)
+            .map(|(_, b)| *b)
+            .sum();
+        bytes as f64 * 8.0 / (span_ns as f64 / 1e9)
+    }
+
+    /// Every half second encoded from `from_ns` to `to_ns`: bits a second carried to the user's
+    /// QP, the highest QP in it, and whether frames waited at the sender then.
+    fn enc_halves(&self, from_ns: u64, to_ns: u64) -> impl Iterator<Item = (f64, u8, bool)> + '_ {
+        let last = to_ns / ENC_BUCKET_NS + 1;
+        let first = (from_ns / ENC_BUCKET_NS + 1).max(last.saturating_sub(ENC_BUCKETS as u64 - 2));
+        let at = |id: u64| {
+            let s = self.enc_buckets[(id as usize) % ENC_BUCKETS];
+            (s.0 == id).then_some((s.1, s.2, s.3))
+        };
+        (first.max(1)..=last).filter_map(move |id| {
+            let (b, q, w) = at(id)?;
+            let (b2, q2, w2) = at(id + 1).unwrap_or((0.0, 0, false));
+            let bps = (b + b2) * 8.0 / (2.0 * ENC_BUCKET_NS as f64 / 1e9);
+            Some((bps, q.max(q2), w || w2))
+        })
+    }
+
+    /// What the content asked for in its heaviest half second over `DEMAND_SPAN_NS`, carried to
+    /// the user's QP.
+    fn demand_at_user(&self, now_ns: u64) -> f64 {
+        self.enc_halves(now_ns.saturating_sub(DEMAND_SPAN_NS), now_ns)
+            .map(|(bps, _, _)| bps)
+            .fold(0.0, f64::max)
+    }
+
+    /// The lowest QP at which every half second encoded over `DEMAND_SPAN_NS` up to `to_ns`,
+    /// carried to it, fits `target`; `None` with nothing to go by.
+    fn fit_q(&self, now_ns: u64, to_ns: u64, target: f64) -> Option<u8> {
+        // where frames waited, the QP did not fit: it is a floor, whatever went through
+        let need = self
+            .enc_halves(now_ns.saturating_sub(DEMAND_SPAN_NS), to_ns)
+            .filter(|(bps, _, _)| *bps > 0.0)
+            .map(|(bps, q, waited)| {
+                if waited {
+                    q as f64
+                } else {
+                    self.q_user as f64 + FIT_HALVING * (bps / target).log2()
+                }
+            })
+            .reduce(f64::max)?;
+        Some((need.ceil().max(0.0) as u8).max(self.q_user))
+    }
+
+    /// Whether the stream at the user's QP has passed `RELEASE_PASS_NS` with nothing waiting at
+    /// the sender, and the link has been shown to take what the content asked for lately.
+    fn may_let_go(&mut self, now_ns: u64) -> bool {
+        if self.q > self.q_user || self.skip_share > 0.0 || self.sender_waiting {
+            self.pass_since_ns = None;
+            return false;
+        }
+        let since = *self.pass_since_ns.get_or_insert(now_ns);
+        now_ns.saturating_sub(since) >= RELEASE_PASS_NS
+            && RELEASE_DEMAND * self.demand_at_user(now_ns) <= self.pace_bps
+    }
+
+    /// Pacing off and the user's QP: nothing of the episode is left.
+    fn let_go(&mut self, now_ns: u64, why: String) -> LinkMove {
+        self.q = self.q_user;
+        self.div = 1;
+        self.pace_bps = 0.0;
+        self.ramp = None;
+        self.ramp_hold_ns = RAMP_HOLD_MIN_NS;
+        self.ramp_not_before_ns = 0;
+        self.lower_not_before_ns = 0;
+        self.pass_since_ns = None;
+        self.hold_until_ns = 0;
+        self.last_move_ns = now_ns;
+        self.q_changed_ns = now_ns;
+        self.last_was_raise = false;
+        self.steps += 1;
+        LinkMove {
+            q: self.q,
+            divisor: 1,
+            raise: false,
+            why,
+        }
+    }
+
+    /// The ramp ends without letting go: paced at what the link took with no queue under it,
+    /// and the QP that fitted before less what the pace gained. The next waits twice as long
+    /// unless this one found more room.
+    fn end_ramp(&mut self, now_ns: u64, cause: &str) -> Option<LinkMove> {
+        let r = self.ramp.take()?;
+        let tried = self.pace_bps;
+        let pace = r.from_pace.max(PACE_SHARE * r.carried);
+        let gained = pace > RAMP_PROGRESS * r.from_pace;
+        let back = if gained {
+            (FIT_HALVING * (pace / r.from_pace).log2()).floor() as u8
+        } else {
+            0
+        };
+        let from = self.q;
+        // the QP the seconds before it fit at the new pace, never above the one it left: a
+        // raise is for frames waiting to call for
+        let fit = self
+            .fit_q(now_ns, r.since_ns, pace * SENDER_SHARE)
+            .unwrap_or(r.from_q.saturating_sub(back));
+        self.q = fit.min(r.from_q).max(self.q_user);
+        self.pace_bps = pace;
+        self.ramp_hold_ns = if gained {
+            RAMP_HOLD_MIN_NS
+        } else {
+            (self.ramp_hold_ns * 2).min(RAMP_HOLD_MAX_NS)
+        };
+        self.ramp_not_before_ns = now_ns + self.ramp_hold_ns;
+        self.ramp_ended_ns = now_ns;
+        self.pass_since_ns = None;
+        // what waited at the sender during the ramp is its cost, not a reason to raise
+        self.hold_until_ns = self.hold_until_ns.max(now_ns + SKIP_RAISE_HOLD_NS);
+        self.last_move_ns = now_ns;
+        self.q_changed_ns = if self.q == r.from_q {
+            r.q_changed_ns
+        } else {
+            now_ns
+        };
+        self.last_was_raise = false;
+        self.steps += 1;
+        Some(LinkMove {
+            q: self.q,
+            divisor: self.div,
+            raise: false,
+            why: format!(
+                "ramp ended by {cause} at {:.2} Mbps: paced at {:.2} (from {:.2}), QP {from} -> {}, \
+                 next in {} ms",
+                tried / 1e6,
+                pace / 1e6,
+                r.from_pace / 1e6,
+                self.q,
+                self.ramp_hold_ns / MS
+            ),
+        })
+    }
+
+    /// One step of the ramp: the QP down while the stream leaves room under the pace, the pace up
+    /// while the stream fills it, until a queue rises or the stream at the user's QP passes.
+    fn ramp_step(&mut self, now_ns: u64) -> Option<LinkMove> {
+        let mut r = self.ramp?;
+        if r.rose {
+            return self.end_ramp(now_ns, "a queue");
+        }
+        if self.may_let_go(now_ns) {
+            let why = format!(
+                "the stream at the user's QP passed {} ms under a {:.2} Mbps ramp with no queue and \
+                 nothing waiting: pacing off",
+                RELEASE_PASS_NS / MS,
+                self.pace_bps / 1e6
+            );
+            return Some(self.let_go(now_ns, why));
+        }
+        // a keyframe draining at the pace holds everything behind it: the ramp waits for it
+        if self.sender_waiting || now_ns.saturating_sub(r.stage_ns) < RAMP_STEP_NS {
+            return None;
+        }
+        r.stage_ns = now_ns;
+        let recent = self.enc_recent(now_ns, 2 * RAMP_STEP_NS);
+        // the pace goes up only once the link has delivered most of it with no queue: a step
+        // taken on what the encoder offered alone could be several steps past the link by the
+        // time a heavy second fills it
+        let carried = r.carried >= RAMP_FILLED * self.pace_bps;
+        let waiting = self.skip_share >= RAMP_SKIP;
+        let back_up =
+            waiting && self.q < r.from_q && now_ns.saturating_sub(r.backed_ns) >= SKIP_WINDOW_NS;
+        if back_up {
+            r.backed_ns = now_ns;
+        }
+        self.ramp = Some(r);
+        if carried {
+            self.pace_bps *= if self.pace_bps < RAMP_NEAR * r.from_pace {
+                RAMP_GAIN_NEAR
+            } else {
+                RAMP_GAIN
+            };
+        }
+        if back_up {
+            // most frames waiting: back up a step, the pace still climbs on what goes through
+            let from = self.q;
+            self.q = (from + RAMP_QP_STEP).min(r.from_q);
+            self.q_changed_ns = now_ns;
+            self.last_move_ns = now_ns;
+            return Some(LinkMove {
+                q: self.q,
+                divisor: self.div,
+                raise: true,
+                why: format!(
+                    "ramp: {:.0} % of frames waiting under a {:.2} Mbps pace: QP {from} -> {}",
+                    self.skip_share * 100.0,
+                    self.pace_bps / 1e6,
+                    self.q
+                ),
+            });
+        }
+        // no more than `RAMP_SPAN` under where the last seconds fit the pace, so an attempt on a
+        // cap that stays dips the picture that far and no further; once the pace is well past
+        // where it began with no queue, the cap has moved and nothing holds the QP up
+        let floor = if self.pace_bps >= RAMP_NEAR * r.from_pace {
+            self.q_user
+        } else {
+            self.fit_q(now_ns, now_ns, SENDER_SHARE * self.pace_bps)
+                .map_or(self.q_user, |q| q.saturating_sub(RAMP_SPAN))
+        };
+        if self.q <= floor || recent >= RAMP_FILLED * self.pace_bps || self.skip_share > 0.0 {
+            return None;
+        }
+        let step = if recent < RAMP_ROOMY * self.pace_bps {
+            RAMP_QP_STEP + 1
+        } else {
+            RAMP_QP_STEP
+        };
+        let from = self.q;
+        self.q = from.saturating_sub(step).max(floor);
+        self.q_changed_ns = now_ns;
+        self.last_move_ns = now_ns;
+        Some(LinkMove {
+            q: self.q,
+            divisor: self.div,
+            raise: false,
+            why: format!(
+                "ramp: {:.2} Mbps encoded under a {:.2} Mbps pace, no queue: QP {from} -> {}",
+                recent / 1e6,
+                self.pace_bps / 1e6,
+                self.q
+            ),
+        })
+    }
+
+    /// While paced: hold the QP the heavy stretches fit with room and keep every frame, raise it
+    /// at once when frames wait, lower it a step at a time on seconds of evidence, and look for
+    /// a faster link with a ramp.
+    fn paced(&mut self, now_ns: u64) -> Option<LinkMove> {
+        let skip = self.skip_share;
+        if skip > 0.0 {
+            self.last_skip_ns = now_ns;
+        }
+        // (frames that wait within a skip window of a QP change waited at the QP before it)
+        if skip >= SKIP_RAISE_SHARE && now_ns.saturating_sub(self.q_changed_ns) >= SKIP_WINDOW_NS {
+            let id = now_ns / ENC_BUCKET_NS + 1;
+            let slot = &mut self.enc_buckets[(id as usize) % ENC_BUCKETS];
+            if slot.0 == id {
+                slot.3 = true;
+            }
+        }
+        if skip >= LAST_RESORT_LOWER_SKIP {
+            self.last_heavy_skip_ns = now_ns;
+        }
+        if skip < LAST_RESORT_SKIP {
+            self.half_waiting_since_ns = None;
+        } else if self.q >= self.q_max {
+            self.half_waiting_since_ns.get_or_insert(now_ns);
+        }
+        if self.ramp.is_some() {
+            return self.ramp_step(now_ns);
+        }
+        let target = self.pace_bps * SENDER_SHARE;
+        // past the bound only with half the frames waiting there, a few steps at a time
+        let top = if self.q < self.q_max {
+            self.q_max
+        } else if self.last_resort
+            && now_ns.saturating_sub(self.paced_since_ns) >= LAST_RESORT_AFTER_NS
+            && self
+                .half_waiting_since_ns
+                .is_some_and(|t| now_ns.saturating_sub(t) >= LAST_RESORT_AFTER_NS)
+        {
+            QP_LAST_RESORT
+        } else {
+            self.q
+        };
+        if skip >= SKIP_RAISE_SHARE && now_ns >= self.hold_until_ns && self.q < top && !self.pinned
+        {
+            // sized on what waits, never on the encoded rate scaled up by it: with most frames
+            // waiting that figure runs to several times what the content asks for
+            let step = if skip < 0.2 {
+                2
+            } else if skip < 0.4 {
+                3
+            } else {
+                4
+            };
+            let from = self.q;
+            self.q = from.saturating_add(step).min(top);
+            self.hold_until_ns = now_ns + SKIP_RAISE_HOLD_NS;
+            self.lower_not_before_ns = now_ns + LOWER_AFTER_RAISE_NS;
+            self.ramp_not_before_ns = self.ramp_not_before_ns.max(now_ns + RAMP_HOLD_MIN_NS);
+            self.q_changed_ns = now_ns;
+            self.last_move_ns = now_ns;
+            self.last_was_raise = true;
+            self.raises += 1;
+            return Some(LinkMove {
+                q: self.q,
+                divisor: self.div,
+                raise: true,
+                why: format!(
+                    "{:.0} % of frames waiting at the sender under a {:.2} Mbps pace: QP {from} -> \
+                     {}, held {} s",
+                    skip * 100.0,
+                    self.pace_bps / 1e6,
+                    self.q,
+                    LOWER_AFTER_RAISE_NS / 1_000_000_000
+                ),
+            });
+        }
+        if self.may_let_go(now_ns) {
+            let why = format!(
+                "clear at the user's QP for {} ms, the heaviest stretch lately under the {:.2} Mbps \
+                 pace: pacing off",
+                RELEASE_PASS_NS / MS,
+                self.pace_bps / 1e6
+            );
+            return Some(self.let_go(now_ns, why));
+        }
+        let settled = now_ns >= self.lower_not_before_ns
+            && !self.sender_waiting
+            && now_ns.saturating_sub(self.q_changed_ns) >= LOWER_EVIDENCE_NS;
+        if self.q > self.q_max {
+            // past the bound the frame rate is already the price: back toward it a step a
+            // second once under a fifth of the frames wait
+            if !self.sender_waiting
+                && now_ns.saturating_sub(self.q_changed_ns) >= LAST_RESORT_LOWER_NS
+                && now_ns.saturating_sub(self.last_heavy_skip_ns) >= LAST_RESORT_LOWER_NS
+            {
+                let from = self.q;
+                self.q -= 1;
+                self.q_changed_ns = now_ns;
+                self.last_move_ns = now_ns;
+                self.steps += 1;
+                return Some(LinkMove {
+                    q: self.q,
+                    divisor: self.div,
+                    raise: false,
+                    why: format!(
+                        "under a fifth of the frames waiting for {} ms: QP {from} -> {}",
+                        LAST_RESORT_LOWER_NS / MS,
+                        self.q
+                    ),
+                });
+            }
+        } else if settled
+            && self.q > self.q_user
+            && now_ns.saturating_sub(self.last_skip_ns) >= LOWER_EVIDENCE_NS
+        {
+            // down only to where every half second of the last seconds fits with room, two
+            // steps at most
+            if let Some(fit) = self
+                .fit_q(now_ns, now_ns, target)
+                .filter(|fit| *fit < self.q)
+            {
+                let from = self.q;
+                self.q = from.saturating_sub(LOWER_STEP_MAX).max(fit);
+                self.q_changed_ns = now_ns;
+                self.last_move_ns = now_ns;
+                self.last_was_raise = false;
+                self.steps += 1;
+                return Some(LinkMove {
+                    q: self.q,
+                    divisor: self.div,
+                    raise: false,
+                    why: format!(
+                        "nothing waiting for {} s, and every half second of the last {} s fits \
+                         the {:.2} Mbps the pace carries with room at QP {fit}: QP {from} -> {}",
+                        LOWER_EVIDENCE_NS / 1_000_000_000,
+                        DEMAND_SPAN_NS / 1_000_000_000,
+                        target / 1e6,
+                        self.q
+                    ),
+                });
+            }
+        }
+        let quiet = self
+            .clear_since_ns
+            .is_some_and(|t| now_ns.saturating_sub(t) >= RAMP_QUIET_NS);
+        if !quiet || now_ns < self.ramp_not_before_ns || self.sender_waiting {
+            return None;
+        }
+        self.ramp = Some(Ramp {
+            from_pace: self.pace_bps,
+            from_q: self.q,
+            base_us: self.last.queue_us.max(0),
+            stage_ns: now_ns.saturating_sub(RAMP_STEP_NS),
+            carried: 0.0,
+            rose: false,
+            since_ns: now_ns,
+            q_changed_ns: self.q_changed_ns,
+            backed_ns: 0,
+        });
+        self.probes += 1;
+        self.ramp_step(now_ns)
     }
 
     /// The response to the last raise, read once, from frames encoded after it only.
@@ -832,7 +1760,11 @@ impl LinkGovernor {
     }
 
     fn release_if_idle(&mut self, now_ns: u64) -> Option<LinkMove> {
-        if self.q <= self.q_user && self.div == 1 {
+        // frames waiting at the sender are not a light stream: a keyframe draining at the pace
+        // holds everything behind it
+        if !self.engaged()
+            || (self.pace_bps > 0.0 && (self.skip_share > 0.0 || self.sender_waiting))
+        {
             self.idle_since_ns = None;
             return None;
         }
@@ -847,6 +1779,7 @@ impl LinkGovernor {
         let from = (self.q, self.div);
         self.q = self.q_user;
         self.div = 1;
+        self.pace_bps = 0.0;
         self.idle_since_ns = None;
         self.failed = None;
         self.last_down = None;
@@ -894,19 +1827,30 @@ impl LinkGovernor {
         if self.undo.is_none() {
             self.undo = Some((now_ns, (self.q, self.div), enc, a.delivered_bps));
         }
-        let sized = (self.halving_qp * (enc / target).log2()).ceil().max(1.0);
+        // paced, frames wait at the sender until the QP is high enough: sized on the weakest
+        // response, one raise gets there
+        let h = if self.pacing {
+            SLOPE_MAX
+        } else {
+            self.halving_qp
+        };
+        let sized = (h * (enc / target).log2()).ceil().max(1.0);
         if from.0 < self.q_max {
             self.q = from.0.saturating_add(sized as u8).min(self.q_max);
             self.last_raise = Some((enc, self.q - from.0, now_ns));
+        } else if self.pacing {
+            // the pacer and the skips at the sender take the frame rate down instead
+            return None;
         } else if self.div < MAX_DIVISOR && self.hold_frames {
             // a picture that stands for more periods carries more change; taken as the square
-            // root of the periods, the frame count has to fall by the square of the overshoot
+            // root of the periods, the frame count has to fall by the square of the overshoot.
+            // The smallest cut that does it, and never more than a halving at once
             let want = (self.div as f64 * (enc / target).powi(2)).ceil() as u32;
             self.q = from.0;
-            self.div = want.clamp(self.div + 1, MAX_DIVISOR);
-        } else if self.hold_frames && !self.pinned && from.0 < QP_LAST_RESORT {
-            // only after the frame rate is at a quarter: where frames cannot be held the QP stops
-            // at the bound, which is set by legibility
+            self.div = want.clamp(self.div + 1, (2 * self.div).min(MAX_DIVISOR));
+        } else if self.hold_frames && self.last_resort && !self.pinned && from.0 < QP_LAST_RESORT {
+            // only after the frame rate is at a quarter, and only on the ring's trailing edge:
+            // elsewhere the QP stops at the bound, which is set by legibility
             // a few steps at a time: a shallow queue drops bursts of sparse frames even when the
             // average fits, and the delivered rate read during those drops understates the link
             let step = sized.min(LAST_RESORT_STEP) as u8;
@@ -916,6 +1860,10 @@ impl LinkGovernor {
         }
         let queue_ns = a.queue_us.max(0) as u64 * 1_000;
         self.hold_until_ns = now_ns + (RAISE_HOLD_NS + 2 * queue_ns).min(RAISE_HOLD_MAX_NS);
+        if self.pacing {
+            self.lower_not_before_ns = now_ns + LOWER_AFTER_RAISE_NS;
+            self.q_changed_ns = now_ns;
+        }
         self.last_move_ns = now_ns;
         self.last_was_raise = true;
         self.raises += 1;
@@ -1140,6 +2088,7 @@ pub(crate) struct Governors {
     total_bytes: u64,
     pending: Option<String>,
     shown: (u8, u32),
+    shown_pace: bool,
     check: MoveCheck,
     costly_at: Option<u64>,
     /// The encoder ignores QP changes: only the frame rate is left.
@@ -1158,6 +2107,7 @@ impl Governors {
             total_bytes: 0,
             pending: None,
             shown: (q_user, 1),
+            shown_pace: false,
             check: MoveCheck::default(),
             costly_at: None,
             qp_dead: false,
@@ -1189,6 +2139,48 @@ impl Governors {
         }
     }
 
+    pub(crate) fn set_pacing(&mut self, yes: bool) {
+        if let Some(g) = self.link.as_mut() {
+            g.set_pacing(yes);
+        }
+    }
+
+    pub(crate) fn pace_bps(&self) -> f64 {
+        self.link.as_ref().map_or(0.0, |g| g.pace_bps())
+    }
+
+    pub(crate) fn sender(&mut self, skip_share: f64, waiting: bool) {
+        if let Some(g) = self.link.as_mut() {
+            g.sender(skip_share, waiting);
+        }
+    }
+
+    /// Whether the QP may go past the bound (see [`LinkGovernor::last_resort`]).
+    pub(crate) fn last_resort(&mut self, yes: bool) {
+        if let Some(g) = self.link.as_mut() {
+            g.last_resort(yes);
+        }
+    }
+
+    pub(crate) fn limit_qp(&mut self, top: u8) {
+        if let Some(g) = self.link.as_mut() {
+            g.limit_qp(top);
+        }
+    }
+
+    /// The link side has cut something: what a keyframe nobody asked for waits behind.
+    pub(crate) fn link_engaged(&self) -> bool {
+        self.link.as_ref().is_some_and(|g| g.engaged())
+    }
+
+    pub(crate) fn link_bps(&self) -> f64 {
+        self.link.as_ref().map_or(0.0, |g| g.link_bps())
+    }
+
+    pub(crate) fn halving_qp(&self) -> f64 {
+        self.link.as_ref().map_or(SLOPE_MIN, |g| g.halving_qp())
+    }
+
     pub(crate) fn path_changed(&mut self) {
         if let Some(g) = self.link.as_mut() {
             g.path_changed();
@@ -1211,6 +2203,7 @@ impl Governors {
         repeat: bool,
         keyframe: bool,
         readback: Option<u8>,
+        asked: u8,
     ) -> Option<(u8, u8)> {
         self.total_bytes += bytes;
         if let Some(g) = self.ceiling.as_mut() {
@@ -1223,9 +2216,11 @@ impl Governors {
         if let Some(g) = self.link.as_mut() {
             g.encoded(now_ns, bytes, keyframe);
         }
-        // a keyframe may carry the boosted QP; it says nothing about the move
-        let readback = readback.filter(|_| !keyframe);
-        match self.check.frame(bytes, readback, !repeat && !keyframe) {
+        // a keyframe may carry the boosted QP, and a frame walking back from one was asked for
+        // another QP than the governors': neither says anything about the move
+        let aside = keyframe || asked != self.q();
+        let readback = readback.filter(|_| !aside);
+        match self.check.frame(bytes, readback, !repeat && !aside) {
             Check::Waiting => None,
             Check::Confirmed => {
                 self.confirmed += 1;
@@ -1318,14 +2313,163 @@ impl Governors {
             }
         }
         let now = (self.q(), self.divisor());
-        if now == self.shown {
+        let pacing = self.pace_bps() > 0.0;
+        if now == self.shown && pacing == self.shown_pace {
             return None;
         }
+        self.shown_pace = pacing;
         if now.0 != self.shown.0 && !self.qp_dead {
             self.check.raised(self.shown.0, now.0, false);
         }
         self.shown = now;
-        Some(why.unwrap_or_default())
+        // the pace alone moved: say so, and why
+        Some(why.unwrap_or_else(|| match self.link.as_ref() {
+            Some(l) if pacing => format!(
+                "paced at {:.2} Mbps: {}",
+                l.pace_bps() / 1e6,
+                l.last_engagement
+            ),
+            _ => "pacing off".to_string(),
+        }))
+    }
+}
+
+/// Keyframes on a governed link: how large, and how often.
+///
+/// Every request (a PLI, a lagging viewer, the packet distance) reaches the encoder as one flag,
+/// and on a congested link each answer overflows the queue, the loss opens the PLI back-off, and
+/// the next periodic PLI is answered too. While the link side is engaged a request is held until
+/// the last keyframe has had time to drain, and the keyframe is coded to fit a burst the link can
+/// queue. A request the page itself makes (its out-of-band keyframe request) is a decoder that
+/// cannot go on, and goes at once. With the link side idle every request goes as it came.
+#[derive(Debug)]
+pub(crate) struct KeyPolicy {
+    held: bool,
+    held_urgent: bool,
+    last_key_ns: Option<u64>,
+    /// The newest keyframe that left: bytes, QP.
+    last_key: Option<(u64, u8)>,
+    key_halving: f64,
+    pub held_requests: u64,
+}
+
+impl Default for KeyPolicy {
+    fn default() -> Self {
+        KeyPolicy {
+            held: false,
+            held_urgent: false,
+            last_key_ns: None,
+            last_key: None,
+            key_halving: KEY_HALVING,
+            held_requests: 0,
+        }
+    }
+}
+
+impl KeyPolicy {
+    /// How long after the last keyframe the next unasked one may go.
+    pub(crate) fn gap_ns(&self, link_bps: f64) -> u64 {
+        let drain_s = match self.last_key {
+            Some((bytes, _)) if link_bps > 0.0 => bytes as f64 * 8.0 / (KEY_DRAIN_SHARE * link_bps),
+            _ => 0.0,
+        };
+        ((2.0 * drain_s * 1e9) as u64).clamp(KEY_GAP_MIN_NS, KEY_GAP_MAX_NS)
+    }
+
+    /// Whether this submit is a keyframe: `asked` is a request taken from the encoder's flag just
+    /// now, `page` that the page asked for one since the last look, `engaged` that the link side
+    /// has cut something. Idle, the answer is `asked` and nothing is held.
+    pub(crate) fn admit(
+        &mut self,
+        now_ns: u64,
+        asked: bool,
+        page: bool,
+        engaged: bool,
+        link_bps: f64,
+    ) -> bool {
+        if !asked && !self.held {
+            return false;
+        }
+        let open = self
+            .last_key_ns
+            .is_none_or(|t| now_ns.saturating_sub(t) >= self.gap_ns(link_bps));
+        if !engaged || page || open {
+            self.held = false;
+            self.last_key_ns = Some(now_ns);
+            return true;
+        }
+        if asked && !self.held {
+            self.held_requests += 1;
+        }
+        self.held = true;
+        false
+    }
+
+    /// While the sender is paced: an urgent request (a decoder that cannot go on or has not
+    /// started) goes once the last keyframe has drained (`clear`); a routine one (a PLI, the
+    /// packet distance) also waits for `routine`, so the browser's periodic PLI cannot keep a
+    /// slow link draining keyframes. Until then it is held, never lost.
+    pub(crate) fn admit_paced(
+        &mut self,
+        now_ns: u64,
+        asked: bool,
+        urgent: bool,
+        clear: bool,
+        routine: bool,
+    ) -> bool {
+        if !asked && !self.held {
+            return false;
+        }
+        self.held_urgent |= asked && urgent;
+        if clear && (self.held_urgent || routine) {
+            self.held = false;
+            self.held_urgent = false;
+            self.last_key_ns = Some(now_ns);
+            return true;
+        }
+        if asked && !self.held {
+            self.held_requests += 1;
+        }
+        self.held = true;
+        false
+    }
+
+    /// A held request may go now (for an idle path to know it should submit something).
+    pub(crate) fn due(&self, now_ns: u64, engaged: bool, link_bps: f64) -> bool {
+        self.held
+            && (!engaged
+                || self
+                    .last_key_ns
+                    .is_none_or(|t| now_ns.saturating_sub(t) >= self.gap_ns(link_bps)))
+    }
+
+    /// The QP for a keyframe on an engaged link at `q`: the boost at least, more when the last
+    /// keyframe says it would not fit `KEY_BURST_S` of the link, never past `KEY_QP_MAX` and
+    /// never under `q`.
+    pub(crate) fn key_qp(&self, q: u8, link_bps: f64, paced: bool) -> u8 {
+        let floor = q.saturating_add(KEYFRAME_BOOST).min(KEY_QP_MAX).max(q);
+        let Some((bytes, kq)) = self.last_key.filter(|_| link_bps > 0.0) else {
+            return floor;
+        };
+        let budget = link_bps * if paced { KEY_PACED_S } else { KEY_BURST_S } / 8.0;
+        let need = kq as f64 + self.key_halving * (bytes as f64 / budget).log2();
+        // paced, a keyframe's size is time every frame behind it waits: it may go to the last
+        // resort, and the frames after it walk back
+        let top = if paced { QP_LAST_RESORT } else { KEY_QP_MAX };
+        let need = need.ceil().clamp(0.0, top as f64) as u8;
+        need.max(floor).min(top).max(q)
+    }
+
+    /// A keyframe left: its size and QP. Two at different QPs show how size answers QP here.
+    pub(crate) fn sent(&mut self, bytes: u64, qp: u8) {
+        if let Some((b0, q0)) = self.last_key {
+            if qp >= q0.saturating_add(4) && bytes > 0 && bytes < b0 {
+                let h = (qp - q0) as f64 / (b0 as f64 / bytes as f64).log2();
+                self.key_halving =
+                    (0.5 * self.key_halving + 0.5 * h).clamp(SLOPE_MIN, KEY_HALVING_MAX);
+            }
+        }
+        self.last_key = Some((bytes, qp));
     }
 }
 
@@ -1826,9 +2970,11 @@ pub struct LinkShared {
     feedback: Mutex<VecDeque<(u64, PathSample)>>,
     /// The frame-rate divisor the capture gate applies; 0 and 1 are the full rate.
     divisor: AtomicU32,
-    /// The capture path can hold a gated frame and deliver it later (the ring's trailing edge).
-    /// Without that the frame rate is never cut.
+    /// The capture path can hold a gated frame and deliver it later (the ring's trailing edge, or
+    /// the classic path's held copy). Without that the frame rate is never cut.
     frame_hold: AtomicBool,
+    /// ... on the ring's trailing edge, the one measured live: only there may the QP pass the bound.
+    trailing_edge: AtomicBool,
     /// Bumped by the transport when ICE selects a new candidate pair.
     path_changes: AtomicU64,
     /// Which `QpControl` is current: a capture can be opened again on the same telemetry, and an
@@ -1868,8 +3014,228 @@ pub struct LinkShared {
     qp_change_confirmed: AtomicU64,
     costly_applied: AtomicU64,
     qp_ineffective: AtomicBool,
+    keyframes_held: AtomicU64,
+    /// The rate the writer paces this viewer at; 0 while the link side is not pacing, and then the
+    /// writer paces exactly as it always did.
+    pace_bps: AtomicU64,
+    /// The link side has cut something: loss is no longer news, and does not open the PLI back-off.
+    engaged: AtomicBool,
+    /// When what the writer holds will have left at the pacing rate (host ns), as the writer
+    /// sees it, and as the encode thread sees it with the frames it has sent since.
+    writer_until_ns: AtomicU64,
+    send_until_ns: AtomicU64,
+    /// Frames skipped at the sender for the backlog.
+    skipped: AtomicU64,
+    /// [`key_origin`] bits of the keyframe requests since the encoder last took the flag.
+    key_origins: AtomicU32,
+    keyframes_unrepairable: AtomicU64,
+    keyframes_paced: AtomicU64,
+    /// Keyframes sent, by the origins of the requests behind them.
+    keyframes_by_origin: [AtomicU64; 6],
+    engagements: AtomicU64,
+    engaged_ms: AtomicU64,
+    last_engagement: Slot<String>,
+    /// PLIs from a painting page that were not answered.
+    plis_ignored: AtomicU64,
     last_move: Slot<String>,
     state: Slot<String>,
+}
+
+/// Where a keyframe request came from, as bits.
+pub mod key_origin {
+    /// The page's own out-of-band request: its decoder cannot go on.
+    pub const PAGE: u32 = 1;
+    /// An RTCP PLI or FIR: on an encoded-transform page, mostly libwebrtc's idle decoder.
+    pub const PLI: u32 = 2;
+    /// A delta near the packet distance some receivers allow.
+    pub const DISTANCE: u32 = 4;
+    /// The broadcast dropped frames on this viewer.
+    pub const LAG: u32 = 8;
+    /// A resend refused for age or budget: that frame can never be completed.
+    pub const UNREPAIRABLE: u32 = 16;
+    /// The connection came up, the first RTP reached the wire, or nothing could be packetized.
+    pub const START: u32 = 32;
+    /// A decoder that cannot go on or has not started.
+    pub const URGENT: u32 = PAGE | LAG | UNREPAIRABLE | START;
+}
+
+/// A token bucket at the link's pace for everything the writer sends one viewer, media and
+/// resends alike. Unlike the transport's own pacer it never gives up on a frame: what it cannot
+/// pass waits, and the sender skips frames against that wait instead of the network dropping
+/// packets.
+#[derive(Debug, Default)]
+pub(crate) struct LinkPacer {
+    rate: f64,
+    tokens: f64,
+    last: Option<std::time::Instant>,
+}
+
+/// The burst the link pacer lets out at once: a few milliseconds of the rate, at least two
+/// packets.
+const PACE_BURST_S: f64 = 0.004;
+const PACE_BURST_MIN: f64 = 2.0 * 1_200.0;
+
+impl LinkPacer {
+    pub(crate) fn set_rate(&mut self, bps: u64) {
+        self.rate = bps as f64 / 8.0;
+    }
+
+    fn burst(&self) -> f64 {
+        (self.rate * PACE_BURST_S).max(PACE_BURST_MIN)
+    }
+
+    fn refill(&mut self, now: std::time::Instant) {
+        self.tokens = match self.last {
+            Some(t) => (self.tokens + self.rate * now.saturating_duration_since(t).as_secs_f64())
+                .min(self.burst()),
+            None => self.burst(),
+        };
+        self.last = Some(now);
+    }
+
+    /// How long to wait before writing `bytes`.
+    pub(crate) fn schedule(
+        &mut self,
+        bytes: usize,
+        now: std::time::Instant,
+    ) -> std::time::Duration {
+        if self.rate <= 0.0 {
+            return std::time::Duration::ZERO;
+        }
+        self.refill(now);
+        self.tokens -= bytes as f64;
+        if self.tokens >= 0.0 {
+            return std::time::Duration::ZERO;
+        }
+        std::time::Duration::from_secs_f64((-self.tokens / self.rate).min(2.0))
+    }
+
+    /// How long until `more` bytes on top of what is owed have left.
+    pub(crate) fn backlog(&mut self, more: usize, now: std::time::Instant) -> std::time::Duration {
+        if self.rate <= 0.0 {
+            return std::time::Duration::ZERO;
+        }
+        self.refill(now);
+        let owed = more as f64 - self.tokens;
+        std::time::Duration::from_secs_f64((owed / self.rate).clamp(0.0, 10.0))
+    }
+}
+
+/// A keyframe goes no sooner than this after the previous one has drained at the pace: what
+/// stops a storm, and the only limit left while the sender is paced.
+const KEY_MARGIN_NS: u64 = 100 * MS;
+/// A routine keyframe (a PLI, the packet distance) waits this many of the last keyframe's drain
+/// times, and `KEY_GAP_MIN_NS` at least: keyframes then hold the link a quarter of the time at
+/// most however slow it is.
+const KEY_ROUTINE_DRAINS: u64 = 4;
+const SKIP_BUCKET_NS: u64 = 125 * MS;
+const SKIP_BUCKETS: usize = 4;
+
+/// The page painted something within this long: it counts as painting.
+const PAINT_RECENT_NS: u64 = 3_000 * MS;
+
+/// A PLI from a page that is painting through its own decoder is libwebrtc's idle decoder, not a
+/// picture anyone lost: with no other reason behind it, it is answered at the healthy cadence
+/// only (`keyframe::PLI_BACKOFF_CAP_HEALTHY_MS`), paced link or not.
+pub(crate) fn pli_is_noise(origins: u32, painting: bool, since_key_ns: u64) -> bool {
+    painting
+        && origins & key_origin::PLI != 0
+        && origins & !key_origin::PLI == 0
+        && since_key_ns < crate::streamer::keyframe::PLI_BACKOFF_CAP_HEALTHY_MS * MS
+}
+
+/// The sender's side of pacing: when what it has handed the writer will have left at the pace,
+/// which frames it skipped against that, and when the last keyframe has drained.
+#[derive(Debug, Default)]
+pub(crate) struct SendGate {
+    until_ns: u64,
+    key_clear_ns: u64,
+    key_routine_ns: u64,
+    /// `(bucket, sent, skipped)`.
+    buckets: [(u64, u32, u32); SKIP_BUCKETS],
+}
+
+impl SendGate {
+    /// The writer holds more than `period_ns` of sending: a new frame would only wait behind it.
+    pub(crate) fn busy(&self, now_ns: u64, writer_until_ns: u64, period_ns: u64) -> bool {
+        self.until(writer_until_ns) > now_ns + period_ns
+    }
+
+    pub(crate) fn until(&self, writer_until_ns: u64) -> u64 {
+        self.until_ns.max(writer_until_ns)
+    }
+
+    /// An access unit of `bytes` was handed to the writer.
+    pub(crate) fn sent(
+        &mut self,
+        now_ns: u64,
+        bytes: u64,
+        pace_bps: f64,
+        writer_until_ns: u64,
+        keyframe: bool,
+    ) {
+        let start = now_ns.max(self.until(writer_until_ns));
+        self.until_ns = start + (bytes as f64 * 8e9 / pace_bps.max(PACE_MIN_BPS)) as u64;
+        if keyframe {
+            self.key_clear_ns = self.until_ns + KEY_MARGIN_NS;
+            let drain = self.until_ns - start;
+            self.key_routine_ns = now_ns + (KEY_ROUTINE_DRAINS * drain).max(KEY_GAP_MIN_NS);
+        }
+        self.count(now_ns, 1, 0);
+    }
+
+    /// Frames that waited at the sender. Those behind a keyframe still draining are its cost,
+    /// paid once, and say nothing about the QP.
+    pub(crate) fn skipped(&mut self, now_ns: u64, n: u32) {
+        if n > 0 && now_ns >= self.key_clear_ns {
+            self.count(now_ns, 0, n);
+        }
+    }
+
+    /// A keyframe is still draining at the pace, with the frames behind it waiting, or did so
+    /// within the encoded-rate window: what was encoded meanwhile is not the content's rate.
+    pub(crate) fn draining(&self, now_ns: u64) -> bool {
+        now_ns < self.key_clear_ns + ENC_WINDOW_NS
+    }
+
+    fn count(&mut self, now_ns: u64, sent: u32, skipped: u32) {
+        let id = now_ns / SKIP_BUCKET_NS + 1;
+        let b = &mut self.buckets[(id as usize) % SKIP_BUCKETS];
+        if b.0 != id {
+            *b = (id, 0, 0);
+        }
+        b.1 += sent;
+        b.2 += skipped;
+    }
+
+    /// Skipped over sent and skipped, the last half second.
+    pub(crate) fn skip_share(&self, now_ns: u64) -> f64 {
+        let id = now_ns / SKIP_BUCKET_NS + 1;
+        let (sent, skipped) = self
+            .buckets
+            .iter()
+            .filter(|b| b.0 != 0 && b.0 + SKIP_BUCKETS as u64 > id)
+            .fold((0u32, 0u32), |(a, b), x| (a + x.1, b + x.2));
+        if sent + skipped == 0 {
+            0.0
+        } else {
+            skipped as f64 / (sent + skipped) as f64
+        }
+    }
+
+    /// The last keyframe has drained, and a little more.
+    pub(crate) fn key_clear(&self, now_ns: u64) -> bool {
+        now_ns >= self.key_clear_ns
+    }
+
+    /// Long enough since the last keyframe for a routine one.
+    pub(crate) fn key_routine(&self, now_ns: u64) -> bool {
+        now_ns >= self.key_routine_ns
+    }
+
+    pub(crate) fn reset(&mut self) {
+        *self = SendGate::default();
+    }
 }
 
 const FEEDBACK_QUEUE: usize = 64;
@@ -1892,6 +3258,79 @@ impl LinkShared {
         self.path_changes.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// The writer's pacing rate for this viewer; 0 when it paces as it always did.
+    pub fn pace_bps(&self) -> u64 {
+        self.pace_bps.load(Ordering::Relaxed)
+    }
+
+    /// The link side has cut something.
+    pub fn engaged(&self) -> bool {
+        self.engaged.load(Ordering::Relaxed)
+    }
+
+    /// How long the link side has been engaged in all, for as long as this governor has run.
+    pub fn engaged_ms(&self) -> u64 {
+        self.engaged_ms.load(Ordering::Relaxed)
+    }
+
+    /// What the link delivered in the newest judged window, for the resend budget's basis.
+    pub fn delivered_bps(&self) -> u64 {
+        self.delivered_bps.load(Ordering::Relaxed)
+    }
+
+    /// Nothing paced, nothing engaged, no backlog and no request pending: what a governor that
+    /// no longer runs left here would otherwise defer the next pipeline's frames, keep the writer
+    /// pacing and refusing resends, and keep loss from reaching the PLI back-off.
+    fn clear_link_state(&self) {
+        self.pace_bps.store(0, Ordering::Relaxed);
+        self.engaged.store(false, Ordering::Relaxed);
+        self.writer_until_ns.store(0, Ordering::Relaxed);
+        self.send_until_ns.store(0, Ordering::Relaxed);
+        self.key_origins.store(0, Ordering::Relaxed);
+        self.divisor.store(1, Ordering::Relaxed);
+        self.feedback.lock_recover().clear();
+    }
+
+    /// The writer's half: when what it holds will have left.
+    pub fn set_writer_until(&self, ns: u64) {
+        self.writer_until_ns.store(ns, Ordering::Relaxed);
+    }
+
+    /// The capture side's half: the sender holds more than a frame period, so the frame waits
+    /// (one relaxed load while nothing is paced).
+    pub fn sender_busy(&self) -> bool {
+        if self.pace_bps.load(Ordering::Relaxed) == 0 {
+            return false;
+        }
+        let period = 1_000_000_000 / self.fps.load(Ordering::Relaxed).max(1) as u64;
+        self.busy_until_ns() > crate::streamer::audio::host_now_ns() + BACKLOG_PERIODS * period
+    }
+
+    /// When the sender's backlog will have left (host ns).
+    pub fn busy_until_ns(&self) -> u64 {
+        self.writer_until_ns
+            .load(Ordering::Relaxed)
+            .max(self.send_until_ns.load(Ordering::Relaxed))
+    }
+
+    /// A frame was skipped at the sender for the backlog.
+    pub fn note_skip(&self) {
+        self.skipped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A keyframe request, with where it came from.
+    pub fn note_key_origin(&self, origin: u32) {
+        self.key_origins.fetch_or(origin, Ordering::Relaxed);
+        if origin & key_origin::UNREPAIRABLE != 0 {
+            self.keyframes_unrepairable.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn key_origins_pending(&self) -> u32 {
+        self.key_origins.load(Ordering::Relaxed)
+    }
+
     /// The capture gate's half.
     pub fn frame_divisor(&self) -> u32 {
         self.divisor.load(Ordering::Relaxed).clamp(1, MAX_DIVISOR)
@@ -1903,12 +3342,28 @@ impl LinkShared {
             return (!state.is_empty()).then(|| serde_json::json!({ "state": state }));
         }
         let r = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        let pacing = serde_json::json!({
+            "pace_mbps": r(&self.pace_bps) as f64 / 1e6,
+            "frames_skipped_at_sender": r(&self.skipped),
+            "keyframes_unrepairable": r(&self.keyframes_unrepairable),
+            "keyframes_paced": r(&self.keyframes_paced),
+            "plis_ignored_while_painting": r(&self.plis_ignored),
+            "keyframes_by_origin": {
+                "page": r(&self.keyframes_by_origin[0]),
+                "pli": r(&self.keyframes_by_origin[1]),
+                "distance": r(&self.keyframes_by_origin[2]),
+                "lag": r(&self.keyframes_by_origin[3]),
+                "unrepairable": r(&self.keyframes_by_origin[4]),
+                "start": r(&self.keyframes_by_origin[5]),
+            },
+        });
         Some(serde_json::json!({
             "state": self.state.get(),
             "link": self.link_on.load(Ordering::Relaxed),
             "ceiling": self.ceiling_on.load(Ordering::Relaxed),
             "qp_unsupported": self.qp_unsupported.load(Ordering::Relaxed),
             "frame_hold": self.frame_hold.load(Ordering::Relaxed),
+            "trailing_edge": self.trailing_edge.load(Ordering::Relaxed),
             "qp_user": self.user_qp.load(Ordering::Relaxed),
             "qp_effective": self.qp_effective.load(Ordering::Relaxed),
             "qp_link": self.qp_link.load(Ordering::Relaxed),
@@ -1941,6 +3396,13 @@ impl LinkShared {
             "qp_change_unconfirmed": r(&self.qp_change_unconfirmed),
             "costly_qp_changes": r(&self.costly_applied),
             "qp_ineffective": self.qp_ineffective.load(Ordering::Relaxed),
+            "keyframes_held": r(&self.keyframes_held),
+            "engagement": {
+                "count": r(&self.engagements),
+                "engaged_ms": r(&self.engaged_ms),
+                "last": self.last_engagement.get(),
+            },
+            "pacing": pacing,
         }))
     }
 }
@@ -1957,14 +3419,19 @@ pub(crate) fn arm(telemetry: &SessionTelemetry, config: &EncoderConfig) {
     l.height.store(config.height, Ordering::Relaxed);
     l.fps.store(config.fps, Ordering::Relaxed);
     l.frame_hold.store(false, Ordering::Relaxed);
+    l.trailing_edge.store(false, Ordering::Relaxed);
 }
 
-/// What the capture answers to "can I deliver a gated frame later": asked on every frame it
-/// gates, stored only when the answer changes.
-pub(crate) fn set_frame_hold(telemetry: &SessionTelemetry, yes: bool) {
-    let hold = &telemetry.link.frame_hold;
-    if hold.load(Ordering::Relaxed) != yes {
-        hold.store(yes, Ordering::Relaxed);
+/// What the capture answers to "can I deliver a gated frame later", and whether that is the
+/// ring's trailing edge: asked on every frame it gates, stored only when the answer changes.
+pub(crate) fn set_frame_hold(telemetry: &SessionTelemetry, yes: bool, trailing_edge: bool) {
+    let l = &telemetry.link;
+    if l.frame_hold.load(Ordering::Relaxed) != yes {
+        l.frame_hold.store(yes, Ordering::Relaxed);
+    }
+    let trailing_edge = yes && trailing_edge;
+    if l.trailing_edge.load(Ordering::Relaxed) != trailing_edge {
+        l.trailing_edge.store(trailing_edge, Ordering::Relaxed);
     }
 }
 
@@ -1982,6 +3449,10 @@ pub(crate) trait QpEncoder {
     fn set_qp_costly(&mut self, _qp: u8) -> Result<bool> {
         Ok(false)
     }
+    /// The highest QP `set_qp` reaches (libx264 widened for a user setting under 4 stops at 39).
+    fn qp_top(&self) -> u8 {
+        51
+    }
 }
 
 /// Verify the first frames after every change, then one in this many.
@@ -1997,6 +3468,8 @@ struct Emitted {
     len: u64,
     repeat: bool,
     keyframe: bool,
+    /// The QP it was submitted at.
+    q: u8,
     prefix: Option<Vec<u8>>,
 }
 
@@ -2029,16 +3502,40 @@ pub(crate) struct QpControl {
     /// The next submit is a keyframe; then, the last submit was.
     keyframe_next: bool,
     last_submit_key: bool,
+    keys: KeyPolicy,
+    /// Pace the sender to the link once engaged (`link_pace`).
+    link_pace: bool,
+    gate: SendGate,
+    skips_seen: u64,
+    /// Origins of the requests behind the keyframe still to come.
+    key_origins: u32,
+    /// The page's last stats `(received, frames painted)`, and whether it was painting then.
+    paint_seen: (u64, u32),
+    paint_moved_ns: u64,
+    painting: bool,
+    paint_polled_ns: u64,
+    /// The QP the frames after a coarse keyframe walk back from.
+    walk: u8,
+    /// The highest QP the encoder reaches; 0 until it has been asked.
+    top: u8,
 }
 
 impl QpControl {
     pub(crate) fn from_telemetry(telemetry: &std::sync::Arc<SessionTelemetry>) -> Option<Self> {
         Self::build(
             telemetry,
-            super::tune::candidate("link_governor"),
+            super::tune::on("link_governor"),
             super::tune::candidate("qp_ceiling_governor"),
             super::tune::candidate("client_pace_governor"),
         )
+        .map(|c| c.with_link_pace(super::tune::on("link_pace")))
+    }
+
+    /// Pace the sender to the link once the link side is engaged, instead of the frame divisor.
+    pub(crate) fn with_link_pace(mut self, yes: bool) -> Self {
+        self.link_pace = yes;
+        self.gov.set_pacing(yes);
+        self
     }
 
     pub(crate) fn build(
@@ -2075,7 +3572,7 @@ impl QpControl {
         l.qp_effective.store(q as u32, Ordering::Relaxed);
         l.qp_link.store(q as u32, Ordering::Relaxed);
         l.qp_max.store(QP_LINK_MAX.max(q) as u32, Ordering::Relaxed);
-        l.divisor.store(1, Ordering::Relaxed);
+        l.clear_link_state();
         l.state.set("armed".into());
         l.running.store(true, Ordering::Relaxed);
         l.listening.store(link, Ordering::Relaxed);
@@ -2113,6 +3610,17 @@ impl QpControl {
             path_changes_seen: l.path_changes.load(Ordering::Relaxed),
             keyframe_next: false,
             last_submit_key: false,
+            keys: KeyPolicy::default(),
+            link_pace: false,
+            gate: SendGate::default(),
+            skips_seen: l.skipped.load(Ordering::Relaxed),
+            key_origins: 0,
+            paint_seen: (0, 0),
+            paint_moved_ns: 0,
+            painting: false,
+            paint_polled_ns: 0,
+            walk: 0,
+            top: 0,
         })
     }
 
@@ -2122,12 +3630,14 @@ impl QpControl {
         if self.qp_unsupported {
             self.qp_unsupported = false;
             self.gov = Governors::new(self.q_user, self.ceiling_bps, self.fps, self.link);
+            self.gov.set_pacing(self.link_pace);
             self.shared
                 .link
                 .qp_unsupported
                 .store(false, Ordering::Relaxed);
         }
         self.applied = self.q_user;
+        self.top = 0;
     }
 
     /// Before every submit, frames and repeats alike: look at what left since the last one, take
@@ -2155,10 +3665,18 @@ impl QpControl {
                 tprintln!("QP governor: QP {q} applied through the encoder's slower path");
             }
         }
+        if self.top == 0 {
+            self.top = enc.qp_top().max(1);
+            self.gov.limit_qp(self.top);
+        }
         let now = crate::streamer::audio::host_now_ns();
         let l = &self.shared.link;
         let hold = l.frame_hold.load(Ordering::Relaxed);
+        // the classic path's held copy serves the link side only: the client's pace cuts the
+        // frame rate where it always could, on the ring's trailing edge
+        let trailing = l.trailing_edge.load(Ordering::Relaxed);
         self.gov.hold_frames(hold);
+        self.gov.last_resort(trailing);
         let changes = l.path_changes.load(Ordering::Relaxed);
         if changes != self.path_changes_seen {
             self.path_changes_seen = changes;
@@ -2171,6 +3689,32 @@ impl QpControl {
             for (t, s) in self.drained.drain(..) {
                 self.gov.feedback(t, &s);
             }
+        }
+        if self.gov.pace_bps() > 0.0 && now.saturating_sub(self.paint_polled_ns) >= 500 * MS {
+            self.paint_polled_ns = now;
+            // painting through its own decoder within the last few seconds: a keyframe draining
+            // at the pace pauses the picture longer than one stats interval, and is not a stall
+            if let Some(c) = self
+                .shared
+                .client
+                .get()
+                .filter(|c| c.transport_tier != 0 && c.received_host_ns != self.paint_seen.0)
+            {
+                if self.paint_seen.0 != 0 && c.frames_painted != self.paint_seen.1 {
+                    self.paint_moved_ns = c.received_host_ns;
+                }
+                self.paint_seen = (c.received_host_ns, c.frames_painted);
+            }
+            self.painting = self.paint_moved_ns != 0
+                && now.saturating_sub(self.paint_moved_ns) < PAINT_RECENT_NS;
+        }
+        if self.link_pace {
+            let skipped = l.skipped.load(Ordering::Relaxed);
+            self.gate
+                .skipped(now, skipped.saturating_sub(self.skips_seen) as u32);
+            self.skips_seen = skipped;
+            self.gov
+                .sender(self.gate.skip_share(now), self.gate.draining(now));
         }
         let was_engaged = self.gov.engaged();
         if let Some(why) = self.gov.tick(now) {
@@ -2188,7 +3732,7 @@ impl QpControl {
         }
         // the client's own pace, about once a STATS frame: its divisor never touches the QP, and
         // a path that cannot hold a gated frame does not cut the frame rate for it either
-        if let Some(pace) = self.pace.as_mut().filter(|_| hold) {
+        if let Some(pace) = self.pace.as_mut().filter(|_| trailing) {
             if now.saturating_sub(self.pace_polled_ns) >= 250 * MS {
                 self.pace_polled_ns = now;
                 if let Some(why) = pace.observe(now, self.shared.client_pace()) {
@@ -2199,10 +3743,13 @@ impl QpControl {
                 }
             }
         }
+        let client = if trailing {
+            self.pace.as_ref().map_or(1, |p| p.divisor())
+        } else {
+            1
+        };
         let div = if hold {
-            self.gov
-                .divisor()
-                .max(self.pace.as_ref().map_or(1, |p| p.divisor()))
+            self.gov.divisor().max(client)
         } else {
             1
         };
@@ -2221,8 +3768,26 @@ impl QpControl {
                 .store((w.sigma * 1e3) as u64, Ordering::Relaxed);
             l.loss_milli.store((w.loss * 1e3) as u64, Ordering::Relaxed);
             l.rebases.store(g.rebases, Ordering::Relaxed);
+            l.engaged_ms.store(g.engaged_ns / MS, Ordering::Relaxed);
+            if l.engagements.load(Ordering::Relaxed) != g.engagements {
+                l.engagements.store(g.engagements, Ordering::Relaxed);
+                l.last_engagement.set(g.last_engagement.clone());
+            }
             l.halving_milli
                 .store((g.halving_qp() * 1e3) as u64, Ordering::Relaxed);
+        }
+        let pace = self.gov.pace_bps() as u64;
+        if l.pace_bps.load(Ordering::Relaxed) != pace {
+            l.pace_bps.store(pace, Ordering::Relaxed);
+            if pace == 0 {
+                self.gate.reset();
+                l.writer_until_ns.store(0, Ordering::Relaxed);
+                l.send_until_ns.store(0, Ordering::Relaxed);
+            }
+        }
+        let engaged = self.gov.link_engaged();
+        if l.engaged.load(Ordering::Relaxed) != engaged {
+            l.engaged.store(engaged, Ordering::Relaxed);
         }
         let key = std::mem::take(&mut self.keyframe_next);
         self.last_submit_key = key;
@@ -2231,8 +3796,30 @@ impl QpControl {
             return;
         }
         let mut q = self.gov.q();
+        if !self.gov.engaged() {
+            // let go means let go: no frame walks back from a keyframe the governor coarsened
+            self.walk = 0;
+        }
         if key && self.gov.engaged() && !self.gov.qp_dead {
-            q = q.saturating_add(KEYFRAME_BOOST).min(QP_LAST_RESORT);
+            if self.gov.link_engaged() {
+                q = self
+                    .keys
+                    .key_qp(q, self.gov.link_bps(), self.gov.pace_bps() > 0.0)
+                    .min(self.top.max(q));
+                self.walk = q;
+            } else {
+                // the ceiling alone: boosted, and the frame after goes straight back, as it did
+                q = q.saturating_add(KEYFRAME_BOOST).min(QP_LAST_RESORT);
+                self.walk = 0;
+            }
+        } else if self.walk > q {
+            self.walk = self.walk.saturating_sub(KEY_RETURN_STEP).max(q);
+            q = self.walk;
+            if self.walk == self.gov.q() {
+                self.walk = 0;
+            }
+        } else {
+            self.walk = 0;
         }
         match enc.set_qp(q) {
             Ok(true) => {
@@ -2304,12 +3891,105 @@ impl QpControl {
         self.keyframe_next = keyframe;
     }
 
+    /// Whether the next submit is a keyframe, `asked` being the request just taken from the
+    /// encoder's flag (see [`KeyPolicy`]). Called for every submit but a session's first. With
+    /// the link side idle it answers `asked`.
+    pub(crate) fn admit_keyframe(&mut self, asked: bool) -> bool {
+        if self.off {
+            return asked;
+        }
+        let l = &self.shared.link;
+        let origins = if asked {
+            l.key_origins.swap(0, Ordering::Relaxed)
+        } else {
+            0
+        };
+        let held = self.keys.held_requests;
+        let now = crate::streamer::audio::host_now_ns();
+        let since_key = self
+            .keys
+            .last_key_ns
+            .map_or(u64::MAX, |t| now.saturating_sub(t));
+        let paced = self.gov.pace_bps() > 0.0;
+        let asked = if paced && asked && pli_is_noise(origins, self.painting, since_key) {
+            l.plis_ignored.fetch_add(1, Ordering::Relaxed);
+            false
+        } else {
+            asked
+        };
+        if asked {
+            self.key_origins |= origins;
+        }
+        let go = if paced {
+            let go = self.keys.admit_paced(
+                now,
+                asked,
+                origins & key_origin::URGENT != 0,
+                self.gate.key_clear(now),
+                self.gate.key_routine(now),
+            );
+            if go {
+                l.keyframes_paced.fetch_add(1, Ordering::Relaxed);
+            }
+            go
+        } else {
+            self.keys.admit(
+                now,
+                asked,
+                origins & key_origin::URGENT != 0,
+                self.gov.link_engaged(),
+                self.gov.link_bps(),
+            )
+        };
+        if self.keys.held_requests != held {
+            l.keyframes_held
+                .store(self.keys.held_requests, Ordering::Relaxed);
+        }
+        if go {
+            let o = std::mem::take(&mut self.key_origins);
+            for (i, c) in l.keyframes_by_origin.iter().enumerate() {
+                if o & (1 << i) != 0 {
+                    c.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        go
+    }
+
+    /// A held keyframe request may go now: an idle path should submit something to carry it.
+    pub(crate) fn keyframe_due(&self) -> bool {
+        if self.off || !self.keys.held {
+            return false;
+        }
+        let now = crate::streamer::audio::host_now_ns();
+        if self.gov.pace_bps() > 0.0 {
+            return self.gate.key_clear(now)
+                && (self.keys.held_urgent || self.gate.key_routine(now));
+        }
+        self.keys
+            .due(now, self.gov.link_engaged(), self.gov.link_bps())
+    }
+
     /// After an access unit has been handed to the transport. Records it and nothing more: the
     /// first bytes are copied only when a read is due (a keyframe, a move being checked, a
     /// periodic check), and everything else waits for the next submit.
     pub(crate) fn emitted(&mut self, au: &[u8], repeat: bool) {
         if self.off || au.is_empty() {
             return;
+        }
+        let pace = self.gov.pace_bps();
+        if pace > 0.0 {
+            let l = &self.shared.link;
+            let writer = l.writer_until_ns.load(Ordering::Relaxed);
+            self.gate.sent(
+                crate::streamer::audio::host_now_ns(),
+                au.len() as u64,
+                pace,
+                writer,
+                self.last_submit_key,
+            );
+            l.send_until_ns
+                .store(self.gate.until(writer), Ordering::Relaxed);
         }
         if self.pending.len() >= PENDING_KEEP {
             // nothing has been submitted for a while; the oldest records say nothing new
@@ -2336,6 +4016,7 @@ impl QpControl {
             len: au.len() as u64,
             repeat,
             keyframe: key,
+            q: self.applied,
             prefix,
         });
     }
@@ -2354,9 +4035,15 @@ impl QpControl {
             None => (None, false),
         };
         let keyframe = e.keyframe || idr;
+        if keyframe {
+            self.keys.sent(e.len, qp.unwrap_or(e.q));
+        }
         let l = &self.shared.link;
         let unconfirmed = self.gov.unconfirmed;
-        if let Some(c) = self.gov.emitted(e.at_ns, e.len, e.repeat, keyframe, qp) {
+        if let Some(c) = self
+            .gov
+            .emitted(e.at_ns, e.len, e.repeat, keyframe, qp, e.q)
+        {
             self.costly = Some(c);
         }
         if self.gov.unconfirmed != unconfirmed {
@@ -2415,7 +4102,7 @@ impl Drop for QpControl {
         let l = &self.shared.link;
         if l.generation.load(Ordering::Relaxed) == self.generation {
             l.listening.store(false, Ordering::Relaxed);
-            l.divisor.store(1, Ordering::Relaxed);
+            l.clear_link_state();
         }
     }
 }
@@ -2569,10 +4256,44 @@ mod tests {
         },
     }
 
+    /// How the simulated host answers a keyframe request.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Keys {
+        /// A keyframe at the governed QP, at once (what the simulations always did).
+        Plain,
+        /// The code before keyframes were governed: at once, six steps coarser while engaged.
+        Boosted,
+        /// [`KeyPolicy`], with the walk back after a coarse keyframe, as `QpControl` does it.
+        Governed,
+    }
+
+    /// A keyframe's size at QP 15: the desktop's.
+    const KEY_BYTES: u64 = 400_000;
+
     struct Sim {
         /// QP steps that halve the bits: 6 by the textbook, ~16 for noise-dominated content
         /// (the real-encoder tests below measured x1.26 to x1.30 per six steps on such content).
         halving_qp: f64,
+        keys: Keys,
+        /// The same for a keyframe.
+        key_halving: f64,
+        /// The browser's PLIs: one every so many ms, through the PLI back-off (opened by any
+        /// loss a report shows) and the keyframe gate, as the transport takes them.
+        pli_every_ms: Option<u64>,
+        /// The page's own keyframe requests, one every so many ms.
+        page_every_ms: Option<u64>,
+        /// A P frame finer than the picture it predicts from refines it: this share of a
+        /// keyframe's bytes at the finer QP, less the coarser one's.
+        refine: Option<f64>,
+        policy: KeyPolicy,
+        backoff: crate::streamer::keyframe::PliBackoff,
+        gate: crate::streamer::keyframe::KeyframeGate,
+        idr_flag: bool,
+        page_asked: bool,
+        level: u8,
+        walk: u8,
+        /// (send ms, bytes, QP) of every keyframe.
+        keyframes: Vec<(u64, u64, u8)>,
         model: Model,
         /// The QP the costly path put in force, for `Model::Ignores`.
         costly_q: Option<u8>,
@@ -2590,6 +4311,10 @@ mod tests {
         reports: VecDeque<(u64, PathSample)>,
         /// (time ms, q, divisor) at every change.
         trace: Vec<(u64, u8, u32)>,
+        /// Loss starts here (ns); feedback reports lost on the way back.
+        loss_from_ns: u64,
+        loss_until_ns: u64,
+        report_loss: f64,
         /// Per frame: (send ms, queueing delay of its first packet in ms, None if it lost one).
         frames: Vec<(u64, Option<f64>)>,
     }
@@ -2598,6 +4323,19 @@ mod tests {
         fn new(path: Path, seed: u64) -> Self {
             Sim {
                 halving_qp: 6.0,
+                keys: Keys::Plain,
+                key_halving: 6.0,
+                pli_every_ms: None,
+                page_every_ms: None,
+                refine: None,
+                policy: KeyPolicy::default(),
+                backoff: crate::streamer::keyframe::PliBackoff::new(),
+                gate: crate::streamer::keyframe::KeyframeGate::new(),
+                idr_flag: false,
+                page_asked: false,
+                level: 15,
+                walk: 0,
+                keyframes: Vec::new(),
                 model: Model::Honest,
                 costly_q: None,
                 force_key: false,
@@ -2612,6 +4350,9 @@ mod tests {
                 reported_to: 0,
                 reports: VecDeque::new(),
                 trace: Vec::new(),
+                loss_from_ns: 0,
+                loss_until_ns: u64::MAX,
+                report_loss: 0.0,
                 frames: Vec::new(),
             }
         }
@@ -2646,7 +4387,13 @@ mod tests {
                 let lost = if self.lose_next > 0 {
                     self.lose_next -= 1;
                     true
-                } else if self.rng.next() < self.path.loss {
+                } else if self.rng.next()
+                    < if (self.loss_from_ns..self.loss_until_ns).contains(&t_ns) {
+                        self.path.loss
+                    } else {
+                        0.0
+                    }
+                {
                     self.lose_next = self.path.loss_run;
                     true
                 } else {
@@ -2727,6 +4474,10 @@ mod tests {
                     }
                 }
                 self.reported_to = j + 1;
+                // feedback lost on the way back is never repeated
+                if self.report_loss > 0.0 && self.rng.next() < self.report_loss {
+                    continue;
+                }
                 self.reports
                     .push_back(((r + self.path.prop_us) as u64 * 1_000, s));
             }
@@ -2740,7 +4491,29 @@ mod tests {
                 self.client_reports(now);
                 while self.reports.front().is_some_and(|(t, _)| *t <= now) {
                     let (t, s) = self.reports.pop_front().unwrap();
+                    if s.lost > 0 {
+                        self.backoff.note_evidence();
+                    }
                     g.feedback(t, &s);
+                }
+                let tick = |every: Option<u64>| {
+                    every.is_some_and(|ms| {
+                        k > 0 && (k * 1_000 / FPS) / ms > ((k - 1) * 1_000 / FPS) / ms
+                    })
+                };
+                if tick(self.pli_every_ms)
+                    && self
+                        .backoff
+                        .allow_with_cap(now, crate::streamer::keyframe::PLI_BACKOFF_CAP_MS)
+                    && self.gate.allow(now)
+                {
+                    self.idr_flag = true;
+                }
+                if tick(self.page_every_ms) {
+                    self.page_asked = true;
+                    if self.gate.allow(now) {
+                        self.idr_flag = true;
+                    }
                 }
                 g.tick(now);
                 let (q, d) = (g.q(), g.divisor());
@@ -2752,20 +4525,67 @@ mod tests {
                     continue;
                 }
                 let (mut base, mut key) = content(k);
-                if std::mem::take(&mut self.force_key) {
-                    (base, key) = (400_000, true);
+                let asked = std::mem::take(&mut self.idr_flag);
+                let forced = match self.keys {
+                    Keys::Plain | Keys::Boosted => asked,
+                    Keys::Governed => {
+                        let page = std::mem::take(&mut self.page_asked);
+                        self.policy
+                            .admit(now, asked, page, g.link_engaged(), g.link_bps())
+                    }
+                };
+                if std::mem::take(&mut self.force_key) || forced {
+                    (base, key) = (KEY_BYTES, true);
                 }
                 if base == 0 {
                     // nothing changed on screen and no repeat is due
                     continue;
                 }
-                let sq = match self.model {
+                let mut sq = match self.model {
                     Model::Honest => q,
                     Model::Ignores { .. } => self.costly_q.unwrap_or(15),
                 };
-                let scale = 2f64.powf(-(sq as f64 - 15.0) / self.halving_qp) * (d as f64).sqrt();
-                let bytes = (base as f64 * scale) as u64;
-                if let Some((want, in_force)) = g.emitted(now, bytes, false, key, Some(sq)) {
+                if self.model == Model::Honest {
+                    let engaged = g.engaged();
+                    match self.keys {
+                        Keys::Boosted if key && engaged => {
+                            sq = sq.saturating_add(KEYFRAME_BOOST).min(QP_LAST_RESORT);
+                        }
+                        Keys::Governed if key && engaged => {
+                            sq = if g.link_engaged() {
+                                self.policy.key_qp(sq, g.link_bps(), false)
+                            } else {
+                                sq.saturating_add(KEYFRAME_BOOST).min(QP_LAST_RESORT)
+                            };
+                            self.walk = sq;
+                        }
+                        Keys::Governed if !key && self.walk > sq => {
+                            self.walk = self.walk.saturating_sub(KEY_RETURN_STEP).max(sq);
+                            sq = self.walk;
+                        }
+                        _ => {}
+                    }
+                }
+                let at = |q: u8, h: f64| 2f64.powf(-(q as f64 - 15.0) / h);
+                let mut bytes = if key {
+                    (base as f64 * at(sq, self.key_halving)) as u64
+                } else {
+                    (base as f64 * at(sq, self.halving_qp) * (d as f64).sqrt()) as u64
+                };
+                if let Some(share) = self.refine {
+                    if !key && sq < self.level {
+                        let kh = self.key_halving;
+                        bytes +=
+                            (share * KEY_BYTES as f64 * (at(sq, kh) - at(self.level, kh))) as u64;
+                    }
+                    self.level = sq;
+                }
+                if key {
+                    self.policy.sent(bytes, sq);
+                    self.keyframes.push((now / MS, bytes, sq));
+                }
+                let asked = if self.model == Model::Honest { sq } else { q };
+                if let Some((want, in_force)) = g.emitted(now, bytes, false, key, Some(sq), asked) {
                     let works = self.model == Model::Ignores { costly_works: true };
                     if works {
                         self.costly_q = Some(want);
@@ -2776,6 +4596,14 @@ mod tests {
                 }
                 self.send(now, bytes);
             }
+        }
+
+        /// Keyframes sent in `[from, to)` ms.
+        fn keyframes_in(&self, from: u64, to: u64) -> usize {
+            self.keyframes
+                .iter()
+                .filter(|(t, _, _)| (from..to).contains(t))
+                .count()
         }
 
         fn moves(&self) -> usize {
@@ -2948,7 +4776,8 @@ mod tests {
         let settled = sim
             .settled_after(10_000, 60.0, 1_000)
             .expect("never fitted");
-        assert!(settled <= 1_000, "settled {settled} ms after the cap");
+        // engagement takes a second of sustained shortfall on top of the first verdict
+        assert!(settled <= 2_000, "settled {settled} ms after the cap");
         assert_eq!(g.divisor(), 1, "5 Mbps needs no frame-rate cut for 12 Mbps");
         let late = sim.bad_frames(12_000, 40_000, 60.0);
         assert!(late * 100 < 28 * FPS as usize * 3, "{late} late frames");
@@ -2958,7 +4787,8 @@ mod tests {
     }
 
     #[test]
-    fn a_step_down_to_1_5_mbps_fits_and_gates_the_frame_rate_only_past_the_qp_bound() {
+    fn a_step_down_to_1_5_mbps_fits_at_the_full_frame_rate() {
+        // 20 Mbps at QP 40 is 1.1 Mbps: the QP range carries it, so no frame is withheld
         let mut g = governors();
         let mut sim = Sim::new(capped(|t| if t < 10_000 * MS { 1e9 } else { 1.5e6 }), 31);
         sim.run(&mut g, 40, &steady(20.0));
@@ -2967,15 +4797,73 @@ mod tests {
             .settled_after(10_000, 60.0, 1_000)
             .expect("never fitted");
         assert!(settled <= 2_500, "settled {settled} ms after the cap");
-        for w in sim.trace.windows(2) {
-            if w[1].2 > w[0].2 {
-                assert_eq!(w[0].1, QP_LINK_MAX, "{:?}", sim.trace);
+        assert!(sim.trace.iter().all(|t| t.2 == 1), "{:?}", sim.trace);
+    }
+
+    /// Steady content into a cap the QP range can carry (`rate at QP_LINK_MAX` under what the
+    /// governor aims for), from a light squeeze to 1 Mbps: the frame rate is never touched.
+    #[test]
+    fn for_any_cap_the_qp_range_can_carry_the_frame_rate_is_never_touched() {
+        type Cap = (fn(u64) -> f64, f64);
+        let caps: [Cap; 6] = [
+            (|t| if t < 5_000 * MS { 1e9 } else { 8e6 }, 8e6),
+            (|t| if t < 5_000 * MS { 1e9 } else { 5e6 }, 5e6),
+            (|t| if t < 5_000 * MS { 1e9 } else { 3e6 }, 3e6),
+            (|t| if t < 5_000 * MS { 1e9 } else { 2e6 }, 2e6),
+            (|t| if t < 5_000 * MS { 1e9 } else { 1.5e6 }, 1.5e6),
+            (|t| if t < 5_000 * MS { 1e9 } else { 1e6 }, 1e6),
+        ];
+        for (seed, (cap, bps)) in caps.into_iter().enumerate() {
+            for mbps in [12.0, 20.0] {
+                let at_bound = mbps * 1e6 * 2f64.powf(-((QP_LINK_MAX - 15) as f64) / 6.0);
+                if at_bound > TARGET_MAX * bps * 0.95 {
+                    continue;
+                }
+                let mut g = governors();
+                let mut sim = Sim::new(capped(cap), 200 + seed as u64);
+                sim.run(&mut g, 30, &steady(mbps));
+                eprintln!("{mbps} Mbps into {:.1} Mbps: {:?}", bps / 1e6, sim.trace);
+                assert!(
+                    sim.trace.iter().all(|t| t.2 == 1),
+                    "{mbps} Mbps into {bps}: {:?}",
+                    sim.trace
+                );
+                assert!(sim.settled_after(5_000, 60.0, 1_000).is_some());
             }
         }
-        assert!(
-            g.divisor() > 1,
-            "20 Mbps at QP 34 is 2.2 Mbps: the rate must come down"
-        );
+    }
+
+    #[test]
+    fn past_the_qp_bound_the_frame_rate_is_halved_before_it_is_quartered() {
+        // 40 Mbps at QP 40 is 2.2 Mbps into 1.5: only now is the frame rate cut
+        for (seed, last_resort) in [(32u64, true), (33, false)] {
+            let mut g = governors();
+            g.last_resort(last_resort);
+            let mut sim = Sim::new(capped(|t| if t < 10_000 * MS { 1e9 } else { 1.5e6 }), seed);
+            sim.run(&mut g, 40, &steady(40.0));
+            report("cap1_5, 40 Mbps", &sim, 10_000);
+            assert!(sim.trace.iter().any(|t| t.2 > 1), "{:?}", sim.trace);
+            let mut prev = (15, 1);
+            for &(_, q, d) in &sim.trace {
+                if d > prev.1 {
+                    assert_eq!(
+                        prev.0, QP_LINK_MAX,
+                        "frames before quality: {:?}",
+                        sim.trace
+                    );
+                    assert!(
+                        d <= 2 * prev.1,
+                        "more than a halving at once: {:?}",
+                        sim.trace
+                    );
+                }
+                if !last_resort {
+                    assert!(q <= QP_LINK_MAX, "past the bound off the trailing edge");
+                }
+                prev = (q, d);
+            }
+            assert!(sim.settled_after(10_000, 60.0, 1_000).unwrap() <= 3_500);
+        }
     }
 
     #[test]
@@ -3079,12 +4967,13 @@ mod tests {
         let late = sim.bad_frames(14_000, 40_000, 60.0);
         // detection waits for two windows of evidence on the window minimum, and each failed
         // probe runs that much longer into the cap
-        assert!(late * 100 < 26 * FPS as usize * 8, "{late} late frames");
+        // and engagement waits for a second of sustained shortfall
+        assert!(late * 100 < 26 * FPS as usize * 25, "{late} late frames");
     }
 
     #[test]
     fn past_the_bound_and_a_quarter_of_the_frames_the_qp_is_the_last_resort() {
-        // 40 Mbps of noise into 1.5 Mbps: QP 34 at a quarter of the frames is still 2.2 Mbps
+        // 80 Mbps of noise into 1.5 Mbps: QP 40 at a quarter of the frames is still 2.2 Mbps
         let mut g = governors();
         let lifts = |t| {
             if (10_000 * MS..30_000 * MS).contains(&t) {
@@ -3094,7 +4983,7 @@ mod tests {
             }
         };
         let mut sim = Sim::new(capped(lifts), 111);
-        sim.run(&mut g, 60, &steady(40.0));
+        sim.run(&mut g, 60, &steady(80.0));
         report("last resort", &sim, 10_000);
         let peak = sim.trace.iter().map(|t| t.1).max().unwrap();
         assert!(peak > QP_LINK_MAX, "{:?}", sim.trace);
@@ -3115,7 +5004,10 @@ mod tests {
             after[..first_div_step].iter().all(|t| t.1 >= QP_LINK_MAX),
             "{after:?}"
         );
-        assert_eq!((g.q(), g.divisor()), (15, 1), "{:?}", sim.trace);
+        // the link side lets go entirely; 80 Mbps is over the LAN ceiling, which keeps its own
+        let l = g.link.as_ref().unwrap();
+        assert_eq!((l.q(), l.divisor()), (15, 1), "{:?}", sim.trace);
+        assert_eq!(g.q(), g.ceiling.as_ref().unwrap().q());
     }
 
     #[test]
@@ -3135,7 +5027,7 @@ mod tests {
         let settled = sim
             .settled_after(10_000, 60.0, 1_000)
             .expect("never fitted");
-        assert!(settled <= 3_000, "settled {settled} ms after the cap");
+        assert!(settled <= 4_500, "settled {settled} ms after the cap");
     }
 
     #[test]
@@ -3297,12 +5189,238 @@ mod tests {
         }
     }
 
+    // keyframes on a governed link
+
+    #[test]
+    fn an_idle_link_answers_every_keyframe_request_as_it_came() {
+        let mut p = KeyPolicy::default();
+        let mut r = Rng(5);
+        for k in 0..2_000u64 {
+            let asked = r.next() < 0.3;
+            let page = r.next() < 0.1;
+            assert_eq!(
+                p.admit(k * PERIOD_NS, asked, page, false, 5e6),
+                asked,
+                "frame {k}"
+            );
+            if asked {
+                p.sent(400_000, 15);
+            }
+        }
+        assert_eq!(p.held_requests, 0);
+        assert!(!p.due(2_000 * PERIOD_NS, false, 5e6));
+    }
+
+    #[test]
+    fn an_engaged_link_holds_unasked_keyframes_and_never_the_pages() {
+        let mut p = KeyPolicy::default();
+        let link = 5e6;
+        assert!(p.admit(0, true, false, true, link), "the first one goes");
+        p.sent(40_000, 34);
+        // a PLI 300 ms later waits for the gap, and is not lost
+        assert!(!p.admit(300 * MS, true, false, true, link));
+        assert_eq!(p.held_requests, 1);
+        assert!(!p.admit(1_000 * MS, false, false, true, link));
+        assert!(!p.due(1_900 * MS, true, link));
+        assert!(p.due(KEY_GAP_MIN_NS, true, link));
+        assert!(
+            p.admit(KEY_GAP_MIN_NS, false, false, true, link),
+            "carried after the gap"
+        );
+        // the page asking goes at once, and takes a held request with it
+        let t = KEY_GAP_MIN_NS;
+        assert!(p.admit(t + 100 * MS, true, true, true, link));
+        assert!(!p.admit(t + 200 * MS, true, false, true, link));
+        assert!(p.admit(t + 250 * MS, false, true, true, link));
+        // a link that lets go lets a held request go with it
+        assert!(!p.admit(t + 300 * MS, true, false, true, link));
+        assert!(p.admit(t + 316 * MS, false, false, false, link));
+        assert_eq!(p.held_requests, 3);
+    }
+
+    #[test]
+    fn the_keyframe_gap_follows_what_the_last_one_costs_to_drain_within_bounds() {
+        let mut p = KeyPolicy::default();
+        assert_eq!(p.gap_ns(0.0), KEY_GAP_MIN_NS);
+        // 15 KB at 1.5 Mbps drains through the 15 % the stream leaves free in 0.53 s
+        p.sent(15_000, 46);
+        assert_eq!(p.gap_ns(1.5e6), KEY_GAP_MIN_NS);
+        p.sent(45_000, 46);
+        let g = p.gap_ns(1.5e6);
+        assert!(g > KEY_GAP_MIN_NS && g < KEY_GAP_MAX_NS, "{g}");
+        p.sent(400_000, 46);
+        assert_eq!(p.gap_ns(1.5e6), KEY_GAP_MAX_NS);
+    }
+
+    #[test]
+    fn a_keyframe_on_a_governed_link_is_sized_to_the_link_and_bounded() {
+        let mut p = KeyPolicy::default();
+        // nothing known yet: the boost
+        assert_eq!(p.key_qp(24, 5e6, false), 24 + KEYFRAME_BOOST);
+        // 400 KB at QP 15 into 5 Mbps: a 50 KB burst is three halvings, eight steps each
+        p.sent(400_000, 15);
+        assert_eq!(p.key_qp(24, 5e6, false), 39);
+        // never past the bound, never under the frames' own QP
+        assert_eq!(p.key_qp(30, 1.5e6, false), KEY_QP_MAX);
+        assert_eq!(p.key_qp(48, 1.5e6, false), 48);
+        // one that fits gets the boost and no more
+        p.sent(20_000, 30);
+        assert_eq!(p.key_qp(24, 5e6, false), 30);
+        // two keyframes at different QPs show how size answers QP here
+        let mut p = KeyPolicy::default();
+        p.sent(400_000, 15);
+        p.sent(100_000, 27);
+        assert!(p.key_halving < KEY_HALVING, "{}", p.key_halving);
+        assert!(p.key_halving >= SLOPE_MIN);
+    }
+
+    /// The browser's periodic PLIs (an encoded-transform page's idle decoder asks about every
+    /// 280 ms, and loss opens the back-off) on a 5 Mbps cap: with keyframes answered at once the
+    /// loop the live runs showed comes back every few seconds; governed, the stream fits and the
+    /// frame rate is never touched.
+    #[test]
+    fn periodic_plis_on_a_5_mbps_cap_no_longer_cut_the_frame_rate() {
+        let run = |keys: Keys| {
+            let mut g = governors();
+            let mut sim = Sim::new(capped(|t| if t < 10_000 * MS { 1e9 } else { 5e6 }), 301);
+            sim.keys = keys;
+            sim.key_halving = 10.0;
+            sim.pli_every_ms = Some(280);
+            sim.refine = Some(0.5);
+            sim.run(&mut g, 40, &steady(11.0));
+            sim
+        };
+        let before = run(Keys::Boosted);
+        let after = run(Keys::Governed);
+        for (name, sim) in [("answered at once", &before), ("governed", &after)] {
+            report(name, sim, 10_000);
+            eprintln!(
+                "  {name}: {} keyframes in the capped 30 s, {} frame-rate moves, {} late or \
+                 broken frames after the first 4 s",
+                sim.keyframes_in(10_000, 40_000),
+                sim.trace.iter().filter(|t| t.2 > 1).count(),
+                sim.bad_frames(14_000, 40_000, 60.0),
+            );
+        }
+        assert!(after.trace.iter().all(|t| t.2 == 1), "{:?}", after.trace);
+        assert!(
+            after.keyframes_in(12_000, 40_000) as u64 <= 28_000 * MS / KEY_GAP_MIN_NS + 1,
+            "{:?}",
+            after.keyframes
+        );
+        assert!(
+            after.bad_frames(14_000, 40_000, 60.0) < before.bad_frames(14_000, 40_000, 60.0),
+            "governed keyframes did not help"
+        );
+    }
+
+    /// The same at 1.5 Mbps, where even a keyframe at the bound does not fit a burst: one per
+    /// gap, and the frame rate is still never touched for it.
+    #[test]
+    fn periodic_plis_on_a_1_5_mbps_cap_leave_the_frame_rate_alone() {
+        let mut g = governors();
+        let mut sim = Sim::new(capped(|t| if t < 10_000 * MS { 1e9 } else { 1.5e6 }), 303);
+        sim.keys = Keys::Governed;
+        sim.key_halving = 10.0;
+        sim.pli_every_ms = Some(280);
+        sim.refine = Some(0.5);
+        sim.run(&mut g, 40, &steady(11.0));
+        report("cap1_5 with PLIs, governed", &sim, 10_000);
+        eprintln!("  keyframes {:?}", sim.keyframes);
+        assert!(sim.trace.iter().all(|t| t.2 == 1), "{:?}", sim.trace);
+        assert!(sim.keyframes_in(12_000, 40_000) as u64 <= 28_000 * MS / KEY_GAP_MIN_NS + 1);
+        assert!(sim
+            .keyframes
+            .iter()
+            .filter(|k| k.0 >= 12_000)
+            .all(|k| k.2 <= KEY_QP_MAX));
+    }
+
+    /// The page asks for a keyframe when its decoder cannot go on: on a governed link that is
+    /// answered within a frame, every time.
+    #[test]
+    fn the_pages_own_keyframe_request_is_answered_at_once_on_a_governed_link() {
+        let mut g = governors();
+        let mut sim = Sim::new(capped(|t| if t < 5_000 * MS { 1e9 } else { 5e6 }), 311);
+        sim.keys = Keys::Governed;
+        sim.key_halving = 10.0;
+        sim.page_every_ms = Some(700);
+        sim.run(&mut g, 20, &steady(11.0));
+        assert!(sim.q_at(19_000).0 > 15, "never engaged: {:?}", sim.trace);
+        for n in 8..28u64 {
+            let asked = n * 700;
+            assert!(
+                sim.keyframes
+                    .iter()
+                    .any(|k| k.0 + 1 >= asked && k.0 <= asked + 2 * PERIOD_NS / MS),
+                "the request at {asked} ms waited: {:?}",
+                sim.keyframes
+            );
+        }
+    }
+
+    /// On links that never give a congestion verdict (a clean LAN, random and burst loss, a
+    /// jittery path) a governor with every switch on sends the same keyframes, at the same QP and
+    /// the same moments, as no governor at all, and never moves the QP or the frame rate.
+    #[test]
+    fn with_no_congestion_verdict_keyframes_qp_and_frame_rate_are_as_without_a_governor() {
+        let lossy = Path {
+            cap: |_| 200e6,
+            queue_s: 0.2,
+            prop_us: 20_000,
+            jitter_us: 10_000.0,
+            loss: 0.02,
+            stall: None,
+            delay_step: None,
+            loss_run: 3,
+        };
+        for (i, path) in [lan(), lossy].into_iter().enumerate() {
+            let run = |keys: Keys, governed: bool| {
+                let mut g = if governed {
+                    governors()
+                } else {
+                    Governors::new(15, None, 60, false)
+                };
+                let mut sim = Sim::new(path.clone(), 401 + i as u64);
+                sim.keys = keys;
+                sim.pli_every_ms = Some(280);
+                sim.page_every_ms = Some(1_300);
+                sim.run(&mut g, 60, &desktop(4));
+                sim
+            };
+            let bare = run(Keys::Plain, false);
+            let gov = run(Keys::Governed, true);
+            assert_eq!(gov.moves(), 0, "path {i}: {:?}", gov.trace);
+            assert!(!bare.keyframes.is_empty());
+            assert_eq!(gov.keyframes, bare.keyframes, "path {i}");
+            assert_eq!(gov.frames, bare.frames, "path {i}");
+        }
+    }
+
+    /// A classic capture holds its gated frames (frame hold) but is not the trailing edge: past
+    /// the bound it cuts the frame rate, and the QP never goes past the bound.
+    #[test]
+    fn a_classic_path_cuts_the_frame_rate_after_the_bound_and_stops_the_qp_there() {
+        let mut g = governors();
+        g.hold_frames(true);
+        g.last_resort(false);
+        let mut sim = Sim::new(capped(|t| if t < 10_000 * MS { 1e9 } else { 1.5e6 }), 321);
+        sim.run(&mut g, 40, &steady(80.0));
+        report("classic, 80 Mbps into 1.5", &sim, 10_000);
+        assert!(sim.trace.iter().any(|t| t.2 > 1), "{:?}", sim.trace);
+        assert!(
+            sim.trace.iter().all(|t| t.1 <= QP_LINK_MAX),
+            "{:?}",
+            sim.trace
+        );
+    }
+
     #[test]
     fn without_frame_hold_only_the_qp_answers_and_stops_at_the_bound() {
         let mut g = governors();
         g.hold_frames(false);
         let mut sim = Sim::new(capped(|t| if t < 10_000 * MS { 1e9 } else { 1.5e6 }), 131);
-        sim.run(&mut g, 30, &steady(20.0));
+        sim.run(&mut g, 30, &steady(40.0));
         report("cap1_5 without frame hold", &sim, 10_000);
         assert!(sim.trace.iter().all(|t| t.2 == 1), "{:?}", sim.trace);
         assert_eq!(
@@ -3387,8 +5505,9 @@ mod tests {
             assert!(l.raises >= 1, "never called: {:?}", sim.trace);
             assert_eq!(l.rebases, 0, "a creeping queue was taken for the base");
             let late = sim.bad_frames(30_000, 40_000, 100.0);
+            // each episode waits for the standing queue to be sustained before engaging
             assert!(
-                late * 100 < 10 * FPS as usize * 5,
+                late * 100 < 10 * FPS as usize * 8,
                 "{late} frames over 100 ms late"
             );
         }
@@ -3404,7 +5523,7 @@ mod tests {
         sim.run(&mut g, 30, &steady(12.0));
         report("cap after a base step", &sim, 15_000);
         assert!(sim.trace.iter().all(|t| t.0 >= 15_000), "{:?}", sim.trace);
-        assert!(sim.settled_after(15_000, 60.0, 1_000).unwrap() <= 1_500);
+        assert!(sim.settled_after(15_000, 60.0, 1_000).unwrap() <= 2_500);
     }
 
     #[test]
@@ -3551,7 +5670,7 @@ mod tests {
     fn armed(qp: u8) -> std::sync::Arc<SessionTelemetry> {
         let t = SessionTelemetry::new_shared();
         arm(&t, &cfg(qp));
-        set_frame_hold(&t, true);
+        set_frame_hold(&t, true, true);
         t
     }
 
@@ -3576,6 +5695,49 @@ mod tests {
         assert!(t.link.listening.load(Ordering::Relaxed));
         drop(newer);
         assert!(!t.link.listening.load(Ordering::Relaxed));
+    }
+
+    /// A pipeline rebuilt while the link is paced starts clean: its first frames are not held
+    /// behind the old backlog, and the writer stops pacing, refusing resends and withdrawing
+    /// loss for a governor that is gone. An older control dropped late clears nothing.
+    #[test]
+    fn a_rebuild_while_paced_leaves_nothing_of_the_old_governor() {
+        let t = armed(18);
+        let paced = |l: &LinkShared| {
+            l.pace_bps.store(1_500_000, Ordering::Relaxed);
+            l.engaged.store(true, Ordering::Relaxed);
+            let later = crate::streamer::audio::host_now_ns() + 5_000 * MS;
+            l.writer_until_ns.store(later, Ordering::Relaxed);
+            l.send_until_ns.store(later, Ordering::Relaxed);
+            l.key_origins.store(key_origin::LAG, Ordering::Relaxed);
+            l.divisor.store(2, Ordering::Relaxed);
+        };
+        let clean = |l: &LinkShared| {
+            l.pace_bps() == 0
+                && !l.engaged()
+                && !l.sender_busy()
+                && l.busy_until_ns() == 0
+                && l.key_origins.load(Ordering::Relaxed) == 0
+                && l.frame_divisor() == 1
+        };
+        let old = QpControl::build(&t, true, false, false).unwrap();
+        paced(&t.link);
+        assert!(t.link.sender_busy());
+        drop(old);
+        assert!(clean(&t.link), "dropped while paced");
+        // rebuilt before the old one is dropped: the build clears, the late drop leaves it be
+        let old = QpControl::build(&t, true, false, false).unwrap();
+        paced(&t.link);
+        let new = QpControl::build(&t, true, false, false).unwrap();
+        assert!(clean(&t.link), "built over a paced one");
+        t.link.pace_bps.store(2_000_000, Ordering::Relaxed);
+        drop(old);
+        assert_eq!(
+            t.link.pace_bps(),
+            2_000_000,
+            "a late drop touched the new one"
+        );
+        drop(new);
     }
 
     #[test]
@@ -3615,7 +5777,38 @@ mod tests {
         c.keyframe_next(true);
         c.before_submit(&mut f);
         c.before_submit(&mut f);
-        assert_eq!(f.set, vec![18, 25 + KEYFRAME_BOOST, 25]);
+        c.before_submit(&mut f);
+        c.before_submit(&mut f);
+        // the frames after it walk back three steps a frame
+        assert_eq!(f.set, vec![18, 25 + KEYFRAME_BOOST, 28, 25, 25]);
+    }
+
+    /// Under the other switches nothing is as the link side made it: with only the ceiling
+    /// engaged the frame after a boosted keyframe goes straight back, and the client's pace
+    /// cuts the frame rate only on the ring's trailing edge, never through the classic path's
+    /// held copy.
+    #[test]
+    fn the_ceiling_and_the_client_pace_behave_as_before_the_link_side() {
+        let t = armed(18);
+        let mut c = QpControl::build(&t, false, true, false).unwrap();
+        let mut f = Fake {
+            set: Vec::new(),
+            ok: true,
+        };
+        c.gov.ceiling.as_mut().unwrap().q = 25;
+        c.keyframe_next(true);
+        c.before_submit(&mut f);
+        c.before_submit(&mut f);
+        assert_eq!(f.set, vec![25 + KEYFRAME_BOOST, 25]);
+        drop(c);
+        let t = armed(18);
+        let mut c = QpControl::build(&t, false, false, true).unwrap();
+        c.pace.as_mut().unwrap().div = 2;
+        for trailing in [false, true] {
+            set_frame_hold(&t, true, trailing);
+            c.before_submit(&mut f);
+            assert_eq!(t.link.frame_divisor(), if trailing { 2 } else { 1 });
+        }
     }
 
     /// What the governor adds per frame, after the send and before the next submit, against a
@@ -3704,6 +5897,65 @@ mod tests {
         assert!(l.verified.load(Ordering::Relaxed) >= 2);
     }
 
+    /// x264 widened under a governor, at a user QP of 5 and of 18: idle, a keyframe keeps
+    /// libx264's own I-frame offset and every picture the user's QP; engaged, the keyframe carries
+    /// the QP the governor chose and the frames after it walk back to the governed QP.
+    #[test]
+    fn x264_under_a_governor_codes_keyframes_as_asked_idle_and_engaged() {
+        use super::super::x264::encoder::X264Encoder;
+        struct X<'a>(&'a mut X264Encoder);
+        impl QpEncoder for X<'_> {
+            fn set_qp(&mut self, qp: u8) -> Result<bool> {
+                self.0.set_qp(qp)
+            }
+            fn qp_top(&self) -> u8 {
+                self.0.qp_range().map_or(51, |(_, top)| top)
+            }
+        }
+        for base in [5u8, 18] {
+            let mut e = match x264_open(cfg(base), true) {
+                Ok(e) => e,
+                Err(e) => return crate::test_support::skip("x264 under a governor", e),
+            };
+            let (key, top) = e.qp_range().expect("widened");
+            let t = armed(base);
+            let mut c = QpControl::build(&t, true, false, false).unwrap();
+            let mut reader = SliceQp::default();
+            let mut buf = vec![0u8; 640 * 360 * 4];
+            let mut frame = |c: &mut QpControl, e: &mut X264Encoder, k: u32, keyframe: bool| {
+                fill(&mut buf, 640, 360, k);
+                c.keyframe_next(keyframe);
+                c.before_submit(&mut X(e));
+                let au = e.encode_bgra(&buf, keyframe).unwrap();
+                c.emitted(&au, false);
+                reader.read(&au, true)
+            };
+            assert_eq!(
+                frame(&mut c, &mut e, 0, true),
+                (Some(key), true),
+                "QP {base}"
+            );
+            assert_eq!(frame(&mut c, &mut e, 1, false), (Some(base), false));
+            assert_eq!(
+                frame(&mut c, &mut e, 2, true),
+                (Some(key), true),
+                "QP {base}"
+            );
+            assert_eq!(frame(&mut c, &mut e, 3, false), (Some(base), false));
+            c.gov.link.as_mut().unwrap().q = 30;
+            assert_eq!(frame(&mut c, &mut e, 4, false), (Some(30), false));
+            let want = (30 + KEYFRAME_BOOST).min(top);
+            assert_eq!(
+                frame(&mut c, &mut e, 5, true),
+                (Some(want), true),
+                "QP {base}"
+            );
+            let walk: Vec<_> = (6..9).map(|k| frame(&mut c, &mut e, k, false).0).collect();
+            assert_eq!(walk, [Some(want - 3), Some(30), Some(30)], "QP {base}");
+            assert_eq!(t.link.mismatches.load(Ordering::Relaxed), 0, "QP {base}");
+        }
+    }
+
     fn x264_open(
         config: EncoderConfig,
         wide: bool,
@@ -3721,8 +5973,8 @@ mod tests {
     #[test]
     fn x264_without_a_switch_has_default_cqp_parameters_and_is_deterministic() {
         use super::super::x264::encoder::X264Options;
-        // this process names no switch, so the options a session gets leave CQP alone
-        assert!(!X264Options::from_switches().wide_qp_clamp);
+        // the link governor ships on, so a session opens x264 widened; without it CQP is left alone
+        assert!(X264Options::from_switches().wide_qp_clamp);
         let run = |wide: bool| x264_open(cfg(18), wide).map(|e| e.effective_params());
         let (narrow, wide) = match (run(false), run(true)) {
             (Ok(a), Ok(b)) => (a, b),
@@ -3762,7 +6014,11 @@ mod tests {
                     }
                 };
             let (_, top) = wide.qp_range().expect("widened");
-            assert!(top >= QP_LINK_MAX.max(base), "setting {base}: top {top}");
+            // under 4 libx264's keyframe offset leaves 39 above it, and the governor's bound
+            // follows the encoder's top there (`QpEncoder::qp_top`)
+            if base >= 4 {
+                assert!(top >= QP_LINK_MAX.max(base), "setting {base}: top {top}");
+            }
             if base >= 15 {
                 assert_eq!(top, 51, "setting {base}");
             }
@@ -3775,7 +6031,10 @@ mod tests {
                 assert!(qa.0.is_some(), "setting {base}, frame {k}: unreadable");
                 assert_eq!(qa, qb, "setting {base}, frame {k}");
             }
-            for (i, q) in [QP_LINK_MAX.max(base), top, base].into_iter().enumerate() {
+            for (i, q) in [QP_LINK_MAX.max(base).min(top), top, base]
+                .into_iter()
+                .enumerate()
+            {
                 assert!(wide.set_qp(q).unwrap());
                 fill(&mut buf, 640, 360, 3 + i as u32);
                 let au = wide.encode_bgra(&buf, false).unwrap();
@@ -4104,4 +6363,613 @@ mod tests {
         assert_eq!(r.bits(24), Some(1));
         assert_eq!(r.bit(), None);
     }
+
+    // pacing to the link
+
+    #[test]
+    fn the_link_pacer_holds_its_rate_and_says_how_far_behind_it_is() {
+        let t0 = std::time::Instant::now();
+        let mut p = LinkPacer::default();
+        assert_eq!(
+            p.schedule(1_200, t0),
+            std::time::Duration::ZERO,
+            "no rate, no pacing"
+        );
+        p.set_rate(2_000_000);
+        let mut now = t0;
+        for _ in 0..500 {
+            now += p.schedule(1_200, now);
+        }
+        // 600 KB at 2 Mbps is 2.4 s, less the opening burst
+        let took = now.duration_since(t0).as_secs_f64();
+        assert!((2.3..2.45).contains(&took), "{took}");
+        // a 290 KB keyframe on top of an empty bucket waits 1.16 s to leave
+        let later = now + std::time::Duration::from_secs(5);
+        let left = p.backlog(290_000, later).as_secs_f64();
+        assert!((1.14..1.17).contains(&left), "{left}");
+    }
+
+    #[test]
+    fn the_send_gate_is_busy_while_a_frame_period_waits_and_counts_skips() {
+        let mut g = SendGate::default();
+        let period = 16_666_667;
+        assert!(!g.busy(0, 0, period));
+        // 290 KB at 1.35 Mbps: 1.7 s of sending
+        g.sent(0, 290_000, 1.35e6, 0, true);
+        assert!(g.busy(100 * MS, 0, period));
+        assert!(!g.key_clear(1_000 * MS));
+        assert!(!g.busy(1_710 * MS, 0, period));
+        assert!(g.key_clear(1_820 * MS));
+        // the writer may know better: it is still sending
+        assert!(g.busy(1_710 * MS, 3_000 * MS, period));
+        for k in 0..30u64 {
+            if k % 3 == 0 {
+                g.skipped(2_000 * MS + k * period, 1);
+            } else {
+                g.sent(2_000 * MS + k * period, 1_000, 1.35e6, 0, false);
+            }
+        }
+        let share = g.skip_share(2_000 * MS + 30 * period);
+        assert!((0.25..0.4).contains(&share), "{share}");
+        assert_eq!(g.skip_share(10_000 * MS), 0.0, "old skips are forgotten");
+    }
+
+    /// Paced, a congested link sets the pace to what it delivered; the QP rises against what the
+    /// sender skips, to the bound and no further while fewer than half the frames wait, past it
+    /// toward the last resort once half do, and the divisor is never used.
+    #[test]
+    fn paced_the_qp_rises_against_skips_to_the_bound_and_past_it_only_at_half_the_frames() {
+        for (skip, top) in [(0.3, QP_LINK_MAX), (0.5, QP_LAST_RESORT)] {
+            let mut l = LinkGovernor::new(15);
+            l.set_pacing(true);
+            let w = Window {
+                valid: true,
+                packets: 100,
+                share: 0.8,
+                sigma: 1.0,
+                queue_us: 60_000,
+                delivered_bps: 1.5e6,
+                sent_bps: 3e6,
+                loss: 0.2,
+            };
+            for k in 0..30u64 {
+                l.encoded(k * 16 * MS, 20_000, false);
+            }
+            l.pace_to(500 * MS, &w);
+            assert!((l.pace_bps() - 1.35e6).abs() < 1.0, "{}", l.pace_bps());
+            assert!(l.engaged());
+            let mut t = 500 * MS;
+            for _ in 0..40 {
+                t += 500 * MS;
+                for k in 0..30u64 {
+                    l.encoded(t - 480 * MS + k * 16 * MS, 20_000, false);
+                }
+                l.sender(skip, true);
+                l.paced(t);
+            }
+            assert_eq!(l.q(), top, "{skip}");
+            assert_eq!(l.divisor(), 1);
+            l.raise(t + 2_000 * MS, top, w);
+            assert_eq!((l.q(), l.divisor()), (top, 1));
+        }
+    }
+
+    /// A paced QP that frames waiting forced up is held: a light second right after it does
+    /// not bring it down, and a step down later goes one or two steps on seconds of evidence.
+    #[test]
+    fn a_raise_that_skipping_forced_is_held_and_comes_down_a_step_at_a_time() {
+        let mut l = LinkGovernor::new(15);
+        l.set_pacing(true);
+        l.q = 30;
+        l.pace_bps = 4.5e6;
+        l.clear_since_ns = Some(0);
+        l.ramp_not_before_ns = u64::MAX;
+        let mut t = 0;
+        let feed = |l: &mut LinkGovernor, t: u64, frame: u64| {
+            for k in 0..6u64 {
+                l.encoded(t - 100 * MS + k * 16 * MS, frame, false);
+            }
+        };
+        t += 100 * MS;
+        feed(&mut l, t, 6_000);
+        l.sender(0.3, false);
+        let m = l.paced(t).expect("a raise");
+        assert!(m.raise && m.q == 33, "{m:?}");
+        // light from here on: nothing for six seconds, then single steps two seconds apart
+        let mut downs = Vec::new();
+        while t < 16_000 * MS {
+            t += 100 * MS;
+            feed(&mut l, t, 1_500);
+            l.sender(0.0, false);
+            if let Some(m) = l.paced(t) {
+                assert!(!m.raise, "{m:?}");
+                downs.push((t / MS, m.q));
+            }
+        }
+        assert!(downs.first().is_some_and(|d| d.0 >= 6_100), "{downs:?}");
+        assert!(
+            downs
+                .windows(2)
+                .all(|w| w[1].0 - w[0].0 >= 2_000 && w[0].1 - w[1].1 <= 2),
+            "{downs:?}"
+        );
+    }
+
+    /// Paced on a clear link the ramp walks the QP down while the stream leaves room under the
+    /// pace and the pace up while the stream fills it, and once the stream at the user's QP has
+    /// passed with nothing waiting, pacing lets go.
+    #[test]
+    fn paced_recovery_ramps_the_qp_down_and_the_pace_up_and_lets_go() {
+        let mut l = LinkGovernor::new(15);
+        l.set_pacing(true);
+        l.q = QP_LINK_MAX;
+        l.pace_bps = 1.35e6;
+        l.clear_since_ns = Some(0);
+        let mut t = 0;
+        let mut moves = 0;
+        // 0.4 Mbps at QP 40, halving every 10 steps
+        while t < 20_000 * MS && l.engaged() {
+            t += 100 * MS;
+            let frame = 800.0 * 2f64.powf((QP_LINK_MAX - l.q()) as f64 / 10.0);
+            for k in 0..6u64 {
+                l.encoded(t - 100 * MS + k * 16 * MS, frame as u64, false);
+            }
+            l.sender(0.0, false);
+            if l.paced(t).is_some() {
+                moves += 1;
+            }
+            // a link that carries all of it
+            if let Some(r) = l.ramp.as_mut() {
+                r.carried = l.pace_bps;
+            }
+        }
+        assert!(!l.engaged(), "q {} pace {}", l.q(), l.pace_bps());
+        assert!(t <= 4_000 * MS, "took {} ms over {moves} moves", t / MS);
+        assert_eq!((l.q(), l.divisor()), (15, 1));
+        assert_eq!(l.probes, 1);
+    }
+
+    /// A ramp that meets a queue goes back to the pace and the QP it left, and the next waits
+    /// twice as long, up to the max; one that found room starts the hold again.
+    #[test]
+    fn a_ramp_that_meets_a_queue_goes_back_and_waits_twice_as_long_next_time() {
+        let mut l = LinkGovernor::new(15);
+        l.set_pacing(true);
+        l.q = 34;
+        l.pace_bps = 4.5e6;
+        l.lower_not_before_ns = u64::MAX;
+        let mut t = 0;
+        let mut holds = Vec::new();
+        for _ in 0..5 {
+            t += 10_000 * MS;
+            l.clear_since_ns = Some(t - RAMP_QUIET_NS);
+            for k in 0..30u64 {
+                l.encoded(t - 480 * MS + k * 16 * MS, 4_000, false);
+            }
+            l.sender(0.0, false);
+            l.paced(t);
+            assert!(l.attempting());
+            l.ramp.as_mut().unwrap().rose = true;
+            let m = l.paced(t + 100 * MS).expect("the ramp ends");
+            // back to where the content fits at the old pace, never above where it left
+            assert!(m.q <= 34 && l.pace_bps() == 4.5e6, "{m:?}");
+            holds.push(l.ramp_not_before_ns - (t + 100 * MS));
+        }
+        assert_eq!(RAMP_HOLD_MAX_NS, 2 * RAMP_HOLD_MIN_NS);
+        assert_eq!(holds, [RAMP_HOLD_MAX_NS; 5], "{holds:?}");
+        // room found: paced at what was carried, QP back by what that gains, hold reset
+        t += 10_000 * MS;
+        l.clear_since_ns = Some(t - RAMP_QUIET_NS);
+        l.paced(t);
+        l.ramp.as_mut().unwrap().carried = 7e6;
+        l.ramp.as_mut().unwrap().rose = true;
+        let m = l.paced(t + 100 * MS).expect("the ramp ends");
+        assert!((l.pace_bps() - 6.3e6).abs() < 1.0, "{}", l.pace_bps());
+        assert!(m.q < 34, "{m:?}");
+        assert_eq!(l.ramp_not_before_ns, t + 100 * MS + RAMP_HOLD_MIN_NS);
+    }
+
+    /// Paced, a keyframe goes once the last one has drained, whatever asked for it, and is held
+    /// (never lost) until then.
+    #[test]
+    fn paced_keyframes_wait_only_for_the_last_one_to_drain() {
+        let mut p = KeyPolicy::default();
+        assert!(p.admit_paced(0, true, true, true, false));
+        assert!(!p.admit_paced(10 * MS, true, true, false, true));
+        assert!(
+            !p.admit_paced(20 * MS, false, false, false, true),
+            "held, not lost"
+        );
+        assert!(
+            p.admit_paced(30 * MS, false, false, true, false),
+            "urgent, held as such"
+        );
+        assert!(
+            !p.admit_paced(40 * MS, false, false, true, true),
+            "nothing asked"
+        );
+        // a routine request waits for its own gap as well
+        assert!(!p.admit_paced(50 * MS, true, false, true, false));
+        assert!(p.admit_paced(60 * MS, false, false, true, true));
+        assert_eq!(p.held_requests, 2);
+    }
+
+    /// With `link_pace` on and nothing congested: nothing is paced, nothing waits at the sender,
+    /// every keyframe request goes as it came, and the QP is the user's.
+    #[test]
+    fn with_link_pace_on_and_no_congestion_nothing_is_paced_skipped_or_held() {
+        let t = armed(18);
+        let mut c = QpControl::build(&t, true, true, true)
+            .unwrap()
+            .with_link_pace(true);
+        let mut f = Fake {
+            set: Vec::new(),
+            ok: true,
+        };
+        let mut r = Rng(11);
+        for _ in 0..600 {
+            let asked = r.next() < 0.2;
+            if r.next() < 0.1 {
+                t.link.note_key_origin(key_origin::PLI);
+            }
+            let key = c.admit_keyframe(asked);
+            assert_eq!(key, asked);
+            c.keyframe_next(key);
+            c.before_submit(&mut f);
+            let au: &[u8] = if key {
+                &[0, 0, 0, 1, 0x65, 0x88]
+            } else {
+                &[0, 0, 0, 1, 0x41, 0x9a]
+            };
+            c.emitted(au, false);
+            assert!(!t.link.sender_busy());
+            assert!(!c.keyframe_due());
+        }
+        assert!(f.set.iter().all(|q| *q == 18));
+        assert_eq!(t.link.pace_bps(), 0);
+        assert!(!t.link.engaged());
+        assert_eq!(t.link.busy_until_ns(), 0);
+        assert_eq!(t.link.frame_divisor(), 1);
+    }
+
+    // the onset, the periodic PLI, a keyframe's own queue
+
+    fn queued(q: i64) -> Window {
+        Window {
+            valid: true,
+            packets: 50,
+            share: 1.0,
+            sigma: 1.0,
+            queue_us: q,
+            delivered_bps: 20e6,
+            sent_bps: 20e6,
+            loss: 0.0,
+        }
+    }
+
+    /// A queue rising by 10 ms twice in 600 ms is congestion; the same rise with nothing lost
+    /// within 1.5 s of a keyframe is the keyframe's own burst draining (Quick Sync under a
+    /// relay's per-packet jitter read 67 ms behind one).
+    #[test]
+    fn a_lossless_queue_behind_our_own_keyframe_is_not_congestion() {
+        for keyframe in [false, true] {
+            let mut l = LinkGovernor::new(15);
+            l.queue_hist.push_back((0, 20_000, 1.0));
+            l.queue_hist.push_back((300 * MS, 45_000, 1.0));
+            if keyframe {
+                l.encoded(100 * MS, 300_000, true);
+            }
+            let v = l.judge(600 * MS, &queued(67_000), &queued(60_000));
+            if keyframe {
+                assert_ne!(v, Verdict::Congested);
+            } else {
+                assert_eq!(v, Verdict::Congested);
+            }
+        }
+        // loss behind the keyframe is still the link
+        let mut l = LinkGovernor::new(15);
+        l.encoded(100 * MS, 300_000, true);
+        let lossy = Window {
+            share: 0.5,
+            ..queued(80_000)
+        };
+        assert_eq!(l.judge(600 * MS, &lossy, &lossy), Verdict::Congested);
+    }
+
+    /// The pace starts from the best reading of the link the last second gave (a window read
+    /// during the loss burst undershoots by half), and a window the link carried in full never
+    /// lowers it.
+    #[test]
+    fn the_pace_follows_the_link_and_never_a_sample_the_sender_limited() {
+        let mut l = LinkGovernor::new(15);
+        l.set_pacing(true);
+        let w = |q: i64, delivered: f64, sent: f64| Window {
+            delivered_bps: delivered,
+            sent_bps: sent,
+            share: 0.3,
+            ..queued(q)
+        };
+        // the link delivered 5.1 Mbps in one window and 2.3 in the one that triggered
+        l.judge(200 * MS, &w(60_000, 5.1e6, 11e6), &Window::default());
+        l.pace_to(400 * MS, &w(80_000, 2.3e6, 11e6));
+        assert!((l.pace_bps() - 0.9 * 5.1e6).abs() < 1.0, "{}", l.pace_bps());
+        // paced, a window that arrived as fast as it was sent leaves the pace alone
+        l.pace_to(900 * MS, &w(50_000, 1.9e6, 1.95e6));
+        assert!((l.pace_bps() - 0.9 * 5.1e6).abs() < 1.0, "{}", l.pace_bps());
+        // one the link did not carry lowers it, never raises it
+        l.pace_to(1_000 * MS, &w(50_000, 4.0e6, 4.6e6));
+        assert!((l.pace_bps() - 0.9 * 5.1e6).abs() < 1.0, "{}", l.pace_bps());
+        l.link_hist.clear();
+        l.pace_to(3_000 * MS, &w(50_000, 4.0e6, 4.6e6));
+        assert!((l.pace_bps() - 3.6e6).abs() < 1.0, "{}", l.pace_bps());
+    }
+
+    #[test]
+    fn a_pli_from_a_painting_page_is_not_a_reason_for_a_keyframe() {
+        let s = 1_000 * MS;
+        assert!(pli_is_noise(key_origin::PLI, true, 5 * s));
+        assert!(
+            !pli_is_noise(key_origin::PLI, false, 5 * s),
+            "a page not painting"
+        );
+        assert!(
+            !pli_is_noise(key_origin::PLI, true, 61 * s),
+            "the healthy cadence"
+        );
+        assert!(!pli_is_noise(
+            key_origin::PLI | key_origin::PAGE,
+            true,
+            5 * s
+        ));
+        assert!(!pli_is_noise(key_origin::UNREPAIRABLE, true, 5 * s));
+        assert!(!pli_is_noise(0, true, 5 * s), "an untagged request");
+    }
+
+    // the governor stays out of the way: the uncapped scenarios of the browser harness
+
+    /// Quick Sync's pattern: frames swing from a third to twice the average (sliced, with big
+    /// refreshes), and a 400 KB keyframe every 5 s, as the jitter run had.
+    fn quick_sync_like(seed: u64) -> impl Fn(u64) -> (u64, bool) {
+        move |k| {
+            if k % (5 * FPS) == 0 {
+                return (400_000, true);
+            }
+            let mut r = Rng((seed ^ k.wrapping_mul(0xD6E8_FEB8_6659_FD93)) | 1);
+            let x = r.next();
+            let swing = if x < 0.1 { 2.2 } else { 0.35 + 1.1 * r.next() };
+            ((14e6 / 8.0 / FPS as f64 * swing) as u64, false)
+        }
+    }
+
+    /// NVENC's: the desktop's frame-to-frame variation and scene changes, and a keyframe every
+    /// 5 s.
+    fn nvenc_like(seed: u64) -> impl Fn(u64) -> (u64, bool) {
+        let d = desktop(seed);
+        move |k| {
+            if k % (5 * FPS) == 0 {
+                return (400_000, true);
+            }
+            d(k)
+        }
+    }
+
+    /// Stall, random and burst loss, loss on the return path, delay jitter of +-10 and +-30 ms,
+    /// a step in base delay and a loss step: on either encoder's pattern, with pacing on as it
+    /// ships, the link side never engages, never moves anything, and every keyframe goes as asked.
+    #[test]
+    fn no_uncapped_scenario_ever_engages_the_link_side() {
+        struct Case {
+            name: &'static str,
+            loss: f64,
+            loss_run: u32,
+            jitter_ms: f64,
+            stall: Option<(u64, u64)>,
+            step: bool,
+            report_loss: f64,
+            loss_from_s: u64,
+        }
+        let base = Case {
+            name: "",
+            loss: 0.0,
+            loss_run: 0,
+            jitter_ms: 1.0,
+            stall: None,
+            step: false,
+            report_loss: 0.0,
+            loss_from_s: 0,
+        };
+        let cases = [
+            Case {
+                name: "stall200",
+                stall: Some((3, 200)),
+                ..base
+            },
+            Case {
+                name: "loss1",
+                loss: 0.01,
+                ..base
+            },
+            Case {
+                name: "loss5",
+                loss: 0.05,
+                ..base
+            },
+            Case {
+                name: "burst",
+                loss: 0.01,
+                loss_run: 4,
+                ..base
+            },
+            Case {
+                name: "loss5_up",
+                report_loss: 0.05,
+                ..base
+            },
+            Case {
+                name: "delay_jitter 10",
+                jitter_ms: 20.0,
+                ..base
+            },
+            Case {
+                name: "delay_jitter 30",
+                jitter_ms: 60.0,
+                ..base
+            },
+            Case {
+                name: "delay_step",
+                step: true,
+                ..base
+            },
+            Case {
+                name: "loss_step3",
+                loss: 0.03,
+                loss_from_s: 10,
+                ..base
+            },
+        ];
+        for (i, c) in cases.iter().enumerate() {
+            for (pattern, content) in [
+                (
+                    "nvenc",
+                    Box::new(nvenc_like(i as u64 + 3)) as Box<dyn Fn(u64) -> (u64, bool)>,
+                ),
+                ("quick sync", Box::new(quick_sync_like(i as u64 + 5))),
+            ] {
+                let mut g = governors();
+                g.set_pacing(true);
+                let path = Path {
+                    cap: |_| 200e6,
+                    queue_s: 0.2,
+                    prop_us: 20_000,
+                    jitter_us: c.jitter_ms * 1e3,
+                    loss: c.loss,
+                    stall: c.stall,
+                    delay_step: c.step.then_some((10_000 * MS, 60_000)),
+                    loss_run: c.loss_run,
+                };
+                let mut sim = Sim::new(path, 900 + i as u64);
+                sim.report_loss = c.report_loss;
+                sim.loss_from_ns = c.loss_from_s * 1_000 * MS;
+                sim.keys = Keys::Governed;
+                sim.pli_every_ms = Some(280);
+                sim.run(&mut g, 40, &*content);
+                let l = g.link.as_ref().unwrap();
+                assert_eq!(
+                    (l.engagements, sim.moves(), g.pace_bps()),
+                    (0, 0, 0.0),
+                    "{} on {pattern}: {} / {:?}",
+                    c.name,
+                    l.last_engagement,
+                    sim.trace
+                );
+            }
+        }
+    }
+
+    /// Heavy loss with no capacity limit behind it, and a route change with light loss: neither
+    /// is a bottleneck, and on either encoder's pattern the link side never engages. At 15 % or
+    /// more the shortfall is the loss itself, and a step in the path's delay stands flat.
+    #[test]
+    fn heavy_loss_and_a_route_change_with_light_loss_never_engage() {
+        struct Case {
+            name: String,
+            loss: f64,
+            loss_run: u32,
+            from_s: u64,
+            until_s: u64,
+            step_us: Option<i64>,
+        }
+        let mut cases = Vec::new();
+        for loss in [0.15, 0.2, 0.3] {
+            cases.push(Case {
+                name: format!("{:.0} % for 5 s", loss * 100.0),
+                loss,
+                loss_run: 0,
+                from_s: 10,
+                until_s: 15,
+                step_us: None,
+            });
+        }
+        // bursts of 30 packets: most of two seconds gone, as in a dead zone
+        cases.push(Case {
+            name: "an outage-like 2 s".into(),
+            loss: 0.05,
+            loss_run: 30,
+            from_s: 10,
+            until_s: 12,
+            step_us: None,
+        });
+        for step_ms in [40, 60, 100] {
+            for loss in [0.005, 0.01, 0.03] {
+                cases.push(Case {
+                    name: format!("a {step_ms} ms step at {:.1} % loss", loss * 100.0),
+                    loss,
+                    loss_run: 0,
+                    from_s: 0,
+                    until_s: 1_000,
+                    step_us: Some(step_ms * 1_000),
+                });
+            }
+        }
+        let mut failed = Vec::new();
+        for (i, c) in cases.iter().enumerate() {
+            for (pattern, content) in [
+                (
+                    "nvenc",
+                    Box::new(nvenc_like(i as u64 + 31)) as Box<dyn Fn(u64) -> (u64, bool)>,
+                ),
+                ("quick sync", Box::new(quick_sync_like(i as u64 + 37))),
+            ] {
+                let mut g = governors();
+                g.set_pacing(true);
+                let path = Path {
+                    cap: |_| 200e6,
+                    queue_s: 0.2,
+                    prop_us: 20_000,
+                    jitter_us: 1_000.0,
+                    loss: c.loss,
+                    stall: None,
+                    delay_step: c.step_us.map(|us| (10_000 * MS, us)),
+                    loss_run: c.loss_run,
+                };
+                let mut sim = Sim::new(path, 700 + i as u64);
+                sim.loss_from_ns = c.from_s * 1_000 * MS;
+                sim.loss_until_ns = c.until_s * 1_000 * MS;
+                sim.keys = Keys::Governed;
+                sim.pli_every_ms = Some(280);
+                sim.run(&mut g, 30, &*content);
+                let l = g.link.as_ref().unwrap();
+                if (l.engagements, sim.moves(), g.pace_bps()) != (0, 0, 0.0) {
+                    failed.push(format!("{} on {pattern}: {}", c.name, l.last_engagement));
+                }
+            }
+        }
+        assert!(failed.is_empty(), "{failed:#?}");
+    }
+
+    /// A cap behind a 100 ms buffer: the queue it overflows is short, and it still engages, with
+    /// the queue and the loss both there.
+    #[test]
+    fn a_cap_behind_a_short_buffer_still_engages() {
+        for (bps, pattern) in [(5e6, 0u64), (2e6, 1)] {
+            let mut g = governors();
+            g.set_pacing(true);
+            let mut path = capped(if pattern == 0 {
+                |t| if t < 5_000 * MS { 1e9 } else { 5e6 }
+            } else {
+                |t| if t < 5_000 * MS { 1e9 } else { 2e6 }
+            });
+            path.queue_s = 0.1;
+            let mut sim = Sim::new(path, 811 + pattern);
+            sim.keys = Keys::Governed;
+            sim.run(&mut g, 15, &nvenc_like(41 + pattern));
+            let l = g.link.as_ref().unwrap();
+            assert_eq!(l.engagements, 1, "{bps}: {:?}", sim.trace);
+            assert!(g.engaged(), "{bps}: {}", l.last_engagement);
+        }
+    }
 }
+
+#[cfg(test)]
+#[path = "test/link_sim.rs"]
+mod link_sim;

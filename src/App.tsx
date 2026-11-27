@@ -48,6 +48,7 @@ import { PermissionLapseDialog } from "@/components/permission-lapse-dialog";
 import { commands, events } from "@/lib/bindings";
 import { buildQrValues } from "@/lib/utils";
 import { toast } from "@/components/ui/use-toast";
+import { ToastAction } from "@/components/ui/toast";
 import { t, useTranslation } from "@/i18n";
 import "non.geist";
 const appWindow = getCurrentWebviewWindow();
@@ -456,6 +457,29 @@ function GlobalState({ children }: { children: ReactNode }) {
           title: t("toasts.joinAttemptsPaused.title"),
           description: t("toasts.joinAttemptsPaused.description", { seconds }),
         });
+      }));
+      unlisteners.push(await events.slowConnection.listen(event => {
+        const p = event.payload;
+        const known = devicesRef.current.find(d => d.joinId === p.joinId);
+        const name = p.name || known?.name || p.ip;
+        toast({
+          title: t("toasts.slowConnection.title", { name }),
+          description: t("toasts.slowConnection.description", { name }),
+          // long enough to read and act on
+          duration: 15000,
+          action: (
+            <ToastAction
+              altText={t("toasts.slowConnection.action")}
+              onClick={() => void router.navigate("/settings", { state: { focus: "hostedNetwork" } })}
+            >
+              {t("toasts.slowConnection.action")}
+            </ToastAction>
+          ),
+        });
+        void notifyIfUnfocused(
+          t("notifications.slowConnection.title", { name }),
+          t("notifications.slowConnection.body", { name }),
+        );
       }));
     }
     void start_listener().catch(e => {

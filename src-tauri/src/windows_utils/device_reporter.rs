@@ -9,7 +9,7 @@ use crate::streamer::session::{
 };
 use crate::{
     AudioOutput, Device, DeviceAudioOutputs, DeviceJoin, DeviceModify, DeviceRemove,
-    JoinAttemptsPaused,
+    JoinAttemptsPaused, SlowConnection,
 };
 
 #[derive(Debug)]
@@ -104,6 +104,31 @@ impl DeviceReporter for TauriDeviceReporter {
         };
         if let Err(e) = event.emit(&self.app) {
             teprintln!("[device-reporter] emit JoinAttemptsPaused failed: {e:?}");
+        }
+    }
+
+    fn report_slow_connection(&self, info: DeviceInfo, engaged_secs: u32, window_secs: u32) {
+        // logged as well: `serve` has no window to show it in
+        tprintln!(
+            "[dashboard] slow connection to {}: join={} token={} ({}), governor engaged {}s of \
+             the last {}s; the hosted network would give it a direct link",
+            info.name,
+            info.join_id,
+            info.token,
+            info.ip,
+            engaged_secs,
+            window_secs
+        );
+        let event = SlowConnection {
+            join_id: info.join_id,
+            token: info.token,
+            name: info.name,
+            ip: info.ip,
+            engaged_secs,
+            window_secs,
+        };
+        if let Err(e) = event.emit(&self.app) {
+            teprintln!("[device-reporter] emit SlowConnection failed: {e:?}");
         }
     }
 
