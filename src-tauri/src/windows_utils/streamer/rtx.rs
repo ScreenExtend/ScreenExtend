@@ -954,12 +954,8 @@ mod tests {
             );
         }
         // once the encoder fits, what enters the link stays near the cap
-        for s in 4..12 {
-            assert!(
-                ours.offered_bps[s] < 1.8e6,
-                "second {s}: offered {:.2}",
-                ours.offered_bps[s] / 1e6
-            );
+        for (s, offered) in ours.offered_bps.iter().enumerate().take(12).skip(4) {
+            assert!(*offered < 1.8e6, "second {s}: offered {:.2}", offered / 1e6);
         }
     }
 
