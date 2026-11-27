@@ -174,7 +174,7 @@ jobs:
             echo "::error::doctor reports this macOS is unsupported"
             exit 1
           fi
-          for field in '.os.name' '.os.version' '.os.supported' '.audioBackend' '.displayBackend'; do
+          for field in '.os.name' '.os.version' '.os.supported' '.backends.audio' '.backends.display'; do
             value=$(jq -r "$field" doctor.json)
             if [ -z "$value" ] || [ "$value" = "null" ]; then
               echo "::error::doctor --json is missing $field"
@@ -188,7 +188,7 @@ jobs:
       - name: the probed audio tier matches the runner's macOS
         working-directory: src-tauri
         run: |
-          backend=$(jq -r '.audioBackend' doctor.json)
+          backend=$(jq -r '.backends.audio' doctor.json)
           version=$(jq -r '.os.version' doctor.json)
           echo "macOS $version selected audio backend: $backend"
           # AudioBackend::as_str: process_tap (14.2+) > screencapturekit (13.0+) >
@@ -351,7 +351,8 @@ jobs:
           fi
           echo "measuring with: $measure"
           for i in 1 2 3; do
-            $measure | tee "../perf-run-$i.txt"
+            # the timing lines go to stderr: cargo test only captures stdout
+            $measure 2>&1 | tee "../perf-run-$i.txt"
           done
 
       - name: compare against ci/perf-baseline.json
