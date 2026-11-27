@@ -58,6 +58,10 @@ jobs:
       - name: startup gate rules
         run: pnpm test:gate
 
+      # the Rearrange Displays snapping is pure geometry, so it runs without any display
+      - name: display arrangement geometry
+        run: pnpm test:arrange
+
       # two silent failures of the Settings config.json editor: a config key missing from the
       # schema (the editor rejects the user's own config), and an inline <style> in index.html,
       # which makes Tauri nonce style-src and voids the 'unsafe-inline' monaco's theme sheet needs.

@@ -2,6 +2,7 @@ pub mod audio;
 pub mod com;
 pub mod compatibility;
 pub mod device_reporter;
+pub mod display_layout;
 pub mod driver_health;
 pub mod driver_ipc;
 pub mod hosted_network;

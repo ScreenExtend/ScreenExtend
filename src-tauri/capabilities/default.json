@@ -98,18 +98,6 @@
           ]
         },
         {
-          "name": "control",
-          "cmd": "control",
-          "sidecar": false,
-          "args": ["desk.cpl"]
-        },
-        {
-          "name": "open",
-          "cmd": "open",
-          "sidecar": false,
-          "args": ["x-apple.systempreferences:com.apple.preference.displays"]
-        },
-        {
           "name": "open",
           "cmd": "open",
           "sidecar": false,

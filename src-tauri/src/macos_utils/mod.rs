@@ -2,6 +2,7 @@ pub mod airplay;
 pub mod audio;
 pub mod compatibility;
 pub mod device_reporter;
+pub mod display_layout;
 pub mod hosted_network;
 pub mod networking;
 pub mod objc_exception;

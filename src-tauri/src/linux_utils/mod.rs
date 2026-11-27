@@ -1,5 +1,6 @@
 pub mod audio;
 pub mod compatibility;
+pub mod display_layout;
 pub mod hosted_network;
 pub mod networking;
 pub mod permissions;

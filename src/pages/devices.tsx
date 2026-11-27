@@ -4,7 +4,7 @@ import { Link } from "react-router-dom";
 import Layout from "@/layout/layout";
 import { DeviceDetails } from "@/components/pages/device-details";
 import { buttonVariants, Button } from "@/components/ui/button";
-import { Plus, Info, ExternalLink, RefreshCw } from "lucide-react";
+import { Plus, Info, Monitor, RefreshCw } from "lucide-react";
 import {
   Tooltip,
   TooltipContent,
@@ -22,12 +22,11 @@ import {
 
 import { toast } from "@/components/ui/use-toast";
 import { useTranslation } from "@/i18n";
-import { Command } from "@tauri-apps/plugin-shell";
-import { type } from "@tauri-apps/plugin-os";
 import { useConnectedDevices } from "@/components/global-provider";
 import { type ConnectedDevice } from "@/components/config-provider";
 import { commands } from "@/lib/bindings";
 import { cn } from "@/lib/utils";
+import { RearrangeDisplaysDialog } from "@/components/rearrange-displays-dialog";
 
 function RefreshStream({ device, label }: { device: ConnectedDevice; label: string }) {
   const [busy, setBusy] = useState(false);
@@ -101,6 +100,7 @@ function rowLabel(device: ConnectedDevice, all: ConnectedDevice[]): string {
 
 export default function Devices() {
   const [devicesTooltipOpen, setDevicesTooltipOpen] = useState(false);
+  const [arrangeOpen, setArrangeOpen] = useState(false);
   const devices = useConnectedDevices();
   const { t } = useTranslation();
 
@@ -120,37 +120,16 @@ export default function Devices() {
                   <Info size={15} />
                 </TooltipTrigger>
                 <TooltipContent className="max-w-[220px]">
-                  <p>Rearrange extended displays in your system's display settings.</p>
+                  <p>{t("rearrangeDisplays.tooltip")}</p>
                 </TooltipContent>
               </Tooltip>
             </TooltipProvider>
             <div className="flex-grow"></div>
-            <Button variant="secondary" size="sm" onClick={async () => {
-              const notifyFailure = () => toast({
-                variant: "destructive",
-                title: t("toasts.displaySettingsUnavailable.title"),
-                description: t("toasts.displaySettingsUnavailable.description"),
-              });
-              try {
-                const osType = type();
-                if (osType === "windows") {
-                  await Command.create("control", ["desk.cpl"]).spawn();
-                } else if (osType === "macos") {
-                  await Command.create("open", ["x-apple.systempreferences:com.apple.preference.displays"]).spawn();
-                } else {
-                  toast({
-                    title: t("toasts.displaySettingsUnavailable.title"),
-                    description: t("toasts.displaySettingsUnavailable.description"),
-                  });
-                }
-              } catch (e) {
-                console.error("failed to open display settings", e);
-                notifyFailure();
-              }
-            }}>
-              <ExternalLink className="mr-2" size={16} />
-              Display Settings
+            <Button variant="secondary" size="sm" onClick={() => setArrangeOpen(true)}>
+              <Monitor className="mr-2" size={16} />
+              {t("rearrangeDisplays.button")}
             </Button>
+            <RearrangeDisplaysDialog open={arrangeOpen} onOpenChange={setArrangeOpen} />
           </div>
           <p className="text-gray-500">{ devices.length } Screen{ devices.length !== 1 && "s" } Connected</p>
         </div>

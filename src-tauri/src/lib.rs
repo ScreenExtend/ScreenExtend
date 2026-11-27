@@ -15,6 +15,8 @@ mod logbus;
 mod bench;
 mod cli;
 mod data_dir;
+mod display_arrange;
+mod display_layout;
 mod envcfg;
 mod exit_reason;
 mod single_instance;
@@ -1140,6 +1142,8 @@ pub fn run() {
             get_disable_gpu_encode,
             streamer::config::set_disable_link_governor,
             streamer::config::get_disable_link_governor,
+            display_arrange::get_display_layout,
+            display_arrange::apply_display_layout,
             logbus::get_log_backlog,
             logbus::set_log_streaming,
             logbus::log_frontend_error
@@ -1156,6 +1160,7 @@ pub fn run() {
             SessionIdChange,
             JoinAttemptsPaused,
             SlowConnection,
+            display_arrange::DisplayLayoutChanged,
             logbus::LogLine
         ]);
 
@@ -1343,6 +1348,7 @@ pub fn run() {
                     .build()?;
 
                     focus_main_window(&window);
+                    display_arrange::start_watching(app.handle().clone());
 
                     if let Err(e) = single_instance::start_control_server(
                         app.handle().clone(),

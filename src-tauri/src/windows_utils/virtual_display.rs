@@ -1399,7 +1399,7 @@ pub fn forget_display_identity(display_id: u32, device_path: &str) {
     }
 }
 
-fn is_owned_path(device_path: &str) -> bool {
+pub(crate) fn is_owned_path(device_path: &str) -> bool {
     owned_paths()
         .as_ref()
         .is_some_and(|map| map.get(device_path).is_some_and(|ids| !ids.is_empty()))
@@ -1721,7 +1721,7 @@ pub fn in_before_set(active: bool, available: bool, ours: bool) -> bool {
     active || available || !ours
 }
 
-fn wide_to_string(w: &[u16]) -> String {
+pub(crate) fn wide_to_string(w: &[u16]) -> String {
     let end = w.iter().position(|&c| c == 0).unwrap_or(w.len());
     String::from_utf16_lossy(&w[..end])
 }
@@ -1784,7 +1784,10 @@ fn query_display_config(
 }
 
 /// A target's EDID friendly name and its device-interface path.
-fn target_name(adapter: windows::Win32::Foundation::LUID, id: u32) -> Option<(String, String)> {
+pub(crate) fn target_name(
+    adapter: windows::Win32::Foundation::LUID,
+    id: u32,
+) -> Option<(String, String)> {
     use windows::Win32::Devices::Display::{
         DisplayConfigGetDeviceInfo, DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
         DISPLAYCONFIG_DEVICE_INFO_HEADER, DISPLAYCONFIG_TARGET_DEVICE_NAME,

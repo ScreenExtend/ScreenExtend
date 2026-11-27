@@ -262,6 +262,22 @@ async setDisableLinkGovernor(disabled: boolean) : Promise<void> {
 async getDisableLinkGovernor() : Promise<boolean> {
     return await TAURI_INVOKE("get_disable_link_governor");
 },
+async getDisplayLayout() : Promise<Result<DisplayLayout, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_display_layout") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async applyDisplayLayout(placements: DisplayPlacement[]) : Promise<Result<DisplayLayout, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("apply_display_layout", { placements }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async getLogBacklog() : Promise<string[]> {
     return await TAURI_INVOKE("get_log_backlog");
 },
@@ -296,6 +312,7 @@ deviceAudioOutputs: DeviceAudioOutputs,
 deviceJoin: DeviceJoin,
 deviceModify: DeviceModify,
 deviceRemove: DeviceRemove,
+displayLayoutChanged: DisplayLayoutChanged,
 hostedNetworkNoPassword: HostedNetworkNoPassword,
 joinAttemptsPaused: JoinAttemptsPaused,
 logLine: LogLine,
@@ -309,6 +326,7 @@ deviceAudioOutputs: "device-audio-outputs",
 deviceJoin: "device-join",
 deviceModify: "device-modify",
 deviceRemove: "device-remove",
+displayLayoutChanged: "display-layout-changed",
 hostedNetworkNoPassword: "hosted-network-no-password",
 joinAttemptsPaused: "join-attempts-paused",
 logLine: "log-line",
@@ -324,6 +342,30 @@ slowConnection: "slow-connection"
 
 /** user-defined types **/
 
+/**
+ * One display as the arrangement sees it.
+ */
+export type ArrangedDisplay = { 
+/**
+ * Stable across reboots: the monitor device path on Windows, the display UUID on macOS.
+ */
+id: string; 
+/**
+ * What the user sees in the system's own settings.
+ */
+name: string; 
+/**
+ * Top-left on the desktop, in `units`. The primary display is at (0, 0).
+ */
+x: number; y: number; width: number; height: number; primary: boolean; 
+/**
+ * A virtual display this host created for a client.
+ */
+ours: boolean; 
+/**
+ * Displays showing the same picture share a group and move together.
+ */
+mirrorGroup: number | null }
 export type AudioOutput = { id: string; label: string }
 export type AudioOutputsReport = { supported: boolean; outputs: AudioOutput[]; 
 /**
@@ -465,6 +507,27 @@ threshold_threads: number;
  * One line for the log and `doctor`.
  */
 detail: string }
+export type DisplayLayout = { displays: ArrangedDisplay[]; 
+/**
+ * "pixels" on Windows, "points" on macOS.
+ */
+units: string; 
+/**
+ * Whether this session may move displays at all (false over Remote Desktop, or unsupported).
+ */
+canApply: boolean; 
+/**
+ * Why `can_apply` is false, for the UI.
+ */
+reason: string | null }
+/**
+ * The arrangement changed: a display was added, removed or moved, by anyone.
+ */
+export type DisplayLayoutChanged = DisplayLayout
+/**
+ * A requested position for one display, by [`ArrangedDisplay::id`].
+ */
+export type DisplayPlacement = { id: string; x: number; y: number }
 /**
  * What an elevated `drivers restart` came back with.
  */

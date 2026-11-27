@@ -28,9 +28,9 @@
       "description": "Picture quality was lowered to keep the stream moving. The hosted network gives {name} a direct connection to this computer.",
       "action": "Hosted Network"
     },
-    "displaySettingsUnavailable": {
-      "title": "Unable to Open Display Settings",
-      "description": "Please adjust your display settings manually."
+    "rearrangeDisplays": {
+      "failureTitle": "Could Not Rearrange Displays",
+      "failureDescription": "The system did not accept the new arrangement. Nothing was changed."
     },
     "disconnectTimeout": {
       "title": "Disconnect Timeout Updated",
@@ -531,5 +531,25 @@
       "useMine": "Save my version",
       "useStored": "Discard mine, load current"
     }
+  },
+  "rearrangeDisplays": {
+    "button": "Rearrange Displays",
+    "tooltip": "Use Rearrange Displays to place the extended displays around your own screen.",
+    "title": "Rearrange Displays",
+    "description": "Drag a display to where it sits around your screen. Your main display stays where it is.",
+    "primary": "Main display",
+    "screenExtendDisplay": "ScreenExtend display",
+    "loading": "Reading the display layout…",
+    "loadFailed": "Could not read the display layout: {error}",
+    "none": "No displays to arrange.",
+    "unavailable": "Displays cannot be rearranged here.",
+    "displaysChanged": "The connected displays changed, so the layout was refreshed.",
+    "changesLost": "A display you moved is no longer connected, so your unsaved moves were reset.",
+    "done": "Done",
+    "applying": "Applying…",
+    "discardTitle": "Discard changes?",
+    "discardDescription": "Your new display arrangement has not been applied yet.",
+    "discard": "Discard",
+    "keepEditing": "Keep editing"
   }
 }
