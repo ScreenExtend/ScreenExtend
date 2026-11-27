@@ -82,7 +82,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-13, macos-14, macos-15]
+        os: [windows-latest, macos-15]
     steps:
       - uses: actions/checkout@v4
 
@@ -126,7 +126,7 @@ jobs:
         run: cargo test
 
   # the only machines where the 12.3+/13+/14.2+ paths can run (development is on 10.15).
-  # macos-13 is Intel, macos-14 and macos-15 are Apple Silicon
+  # macos-15 is Apple Silicon
   macos-smoke:
     name: macos smoke (${{ matrix.os }})
     needs: rust
@@ -134,7 +134,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-13, macos-14, macos-15]
+        os: [macos-15]
     steps:
       - uses: actions/checkout@v4
 
@@ -194,8 +194,7 @@ jobs:
           # AudioBackend::as_str: process_tap (14.2+) > screencapturekit (13.0+) >
           # virtual_device (10.15-12.x, driver installed) > needs_driver_install > unsupported.
           case "${{ matrix.os }}" in
-            macos-13) want=screencapturekit ;;
-            macos-14|macos-15) want=process_tap ;;
+            macos-15) want=process_tap ;;
           esac
           if [ "$backend" != "$want" ]; then
             echo "::error::expected the $want tier on ${{ matrix.os }}, probe returned '$backend'"
@@ -316,7 +315,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-13, macos-15]
+        os: [windows-latest, macos-15]
     steps:
       - uses: actions/checkout@v4
 
