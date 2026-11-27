@@ -1569,6 +1569,7 @@ mod desktop {
         ("publicSessionsEnabled", BOOL),
         ("zoomFactor", NUM),
         ("disableGpuEncode", BOOL),
+        ("disableLinkGovernor", BOOL),
         ("legacyVolumeKeyProxy", BOOL),
         ("walkthroughCompleted", BOOL),
         ("disconnectGraceSecs", INT),
@@ -2702,6 +2703,12 @@ mod desktop {
         );
         platform::set_disconnect_grace(app.state(), globals.grace_secs as u32);
         platform::set_legacy_volume_key_proxy(globals.legacy_volume_key_proxy);
+        crate::streamer::config::set_disable_link_governor(
+            saved
+                .get("disableLinkGovernor")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        );
         apply_saved_devices(app, &saved);
         apply_saved_trust(app, &saved);
     }
@@ -4659,7 +4666,9 @@ mod desktop {
         let drivers = driver_state(app);
         let permission_missing = permissions
             .iter()
-            .any(|p| p.required && p.state == "denied");
+            // Accessibility holds the desktop gate but can be skipped there; the verdict (exit 3)
+            // stays what it was: a host that cannot capture
+            .any(|p| p.required && p.state == "denied" && p.key != "accessibility");
 
         #[cfg(target_os = "macos")]
         let probes = platform::permissions::raw_probes();

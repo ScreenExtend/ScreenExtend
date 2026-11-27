@@ -136,6 +136,9 @@ pub async fn setup(app_handle: tauri::AppHandle) -> bool {
     }
 
     audio::legacy::routing::recover_on_launch();
+    // before macOS 11 only a capture can raise the Screen Recording alert: make it here, at
+    // startup, and not at the first join
+    let _ = tauri::async_runtime::spawn_blocking(permissions::ask_once_where_undecidable).await;
     let virtual_display = tauri::async_runtime::spawn_blocking(new_shared_controller).await;
 
     // `setup` returns a bare bool, so the log backlog is the only place the reason survives

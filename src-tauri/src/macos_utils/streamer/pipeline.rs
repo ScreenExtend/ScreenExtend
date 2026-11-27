@@ -2727,7 +2727,7 @@ fn new_qp_governor(
         None => Some(qp_ceiling_bps(cfg.width, cfg.height, cfg.fps)),
     };
     let on = enc.rate_tier() == Some(super::encoder::RateTier::BaseFrameQp);
-    let ceiling = ceiling.filter(|_| on);
+    let ceiling = ceiling.filter(|_| on && !crate::streamer::config::link_governor_disabled());
     telemetry
         .qp_ceiling_bps
         .store(ceiling.unwrap_or(0), Ordering::Relaxed);
@@ -2828,8 +2828,8 @@ fn require_screen_recording() -> Result<()> {
     }
     anyhow::bail!(
         "Screen Recording permission is denied for ScreenExtend, so this display cannot be \
-         captured. Re-approve ScreenExtend under System Settings → Privacy & Security → Screen \
-         Recording (quit and reopen ScreenExtend if the toggle is already on), then join again."
+         captured. Re-approve ScreenExtend under Screen Recording in System Settings → Privacy & \
+         Security (System Preferences → Security & Privacy → Privacy on macOS 12 and earlier) (quit and reopen ScreenExtend if the toggle is already on), then join again."
     )
 }
 

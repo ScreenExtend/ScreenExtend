@@ -303,6 +303,7 @@ export default function Settings() {
   const [configLoaded, setConfigLoaded] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [disableGpuEncode, setDisableGpuEncode] = useState(false);
+  const [disableLinkGovernor, setDisableLinkGovernor] = useState(false);
   const [autostartEnabled, setAutostartEnabled] = useState(false);
   const [knownDevices, setKnownDevices] = useState<KnownDevice[]>([]);
   const [banIpInput, setBanIpInput] = useState("");
@@ -366,6 +367,7 @@ export default function Settings() {
     setOldHttpPort(String(config.serverPorts.http));
     setOldHttpsPort(String(config.serverPorts.https));
     setDisableGpuEncode(config.disableGpuEncode);
+    setDisableLinkGovernor(config.disableLinkGovernor ?? false);
     setZoom(clampZoom(config.zoomFactor));
     setPublicSessionsEnabled(config.publicSessionsEnabled);
     try {
@@ -425,6 +427,7 @@ export default function Settings() {
         setOldHttpPort(String(ports.http));
         setOldHttpsPort(String(ports.https));
         setDisableGpuEncode(config.disableGpuEncode ?? false);
+        setDisableLinkGovernor(config.disableLinkGovernor ?? false);
         configLoadOk.current = true;
         const seconds = await commands.getDisconnectGrace();
         setDisconnectGrace(String(seconds));
@@ -645,6 +648,22 @@ export default function Settings() {
       toast({
         title: t("toasts.autostart.failureTitle"),
         description: t("toasts.autostart.failureDescription"),
+      });
+    }
+  };
+
+  const toggleLinkGovernor = async (disabled: boolean) => {
+    setDisableLinkGovernor(disabled);
+    try {
+      await commands.setDisableLinkGovernor(disabled);
+      await updateConfig({ disableLinkGovernor: disabled });
+      await flushConfig();
+    } catch {
+      setDisableLinkGovernor(await commands.getDisableLinkGovernor().catch(() => !disabled));
+      toast({
+        variant: "destructive",
+        title: t("toasts.linkGovernor.failureTitle"),
+        description: t("toasts.linkGovernor.failureDescription"),
       });
     }
   };
@@ -1444,6 +1463,34 @@ export default function Settings() {
                       <Button onClick={() => void saveServerPorts()}>
                         Save Ports
                       </Button>
+                    </div>
+                  </CardContent>
+                </Card>
+              </div>
+              <div className="mb-4">
+                <Card>
+                  <CardHeader>
+                    <div>
+                      <CardTitle>Stream Quality</CardTitle>
+                      <p className="text-sm text-muted-foreground mt-1">
+                        On a network too slow for the stream, ScreenExtend lowers picture quality and then frame rate to keep it moving.
+                      </p>
+                    </div>
+                  </CardHeader>
+                  <CardContent>
+                    <div className="flex items-center space-x-4 p-3 px-0">
+                      <div className="flex-1 space-y-1">
+                        <p className="text-sm font-medium leading-none">
+                          Always use the highest quality and frame rate
+                        </p>
+                        <p className="text-sm text-muted-foreground">
+                          Turns off bitrate limiting. The picture is never lowered to fit the network, so on a slow link the stream may stutter or freeze instead. Applies to devices that join or reconnect after the change.
+                        </p>
+                      </div>
+                      <Switch
+                        checked={disableLinkGovernor}
+                        onCheckedChange={(checked) => void toggleLinkGovernor(checked)}
+                      />
                     </div>
                   </CardContent>
                 </Card>

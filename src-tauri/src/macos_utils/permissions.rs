@@ -238,11 +238,15 @@ fn accessibility_status() -> (&'static str, bool, String) {
     // prompt has had time to be answered the restart hint is the fallback
     let relaunch = requested_long_enough(&AX_REQUESTED_AT);
     match AX_SECONDARY.get("accessibility", accessibility_api_probe) {
+        // Accessibility holds the gate until macOS says it is granted (or the user presses Go
+        // on regardless): a probe that timed out, typically behind macOS's own alert, is not a
+        // reason to let it pass
         Some(AxSecondary::Unreadable) => (
-            STATE_UNKNOWN,
+            STATE_DENIED,
             relaunch,
-            "The accessibility subsystem did not answer in time, so this could not be read. \
-             Remote control stays available and will report its own error if it is blocked."
+            "Needed for remote control, and macOS does not report it as granted. Turn \
+             ScreenExtend on under System Settings → Privacy & Security → Accessibility; it takes \
+             effect at once. Go on regardless starts without remote control."
                 .to_string(),
         ),
         _ if RESET_ACCESSIBILITY.load(Ordering::Relaxed) => (
@@ -264,9 +268,10 @@ fn accessibility_status() -> (&'static str, bool, String) {
         _ if first_requested_ms(KEY_ACCESSIBILITY).is_some() => (
             STATE_DENIED,
             false,
-            "macOS has already asked once. Turn ScreenExtend on under System Settings → Privacy \
-             & Security → Accessibility. If it is already on and this still says not granted, \
-             press Retry: ScreenExtend will clear the entry and ask again."
+            "Needed for remote control. Turn ScreenExtend on under System Settings → Privacy \
+             & Security → Accessibility; it takes effect at once. If it is already on and this \
+             still says not granted, press Retry: ScreenExtend will clear the entry and ask \
+             again. Go on regardless starts without remote control."
                 .to_string(),
         ),
         _ => (
@@ -633,6 +638,7 @@ fn screen_recording_status() -> (&'static str, bool, String) {
             };
             (STATE_DENIED, relaunch, detail)
         }
+        Silent::Unknown if preflight.is_none() => undecidable_status(),
         Silent::Unknown => (
             STATE_UNKNOWN,
             false,
@@ -665,14 +671,219 @@ fn denied_detail() -> String {
 }
 
 /// PROMPTING. Reachable only with a [`PromptPermit`], i.e. through [`prompt_gate`].
-fn request_screen_capture_access(_permit: PromptPermit) -> bool {
+fn request_screen_capture_access(permit: PromptPermit) -> bool {
     *SCREEN_REQUESTED_AT
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
     match cg_bool_fn("CGRequestScreenCaptureAccess") {
         Some(f) => unsafe { f() },
-        None => false,
+        None => request_by_capturing_a_pixel(permit),
     }
+}
+
+/// PROMPTING. Before macOS 11 there is no request function: the first screen capture an app
+/// attempts is what raises the alert and adds the app to the Screen Recording list. One pixel of
+/// the screen is the smallest such attempt. Without it an app on 10.15 never appears in that
+/// list at all, and after a Retry's `tccutil reset` nothing put it back. Returns false: a grant
+/// made from that alert reaches this process only after a relaunch anyway.
+///
+/// `dlsym`'d: `CGWindowListCreateImage` is obsoleted in the macOS 15 SDK.
+fn request_by_capturing_a_pixel(_permit: PromptPermit) -> bool {
+    #[repr(C)]
+    struct CGRect {
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+    }
+    type CreateImage = unsafe extern "C" fn(CGRect, u32, u32, u32) -> *const c_void;
+    const ON_SCREEN_ONLY: u32 = 1; // kCGWindowListOptionOnScreenOnly
+    const NULL_WINDOW: u32 = 0; // kCGNullWindowID
+    const IMAGE_DEFAULT: u32 = 0; // kCGWindowImageDefault
+    let Ok(name) = CString::new("CGWindowListCreateImage") else {
+        return false;
+    };
+    let p = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
+    if p.is_null() {
+        teprintln!(
+            "[permissions] screen_recording: no request function and no capture to ask with"
+        );
+        return false;
+    }
+    let create: CreateImage = unsafe { std::mem::transmute::<*mut c_void, CreateImage>(p) };
+    let rect = CGRect {
+        x: 0.0,
+        y: 0.0,
+        w: 1.0,
+        h: 1.0,
+    };
+    let image = unsafe { create(rect, ON_SCREEN_ONLY, NULL_WINDOW, IMAGE_DEFAULT) };
+    if !image.is_null() {
+        unsafe { CFRelease(image) };
+    }
+    tprintln!("[permissions] screen_recording: asked by capturing one pixel (no CGRequestScreenCaptureAccess here)");
+    false
+}
+
+/// Before macOS 11 the Screen Recording answer can only be read from other apps' window titles,
+/// and the only way to ask for it is to capture. Without an early capture the macOS alert would
+/// first appear at the first join. `setup` calls this once so the capture, and the alert, happen
+/// at startup. macOS shows its alert only while it has no answer on record, so a Mac that already
+/// allowed or denied it sees nothing.
+static ASKED_UNDECIDABLE: AtomicBool = AtomicBool::new(false);
+static TCC_ALERT_SEEN: AtomicBool = AtomicBool::new(false);
+
+/// The process that draws macOS's own permission alert ("would like to record this computer's
+/// screen") on 10.15. Window owner names are readable without any grant.
+const TCC_ALERT_OWNER: &str = "universalAccessAuthWarn";
+
+/// Whether macOS's permission alert is on screen now. It only reads the window list, so it
+/// never prompts.
+fn tcc_alert_on_screen() -> bool {
+    let list = unsafe {
+        CGWindowListCopyWindowInfo(CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY, CG_NULL_WINDOW_ID)
+    };
+    let Some(arr) = (unsafe { list.as_ref() }) else {
+        return false;
+    };
+    let owner_key = CFString::from_str("kCGWindowOwnerName");
+    let mut found = false;
+    for i in 0..arr.count() {
+        let dict_ptr = unsafe { arr.value_at_index(i) } as *const CFDictionary;
+        let Some(dict) = (unsafe { dict_ptr.as_ref() }) else {
+            continue;
+        };
+        let v = unsafe { CFDictionaryGetValue(dict, (&*owner_key as *const CFString).cast()) };
+        if v.is_null() {
+            continue;
+        }
+        let name = unsafe { &*(v as *const CFString) }.to_string();
+        if name == TCC_ALERT_OWNER {
+            found = true;
+            break;
+        }
+    }
+    unsafe { CFRelease(list.cast()) };
+    if found {
+        TCC_ALERT_SEEN.store(true, Ordering::Relaxed);
+    }
+    found
+}
+
+/// What the startup gate shows for Screen Recording where nothing can read it (before macOS 11,
+/// with no other app's window to look at). The gate must not pass before macOS has been asked
+/// and, if it put its alert up, before that alert has been answered and the app restarted.
+fn undecidable_status() -> (&'static str, bool, String) {
+    if !ASKED_UNDECIDABLE.load(Ordering::Relaxed) {
+        return (
+            STATE_DENIED,
+            false,
+            "Asking macOS for Screen Recording.".to_string(),
+        );
+    }
+    if tcc_alert_on_screen() {
+        return (
+            STATE_DENIED,
+            false,
+            "macOS is asking now. Choose Open System Preferences, tick ScreenExtend under Screen \
+             Recording, and let macOS quit and reopen ScreenExtend."
+                .to_string(),
+        );
+    }
+    if TCC_ALERT_SEEN.load(Ordering::Relaxed) {
+        return (
+            STATE_DENIED,
+            true,
+            "If you allowed Screen Recording, press Restart: macOS gives it to ScreenExtend only \
+             after a restart. If you chose Deny, tick ScreenExtend under System Settings → Privacy \
+             & Security → Screen Recording first."
+                .to_string(),
+        );
+    }
+    (
+        STATE_UNKNOWN,
+        false,
+        "macOS already has an answer on record and cannot report it before macOS 11 without \
+         another app's window on screen. If capture is blocked, the device that joins will say so."
+            .to_string(),
+    )
+}
+
+/// macOS 10.15's own "Quit Now", offered once Screen Recording is ticked, quits ScreenExtend and
+/// does not reopen it. When the startup gate was waiting on exactly that, reopen through
+/// LaunchServices a moment after this process is gone (the single-instance lock is held until
+/// then).
+pub fn reopen_if_quit_for_a_grant() {
+    if !TCC_ALERT_SEEN.load(Ordering::Relaxed) || CONFIRMED.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some(bundle) = std::env::current_exe()
+        .ok()
+        .and_then(|e| bundle_path_of(&e))
+    else {
+        return;
+    };
+    tprintln!(
+        "[permissions] quit from outside while waiting for a Screen Recording grant; reopening {}",
+        bundle.display()
+    );
+    let _ = Command::new("/bin/sh")
+        .arg("-c")
+        .arg("sleep 2; /usr/bin/open -a \"$0\"")
+        .arg(&bundle)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+pub fn ask_once_where_undecidable() {
+    let _ = ask_undecidable();
+}
+
+/// The request itself; true when this call made it.
+fn ask_undecidable() -> bool {
+    // the request function arrived with the preflight one (11.0): where either exists, the
+    // ordinary gate asks
+    if preflight_screen_capture().is_some() || ASKED_UNDECIDABLE.swap(true, Ordering::Relaxed) {
+        return false;
+    }
+    if silent_screen_recording() == Silent::Granted {
+        return false;
+    }
+    record_request(KEY_SCREEN_RECORDING);
+    let permit = PromptPermit(());
+    request_screen_capture_access(permit);
+    // the alert comes up asynchronously: look for it, so the gate's next read already knows
+    for _ in 0..15 {
+        if tcc_alert_on_screen() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    true
+}
+
+/// Whether this Mac's settings app is System Settings (macOS 13+) or System Preferences. Probed
+/// by the app itself, not by a version number. Both the pane URL and the wording depend on it.
+fn has_system_settings_app() -> bool {
+    static MODERN: OnceLock<bool> = OnceLock::new();
+    *MODERN
+        .get_or_init(|| std::path::Path::new("/System/Applications/System Settings.app").exists())
+}
+
+/// The instructions below are written for System Settings. System Preferences names the same
+/// place differently, and a user looking for "Privacy & Security" there finds nothing.
+fn for_this_settings_app(detail: String) -> String {
+    if has_system_settings_app() {
+        return detail;
+    }
+    detail
+        .replace(
+            "System Settings → Privacy & Security",
+            "System Preferences → Security & Privacy → Privacy",
+        )
+        .replace("System Settings", "System Preferences")
 }
 
 // prompt policy: after the first request, poll with silent reads only. The user gets no second
@@ -779,6 +990,35 @@ pub fn prompt_gate(key: &str, explicit_retry: bool) -> bool {
         KEY_SCREEN_RECORDING => KEY_SCREEN_RECORDING,
         _ => return false,
     };
+    if key == KEY_ACCESSIBILITY && !explicit_retry {
+        // asked again at every launch: the AX prompt is cheap to dismiss, and remote control
+        // without it fails silently on the device
+        static AX_ASKED_THIS_LAUNCH: AtomicBool = AtomicBool::new(false);
+        if silent_accessibility().state != Silent::Granted
+            && !AX_ASKED_THIS_LAUNCH.swap(true, Ordering::Relaxed)
+        {
+            record_request(key);
+            let permit = PromptPermit(());
+            // macOS shows one permission alert at a time, and a request made while another is
+            // up is dropped (measured on 10.15: the Screen Recording request then never put the
+            // app in its list). Wait until no alert is on screen, then ask.
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(600);
+                while tcc_alert_on_screen() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+                prompt_accessibility(permit);
+            });
+            return false;
+        }
+        return silent_accessibility().state == Silent::Granted;
+    }
+    if key == KEY_SCREEN_RECORDING && !explicit_retry && preflight_screen_capture().is_none() {
+        // before macOS 11 the request is a capture, and macOS puts its alert up only while it
+        // has no answer on record: once per process is safe whatever the marker says
+        ask_undecidable();
+        return silent_screen_recording() == Silent::Granted;
+    }
     let silent = silent_state(key);
     let first = first_requested_ms(key);
     let owns = owns_tcc_identity();
@@ -1146,10 +1386,10 @@ pub fn probe_permissions() -> Vec<PermissionStatus> {
             description: "Lets connected devices control this Mac's keyboard and mouse."
                 .to_string(),
             state: ax_state.to_string(),
-            detail: ax_detail,
-            // only opt-in remote input needs this: a user who just wants a second monitor
-            // must not be stopped here
-            required: false,
+            detail: for_this_settings_app(ax_detail),
+            // the startup gate holds for it like Screen Recording; the desktop UI offers "Go on
+            // regardless", which lasts until the app quits
+            required: true,
             relaunch_required: ax_relaunch,
         },
         PermissionStatus {
@@ -1157,7 +1397,7 @@ pub fn probe_permissions() -> Vec<PermissionStatus> {
             name: "Screen Recording".to_string(),
             description: "Lets ScreenExtend capture this Mac's screen to stream it.".to_string(),
             state: sr_state.to_string(),
-            detail: sr_detail,
+            detail: for_this_settings_app(sr_detail),
             required: true,
             relaunch_required: sr_relaunch,
         },
@@ -1208,6 +1448,17 @@ pub async fn request_permission(app: tauri::AppHandle, key: String) -> bool {
         Some(k) => (true, k.to_string()),
         None => (false, key),
     };
+    if explicit_retry && key == KEY_SCREEN_RECORDING && preflight_screen_capture().is_none() {
+        // Before macOS 11 a process asks macOS once: a second capture in the same process
+        // raises nothing (measured on 10.15). So Retry clears the entry and restarts, and the
+        // new process asks first thing.
+        if let Some(id) = running_bundle_id() {
+            reset_tcc_row(KEY_SCREEN_RECORDING, id, "retry-before-macos-11");
+        }
+        tprintln!("[permissions] screen_recording: Retry before macOS 11 restarts ScreenExtend to ask again");
+        relaunch_app(app);
+        return false;
+    }
     tauri::async_runtime::spawn_blocking(move || prompt_gate(&key, explicit_retry))
         .await
         .unwrap_or(false)
@@ -1225,9 +1476,15 @@ pub fn open_permission_settings(key: String) {
         KEY_SCREEN_RECORDING => "Privacy_ScreenCapture",
         _ => "Privacy",
     };
-    // Ventura renamed the pane: try the modern identifier first and fall back, so the OS
-    // decides rather than a version number
-    for base in [SETTINGS_PANE_MODERN, SETTINGS_PANE_LEGACY] {
+    // Ventura renamed the pane. `open` succeeds on an identifier the settings app does not know
+    // (System Preferences just opens at its top level), so its exit status cannot pick the
+    // pane: which settings app exists does, with the other identifier as a fallback.
+    let order = if has_system_settings_app() {
+        [SETTINGS_PANE_MODERN, SETTINGS_PANE_LEGACY]
+    } else {
+        [SETTINGS_PANE_LEGACY, SETTINGS_PANE_MODERN]
+    };
+    for base in order {
         let url = format!("{base}?{anchor}");
         match Command::new("open").arg(&url).status() {
             Ok(s) if s.success() => return,
@@ -1668,6 +1925,7 @@ mod tests {
         assert_eq!(
             mints,
             [
+                "ask_undecidable",
                 "silently_granted_permit",
                 "capture_start_permit",
                 "prompt_gate"
@@ -1677,6 +1935,7 @@ mod tests {
         // every prompting call site is inside a fn that demands a permit
         for needle in [
             "\"CGRequestScreenCaptureAccess\"",
+            "\"CGWindowListCreateImage\"",
             "AXTrustedCheckOptionPrompt",
             "AXIsProcessTrustedWithOptions((",
             "sck::probe_screen_recording(",
@@ -1772,6 +2031,7 @@ mod tests {
                 }
                 for line in lines {
                     if line.contains("CGRequestScreenCaptureAccess")
+                        || line.contains("CGWindowListCreateImage")
                         || line.contains("AXTrustedCheckOptionPrompt")
                         || line.contains("AXIsProcessTrustedWithOptions")
                     {

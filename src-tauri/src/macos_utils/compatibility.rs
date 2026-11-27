@@ -135,7 +135,8 @@ fn capability_notes(probes: &Probes) -> Vec<UnsupportedApi> {
             api_key::INPUT_ACCESSIBILITY,
             "Accessibility (Remote Control)",
             "Letting a connected device drive this Mac's keyboard and pointer. Enable \
-             ScreenExtend in System Settings > Privacy & Security > Accessibility.",
+             ScreenExtend under Accessibility in System Settings > Privacy & Security (System \
+             Preferences > Security & Privacy > Privacy on macOS 12 and earlier).",
             "permission not granted",
         ));
     }

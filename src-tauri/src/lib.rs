@@ -1138,6 +1138,8 @@ pub fn run() {
             get_server_ports,
             set_disable_gpu_encode,
             get_disable_gpu_encode,
+            streamer::config::set_disable_link_governor,
+            streamer::config::get_disable_link_governor,
             logbus::get_log_backlog,
             logbus::set_log_streaming,
             logbus::log_frontend_error
@@ -1373,6 +1375,12 @@ pub fn run() {
                 ));
             }
             tauri::RunEvent::ExitRequested { code, .. } => {
+                // nothing of ours asked to exit, so on macOS this is a Quit from outside, such as
+                // the "Quit Now" macOS offers once Screen Recording is granted
+                #[cfg(target_os = "macos")]
+                if exit_reason::recorded().is_none() {
+                    macos_utils::permissions::reopen_if_quit_for_a_grant();
+                }
                 exit_reason::record(format!(
                     "the run loop was asked to exit (code {code:?}) with no window left and no \
                      route of ours having named a reason"

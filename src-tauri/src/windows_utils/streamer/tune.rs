@@ -58,7 +58,8 @@ fn record(name: &'static str, default_on: bool, value: bool) -> bool {
 
 /// Behaviour that ships on. False only when `SE_TUNE_OFF` names it.
 pub fn on(name: &'static str) -> bool {
-    let value = !switches().off.iter().any(|n| n == name);
+    let value = !switches().off.iter().any(|n| n == name)
+        && !(name == "link_governor" && crate::streamer::config::link_governor_disabled());
     record(name, true, value)
 }
 

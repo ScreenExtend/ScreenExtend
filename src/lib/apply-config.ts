@@ -63,6 +63,7 @@ export async function applyConfig(config: Config): Promise<Config> {
     )
   );
   await at("disableGpuEncode", () => commands.setDisableGpuEncode(applied.disableGpuEncode));
+  await at("disableLinkGovernor", () => commands.setDisableLinkGovernor(applied.disableLinkGovernor));
   await at("legacyVolumeKeyProxy", () =>
     commands.setLegacyVolumeKeyProxy(applied.legacyVolumeKeyProxy)
   );

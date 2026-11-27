@@ -84,6 +84,7 @@ export type Config = {
   publicSessionsEnabled: boolean,
   zoomFactor: number,
   disableGpuEncode: boolean,
+  disableLinkGovernor: boolean,
   legacyVolumeKeyProxy: boolean,
   walkthroughCompleted: boolean,
   // seconds a display survives a device dropping off. Kept in config.json, not localStorage:
@@ -137,6 +138,7 @@ export const defaultConfig: Config = {
   publicSessionsEnabled: true,
   zoomFactor: 1,
   disableGpuEncode: false,
+  disableLinkGovernor: false,
   legacyVolumeKeyProxy: false,
   walkthroughCompleted: false,
   disconnectGraceSecs: 10,

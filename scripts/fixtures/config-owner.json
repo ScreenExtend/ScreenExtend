@@ -126,6 +126,7 @@
   "publicSessionsEnabled": true,
   "zoomFactor": 1,
   "disableGpuEncode": false,
+  "disableLinkGovernor": false,
   "legacyVolumeKeyProxy": false,
   "walkthroughCompleted": true,
   "disconnectGraceSecs": 10,

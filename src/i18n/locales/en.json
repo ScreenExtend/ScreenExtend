@@ -216,7 +216,7 @@
       "checkFailedTitle": "Couldn't Check Permissions",
       "checkFailedDescription": "ScreenExtend couldn't read the current permission status. Try again, or restart the app.",
       "checkUnreadableTitle": "Couldn't Read Permissions",
-      "checkUnreadableDescription": "ScreenExtend could not read which permissions are granted, so it started without knowing. If a device connects to a blank screen, check Screen Recording in System Settings."
+      "checkUnreadableDescription": "ScreenExtend could not read which permissions are granted, so it started without knowing. If a device connects to a blank screen, check Screen Recording in this Mac's Privacy settings (System Settings → Privacy & Security, or System Preferences → Security & Privacy → Privacy on macOS 12 and earlier)."
     },
     "driverInstall": {
       "failureTitle": "Couldn't Install Drivers",
@@ -281,6 +281,10 @@
     "driverBusy": {
       "quitFailedTitle": "Couldn't Quit the Other Copy",
       "quitFailedDescription": "The copy holding the display driver did not answer. Close it yourself: check the taskbar, or any terminal running ScreenExtend, then press Try Again."
+    },
+    "linkGovernor": {
+      "failureTitle": "Could not change stream quality",
+      "failureDescription": "The setting was not saved. Try again."
     }
   },
   "device": {
@@ -466,11 +470,13 @@
       "revokedTitle": "Screen Recording Is Off",
       "revokedBody": "macOS is not letting ScreenExtend record the screen: the permission was either never granted or has been turned off, so the connected devices were disconnected. Without it, capture keeps running and sends nothing but your desktop wallpaper, which is why the session is ended instead.",
       "revokedBodyWithCount": "macOS is not letting ScreenExtend record the screen: the permission was either never granted or has been turned off, so {count} connected device(s) were disconnected. Without it, capture keeps running and sends nothing but your desktop wallpaper, which is why the session is ended instead.",
-      "revokedSteps": "Turn ScreenExtend on under System Settings → Privacy & Security → Screen Recording, then restart it and reconnect the device. macOS may give a newly granted permission only to a freshly launched app.",
+      "revokedSteps": "Turn ScreenExtend on under Screen Recording in this Mac's Privacy settings (System Settings → Privacy & Security, or System Preferences → Security & Privacy → Privacy on macOS 12 and earlier), then restart it and reconnect the device. macOS may give a newly granted permission only to a freshly launched app.",
       "openSettings": "Open Settings",
       "retry": "Retry",
       "retryHint": "Ask macOS for this permission again. If macOS clearly reports it as off, ScreenExtend first clears its entry, because macOS will not ask again over an existing one.",
-      "dismiss": "Dismiss"
+      "dismiss": "Dismiss",
+      "skipForNow": "Go on regardless",
+      "skipForNowHint": "Start without Accessibility. Devices can view this Mac but cannot control its keyboard and mouse. ScreenExtend asks again the next time it opens."
     },
     "driverBusy": {
       "title": "ScreenExtend Is Already Running",

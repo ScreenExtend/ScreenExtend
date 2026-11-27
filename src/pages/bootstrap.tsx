@@ -88,7 +88,12 @@ function samePermissions(a: PermissionStatus[] | null, b: PermissionStatus[]): b
 
 // "unknown" is a probe that could not learn the answer, not a refusal. Only a
 // definite "denied" is allowed to hold up startup.
+// "Go on regardless" on the permission gate skips Accessibility only, and only until the app
+// quits, so the next launch asks again
+let accessibilitySkipped = false;
+
 function blocks(p: PermissionStatus): boolean {
+  if (p.key === "accessibility" && accessibilitySkipped) return false;
   return p.required && p.state === "denied";
 }
 
@@ -234,6 +239,9 @@ export default function Bootstrap() {
     }
     if (existing.disableGpuEncode) {
       step("disableGpuEncode", () => commands.setDisableGpuEncode(true));
+    }
+    if (existing.disableLinkGovernor) {
+      step("disableLinkGovernor", () => commands.setDisableLinkGovernor(true));
     }
     if (existing.legacyVolumeKeyProxy) {
       step("legacyVolumeKeyProxy", () => commands.setLegacyVolumeKeyProxy(true));
@@ -498,7 +506,11 @@ export default function Bootstrap() {
     // the automatic request: the host lets it reach the macOS prompt only the first time a
     // permission is ever requested (persisted across relaunches). After that it is a silent
     // read, and only Retry asks macOS again.
-    for (const p of missing) {
+    // Screen Recording first: macOS shows one permission alert at a time, and the host holds
+    // the Accessibility prompt until the Screen Recording alert is gone
+    const ordered = [...missing].sort((a, b) =>
+      Number(b.key === "screen_recording") - Number(a.key === "screen_recording"));
+    for (const p of ordered) {
       try {
         await commands.requestPermission(p.key);
       } catch (e) {
@@ -1241,6 +1253,19 @@ export default function Bootstrap() {
             >
               {t("common.quit")}
             </AlertDialogAction>
+            {(permReport ?? []).some(p => p.key === "accessibility" && blocks(p))
+              && !(permReport ?? []).some(p => p.key !== "accessibility" && blocks(p)) && (
+              <button
+                className="inline-flex h-10 items-center justify-center rounded-md bg-secondary px-4 py-2 text-sm font-medium text-secondary-foreground hover:bg-secondary/80"
+                title={t("bootstrap.permissions.skipForNowHint")}
+                onClick={() => {
+                  accessibilitySkipped = true;
+                  leavePermissionGate();
+                }}
+              >
+                {t("bootstrap.permissions.skipForNow")}
+              </button>
+            )}
             <button
               className="inline-flex h-10 items-center justify-center rounded-md bg-secondary px-4 py-2 text-sm font-medium text-secondary-foreground hover:bg-secondary/80 disabled:opacity-50"
               disabled={rechecking}

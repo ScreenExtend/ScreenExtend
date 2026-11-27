@@ -593,3 +593,34 @@ mod gpu_toggle_tests {
         assert!(!c.software_encode_now(), "and it can be turned back on");
     }
 }
+
+/// The "highest quality, no matter what" switch (`disableLinkGovernor`): with it on, nothing lowers
+/// a stream's quality or frame rate for the link or the bitrate. On Windows that is the link
+/// governor (and everything it gates: paced resends, the slow-link notice); on macOS the QP
+/// ceiling governor. Read when a session starts, so it applies from the next join on.
+static LINK_GOVERNOR_DISABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn link_governor_disabled() -> bool {
+    LINK_GOVERNOR_DISABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn set_disable_link_governor(disabled: bool) {
+    LINK_GOVERNOR_DISABLED.store(disabled, std::sync::atomic::Ordering::Relaxed);
+    tprintln!(
+        "[stream] link/bitrate governor {} (applies from the next join)",
+        if disabled {
+            "disabled: highest quality and frame rate"
+        } else {
+            "enabled"
+        }
+    );
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn get_disable_link_governor() -> bool {
+    link_governor_disabled()
+}
