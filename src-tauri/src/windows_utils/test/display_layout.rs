@@ -141,6 +141,8 @@ fn the_watcher_reports_only_a_changed_geometry() {
         primary: x == 0,
         ours: false,
         mirror_group: None,
+        refresh_hz: None,
+        join_id: None,
     };
     let l = |x| DisplayLayout {
         displays: vec![d(0), d(x)],

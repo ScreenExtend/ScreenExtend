@@ -262,6 +262,17 @@ async setDisableLinkGovernor(disabled: boolean) : Promise<void> {
 async getDisableLinkGovernor() : Promise<boolean> {
     return await TAURI_INVOKE("get_disable_link_governor");
 },
+/**
+ * Settings > Permanent link. `None` for either turns it off.
+ */
+async setPermanentLink(sessionId: string | null, otp: string | null) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_permanent_link", { sessionId, otp }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async getDisplayLayout() : Promise<Result<DisplayLayout, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("get_display_layout") };
@@ -277,6 +288,9 @@ async applyDisplayLayout(placements: DisplayPlacement[]) : Promise<Result<Displa
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+async setDevicePlacements(placements: DevicePlacement[]) : Promise<void> {
+    await TAURI_INVOKE("set_device_placements", { placements });
 },
 async getLogBacklog() : Promise<string[]> {
     return await TAURI_INVOKE("get_log_backlog");
@@ -365,7 +379,15 @@ ours: boolean;
 /**
  * Displays showing the same picture share a group and move together.
  */
-mirrorGroup: number | null }
+mirrorGroup: number | null; 
+/**
+ * The refresh rate the display runs at, when the OS reports one.
+ */
+refreshHz: number | null; 
+/**
+ * For one of ours: the join whose client this display streams to.
+ */
+joinId: string | null }
 export type AudioOutput = { id: string; label: string }
 export type AudioOutputsReport = { supported: boolean; outputs: AudioOutput[]; 
 /**
@@ -465,6 +487,11 @@ current: string | null;
 labelled: boolean | null }
 export type DeviceJoin = Device
 export type DeviceModify = Device
+/**
+ * Where a device's display sits, relative to the main display at (0, 0), as the user last
+ * placed it on the Devices page. Keyed by the device token: an address is recycled.
+ */
+export type DevicePlacement = { token: string; x: number; y: number }
 export type DeviceRemove = Device
 export type DisplayCapacity = { max: number | null; in_use: number; full: boolean; backend: string }
 /**

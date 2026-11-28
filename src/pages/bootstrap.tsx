@@ -53,6 +53,7 @@ import {
   type RepairAttempt,
   type SetupFailure,
 } from "@/lib/startup-gate";
+import { savedPlacements } from "@/lib/arrange";
 import { scheduleConfigEditorPreload } from "@/lib/preload-editor";
 import { loadDashboard, loadDevices, loadSettings } from "@/lib/route-chunks";
 import { useTranslation } from "@/i18n";
@@ -251,6 +252,14 @@ export default function Bootstrap() {
     if (existing.legacyVolumeKeyProxy) {
       step("legacyVolumeKeyProxy", () => commands.setLegacyVolumeKeyProxy(true));
     }
+    const link = existing.permanentLink;
+    if (link?.enabled && link.sessionId && link.otp) {
+      step("permanentLink", async () => {
+        const result = await commands.setPermanentLink(link.sessionId, link.otp);
+        if (result.status === "error") throw new Error(result.error);
+      });
+    }
+    step("devices.placement", () => commands.setDevicePlacements(savedPlacements(existing.devices)));
     // independent per device, so replayed together: with a dozen saved devices, one IPC
     // round-trip at a time is the longest stretch between setup() and the dashboard
     for (const device of existing.devices) {

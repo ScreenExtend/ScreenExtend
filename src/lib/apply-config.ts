@@ -1,4 +1,5 @@
 import { commands } from "@/lib/bindings";
+import { savedPlacements } from "@/lib/arrange";
 import {
   DEFAULT_ADAPTIVE_QUALITY,
   DEFAULT_AUTO_FRAME_RATE,
@@ -70,6 +71,14 @@ export async function applyConfig(config: Config): Promise<Config> {
   await at("disconnectGraceSecs", () =>
     commands.setDisconnectGrace(applied.disconnectGraceSecs)
   );
+  await at("permanentLink", async () => {
+    const link = applied.permanentLink;
+    const on = link.enabled && link.sessionId !== "" && link.otp !== "";
+    const result = await commands.setPermanentLink(on ? link.sessionId : null, on ? link.otp : null);
+    if (result.status === "error") throw new Error(result.error);
+  });
+
+  await at("devices.placement", () => commands.setDevicePlacements(savedPlacements(applied.devices)));
 
   for (const device of applied.devices) {
     // a row saved before tokens existed names only an address, which is recycled between

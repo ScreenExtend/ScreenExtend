@@ -1496,6 +1496,9 @@ mod desktop {
     const NUM: &Shape = &Shape::Num;
     const BOOL: &Shape = &Shape::Bool;
 
+    const PLACEMENT_FIELDS: &[(&str, &Shape)] = &[("x", INT), ("y", INT)];
+    const PLACEMENT: &Shape = &Shape::Object(PLACEMENT_FIELDS);
+
     const DEVICE_FIELDS: &[(&str, &Shape)] = &[
         ("ip", STR),
         ("token", STR),
@@ -1518,6 +1521,7 @@ mod desktop {
         ("screenSize", STR),
         ("dpr", NUM),
         ("maxDpr", NUM),
+        ("placement", PLACEMENT),
     ];
     const DEVICE: &Shape = &Shape::Object(DEVICE_FIELDS);
     const DEVICES: &Shape = &Shape::Array(DEVICE);
@@ -1539,6 +1543,9 @@ mod desktop {
 
     const HOSTED_NETWORK_FIELDS: &[(&str, &Shape)] = &[("name", STR), ("password", STR)];
     const HOSTED_NETWORK: &Shape = &Shape::Object(HOSTED_NETWORK_FIELDS);
+    const PERMANENT_LINK_FIELDS: &[(&str, &Shape)] =
+        &[("enabled", BOOL), ("sessionId", STR), ("otp", STR)];
+    const PERMANENT_LINK: &Shape = &Shape::Object(PERMANENT_LINK_FIELDS);
 
     const TURN_CONFIG_FIELDS: &[(&str, &Shape)] =
         &[("urls", STR), ("username", STR), ("credential", STR)];
@@ -1575,6 +1582,7 @@ mod desktop {
         ("disconnectGraceSecs", INT),
         ("serverPorts", SERVER_PORTS),
         ("hostedNetworkCredentials", HOSTED_NETWORK),
+        ("permanentLink", PERMANENT_LINK),
         ("turnConfig", TURN_CONFIG),
         ("stunUrls", STR),
         ("dontShowAgain", DONT_SHOW_AGAIN),
@@ -2675,6 +2683,16 @@ mod desktop {
         legacy_volume_key_proxy: bool,
     }
 
+    /// The permanent link's pair when it is enabled and complete, else off.
+    fn saved_permanent_link(saved: &Saved) -> Option<(String, String)> {
+        let link = saved.get("permanentLink")?;
+        if link.get("enabled").and_then(Value::as_bool) != Some(true) {
+            return None;
+        }
+        let field = |k: &str| link.get(k).and_then(Value::as_str).map(str::to_string);
+        Some((field("sessionId")?, field("otp")?))
+    }
+
     fn saved_globals(saved: &Saved) -> SavedGlobals {
         SavedGlobals {
             turn_urls: saved_str(saved, "turnConfig.urls").unwrap_or_default(),
@@ -2709,6 +2727,10 @@ mod desktop {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
         );
+        if let Err(e) = crate::streamer::session::apply_permanent_link(saved_permanent_link(&saved))
+        {
+            teprintln!("[serve] the saved permanent link is not usable and stays off: {e}");
+        }
         apply_saved_devices(app, &saved);
         apply_saved_trust(app, &saved);
     }
@@ -2816,6 +2838,9 @@ mod desktop {
     }
 
     fn apply_saved_devices(app: &tauri::AppHandle, saved: &Saved) {
+        crate::display_arrange::replace_placements(crate::display_arrange::placements_from_rows(
+            saved_rows(saved, "devices"),
+        ));
         // Windows `serve`: a RELOAD replays only the rows that changed since the last replay,
         // and forgets the live override of a row that is gone (`win_host::plan_replay`)
         #[cfg(windows)]

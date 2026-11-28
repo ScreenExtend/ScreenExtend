@@ -74,6 +74,16 @@ const deviceSchema: JsonSchema = {
       maximum: 4,
       default: 1,
     },
+    placement: {
+      type: "object",
+      description: "Where this device's display sits relative to the main display, in pixels, as last placed on the Devices page. Restored when the device joins again. Leave it out to let the system place it.",
+      additionalProperties: false,
+      required: ["x", "y"],
+      properties: {
+        x: { type: "integer", description: "Left edge relative to the main display's top-left corner." },
+        y: { type: "integer", description: "Top edge relative to the main display's top-left corner." },
+      },
+    },
     maxDpr: {
       type: "number",
       description: "Highest device pixel ratio this device reported it can display. Reported by the client: changing it by hand has no effect beyond capping dpr.",
@@ -125,6 +135,7 @@ export const configJsonSchema: JsonSchema = {
     "disconnectGraceSecs",
     "serverPorts",
     "hostedNetworkCredentials",
+    "permanentLink",
     "turnConfig",
     "stunUrls",
     "dontShowAgain",
@@ -169,7 +180,7 @@ export const configJsonSchema: JsonSchema = {
     disableLinkGovernor: bool("Highest quality and frame rate no matter what: never lower the picture to fit a slow network or a bitrate ceiling (the link governor on Windows, the bitrate ceiling on macOS). On a slow link the stream may stall instead. Applies from the next join.", false),
     legacyVolumeKeyProxy: bool("macOS 10.15-12.x only. Keeps the hardware volume keys working while the ScreenExtend virtual audio device is the system output.", false),
     walkthroughCompleted: bool("Whether the onboarding walkthrough has been finished. Set this to false to see it again on the next launch.", false),
-    disconnectGraceSecs: int("How long a device's virtual display survives after it drops off, in seconds. 0 removes the display immediately; the host clamps this to 0-600.", 0, 600, 10),
+    disconnectGraceSecs: int("How long a device's virtual display survives after it drops off, in seconds. 0 removes the display immediately; the host clamps this to 0-600.", 0, 600, 3),
     serverPorts: {
       type: "object",
       description: "TCP ports the local-network server listens on. Change these if another app already uses 8080/8443; devices must rejoin with the new link afterwards.",
@@ -192,6 +203,25 @@ export const configJsonSchema: JsonSchema = {
           patternErrorMessage: "The network name must start with \"ScreenExtend\".",
         }),
         password: str("Network password. At least 8 characters on Windows, 10 on macOS.", { maxLength: 63 }),
+      },
+    },
+    permanentLink: {
+      type: "object",
+      description: "A join link that never changes: its session id and OTP are accepted beside the rotating ones while enabled. Anyone with the link can connect.",
+      required: ["enabled", "sessionId", "otp"],
+      additionalProperties: false,
+      properties: {
+        enabled: bool("Accept the permanent session id and OTP.", false),
+        sessionId: str("12 characters from 23456789ABCDEFGHJKLMNPQRSTUVWXYZ, or empty.", {
+          maxLength: 12,
+          pattern: "^([23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{12})?$",
+          patternErrorMessage: "The permanent session id is 12 characters from 23456789ABCDEFGHJKLMNPQRSTUVWXYZ.",
+        }),
+        otp: str("6 digits, or empty.", {
+          maxLength: 6,
+          pattern: "^([0-9]{6})?$",
+          patternErrorMessage: "The permanent OTP is 6 digits.",
+        }),
       },
     },
     turnConfig: {
@@ -247,6 +277,7 @@ export const configJsonSchema: JsonSchema = {
 // node test can load it without React.
 export const MASKED_CONFIG_PATHS = [
   "hostedNetworkCredentials.password",
+  "permanentLink.otp",
   "devices[].token",
   "knownDevices[].token",
   "turnConfig.credential",

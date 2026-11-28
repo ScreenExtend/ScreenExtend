@@ -55,6 +55,11 @@ export type Device = {
   screenSize: string;
   dpr: number;
   maxDpr: number;
+  /**
+   * Where this device's display sits relative to the main display, as last placed on the Devices
+   * page. Restored when the device joins again. Absent: wherever the system puts it.
+   */
+  placement?: { x: number; y: number };
 };
 
 /**
@@ -97,6 +102,12 @@ export type Config = {
   hostedNetworkCredentials: {
     name: string,
     password: string
+  },
+  // a session id and OTP that never rotate, accepted beside the live pair while enabled
+  permanentLink: {
+    enabled: boolean,
+    sessionId: string,
+    otp: string
   },
   turnConfig: {
     urls: string,
@@ -141,7 +152,7 @@ export const defaultConfig: Config = {
   disableLinkGovernor: false,
   legacyVolumeKeyProxy: false,
   walkthroughCompleted: false,
-  disconnectGraceSecs: 10,
+  disconnectGraceSecs: 3,
   serverPorts: {
     http: DEFAULT_HTTP_PORT,
     https: DEFAULT_HTTPS_PORT
@@ -149,6 +160,11 @@ export const defaultConfig: Config = {
   hostedNetworkCredentials: {
     name: "",
     password: ""
+  },
+  permanentLink: {
+    enabled: false,
+    sessionId: "",
+    otp: ""
   },
   turnConfig: {
     urls: "",

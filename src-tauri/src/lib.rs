@@ -1142,8 +1142,10 @@ pub fn run() {
             get_disable_gpu_encode,
             streamer::config::set_disable_link_governor,
             streamer::config::get_disable_link_governor,
+            streamer::session::set_permanent_link,
             display_arrange::get_display_layout,
             display_arrange::apply_display_layout,
+            display_arrange::set_device_placements,
             logbus::get_log_backlog,
             logbus::set_log_streaming,
             logbus::log_frontend_error

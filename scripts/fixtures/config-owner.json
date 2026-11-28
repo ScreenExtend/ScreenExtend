@@ -138,6 +138,11 @@
     "name": "ScreenExtend-sarve",
     "password": "Xk8pQm2ZaB7c"
   },
+  "permanentLink": {
+    "enabled": false,
+    "sessionId": "",
+    "otp": ""
+  },
   "turnConfig": {
     "urls": "turn:turn.example.com:3478",
     "username": "se-user",

@@ -45,6 +45,7 @@ import {
 import { updateConfig, getConfig, flushConfig, getKnownDevices, setKnownDeviceBanned, removeKnownDevice, DEFAULT_HTTP_PORT, DEFAULT_HTTPS_PORT, type Config, type KnownDevice } from "@/components/config-provider";
 import { useAvatar, useConnectedDevices, useGlobalSetters, useSession, useZoom } from "@/components/global-provider";
 import { LogTerminal } from "@/components/log-terminal";
+import { PermanentLinkCard } from "@/components/permanent-link-card";
 const ConfigJsonEditor = lazy(() =>
   import("@/components/config-json-editor").then(m => ({ default: m.ConfigJsonEditor }))
 );
@@ -1172,6 +1173,9 @@ export default function Settings() {
               </div>
             </CardContent>
           </Card>
+        </div>
+        <div className="mb-4">
+          <PermanentLinkCard />
         </div>
         <div className="mb-4">
           <Card>

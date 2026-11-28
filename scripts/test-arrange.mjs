@@ -5,15 +5,17 @@
 // so this runs the module the dialog ships.
 //
 // What it pins: a dropped display always ends up touching the others and overlapping none, the
-// primary never moves, a mirror group moves as one, and only what moved is sent to the host.
+// primary stays at the origin, a mirror group moves as one, and only what moved is sent to the host.
 import assert from 'node:assert/strict';
 import {
+  devicePlacements,
   fit,
   isConnected,
   moveTile,
   normalize,
   placements,
   sameArrangement,
+  savedPlacements,
   snap,
   toTiles,
   touches,
@@ -56,8 +58,22 @@ test('a display dropped on top of another is pushed out, never overlapping', () 
   assert.ok(isConnected(tiles));
 });
 
-test('the primary does not move', () => {
-  const tiles = moveTile(base(), 'main', 500, 500);
+test('dragging the primary moves the others the opposite way, and it stays at the origin', () => {
+  // the primary dropped above the virtual display is the virtual display dropped below it
+  const viaMain = moveTile(base(), 'main', 2000, -1600);
+  const viaOther = moveTile(base(), 'virt', 2560 - 2000, 1600);
+  const main = viaMain.find(t => t.key === 'main');
+  assert.deepEqual([main.x, main.y], [0, 0], 'still primary at the origin');
+  assert.deepEqual(viaMain.map(t => [t.key, t.x, t.y]), viaOther.map(t => [t.key, t.x, t.y]));
+  assert.ok(!overlapping(viaMain));
+  assert.ok(isConnected(viaMain));
+  // the primary itself is never sent: only the displays that moved relative to it
+  const sent = placements(base(), viaMain);
+  assert.deepEqual(sent.map(p => p.id), ['virt']);
+});
+
+test('the primary dropped where it was changes nothing', () => {
+  const tiles = moveTile(base(), 'main', 0, 0);
   assert.deepEqual(tiles.map(t => [t.x, t.y]), [[0, 0], [2560, 0]]);
 });
 
@@ -116,6 +132,46 @@ test('fit keeps every display inside the canvas', () => {
     assert.ok(t.x * scale + offsetX >= 19.5 && (t.x + t.width) * scale + offsetX <= 580.5);
     assert.ok(t.y * scale + offsetY >= 19.5 && (t.y + t.height) * scale + offsetY <= 280.5);
   }
+});
+
+test('a display keeps the join it streams to and its refresh rate, and a mirror group takes the first', () => {
+  const tiles = toTiles([
+    { id: 'p', name: 'Panel', x: 0, y: 0, width: 1920, height: 1080, primary: true, ours: false, mirrorGroup: null, refreshHz: 60 },
+    { id: 'v', name: 'Virtual', x: 1920, y: 0, width: 1280, height: 800, primary: false, ours: true, mirrorGroup: 0, joinId: 'j1', refreshHz: null },
+    { id: 'w', name: 'Clone', x: 1920, y: 0, width: 1280, height: 800, primary: false, ours: true, mirrorGroup: 0, joinId: 'j2' },
+  ]);
+  assert.equal(tiles.length, 2);
+  assert.equal(tiles[0].joinId, null);
+  assert.equal(tiles[0].refreshHz, 60);
+  assert.equal(tiles[1].joinId, 'j1');
+});
+
+test('an applied layout is saved per device token, ours only', () => {
+  const applied = [
+    display('main', 0, 0, 1920, 1080, { primary: true }),
+    display('phone', 1920, 200, 400, 800, { ours: true, joinId: 'j1' }),
+    display('tablet', -1280, 0, 1280, 800, { ours: true, joinId: 'j2' }),
+    display('stranger', 0, 1080, 400, 800, { ours: true, joinId: 'gone' }),
+    display('monitor', 0, -1080, 1920, 1080),
+  ];
+  const tokens = { j1: 'tok-phone', j2: 'tok-tablet' };
+  assert.deepEqual(devicePlacements(applied, j => tokens[j]), [
+    { token: 'tok-phone', x: 1920, y: 200 },
+    { token: 'tok-tablet', x: -1280, y: 0 },
+  ]);
+});
+
+test('saved rows hand back only placements with a token', () => {
+  assert.deepEqual(
+    savedPlacements([
+      { token: 'a', placement: { x: 1920, y: 0 } },
+      { token: 'b' },
+      { token: '', placement: { x: 1, y: 1 } },
+      { placement: { x: 2, y: 2 } },
+      { token: 'c', placement: null },
+    ]),
+    [{ token: 'a', x: 1920, y: 0 }],
+  );
 });
 
 console.log(failed === 0 ? '\nall arrange assertions passed' : `\n${failed} failed`);

@@ -121,6 +121,7 @@ struct Source {
     /// A laptop panel or another display wired inside the machine.
     built_in: bool,
     clone_group: Option<u32>,
+    refresh_hz: Option<f64>,
 }
 
 impl Ccd {
@@ -148,6 +149,9 @@ impl Ccd {
             let (friendly, device_path) =
                 target_name(p.targetInfo.adapterId, p.targetInfo.id).unwrap_or_default();
             let built_in = is_built_in(p.targetInfo.outputTechnology);
+            let rate = p.targetInfo.refreshRate;
+            let refresh_hz = (rate.Denominator != 0 && rate.Numerator != 0)
+                .then(|| f64::from(rate.Numerator) / f64::from(rate.Denominator));
             match out.iter_mut().find(|s| s.mode == mode) {
                 Some(s) => {
                     s.device_paths.push(device_path);
@@ -155,6 +159,7 @@ impl Ccd {
                         s.name = friendly;
                     }
                     s.built_in |= built_in;
+                    s.refresh_hz = s.refresh_hz.or(refresh_hz);
                 }
                 None => out.push(Source {
                     mode,
@@ -162,6 +167,7 @@ impl Ccd {
                     name: friendly,
                     built_in,
                     clone_group: None,
+                    refresh_hz,
                 }),
             }
         }
@@ -200,6 +206,9 @@ impl Ccd {
                     height,
                     primary: pos.x == 0 && pos.y == 0,
                     mirror_group: s.clone_group,
+                    refresh_hz: s.refresh_hz,
+                    // the command layer links ours to their joins
+                    join_id: None,
                 }
             })
             .collect();
@@ -291,6 +300,8 @@ pub(crate) fn gdi_layout() -> Vec<ArrangedDisplay> {
                 primary: r.left == 0 && r.top == 0,
                 ours: false,
                 mirror_group: None,
+                refresh_hz: None,
+                join_id: None,
             });
         }
         true.into()

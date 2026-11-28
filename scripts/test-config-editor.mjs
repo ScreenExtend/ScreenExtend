@@ -116,6 +116,13 @@ test('an empty stunUrls is accepted, a nonsense one is not', () => {
   assert.equal(blockingErrors(validateConfig({ ...fixtureConfig, stunUrls: 'http://x' })).length, 1);
 });
 
+test('a permanent link the join form could not type is refused', () => {
+  const on = (sessionId, otp) => ({ ...fixtureConfig, permanentLink: { enabled: true, sessionId, otp } });
+  assert.deepEqual(validateConfig(on('23456789ABCD', '012345')), []);
+  assert.equal(blockingErrors(validateConfig(on('2345', '012345'))).length, 1);
+  assert.equal(blockingErrors(validateConfig(on('23456789ABCD', '12ab56'))).length, 1);
+});
+
 test('an unknown key is a warning, and the document still saves', () => {
   const found = validateConfig({ ...fixtureConfig, somethingNew: 1 });
   assert.equal(found.length, 1);
@@ -213,6 +220,12 @@ test('each token is masked at its own line, and the tokens differ', () => {
   const tokens = spans.filter(s => s.path.endsWith('.token')).map(covered);
   assert.equal(tokens.length, 11);
   for (const token of tokens) assert.match(token, /^[0-9a-f]{32}$/);
+});
+
+test('a permanent link OTP is masked like the other secrets', () => {
+  const doc = JSON.stringify({ permanentLink: { enabled: true, sessionId: '23456789ABCD', otp: '012345' } }, null, 2);
+  const masked = maskedSpans(scanJson(doc), MASKED_CONFIG_PATHS).map(s => s.path);
+  assert.deepEqual(masked, ['permanentLink.otp']);
 });
 
 test('the hosted-network password and the TURN credential are masked', () => {
@@ -324,6 +337,16 @@ test('after normalisation the replay runs and the dashboard is reachable', () =>
   assert.equal(config.knownDevices.length, fixtureConfig.knownDevices.length);
 });
 
+test('a device with no saved placement keeps none, and a saved one survives', () => {
+  const row = { ...fixtureConfig.devices[0] };
+  delete row.placement;
+  const placed = { ...row, token: 'placed', placement: { x: 1920, y: -40 } };
+  const { config } = normalizeConfig({ ...fixtureConfig, devices: [row, placed] });
+  // filled in as {x: 0, y: 0} it would put the display on top of the main display
+  assert.equal('placement' in config.devices[0], false);
+  assert.deepEqual(config.devices[1].placement, { x: 1920, y: -40 });
+});
+
 test('every top-level key malformed at once still yields the declared shape', () => {
   // The bootstrap has to reach the dashboard with a store in which nothing is the right type.
   const wrecked = {};
@@ -403,7 +426,12 @@ test('a device row missing fields comes out complete, so the replay can hand it 
     devices: [{ ip: '10.0.0.5', token: 'a'.repeat(32) }],
   });
   const device = config.devices[0];
-  for (const key of Object.keys(properties.devices.items.properties)) {
+  for (const [key, child] of Object.entries(properties.devices.items.properties)) {
+    // an object with no default is optional by design (the saved placement): absent stays absent
+    if (child.type === 'object' && !('default' in child)) {
+      assert.equal(device[key], undefined, key + ' was filled in');
+      continue;
+    }
     assert.notEqual(device[key], undefined, key + ' was left undefined');
   }
   assert.equal(device.scale, 100);

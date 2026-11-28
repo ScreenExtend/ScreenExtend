@@ -90,8 +90,21 @@ function TipLabel({
 // `data-[state=closed]:duration-300` in ui/sheet.tsx
 const SHEET_EXIT_MS = 500;
 
-export function DeviceDetails({ device }: { device: ConnectedDevice }) {
+export function DeviceDetails({
+  device,
+  trigger,
+  openRequest = 0,
+}: {
+  device: ConnectedDevice;
+  /// What opens the panel; a plain Edit Device button when omitted, none when null.
+  trigger?: React.ReactElement | null;
+  /// Opens the panel each time it changes to a new non-zero value.
+  openRequest?: number;
+}) {
   const [open, setOpen] = useState(false);
+  useEffect(() => {
+    if (openRequest > 0) setOpen(true);
+  }, [openRequest]);
   const [mounted, setMounted] = useState(false);
   // the root owns onOpenChange, but the unsaved-changes prompt needs formik state from the body
   const closeRequest = React.useRef<() => void>(() => setOpen(false));
@@ -106,9 +119,11 @@ export function DeviceDetails({ device }: { device: ConnectedDevice }) {
 
   return (
     <Sheet onOpenChange={next => (next ? setOpen(true) : closeRequest.current())} open={open}>
-      <SheetTrigger asChild>
-        <Button variant="outline">Edit Device</Button>
-      </SheetTrigger>
+      {trigger !== null && (
+        <SheetTrigger asChild>
+          {trigger ?? <Button variant="outline">Edit Device</Button>}
+        </SheetTrigger>
+      )}
       {mounted && (
         <DeviceDetailsBody
           device={device}

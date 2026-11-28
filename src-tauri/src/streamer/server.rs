@@ -508,7 +508,8 @@ fn router(state: AppState) -> Router {
         // the WHEP resource (RFC 9725 section 4.6); a client that ignores `Location` is unaffected
         .route("/whep/{id}", patch(whep_patch))
         .route("/whep/{id}", delete(whep_delete))
-        .route("/leave", post(leave))
+        // GET too: the oldest pages can only say goodbye with an image request
+        .route("/leave", post(leave).get(leave))
         .route("/transform-worker.js", get(transform_worker))
         .route("/input.js", get(input_js))
         .route("/audio.js", get(audio_js))
@@ -2115,6 +2116,22 @@ async fn start_session(
                     outcome,
                 ),
             );
+        }
+
+        // a display made for this join lands wherever Windows puts it: put it back where the user
+        // last placed this device, before the capture opens on it
+        #[cfg(windows)]
+        if existing.is_none() {
+            let token = device_token.to_string();
+            let path = device_path.clone();
+            let moved = tokio::task::spawn_blocking(move || {
+                crate::display_arrange::restore_placement(&token, &path)
+            })
+            .await
+            .unwrap_or(false);
+            if moved {
+                crate::windows_utils::streamer::capture::note_display_disturbed(&device_path);
+            }
         }
 
         let display_ms = t_display.elapsed().as_secs_f64() * 1000.0;

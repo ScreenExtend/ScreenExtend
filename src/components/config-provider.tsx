@@ -182,11 +182,36 @@ const sameSavedDevice = (d: Device, token: string, ip: string) =>
 
 export const saveDeviceSettings = async (device: Device) => {
   const existing = await getSavedDevices();
+  const prev = existing.find(d => sameSavedDevice(d, device.token, device.ip));
   const devices = [
     ...existing.filter(d => !sameSavedDevice(d, device.token, device.ip)),
-    { ...device, name: "" },
+    // the settings panel knows nothing of the arrangement: keep where the display was placed
+    { ...device, name: "", placement: device.placement ?? prev?.placement },
   ];
   await updateConfig({ devices });
+};
+
+/**
+ * Saves where each device's display was placed on the Devices page, creating a row for a device
+ * that has none yet. Returns every row after the save.
+ */
+export const saveDevicePlacements = async (
+  placed: readonly { device: Device; x: number; y: number }[],
+): Promise<Device[]> => {
+  let devices = await getSavedDevices();
+  for (const { device, x, y } of placed) {
+    if (!device.token) continue;
+    const prev = devices.find(d => sameSavedDevice(d, device.token, device.ip));
+    // a connected device carries its join id, which is per session and never saved
+    const fresh: Device & { joinId?: string } = { ...device, name: "" };
+    delete fresh.joinId;
+    devices = [
+      ...devices.filter(d => !sameSavedDevice(d, device.token, device.ip)),
+      { ...(prev ?? fresh), token: device.token, placement: { x, y } },
+    ];
+  }
+  await updateConfig({ devices });
+  return devices;
 };
 
 export const removeSavedDevice = async (token: string, ip: string) => {

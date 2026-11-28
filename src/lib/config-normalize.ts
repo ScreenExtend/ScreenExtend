@@ -178,6 +178,9 @@ function coerce(
       const childPath = `${path}.${key}`;
       const childFallback = fallbackRecord[key];
       if (!(key in record) || record[key] === undefined) {
+        // an object with no default anywhere is optional (a device's saved placement): absent
+        // means "none", and a filled-in {x: 0, y: 0} would be a real position
+        if (child.type === "object" && !("default" in child) && childFallback === undefined) continue;
         // absent is not malformed: fill it (`undefined` where a number belongs is rejected at
         // the IPC boundary) but do not mark the file as changed
         const filled = defaultFor(child, childFallback);

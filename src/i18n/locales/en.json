@@ -533,10 +533,7 @@
     }
   },
   "rearrangeDisplays": {
-    "button": "Rearrange Displays",
-    "tooltip": "Use Rearrange Displays to place the extended displays around your own screen.",
-    "title": "Rearrange Displays",
-    "description": "Drag a display to where it sits around your screen. Your main display stays where it is.",
+    "tooltip": "Drag the displays below to place them around your own screen, then press Apply. Click a device's display to edit it.",
     "primary": "Main display",
     "screenExtendDisplay": "ScreenExtend display",
     "loading": "Reading the display layout…",
@@ -545,11 +542,29 @@
     "unavailable": "Displays cannot be rearranged here.",
     "displaysChanged": "The connected displays changed, so the layout was refreshed.",
     "changesLost": "A display you moved is no longer connected, so your unsaved moves were reset.",
-    "done": "Done",
+    "apply": "Apply",
+    "pending": "The display arrangement has changes that are not applied yet.",
+    "clickToEdit": "Click to edit this device",
+    "deviceList": "Devices",
     "applying": "Applying…",
     "discardTitle": "Discard changes?",
     "discardDescription": "Your new display arrangement has not been applied yet.",
     "discard": "Discard",
     "keepEditing": "Keep editing"
+  },
+  "permanentLink": {
+    "title": "Permanent Link",
+    "description": "A join link that never changes, for devices you connect often. Open it on the device and press Connect. The rotating session ID and OTP keep working beside it.",
+    "warning": "Anyone with this link can connect to this computer while it is on. Share it only with your own devices.",
+    "noNetwork": "No network address to build the link from. Connect this computer to a network.",
+    "showQr": "Show the QR code for this network",
+    "copy": "Copy",
+    "copied": "Link copied",
+    "regenerate": "Regenerate",
+    "regenerateTitle": "Regenerate the permanent link?",
+    "regenerateDescription": "The current link stops working at once. Devices that saved it need the new one.",
+    "cancel": "Cancel",
+    "failedTitle": "Couldn't Save the Permanent Link",
+    "failedDescription": "The link was not changed. Try again."
   }
 }

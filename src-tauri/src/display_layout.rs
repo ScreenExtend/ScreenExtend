@@ -22,6 +22,10 @@ pub struct ArrangedDisplay {
     pub ours: bool,
     /// Displays showing the same picture share a group and move together.
     pub mirror_group: Option<u32>,
+    /// The refresh rate the display runs at, when the OS reports one.
+    pub refresh_hz: Option<f64>,
+    /// For one of ours: the join whose client this display streams to.
+    pub join_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, specta::Type)]

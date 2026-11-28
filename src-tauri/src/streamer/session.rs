@@ -378,7 +378,7 @@ pub fn is_device_token(s: &str) -> bool {
 
 pub type SharedDisconnectGrace = Arc<std::sync::atomic::AtomicU64>;
 
-pub const DEFAULT_DISCONNECT_GRACE_SECS: u64 = 10;
+pub const DEFAULT_DISCONNECT_GRACE_SECS: u64 = 3;
 pub const MIN_DISCONNECT_GRACE_SECS: u64 = 0;
 pub const MAX_DISCONNECT_GRACE_SECS: u64 = 600;
 
@@ -1176,17 +1176,70 @@ pub struct SessionAuth {
 }
 
 impl SessionAuth {
+    /// The live pair, or the permanent one when the user has made one.
     pub fn validate(&self, session_id: &str, otp: &str) -> bool {
-        use subtle::ConstantTimeEq;
-        let want_session = self.session_id.lock_recover();
-        let want_otp = self.otp.lock_recover();
-        if want_session.is_empty() || want_otp.is_empty() {
-            return false;
-        }
-        let session_ok = want_session.as_bytes().ct_eq(session_id.as_bytes());
-        let otp_ok = want_otp.as_bytes().ct_eq(otp.as_bytes());
-        (session_ok & otp_ok).into()
+        let live = {
+            let want_session = self.session_id.lock_recover();
+            let want_otp = self.otp.lock_recover();
+            pair_matches(&want_session, &want_otp, session_id, otp)
+        };
+        // both compared every time, so the answer takes as long whichever pair matched
+        let permanent = permanent_link_matches(session_id, otp);
+        live | permanent
     }
+}
+
+fn pair_matches(want_session: &str, want_otp: &str, session_id: &str, otp: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    if want_session.is_empty() || want_otp.is_empty() {
+        return false;
+    }
+    let session_ok = want_session.as_bytes().ct_eq(session_id.as_bytes());
+    let otp_ok = want_otp.as_bytes().ct_eq(otp.as_bytes());
+    (session_ok & otp_ok).into()
+}
+
+/// A session id and OTP that do not rotate, for a link a device can keep. Accepted beside the
+/// live pair, never instead of it. Process-wide like the host itself; None when turned off.
+static PERMANENT_LINK: Mutex<Option<(String, String)>> = Mutex::new(None);
+
+fn permanent_link_matches(session_id: &str, otp: &str) -> bool {
+    match PERMANENT_LINK.lock_recover().as_ref() {
+        Some((want_session, want_otp)) => pair_matches(want_session, want_otp, session_id, otp),
+        None => pair_matches("", "", session_id, otp),
+    }
+}
+
+/// The client page's join form takes exactly this: a 12-character id from the minters'
+/// alphabet and a 6-digit OTP. A pair it cannot type is a link that cannot connect.
+pub fn validate_permanent_link(session_id: &str, otp: &str) -> Result<(), String> {
+    const ALPHABET: &str = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+    if session_id.len() != 12 || !session_id.chars().all(|c| ALPHABET.contains(c)) {
+        return Err("a permanent session id is 12 characters from the session id alphabet".into());
+    }
+    if otp.len() != 6 || !otp.chars().all(|c| c.is_ascii_digit()) {
+        return Err("a permanent OTP is 6 digits".into());
+    }
+    Ok(())
+}
+
+/// Turns the permanent link on with this pair, or off with `None`. Takes effect for the next
+/// join; a revoked pair is refused at once.
+pub fn apply_permanent_link(pair: Option<(String, String)>) -> Result<(), String> {
+    if let Some((session_id, otp)) = &pair {
+        validate_permanent_link(session_id, otp)?;
+    }
+    let on = pair.is_some();
+    *PERMANENT_LINK.lock_recover() = pair;
+    tprintln!("[session] permanent link {}", if on { "on" } else { "off" });
+    Ok(())
+}
+
+/// Settings > Permanent link. `None` for either turns it off.
+#[tauri::command]
+#[specta::specta]
+pub fn set_permanent_link(session_id: Option<String>, otp: Option<String>) -> Result<(), String> {
+    apply_permanent_link(session_id.zip(otp))
 }
 
 /// Max failed OTP attempts allowed (per device) before a lockout kicks in.
@@ -1641,6 +1694,65 @@ mod tests {
         assert!(lim.locked_for(key).is_none());
         assert!(lim.global_paused().is_none());
         assert!(lim.note_global_failure().is_none());
+    }
+
+    #[test]
+    fn a_permanent_pair_is_checked_like_the_live_one() {
+        assert!(pair_matches(
+            "ABCDEFGHJKLM",
+            "123456",
+            "ABCDEFGHJKLM",
+            "123456"
+        ));
+        assert!(!pair_matches(
+            "ABCDEFGHJKLM",
+            "123456",
+            "ABCDEFGHJKLM",
+            "123457"
+        ));
+        assert!(!pair_matches(
+            "ABCDEFGHJKLM",
+            "123456",
+            "ZBCDEFGHJKLM",
+            "123456"
+        ));
+        // a turned-off link has no pair, and no input can match an empty one
+        assert!(!pair_matches("", "", "", ""));
+    }
+
+    #[test]
+    fn either_pair_joins_and_a_revoked_permanent_pair_does_not() {
+        // a pair no other test uses, since the permanent link is process-wide
+        let (pid, potp) = ("PQRSTUVWXYZP".to_string(), "975310".to_string());
+        let auth = SessionAuth::default();
+        *auth.session_id.lock_recover() = "ABCDEFGHJKLM".to_string();
+        *auth.otp.lock_recover() = "123456".to_string();
+        assert!(!auth.validate(&pid, &potp));
+        apply_permanent_link(Some((pid.clone(), potp.clone()))).unwrap();
+        assert!(auth.validate(&pid, &potp), "the permanent pair joins");
+        assert!(
+            auth.validate("ABCDEFGHJKLM", "123456"),
+            "the live pair still joins"
+        );
+        assert!(!auth.validate(&pid, "123456"), "pairs do not mix");
+        assert!(!auth.validate("ABCDEFGHJKLM", &potp), "pairs do not mix");
+        apply_permanent_link(None).unwrap();
+        assert!(
+            !auth.validate(&pid, &potp),
+            "a revoked pair is refused at once"
+        );
+        assert!(auth.validate("ABCDEFGHJKLM", "123456"));
+        assert!(apply_permanent_link(Some(("short".into(), "1".into()))).is_err());
+    }
+
+    #[test]
+    fn a_permanent_pair_must_be_one_the_join_form_can_type() {
+        assert!(validate_permanent_link("23456789ABCD", "012345").is_ok());
+        assert!(validate_permanent_link("23456789ABC", "012345").is_err()); // short id
+        assert!(validate_permanent_link("23456789ABC1", "012345").is_err()); // 1 is not in the alphabet
+        assert!(validate_permanent_link("23456789abcd", "012345").is_err()); // lower case
+        assert!(validate_permanent_link("23456789ABCD", "01234a").is_err());
+        assert!(validate_permanent_link("23456789ABCD", "0123456").is_err());
     }
 
     #[test]

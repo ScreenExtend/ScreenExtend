@@ -15,6 +15,9 @@ export type Tile = {
   height: number;
   primary: boolean;
   ours: boolean;
+  /// For one of ours, the join it streams to.
+  joinId: string | null;
+  refreshHz: number | null;
 };
 
 export type LayoutDisplay = {
@@ -27,9 +30,38 @@ export type LayoutDisplay = {
   primary: boolean;
   ours: boolean;
   mirrorGroup: number | null;
+  joinId?: string | null;
+  refreshHz?: number | null;
 };
 
 export type Placement = { id: string; x: number; y: number };
+
+/// A device's display position relative to the main display, saved under its token.
+export type DevicePlacement = { token: string; x: number; y: number };
+
+/// Where each connected device's display now sits, by device token, for a layout the host has just
+/// applied. Positions are already relative to the main display, which the host keeps at (0, 0).
+export function devicePlacements(
+  displays: readonly LayoutDisplay[],
+  tokenOfJoin: (joinId: string) => string | undefined,
+): DevicePlacement[] {
+  const out: DevicePlacement[] = [];
+  for (const d of displays) {
+    if (!d.ours || !d.joinId) continue;
+    const token = tokenOfJoin(d.joinId);
+    if (token) out.push({ token, x: Math.round(d.x), y: Math.round(d.y) });
+  }
+  return out;
+}
+
+/// The placements saved on device rows, for handing back to the host.
+export function savedPlacements(
+  rows: readonly { token?: string; placement?: { x: number; y: number } | null }[],
+): DevicePlacement[] {
+  return rows
+    .filter(r => !!r.token && !!r.placement)
+    .map(r => ({ token: r.token as string, x: r.placement!.x, y: r.placement!.y }));
+}
 
 /// One tile per display, except that displays in one mirror group share a tile.
 export function toTiles(displays: readonly LayoutDisplay[]): Tile[] {
@@ -43,6 +75,8 @@ export function toTiles(displays: readonly LayoutDisplay[]): Tile[] {
       existing.names.push(d.name);
       existing.primary = existing.primary || d.primary;
       existing.ours = existing.ours || d.ours;
+      existing.joinId = existing.joinId ?? d.joinId ?? null;
+      existing.refreshHz = existing.refreshHz ?? d.refreshHz ?? null;
       continue;
     }
     const tile: Tile = {
@@ -55,6 +89,8 @@ export function toTiles(displays: readonly LayoutDisplay[]): Tile[] {
       height: d.height,
       primary: d.primary,
       ours: d.ours,
+      joinId: d.joinId ?? null,
+      refreshHz: d.refreshHz ?? null,
     };
     tiles.push(tile);
     if (group !== null && group !== undefined) byGroup.set(group, tile);
@@ -146,16 +182,18 @@ export function normalize(tiles: readonly Tile[]): Tile[] {
 }
 
 /// Moves one tile, snaps it, then reattaches anything the move left floating, so the result is
-/// always a layout the system accepts. The primary never moves.
+/// always a layout the system accepts. The primary stays primary: moving it is the same as moving
+/// everything else the opposite way, so the result is put back with the primary at (0, 0).
 export function moveTile(tiles: readonly Tile[], key: string, x: number, y: number, align = 0): Tile[] {
   const next = tiles.map(t => ({ ...t }));
   const moving = next.find(t => t.key === key);
-  if (!moving || moving.primary) return next;
+  if (!moving) return next;
   const others = next.filter(t => t !== moving);
   const spot = snap(moving, x, y, others, align);
   moving.x = spot.x;
   moving.y = spot.y;
-  return reattach(next, moving.key);
+  const placed = reattach(next, moving.key);
+  return moving.primary ? normalize(placed) : placed;
 }
 
 /// Snaps every tile cut off from the primary back onto the part that holds it, nearest first.
