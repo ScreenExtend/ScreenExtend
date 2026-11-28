@@ -91,6 +91,7 @@ const source = [
   takeConst('RECONFIG_DEADLINE_MS'),
   'let reconfigWatchdog = null;',
   takeFunction('withJoin'),
+  takeFunction('sendGoodbye'),
   takeFunction('releaseJoin'),
   takeFunction('clearReconfigWatchdog'),
   takeFunction('armReconfigWatchdog'),
@@ -499,6 +500,46 @@ sinkResult = true;
   p.applyReconfig({ epoch: 1, kick: 1, audioSink: 'sink-E' });
   await settle();
   eq('another sink is passed on so a later request is fresh', calls.filter((c) => c === 'noteChoice:sink-E').length, 1);
+}
+
+// The goodbye has to leave on browsers with no sendBeacon too: an iPhone whose tab is closed may
+// never get another chance. Each fallback is probed, and the first that works is the only one used.
+{
+  const src = takeFunction('sendGoodbye');
+  const run = (env) => {
+    const sent = [];
+    const ctx = Object.assign({ noteSuppressed() { sent.push('suppressed'); }, Date: { now: () => 7 } }, env(sent));
+    vm.createContext(ctx);
+    vm.runInContext(src + '\nthis.f = sendGoodbye;', ctx);
+    return { path: ctx.f('/leave?join=ab'), sent };
+  };
+  const beacon = run((sent) => ({ navigator: { sendBeacon: (u) => { sent.push('beacon ' + u); return true; } } }));
+  eq('a browser with sendBeacon uses it', beacon.path, 'beacon');
+  eq('and sends nothing else', beacon.sent.join(','), 'beacon /leave?join=ab');
+  function Req(u) { this.url = u; this.keepalive = false; }
+  const fetchPath = run((sent) => ({
+    navigator: {},
+    Request: Req,
+    fetch: (u, o) => { sent.push('fetch ' + u + ' ' + o.method + ' keepalive=' + o.keepalive); return Promise.resolve(); },
+  }));
+  eq('no sendBeacon: a keepalive fetch', fetchPath.path, 'fetch');
+  eq('as a POST', fetchPath.sent[0], 'fetch /leave?join=ab POST keepalive=true');
+  function Xhr() { this.open = (m, u, a) => { Xhr.log.push(m + ' ' + u + ' async=' + a); }; this.send = () => { Xhr.log.push('send'); }; }
+  Xhr.log = [];
+  const xhrPath = run(() => ({ navigator: {}, fetch: () => Promise.resolve(), Request: function (u) { this.url = u; }, XMLHttpRequest: Xhr }));
+  eq('no keepalive in fetch: a synchronous XHR', xhrPath.path, 'xhr');
+  eq('a blocking POST, so unload waits for it', Xhr.log.join(','), 'POST /leave?join=ab async=false,send');
+  const images = [];
+  function Img() { Object.defineProperty(this, 'src', { set(v) { images.push(v); } }); }
+  const imagePath = run(() => ({
+    navigator: { sendBeacon: () => false },
+    XMLHttpRequest: function () { this.open = () => { throw new Error('blocked'); }; },
+    Image: Img,
+  }));
+  eq('only an image request left: it is used', imagePath.path, 'image');
+  eq('a GET with a cache-buster', images[0], '/leave?join=ab&t=7');
+  const none = run(() => ({ navigator: {} }));
+  eq('nothing at all: it says so and throws nothing', none.path, '');
 }
 
 if (failures) {

@@ -222,14 +222,21 @@ function bootPage(o) {
       requestFullscreen() { doc.fullscreenElement = el; return Promise.resolve(); },
       requestPointerLock() { doc.pointerLockElement = el; return Promise.resolve(); },
     };
+    // an iPhone: no element fullscreen anywhere, only the video element's native player
+    if (o.iphone) {
+      delete el.requestFullscreen;
+      if (el.tagName === 'VIDEO') el.webkitEnterFullscreen = () => { el.webkitDisplayingFullscreen = true; };
+    }
     return el;
   }
   const els = {};
   doc.getElementById = (id) => (els[id] = els[id] || makeEl(id, id === 'canvas' ? 'canvas' : id === 'video' ? 'video' : 'div'));
   const otp = [0, 1, 2, 3, 4, 5].map((i) => makeEl('otp' + i, 'input'));
   doc.querySelectorAll = (sel) => (sel === '#otp input' ? otp : []);
+  doc.querySelector = () => makeEl('');
   doc.createElement = (tag) => makeEl('', tag);
   doc.body = makeEl('body');
+  doc.documentElement = makeEl('html');
 
   const store = (init) => {
     const m = new Map(Object.entries(init || {}));
@@ -296,7 +303,7 @@ function bootPage(o) {
   }
 
   const nav = {
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/154', platform: 'Win32', maxTouchPoints: 0, onLine: true,
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/154', platform: o.platform || 'Win32', maxTouchPoints: 0, onLine: true,
     wakeLock: {
       request() {
         log.wakeRequests++;
@@ -309,6 +316,9 @@ function bootPage(o) {
     keyboard: { locked: false, lock() { this.locked = true; return Promise.resolve(); }, unlock() { this.locked = false; } },
     mediaDevices: { enumerateDevices: () => Promise.resolve([]) },
   };
+
+  // only iOS WebKit defines navigator.standalone
+  if (o.iphone) nav.standalone = !!o.standalone;
 
   const SEAudio = {
     detectCapabilities: () => ({ webcodecsOpus: true, worklet: true }),
@@ -340,11 +350,12 @@ function bootPage(o) {
     fetch: fetchFake,
     navigator: nav, document: doc, location,
     history: { replaceState() {} },
-    localStorage: store({ 'se.compat.hideLimited': '1' }), sessionStorage: store(),
+    localStorage: store(Object.assign({ 'se.compat.hideLimited': '1' }, o.storage)), sessionStorage: store(),
     crypto: { getRandomValues: (b) => b },
     matchMedia: () => ({ matches: false, addEventListener() {} }),
-    screen: { width: 1280, height: 720, refreshRate: 60, orientation: { type: 'landscape-primary', addEventListener() {} } },
-    isSecureContext: true, crossOriginIsolated: true, devicePixelRatio: 1, innerWidth: 1280, innerHeight: 720,
+    screen: Object.assign({ width: 1280, height: 720, refreshRate: 60, orientation: { type: 'landscape-primary', addEventListener() {} } }, o.screen),
+    isSecureContext: true, crossOriginIsolated: true, devicePixelRatio: 1,
+    innerWidth: (o.inner && o.inner.width) || 1280, innerHeight: (o.inner && o.inner.height) || 720,
     addEventListener: (t, f) => W.add(t, f), removeEventListener: (t, f) => W.remove(t, f),
     open() {},
     __SAME_DEVICE__: false,
@@ -422,7 +433,7 @@ function bootPage(o) {
       workersAlive: log.workers.filter((w) => !w.terminated).length,
     };
   }
-  return { log, read, advance, connect, goLive, state, ctrlCBlocked, winListeners, lastPc, JOIN, bumpEpoch: () => { reconfigEpoch++; } };
+  return { log, read, advance, connect, goLive, state, ctrlCBlocked, winListeners, lastPc, JOIN, els, ctx, bumpEpoch: () => { reconfigEpoch++; } };
 }
 
 // The pre-join state every failure must land back on, with its message.
@@ -548,6 +559,121 @@ async function assertRestored(p, what, errRe) {
   const body = takeFunction('start');
   if (/attemptId: attemptId,/.test(body) && /joinId: currentJoinId,/.test(body)) ok('every offer carries the attempt id beside the join id');
   else fail('the WHEP body does not carry attemptId');
+}
+
+// Which fullscreen option the join form offers. Where the Fullscreen API works the toggle is as it
+// always was; where only the native video player can go fullscreen (iPhone Safari) the same
+// checkbox becomes Force fullscreen, off by default; where neither exists nothing changes.
+{
+  const ctx = vm.createContext({});
+  vm.runInContext(takeFunction('fullscreenOption') + '\nthis.f = fullscreenOption;', ctx);
+  const fn = () => {};
+  eq('Fullscreen API on the stage', ctx.f({ requestFullscreen: fn }, { webkitEnterFullscreen: fn }), 'api');
+  eq('prefixed Fullscreen API on the stage', ctx.f({ webkitRequestFullscreen: fn }, {}), 'api');
+  eq('only the native video player (iPhone)', ctx.f({}, { webkitEnterFullscreen: fn }), 'force');
+  eq('neither', ctx.f({}, {}), 'none');
+  eq('neither, no video element', ctx.f({}, null), 'none');
+
+  const boxes = page.match(/type="checkbox" id="fullscreenMode"/g) || [];
+  eq('one fullscreen checkbox on the form, never a second', boxes.length, 1);
+  const optionSrc = page.slice(page.indexOf("const fullscreenOptionKind"), page.indexOf("document.getElementById('brand')"));
+  if (/fullscreenOptionKind === 'force'[\s\S]*'Force fullscreen'[\s\S]*fullscreenModeInput\.checked = false;/.test(optionSrc)) ok('force mode relabels the toggle and starts it unchecked');
+  else fail('force mode does not relabel the toggle and clear it');
+  if (/fullscreenOptionKind === 'force'\) fullscreenModeInput\.checked = localStorage\.getItem\(FORCE_FULLSCREEN_KEY\) === '1'/.test(optionSrc)) ok('force mode is remembered under its own key, off unless saved on');
+  else fail('force mode does not read its own remembered value');
+  const startSrc = takeFunction('start');
+  if (/const webcodecs = [^;]*&& !forceFullscreen;/.test(startSrc)) ok('a forced join renders through <video>, never WebCodecs');
+  else fail('a forced join can still take the WebCodecs path');
+  if (/forceFullscreen = fullscreenOptionKind === 'force' && fullscreenModeInput\.checked;/.test(page)) ok('only a checked Force fullscreen forces the <video> path');
+  else fail('forceFullscreen is not tied to the checked force option');
+}
+
+// Force fullscreen on an iPhone. The page URL carries fs=1 (the plain toggle's default), which
+// must not turn force on; a forced join renders through <video> and must still go live at ICE
+// connect, with no WebCodecs frame ever arriving.
+{
+  const fresh = bootPage({ iphone: true });
+  await fresh.advance(10);
+  eq('iphone: the form offers Force fullscreen', fresh.read('fullscreenOptionKind'), 'force');
+  eq('iphone: fs=1 in the URL leaves Force fullscreen off', fresh.els.fullscreenMode.checked, false);
+  eq('iphone: an old saved force value is not read', bootPage({ iphone: true, storage: { 'se.forceFullscreen': '1' } }).els.fullscreenMode.checked, false);
+
+  const p = bootPage({ iphone: true, storage: { 'se.forceFullscreenOptIn': '1' } });
+  await p.advance(10);
+  eq('iphone: a ticked Force fullscreen is remembered', p.els.fullscreenMode.checked, true);
+  await p.connect();
+  await p.advance(50);
+  eq('forced join: no transform worker (the <video> path)', p.log.workers.length, 0);
+  const pc = p.lastPc();
+  pc.iceConnectionState = 'connected';
+  pc.oniceconnectionstatechange();
+  pc.connectionState = 'connected';
+  pc.onconnectionstatechange();
+  await p.advance(3000);
+  const st = p.state();
+  eq('forced join: live once ICE connects, not stuck on Connecting', st.live + '/' + st.loading, 'true/false');
+}
+
+// The size the host is asked for: always the device's screen. Without real fullscreen the picture
+// fills the page's own box, laid out from the top-left corner at an explicit size.
+{
+  const size = (p) => p.read('joinData.width + "x" + joinData.height');
+  const stageBox = (p) => p.els.stage.style.width + 'x' + p.els.stage.style.height;
+  const desk = { screen: { width: 1920, height: 1080 }, inner: { width: 1280, height: 650 } };
+
+  const fs = bootPage(desk);
+  await fs.advance(10);
+  fs.els.fullscreenMode.checked = true;
+  await fs.connect();
+  eq('real fullscreen: the host is asked for the screen', size(fs), '1920x1080');
+
+  const win = bootPage(desk);
+  await win.advance(10);
+  win.els.fullscreenMode.checked = false;
+  await win.connect();
+  eq('fullscreen off: the host is still asked for the screen', size(win), '1920x1080');
+  await win.goLive();
+  eq('fullscreen off: the stage is sized to that box from the top-left', stageBox(win) + ' ' + win.els.stage.style.bottom, '1280pxx650px auto');
+
+  const phone = { iphone: true, platform: 'iPhone', screen: { width: 428, height: 926, orientation: { type: 'portrait-primary', addEventListener() {} } }, inner: { width: 428, height: 745 } };
+  const tab = bootPage(phone);
+  await tab.advance(10);
+  await tab.connect();
+  eq('iPhone Safari tab: the host is asked for the screen', size(tab), '428x926');
+
+  const app = bootPage(Object.assign({}, phone, { standalone: true, inner: { width: 428, height: 880 } }));
+  await app.advance(10);
+  await app.connect();
+  eq('iPhone Home Screen app: the host is asked for the whole screen', size(app), '428x926');
+  await app.goLive();
+  eq('iPhone Home Screen app: the stage covers the whole screen', stageBox(app), '428pxx926px');
+  eq('iPhone Home Screen app: the picture covers the whole screen', app.read('canvas.style.width + "x" + canvas.style.height'), '428pxx926px');
+  // html and body (height 100%, overflow hidden) would otherwise clip the stage at innerHeight
+  eq('iPhone Home Screen app: html and body are as tall as the stage', app.read('document.documentElement.style.height') + ' ' + app.read('document.body.style.height'), '926px 926px');
+  eq('iPhone Safari tab: html and body keep the stylesheet height', tab.read('document.documentElement.style.height') || '', '');
+}
+
+// The fullscreen option on an iPhone: the Home Screen hint and the remote-control warning only
+// where the page is clearly iOS, and no option at all inside a Home Screen web app.
+{
+  const desc = (p) => p.read('fullscreenOptionHidden') + ' ' + p.read('iosHomeScreenCapable');
+  const tab = bootPage({ iphone: true });
+  await tab.advance(10);
+  eq('iPhone Safari tab: Force fullscreen shown, Home Screen hint on', desc(tab), 'false true');
+  const shown = (p) => (p.els.fsToggle ? p.els.fsToggle.style.display || '' : '');
+  eq('iPhone Safari tab: the option is visible', shown(tab), '');
+  const app = bootPage({ iphone: true, standalone: true });
+  await app.advance(10);
+  eq('iPhone Home Screen app: the fullscreen option is hidden', app.els.fsToggle.style.display, 'none');
+  eq('iPhone Home Screen app: the option stays off', app.els.fullscreenMode.checked, false);
+  const ticked = bootPage({ iphone: true, standalone: true, storage: { 'se.forceFullscreenOptIn': '1' } });
+  await ticked.advance(10);
+  eq('iPhone Home Screen app: a saved force choice is ignored', ticked.els.fullscreenMode.checked, false);
+  const desk = bootPage({});
+  await desk.advance(10);
+  eq('desktop: no Home Screen hint and the option is shown', desc(desk) + ' ' + shown(desk), 'false false ');
+  if (/Force fullscreen[\s\S]{0,400}remote control \(touch and keyboard\) does not work/.test(page)) ok('force mode warns that remote control does not work');
+  else fail('force mode warns that remote control does not work: warning text missing');
 }
 
 if (failures) { console.log(failures + ' failure(s)'); process.exit(1); }

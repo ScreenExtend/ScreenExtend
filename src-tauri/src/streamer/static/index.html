@@ -76,7 +76,7 @@
                                     <input inputmode="numeric" autocomplete="off" maxlength="1" />
                                 </div>
                             </div>
-                            <label class="fs-toggle" for="fullscreenMode">
+                            <label class="fs-toggle" id="fsToggle" for="fullscreenMode">
                                 <input type="checkbox" id="fullscreenMode" checked />
                                 <span class="fs-toggle-text">
                                     <span class="fs-toggle-title">Fullscreen mode</span>
@@ -216,6 +216,9 @@
                 // the answer carried no join id and no cookie set one (a proxy stripped both):
                 // later requests name no session, `/reconfig` reads zeros, `/leave` reaches nothing
                 JOIN_ID_MISSING: 1 << 24,
+                // the user forced fullscreen, so video goes through the native <video> player
+                // instead of WebCodecs
+                FULLSCREEN_FORCED_THROUGH_VIDEO: 1 << 25,
             };
             let degradeFlags = 0;
             let suppressedErrors = 0;
@@ -413,12 +416,38 @@
                 return path + (path.indexOf('?') < 0 ? '?' : '&') + 'join=' + encodeURIComponent(currentJoinId);
             }
 
+            // A POST that survives the page going away, by the best path this browser has: a
+            // beacon, a keepalive fetch, a synchronous XHR (it blocks unload until sent), or an
+            // image request as the last resort, which `/leave` also accepts as a GET.
+            function sendGoodbye(url) {
+                try {
+                    if (navigator.sendBeacon && navigator.sendBeacon(url)) return 'beacon';
+                } catch (_) { noteSuppressed(); }
+                try {
+                    if (typeof fetch === 'function' && typeof Request === 'function' && 'keepalive' in new Request(url)) {
+                        fetch(url, { method: 'POST', keepalive: true }).catch(function () { noteSuppressed(); });
+                        return 'fetch';
+                    }
+                } catch (_) { noteSuppressed(); }
+                try {
+                    var xhr = new XMLHttpRequest();
+                    xhr.open('POST', url, false);
+                    xhr.send();
+                    return 'xhr';
+                } catch (_) { noteSuppressed(); }
+                try {
+                    new Image().src = url + (url.indexOf('?') < 0 ? '?' : '&') + 't=' + Date.now();
+                    return 'image';
+                } catch (_) { noteSuppressed(); }
+                return '';
+            }
+
             // Releases this tab's session so the host takes its display down now, not after the
-            // disconnect grace. A beacon, because a `fetch` from `pagehide` may never leave.
+            // disconnect grace.
             function releaseJoin(id) {
                 var join = id || currentJoinId;
                 if (!join) return;
-                try { navigator.sendBeacon('/leave?join=' + encodeURIComponent(join)); } catch (_) { noteSuppressed(); }
+                sendGoodbye('/leave?join=' + encodeURIComponent(join));
                 if (join === currentJoinId) setJoinId('');
             }
 
@@ -428,7 +457,7 @@
                 var stale = readStoredJoinId();
                 if (!stale) return;
                 setJoinId('');
-                try { navigator.sendBeacon('/leave?join=' + encodeURIComponent(stale)); } catch (_) { noteSuppressed(); }
+                sendGoodbye('/leave?join=' + encodeURIComponent(stale));
             })();
 
             let reconfigPoll = null;
@@ -438,6 +467,7 @@
             let kicked = false;
             let compatBlocked = false;
             let fullscreenMode = true;
+            let forceFullscreen = false;
 
             const PROBE_OK_MS = 1000;
             const PROBE_FAST_MS = 300;
@@ -579,7 +609,10 @@
                     canvas.replaceWith(replacement);
                 }
                 canvas = replacement;
-                if (locked && !currentFullscreenEl()) { canvas.style.width = window.innerWidth + 'px'; canvas.style.height = window.innerHeight + 'px'; }
+                if (locked && !currentFullscreenEl()) {
+                    const box = fillBox();
+                    canvas.style.width = box.w + 'px'; canvas.style.height = box.h + 'px';
+                }
                 return canvas;
             }
 
@@ -840,13 +873,18 @@
                 }
                 return { width: w, height: h, portrait };
             }
+            // The host display is always the device's screen, whatever the window: a smaller page box
+            // letterboxes the picture inside it rather than shrinking the display
+            function joinGeom() {
+                return screenGeom();
+            }
             function geomKey(g) { return g.width + 'x' + g.height + (g.portrait ? 'P' : 'L'); }
             function relayGeomChange() {
                 if (!isLive || reconfiguring || kicked || !joinData) return;
-                const g = screenGeom();
-                const key = geomKey(g);
+                const key = geomKey(screenGeom());
                 if (key === lastGeomKey) return;
                 lastGeomKey = key;
+                const g = joinGeom();
                 joinData.width = g.width;
                 joinData.height = g.height;
                 console.log('[geom] client changed to ' + key + ' (portrait=' + g.portrait + '); resizing host display');
@@ -916,6 +954,7 @@
             let visibilityHandler = null;
             let beforeUnloadHandler = null;
             let fullscreenHandler = null;
+            const VIDEO_FULLSCREEN_EVENTS = ['webkitbeginfullscreen', 'webkitendfullscreen'];
             let gestureHandler = null;
             let pageshowHandler = null;
             let locked = false;
@@ -941,8 +980,19 @@
                 }
                 return Promise.resolve();
             }
+            // 'api': the Fullscreen API works on the stage. 'force': only the native video player can
+            // go fullscreen (iPhone Safari), at the cost of the WebCodecs path. 'none': neither.
+            function fullscreenOption(stageEl, videoEl) {
+                if (stageEl.requestFullscreen || stageEl.webkitRequestFullscreen ||
+                    stageEl.mozRequestFullScreen || stageEl.msRequestFullscreen) {
+                    return 'api';
+                }
+                if (videoEl && typeof videoEl.webkitEnterFullscreen === 'function') return 'force';
+                return 'none';
+            }
             function currentFullscreenEl() {
-                return document.fullscreenElement || document.mozFullScreenElement || document.webkitFullscreenElement || null;
+                return document.fullscreenElement || document.mozFullScreenElement || document.webkitFullscreenElement ||
+                    (video.webkitDisplayingFullscreen ? video : null);
             }
             function fullscreenTarget() {
                 if (stage.requestFullscreen || stage.webkitRequestFullscreen ||
@@ -951,15 +1001,49 @@
                 }
                 return liveEl();
             }
+            // A Home Screen web app has no browser bars, so the page may cover the whole screen,
+            // but iOS can report innerHeight short of it there. The host's display was sized to
+            // the screen, so the picture is laid out at the screen's size: no letterbox.
+            function webAppMode() {
+                try {
+                    if (navigator.standalone === true) return true;
+                    if (window.matchMedia) {
+                        return window.matchMedia('(display-mode: standalone)').matches ||
+                            window.matchMedia('(display-mode: fullscreen)').matches;
+                    }
+                } catch (_) { noteSuppressed(); }
+                return false;
+            }
+            function fillBox() {
+                const w = window.innerWidth;
+                const h = window.innerHeight;
+                if (!webAppMode()) return { w: w, h: h, full: false };
+                const g = screenGeom();
+                return { w: Math.max(w, g.width), h: Math.max(h, g.height), full: true };
+            }
+            function setRootHeight(h) {
+                if (document.documentElement) document.documentElement.style.height = h;
+                if (document.body) document.body.style.height = h;
+            }
             function sizeToViewport() {
-                const w = window.innerWidth + 'px';
-                const h = window.innerHeight + 'px';
+                const box = fillBox();
+                const w = box.w + 'px';
+                const h = box.h + 'px';
+                // html and body are height 100% with overflow hidden, and iOS web apps report that
+                // height short of the screen, so they clip the bottom of a stage taller than it
+                setRootHeight(box.full ? h : '');
+                // explicit size from the top-left corner: `bottom: 0` stops short in iOS web apps
+                stage.style.right = 'auto'; stage.style.bottom = 'auto';
+                stage.style.width = w; stage.style.height = h;
                 canvas.style.width = w; canvas.style.height = h;
                 video.style.width = w; video.style.height = h;
             }
             function clearViewportSize() {
+                setRootHeight('');
                 canvas.style.width = ''; canvas.style.height = '';
                 video.style.width = ''; video.style.height = '';
+                stage.style.right = ''; stage.style.bottom = '';
+                stage.style.width = ''; stage.style.height = '';
             }
             async function acquireKeyboardLock() {
                 if (navigator.keyboard && navigator.keyboard.lock) {
@@ -1092,6 +1176,10 @@
             function enterViewportMode() {
                 viewportModeActive = true;
                 sizeToViewport();
+                // input normalises against the stage, which a web app has just resized
+                if (webAppMode()) {
+                    try { if (window.RemoteInput && RemoteInput.onViewportSettled) RemoteInput.onViewportSettled(); } catch (_) { noteSuppressed(); }
+                }
             }
             function exitViewportMode() {
                 viewportModeActive = false;
@@ -1187,6 +1275,7 @@
                     }
                 };
                 fullscreenEvents.forEach((ev) => document.addEventListener(ev, fullscreenHandler));
+                VIDEO_FULLSCREEN_EVENTS.forEach((ev) => video.addEventListener(ev, fullscreenHandler));
 
                 await enterFullscreen(fullscreenTarget()).catch(() => {});
 
@@ -1204,7 +1293,11 @@
             async function stopLock() {
                 locked = false;
                 const fullscreenEvents = ['fullscreenchange', 'webkitfullscreenchange', 'mozfullscreenchange', 'MSFullscreenChange'];
-                if (fullscreenHandler) { fullscreenEvents.forEach((ev) => document.removeEventListener(ev, fullscreenHandler)); fullscreenHandler = null; }
+                if (fullscreenHandler) {
+                    fullscreenEvents.forEach((ev) => document.removeEventListener(ev, fullscreenHandler));
+                    VIDEO_FULLSCREEN_EVENTS.forEach((ev) => video.removeEventListener(ev, fullscreenHandler));
+                    fullscreenHandler = null;
+                }
                 if (visibilityHandler) { document.removeEventListener('visibilitychange', visibilityHandler); visibilityHandler = null; }
                 if (beforeUnloadHandler) { window.removeEventListener('beforeunload', beforeUnloadHandler); beforeUnloadHandler = null; }
                 if (pageshowHandler) { window.removeEventListener('pageshow', pageshowHandler); pageshowHandler = null; }
@@ -2120,7 +2213,7 @@
                 const stale = () => gen !== startGen;
                 let localTrickle = null;
                 try {
-                    const webcodecs = preferWebCodecs && canWebCodecs && !usingFallback;
+                    const webcodecs = preferWebCodecs && canWebCodecs && !usingFallback && !forceFullscreen;
 
                     const useScriptTransform = useScriptTransformNow();
                     // primed at load, so normally already resolved
@@ -2457,7 +2550,8 @@
                             iceEverConnected = true;
                             iceSettled();
                             armTransformWatchdog();
-                            if (usingFallback || !canWebCodecs) liveOnConnect();
+                            // the <video> path has no WebCodecs frame to wait for, forced or not
+                            if (!webcodecs) liveOnConnect();
                         } else if (s === 'failed') {
                             linkLost('Connection failed.');
                         }
@@ -2624,7 +2718,7 @@
                     if (stale()) { noteSuppressed(); return; }
                     const action = setupFailureAction(err, {
                         answerRetried: answerRetried,
-                        webcodecsTier: preferWebCodecs && canWebCodecs && !usingFallback,
+                        webcodecsTier: preferWebCodecs && canWebCodecs && !usingFallback && !forceFullscreen,
                     });
                     if (action === 'retry') {
                         answerRetried = true;
@@ -2653,7 +2747,9 @@
                     if (joinData.deviceName) u.searchParams.set('name', joinData.deviceName);
                     if (joinData.otp) u.searchParams.set('otp', joinData.otp);
                 }
-                u.searchParams.set('fs', fullscreenMode ? '1' : '0');
+                // its own parameter: the plain toggle defaults on, and must never turn force on
+                if (fullscreenOptionKind === 'force') u.searchParams.set('ffs', fullscreenModeInput.checked ? '1' : '0');
+                else u.searchParams.set('fs', fullscreenMode ? '1' : '0');
                 return u.toString();
             }
             async function offerHttpsUpgrade() {
@@ -2702,15 +2798,34 @@
             const fullscreenModeInput = document.getElementById('fullscreenMode');
 
             const FULLSCREEN_MODE_KEY = 'se.fullscreenMode';
+            // a new name: builds that carried the plain toggle's default into force saved '1' here
+            const FORCE_FULLSCREEN_KEY = 'se.forceFullscreenOptIn';
+            const fullscreenOptionKind = fullscreenOption(stage, video);
+            const fullscreenOptionKey = fullscreenOptionKind === 'force' ? FORCE_FULLSCREEN_KEY : FULLSCREEN_MODE_KEY;
+            // only iOS WebKit defines navigator.standalone, so with video-only fullscreen this is an
+            // iPhone or iPod, where Add to Home Screen gives a true full screen
+            const iosHomeScreenCapable = fullscreenOptionKind === 'force' && typeof navigator.standalone === 'boolean';
+            // a Home Screen web app already covers the screen: no fullscreen option to offer
+            const fullscreenOptionHidden = iosHomeScreenCapable && webAppMode();
+            if (fullscreenOptionKind === 'force') {
+                document.querySelector('#fullscreenMode + .fs-toggle-text .fs-toggle-title').textContent = 'Force fullscreen';
+                document.querySelector('#fullscreenMode + .fs-toggle-text .fs-toggle-desc').textContent =
+                    'Fills the screen through the system video player. Slower, and remote control (touch and keyboard) does not work in this mode.' +
+                    (iosHomeScreenCapable ? ' For a true full screen with remote control, add this page to the Home Screen.' : '');
+                fullscreenModeInput.checked = false;
+            }
+            if (fullscreenOptionHidden) document.getElementById('fsToggle').style.display = 'none';
             const DEVICE_TOKEN_KEY = 'se.deviceToken';
             function readDeviceToken() {
                 try { return localStorage.getItem(DEVICE_TOKEN_KEY) || ''; } catch (_) { noteSuppressed(); return ''; }
             }
             try {
-                if (localStorage.getItem(FULLSCREEN_MODE_KEY) === '0') fullscreenModeInput.checked = false;
+                if (fullscreenOptionHidden) fullscreenModeInput.checked = false;
+                else if (fullscreenOptionKind === 'force') fullscreenModeInput.checked = localStorage.getItem(FORCE_FULLSCREEN_KEY) === '1';
+                else if (localStorage.getItem(FULLSCREEN_MODE_KEY) === '0') fullscreenModeInput.checked = false;
             } catch (_) { noteSuppressed(); }
             fullscreenModeInput.addEventListener('change', () => {
-                try { localStorage.setItem(FULLSCREEN_MODE_KEY, fullscreenModeInput.checked ? '1' : '0'); } catch (_) { noteSuppressed(); }
+                try { localStorage.setItem(fullscreenOptionKey, fullscreenModeInput.checked ? '1' : '0'); } catch (_) { noteSuppressed(); }
             });
 
             document.getElementById('brand').addEventListener('click', () => {
@@ -2797,6 +2912,10 @@
 
                 const name = params.get('name');
                 if (name) nameInput.value = name.slice(0, 20);
+                // a kept link should be open-and-connect: the name typed last time is reused
+                if (!nameInput.value) {
+                    try { nameInput.value = (localStorage.getItem('se.deviceName') || '').slice(0, 20); } catch (_) { noteSuppressed(); }
+                }
 
                 const otp = (params.get('otp') || '').replace(/\D/g, '').slice(0, otpInputs.length);
                 for (let k = 0; k < otp.length; k++) {
@@ -2804,13 +2923,13 @@
                     otpInputs[k].classList.add('filled');
                 }
 
-                const fs = params.get('fs');
-                if (fs === '0' || fs === '1') {
+                const fs = params.get(fullscreenOptionKind === 'force' ? 'ffs' : 'fs');
+                if (!fullscreenOptionHidden && (fs === '0' || fs === '1')) {
                     fullscreenModeInput.checked = fs === '1';
-                    try { localStorage.setItem(FULLSCREEN_MODE_KEY, fs); } catch (_) { noteSuppressed(); }
+                    try { localStorage.setItem(fullscreenOptionKey, fs); } catch (_) { noteSuppressed(); }
                 }
 
-                const consumed = ['otp', 'name', 'fs'];
+                const consumed = ['otp', 'name', 'fs', 'ffs'];
                 if (consumed.some((k) => params.has(k))) {
                     const clean = new URL(window.location.href);
                     consumed.forEach((k) => clean.searchParams.delete(k));
@@ -3082,7 +3201,10 @@
                     }
                 } catch (_) { noteSuppressed(); }
 
-                const g0 = screenGeom();
+                fullscreenMode = fullscreenModeInput.checked;
+                forceFullscreen = fullscreenOptionKind === 'force' && fullscreenModeInput.checked;
+                try { localStorage.setItem('se.deviceName', nameInput.value.trim()); } catch (_) { noteSuppressed(); }
+                const g0 = joinGeom();
                 joinData = {
                     sessionId: sessionInput.value.trim(),
                     deviceName: nameInput.value.trim(),
@@ -3092,9 +3214,9 @@
                     width: g0.width,
                     height: g0.height,
                 };
-                lastGeomKey = geomKey(g0);
-
-                fullscreenMode = fullscreenModeInput.checked;
+                lastGeomKey = geomKey(screenGeom());
+                if (forceFullscreen) degrade(DEG.FULLSCREEN_FORCED_THROUGH_VIDEO);
+                else undegrade(DEG.FULLSCREEN_FORCED_THROUGH_VIDEO);
 
                 showError('');
                 showLinkStatus('');

@@ -566,7 +566,7 @@ pub fn video_late_state_name(code: u8) -> &'static str {
 
 /// Names for the v2 degradation bits, in bit order. Each is a silent fallback on the client: a
 /// swallowed `catch` or an untaken branch.
-pub const CLIENT_DEGRADED_NAMES: [&str; 25] = [
+pub const CLIENT_DEGRADED_NAMES: [&str; 26] = [
     "fullscreen_refused",
     "pointer_lock_refused",
     "no_unadjusted_movement",
@@ -592,6 +592,7 @@ pub const CLIENT_DEGRADED_NAMES: [&str; 25] = [
     "no_trickle_ice",
     "input_suspended_for_modal",
     "join_id_missing",
+    "fullscreen_forced_through_video",
 ];
 
 /// The degradation bits that are set, by name.
