@@ -1580,6 +1580,8 @@ pub(crate) async fn activate_session(
         gate: Arc::clone(&keyframe_gate),
     };
     let feedback = Arc::new(SharedFeedback::default());
+    // whatever arrives from the client, on any channel, proves it is still there
+    let liveness = Arc::new(super::liveness::Liveness::default());
     let clock_epoch = Instant::now();
     *feedback.history.lock_recover() = Some(SendHistory::new(clock_epoch));
     // the pacer refills from the same target the encoder is given, so the two never disagree
@@ -1608,8 +1610,10 @@ pub(crate) async fn activate_session(
         let session_telemetry = Arc::clone(&pipeline.telemetry);
         let keyframes_dc = keyframes.clone();
         let live_for_dc = Arc::clone(&live_input);
+        let liveness_dc = Arc::clone(&liveness);
         pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
             let session_telemetry = Arc::clone(&session_telemetry);
+            let liveness_dc = Arc::clone(&liveness_dc);
             let keyframes_dc = keyframes_dc.clone();
             let live_for_dc = Arc::clone(&live_for_dc);
             let label = dc.label().to_string();
@@ -1678,6 +1682,7 @@ pub(crate) async fn activate_session(
                     pong_tx
                 });
                 dc.on_message(Box::new(move |msg: DataChannelMessage| {
+                    liveness_dc.heard(audio::host_now_ns());
                     // remote control is read per message, never captured: turning it off must not
                     // cost the session a renegotiation
                     let parsed = match input::protocol::parse(&msg.data) {
@@ -1766,6 +1771,7 @@ pub(crate) async fn activate_session(
         let pipeline = pipeline.clone();
         let keyframes = keyframes.clone();
         let feedback = Arc::clone(&feedback);
+        let liveness_rtcp = Arc::clone(&liveness);
         tokio::spawn(async move {
             use webrtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
             use webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
@@ -1787,7 +1793,10 @@ pub(crate) async fn activate_session(
             let mut video_ssrc = 0u32;
             loop {
                 let packets = match rtp_sender.read(&mut rtcp_buf).await {
-                    Ok((packets, _attrs)) => packets,
+                    Ok((packets, _attrs)) => {
+                        liveness_rtcp.heard(audio::host_now_ns());
+                        packets
+                    }
                     // the resends ride this reader: one packet that does not parse must not end it
                     #[cfg(windows)]
                     Err(e) => {
@@ -2369,6 +2378,8 @@ pub(crate) async fn activate_session(
             }));
     }
     let connected_state = Arc::clone(&pipeline.telemetry);
+    let liveness_state = Arc::clone(&liveness);
+    let watchdog_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
     pc.on_peer_connection_state_change(Box::new(move |state: RTCPeerConnectionState| {
         if state == RTCPeerConnectionState::Connected {
             connected_state
@@ -2395,6 +2406,14 @@ pub(crate) async fn activate_session(
         }
         if state == RTCPeerConnectionState::Connected {
             let _ = grace_cancel_tx.send(true);
+            liveness_state.heard(audio::host_now_ns());
+            if !watchdog_started.swap(true, Ordering::Relaxed) {
+                spawn_liveness_watchdog(
+                    Arc::clone(&liveness_state),
+                    Arc::clone(&closed_tx),
+                    pc_state.clone(),
+                );
+            }
             // the first moment the track can carry an IDR: before the binding `write_rtp` returns
             // `Ok(0)`, and with an infinite GOP nothing else would produce a keyframe
             #[cfg(windows)]
@@ -2466,9 +2485,9 @@ pub(crate) async fn activate_session(
             let mut cancel_rx = grace_cancel_rx_closure.clone();
             let _ = grace_cancel_tx.send(false);
             tokio::spawn(async move {
-                tprintln!("peer connection Disconnected, waiting 8s for recovery before closing");
+                tprintln!("peer connection Disconnected, waiting 3s for recovery before closing");
                 tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(8)) => {
+                    _ = tokio::time::sleep(Duration::from_secs(3)) => {
                         tprintln!("peer connection Disconnected grace period expired, closing session");
                         if let Some(tx) = closed_tx.lock_recover().take() {
                             let _ = tx.send(());
@@ -2496,6 +2515,39 @@ pub(crate) async fn activate_session(
             _qos: qos_flow,
         },
     ))
+}
+
+/// Ends the transport once the client has been silent for [`super::liveness::SILENCE_LIMIT`]: a
+/// phone whose tab was killed or whose screen went off says no goodbye. Ending it here, rather
+/// than waiting out ICE's own timeout and the recovery wait after it, hands the join to the
+/// server's disconnect grace sooner, which still holds the display for a rejoin.
+fn spawn_liveness_watchdog(
+    liveness: Arc<super::liveness::Liveness>,
+    closed_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+    pc: std::sync::Weak<webrtc::peer_connection::RTCPeerConnection>,
+) {
+    use super::liveness::{CHECK_EVERY, SILENCE_LIMIT};
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(CHECK_EVERY).await;
+            if pc.upgrade().is_none() {
+                return;
+            }
+            let now = audio::host_now_ns();
+            if !liveness.silent_for(now, SILENCE_LIMIT) {
+                continue;
+            }
+            let Some(tx) = closed_tx.lock_recover().take() else {
+                return;
+            };
+            tprintln!(
+                "client silent for {} ms (no data channel message, no RTCP); closing the transport",
+                now.saturating_sub(liveness.last_ns()) / 1_000_000
+            );
+            let _ = tx.send(());
+            return;
+        }
+    });
 }
 
 /// Prepare and activate in one call. The serial shape, kept for the WHEP self-test and any caller
